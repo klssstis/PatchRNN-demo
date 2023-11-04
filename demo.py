@@ -29,7 +29,8 @@ from natsort import natsorted
 # environment settings.
 _COLAB_ = 0 if (os.getenv('COLAB_GPU', 'NONE') == 'NONE') else 1 # 0 : Local environment, 1 : Google Colaboratory.
 # file paths.
-rootPath = './drive/My Drive/Colab Notebooks/' if (_COLAB_) else './'
+#rootPath = './drive/My Drive/Colab Notebooks/' if (_COLAB_) else './'
+rootPath = './'
 # dataPath = rootPath + '/data/'
 # sDatPath = dataPath + '/security_patch/'
 # pDatPath = dataPath + '/positives/'
