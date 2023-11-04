@@ -1,8 +1,8 @@
 # dependencies.
 import os
-os.system('pip install clang==6.0.0.2')
-os.system('pip install nltk==3.3')
-os.system('pip install natsort')
+os.system('pip3 install clang==6.0.0.2')
+os.system('pip3 install nltk==3.3')
+os.system('pip3 install natsort')
 import re
 import gc
 import time
