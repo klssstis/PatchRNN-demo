@@ -1,0 +1,59 @@
+From 8481f99896a192e9fd57f5e1a99e255e27680a10 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 9 Sep 2021 11:45:48 -0400
+Subject: [PATCH] Check for relation length overrun soon enough.
+
+We don't allow relations to exceed 2^32-1 blocks, because block
+numbers are 32 bits and the last possible block number is reserved
+to mean InvalidBlockNumber.  There is a check for this in mdextend,
+but that's really way too late, because the smgr API requires us to
+create a buffer for the block-to-be-added, and we do not want to
+have any buffer with blocknum InvalidBlockNumber.  (Such a case
+can trigger assertions in bufmgr.c, plus I think it might confuse
+ReadBuffer's logic for data-past-EOF later on.)  So put the check
+into ReadBuffer.
+
+Per report from Christoph Berg.  It's been like this forever,
+so back-patch to all supported branches.
+
+Discussion: https://postgr.es/m/YTn1iTkUYBZfcODk@msg.credativ.de
+---
+ src/backend/storage/buffer/bufmgr.c | 9 +++++++++
+ src/backend/storage/smgr/md.c       | 3 ++-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/storage/buffer/bufmgr.c b/src/backend/storage/buffer/bufmgr.c
+index bc1753ae9160..e88e4e918b09 100644
+--- a/src/backend/storage/buffer/bufmgr.c
++++ b/src/backend/storage/buffer/bufmgr.c
+@@ -824,7 +824,16 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+ 
+ 	/* Substitute proper block number if caller asked for P_NEW */
+ 	if (isExtend)
++	{
+ 		blockNum = smgrnblocks(smgr, forkNum);
++		/* Fail if relation is already at maximum possible length */
++		if (blockNum == P_NEW)
++			ereport(ERROR,
++					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++					 errmsg("cannot extend relation %s beyond %u blocks",
++							relpath(smgr->smgr_rnode, forkNum),
++							P_NEW)));
++	}
+ 
+ 	if (isLocalBuf)
+ 	{
+diff --git a/src/backend/storage/smgr/md.c b/src/backend/storage/smgr/md.c
+index 1e12cfad8e85..b4bca7eed6fe 100644
+--- a/src/backend/storage/smgr/md.c
++++ b/src/backend/storage/smgr/md.c
+@@ -426,7 +426,8 @@ mdextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 	/*
+ 	 * If a relation manages to grow to 2^32-1 blocks, refuse to extend it any
+ 	 * more --- we mustn't create a block whose number actually is
+-	 * InvalidBlockNumber.
++	 * InvalidBlockNumber.  (Note that this failure should be unreachable
++	 * because of upstream checks in bufmgr.c.)
+ 	 */
+ 	if (blocknum == InvalidBlockNumber)
+ 		ereport(ERROR,

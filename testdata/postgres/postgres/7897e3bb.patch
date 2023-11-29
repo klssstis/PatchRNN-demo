@@ -1,0 +1,543 @@
+From 7897e3bb902c557412645b82120f4d95f7474906 Mon Sep 17 00:00:00 2001
+From: Thomas Munro <tmunro@postgresql.org>
+Date: Tue, 16 Jun 2020 13:50:56 +1200
+Subject: [PATCH] Fix buffile.c error handling.
+
+Convert buffile.c error handling to use ereport.  This fixes cases where
+I/O errors were indistinguishable from EOF or not reported.  Also remove
+"%m" from error messages where errno would be bogus.  While we're
+modifying those strings, add block numbers and short read byte counts
+where appropriate.
+
+Back-patch to all supported releases.
+
+Reported-by: Amit Khandekar <amitdkhan.pg@gmail.com>
+Reviewed-by: Melanie Plageman <melanieplageman@gmail.com>
+Reviewed-by: Alvaro Herrera <alvherre@2ndquadrant.com>
+Reviewed-by: Robert Haas <robertmhaas@gmail.com>
+Reviewed-by: Ibrar Ahmed <ibrar.ahmad@gmail.com>
+Reviewed-by: Michael Paquier <michael@paquier.xyz>
+Discussion: https://postgr.es/m/CA%2BhUKGJE04G%3D8TLK0DLypT_27D9dR8F1RQgNp0jK6qR0tZGWOw%40mail.gmail.com
+---
+ src/backend/access/gist/gistbuildbuffers.c | 24 ++++------
+ src/backend/executor/nodeHashjoin.c        | 24 ++++------
+ src/backend/replication/backup_manifest.c  |  9 +---
+ src/backend/storage/file/buffile.c         | 45 +++++++++--------
+ src/backend/utils/sort/logtape.c           | 19 +++++---
+ src/backend/utils/sort/sharedtuplestore.c  | 21 ++++----
+ src/backend/utils/sort/tuplestore.c        | 56 ++++++++++------------
+ 7 files changed, 88 insertions(+), 110 deletions(-)
+
+diff --git a/src/backend/access/gist/gistbuildbuffers.c b/src/backend/access/gist/gistbuildbuffers.c
+index 4b562d8d3f09..4eab9bb83ac0 100644
+--- a/src/backend/access/gist/gistbuildbuffers.c
++++ b/src/backend/access/gist/gistbuildbuffers.c
+@@ -757,26 +757,20 @@ gistRelocateBuildBuffersOnSplit(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
+ static void
+ ReadTempFileBlock(BufFile *file, long blknum, void *ptr)
+ {
++	size_t		nread;
++
+ 	if (BufFileSeekBlock(file, blknum) != 0)
+-		elog(ERROR, "could not seek temporary file: %m");
+-	if (BufFileRead(file, ptr, BLCKSZ) != BLCKSZ)
+-		elog(ERROR, "could not read temporary file: %m");
++		elog(ERROR, "could not seek to block %ld in temporary file", blknum);
++	nread = BufFileRead(file, ptr, BLCKSZ);
++	if (nread != BLCKSZ)
++		elog(ERROR, "could not read temporary file: read only %zu of %zu bytes",
++			 nread, (size_t) BLCKSZ);
+ }
+ 
+ static void
+ WriteTempFileBlock(BufFile *file, long blknum, void *ptr)
+ {
+ 	if (BufFileSeekBlock(file, blknum) != 0)
+-		elog(ERROR, "could not seek temporary file: %m");
+-	if (BufFileWrite(file, ptr, BLCKSZ) != BLCKSZ)
+-	{
+-		/*
+-		 * the other errors in Read/WriteTempFileBlock shouldn't happen, but
+-		 * an error at write can easily happen if you run out of disk space.
+-		 */
+-		ereport(ERROR,
+-				(errcode_for_file_access(),
+-				 errmsg("could not write block %ld of temporary file: %m",
+-						blknum)));
+-	}
++		elog(ERROR, "could not seek to block %ld in temporary file", blknum);
++	BufFileWrite(file, ptr, BLCKSZ);
+ }
+diff --git a/src/backend/executor/nodeHashjoin.c b/src/backend/executor/nodeHashjoin.c
+index 2cdc38a60147..9bb23fef1a6e 100644
+--- a/src/backend/executor/nodeHashjoin.c
++++ b/src/backend/executor/nodeHashjoin.c
+@@ -1043,7 +1043,7 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
+ 		if (BufFileSeek(innerFile, 0, 0L, SEEK_SET))
+ 			ereport(ERROR,
+ 					(errcode_for_file_access(),
+-					 errmsg("could not rewind hash-join temporary file: %m")));
++					 errmsg("could not rewind hash-join temporary file")));
+ 
+ 		while ((slot = ExecHashJoinGetSavedTuple(hjstate,
+ 												 innerFile,
+@@ -1073,7 +1073,7 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
+ 		if (BufFileSeek(hashtable->outerBatchFile[curbatch], 0, 0L, SEEK_SET))
+ 			ereport(ERROR,
+ 					(errcode_for_file_access(),
+-					 errmsg("could not rewind hash-join temporary file: %m")));
++					 errmsg("could not rewind hash-join temporary file")));
+ 	}
+ 
+ 	return true;
+@@ -1219,7 +1219,6 @@ ExecHashJoinSaveTuple(MinimalTuple tuple, uint32 hashvalue,
+ 					  BufFile **fileptr)
+ {
+ 	BufFile    *file = *fileptr;
+-	size_t		written;
+ 
+ 	if (file == NULL)
+ 	{
+@@ -1228,17 +1227,8 @@ ExecHashJoinSaveTuple(MinimalTuple tuple, uint32 hashvalue,
+ 		*fileptr = file;
+ 	}
+ 
+-	written = BufFileWrite(file, (void *) &hashvalue, sizeof(uint32));
+-	if (written != sizeof(uint32))
+-		ereport(ERROR,
+-				(errcode_for_file_access(),
+-				 errmsg("could not write to hash-join temporary file: %m")));
+-
+-	written = BufFileWrite(file, (void *) tuple, tuple->t_len);
+-	if (written != tuple->t_len)
+-		ereport(ERROR,
+-				(errcode_for_file_access(),
+-				 errmsg("could not write to hash-join temporary file: %m")));
++	BufFileWrite(file, (void *) &hashvalue, sizeof(uint32));
++	BufFileWrite(file, (void *) tuple, tuple->t_len);
+ }
+ 
+ /*
+@@ -1279,7 +1269,8 @@ ExecHashJoinGetSavedTuple(HashJoinState *hjstate,
+ 	if (nread != sizeof(header))
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not read from hash-join temporary file: %m")));
++				 errmsg("could not read from hash-join temporary file: read only %zu of %zu bytes",
++						nread, sizeof(header))));
+ 	*hashvalue = header[0];
+ 	tuple = (MinimalTuple) palloc(header[1]);
+ 	tuple->t_len = header[1];
+@@ -1289,7 +1280,8 @@ ExecHashJoinGetSavedTuple(HashJoinState *hjstate,
+ 	if (nread != header[1] - sizeof(uint32))
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not read from hash-join temporary file: %m")));
++				 errmsg("could not read from hash-join temporary file: read only %zu of %zu bytes",
++						nread, header[1] - sizeof(uint32))));
+ 	ExecForceStoreMinimalTuple(tuple, tupleSlot, true);
+ 	return tupleSlot;
+ }
+diff --git a/src/backend/replication/backup_manifest.c b/src/backend/replication/backup_manifest.c
+index 807c5f16b4f3..b6260049271b 100644
+--- a/src/backend/replication/backup_manifest.c
++++ b/src/backend/replication/backup_manifest.c
+@@ -319,7 +319,7 @@ SendBackupManifest(backup_manifest_info *manifest)
+ 	if (BufFileSeek(manifest->buffile, 0, 0L, SEEK_SET))
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not rewind temporary file: %m")));
++				 errmsg("could not rewind temporary file")));
+ 
+ 	/* Send CopyOutResponse message */
+ 	pq_beginmessage(&protobuf, 'H');
+@@ -365,15 +365,10 @@ static void
+ AppendStringToManifest(backup_manifest_info *manifest, char *s)
+ {
+ 	int			len = strlen(s);
+-	size_t		written;
+ 
+ 	Assert(manifest != NULL);
+ 	if (manifest->still_checksumming)
+ 		pg_sha256_update(&manifest->manifest_ctx, (uint8 *) s, len);
+-	written = BufFileWrite(manifest->buffile, s, len);
+-	if (written != len)
+-		ereport(ERROR,
+-				(errcode_for_file_access(),
+-				 errmsg("could not write to temporary file: %m")));
++	BufFileWrite(manifest->buffile, s, len);
+ 	manifest->manifest_size += len;
+ }
+diff --git a/src/backend/storage/file/buffile.c b/src/backend/storage/file/buffile.c
+index 35e8f12e62da..298b10b543ac 100644
+--- a/src/backend/storage/file/buffile.c
++++ b/src/backend/storage/file/buffile.c
+@@ -99,7 +99,7 @@ static BufFile *makeBufFile(File firstfile);
+ static void extendBufFile(BufFile *file);
+ static void BufFileLoadBuffer(BufFile *file);
+ static void BufFileDumpBuffer(BufFile *file);
+-static int	BufFileFlush(BufFile *file);
++static void BufFileFlush(BufFile *file);
+ static File MakeNewSharedSegment(BufFile *file, int segment);
+ 
+ /*
+@@ -434,7 +434,14 @@ BufFileLoadBuffer(BufFile *file)
+ 							file->curOffset,
+ 							WAIT_EVENT_BUFFILE_READ);
+ 	if (file->nbytes < 0)
++	{
+ 		file->nbytes = 0;
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not read file \"%s\": %m",
++						FilePathName(thisfile))));
++	}
++
+ 	/* we choose not to advance curOffset here */
+ 
+ 	if (file->nbytes > 0)
+@@ -490,7 +497,10 @@ BufFileDumpBuffer(BufFile *file)
+ 								 file->curOffset,
+ 								 WAIT_EVENT_BUFFILE_WRITE);
+ 		if (bytestowrite <= 0)
+-			return;				/* failed to write */
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("could not write to file \"%s\" : %m",
++							FilePathName(thisfile))));
+ 		file->curOffset += bytestowrite;
+ 		wpos += bytestowrite;
+ 
+@@ -522,7 +532,8 @@ BufFileDumpBuffer(BufFile *file)
+ /*
+  * BufFileRead
+  *
+- * Like fread() except we assume 1-byte element size.
++ * Like fread() except we assume 1-byte element size and report I/O errors via
++ * ereport().
+  */
+ size_t
+ BufFileRead(BufFile *file, void *ptr, size_t size)
+@@ -530,12 +541,7 @@ BufFileRead(BufFile *file, void *ptr, size_t size)
+ 	size_t		nread = 0;
+ 	size_t		nthistime;
+ 
+-	if (file->dirty)
+-	{
+-		if (BufFileFlush(file) != 0)
+-			return 0;			/* could not flush... */
+-		Assert(!file->dirty);
+-	}
++	BufFileFlush(file);
+ 
+ 	while (size > 0)
+ 	{
+@@ -569,7 +575,8 @@ BufFileRead(BufFile *file, void *ptr, size_t size)
+ /*
+  * BufFileWrite
+  *
+- * Like fwrite() except we assume 1-byte element size.
++ * Like fwrite() except we assume 1-byte element size and report errors via
++ * ereport().
+  */
+ size_t
+ BufFileWrite(BufFile *file, void *ptr, size_t size)
+@@ -585,11 +592,7 @@ BufFileWrite(BufFile *file, void *ptr, size_t size)
+ 		{
+ 			/* Buffer full, dump it out */
+ 			if (file->dirty)
+-			{
+ 				BufFileDumpBuffer(file);
+-				if (file->dirty)
+-					break;		/* I/O error */
+-			}
+ 			else
+ 			{
+ 				/* Hmm, went directly from reading to writing? */
+@@ -621,19 +624,15 @@ BufFileWrite(BufFile *file, void *ptr, size_t size)
+ /*
+  * BufFileFlush
+  *
+- * Like fflush()
++ * Like fflush(), except that I/O errors are reported with ereport().
+  */
+-static int
++static void
+ BufFileFlush(BufFile *file)
+ {
+ 	if (file->dirty)
+-	{
+ 		BufFileDumpBuffer(file);
+-		if (file->dirty)
+-			return EOF;
+-	}
+ 
+-	return 0;
++	Assert(!file->dirty);
+ }
+ 
+ /*
+@@ -642,6 +641,7 @@ BufFileFlush(BufFile *file)
+  * Like fseek(), except that target position needs two values in order to
+  * work when logical filesize exceeds maximum value representable by off_t.
+  * We do not support relative seeks across more than that, however.
++ * I/O errors are reported by ereport().
+  *
+  * Result is 0 if OK, EOF if not.  Logical position is not moved if an
+  * impossible seek is attempted.
+@@ -699,8 +699,7 @@ BufFileSeek(BufFile *file, int fileno, off_t offset, int whence)
+ 		return 0;
+ 	}
+ 	/* Otherwise, must reposition buffer, so flush any dirty data */
+-	if (BufFileFlush(file) != 0)
+-		return EOF;
++	BufFileFlush(file);
+ 
+ 	/*
+ 	 * At this point and no sooner, check for seek past last segment. The
+diff --git a/src/backend/utils/sort/logtape.c b/src/backend/utils/sort/logtape.c
+index 138da0c1b42c..5517e59c50fd 100644
+--- a/src/backend/utils/sort/logtape.c
++++ b/src/backend/utils/sort/logtape.c
+@@ -262,12 +262,12 @@ ltsWriteBlock(LogicalTapeSet *lts, long blocknum, void *buffer)
+ 	}
+ 
+ 	/* Write the requested block */
+-	if (BufFileSeekBlock(lts->pfile, blocknum) != 0 ||
+-		BufFileWrite(lts->pfile, buffer, BLCKSZ) != BLCKSZ)
++	if (BufFileSeekBlock(lts->pfile, blocknum) != 0)
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not write block %ld of temporary file: %m",
++				 errmsg("could not seek to block %ld of temporary file",
+ 						blocknum)));
++	BufFileWrite(lts->pfile, buffer, BLCKSZ);
+ 
+ 	/* Update nBlocksWritten, if we extended the file */
+ 	if (blocknum == lts->nBlocksWritten)
+@@ -283,12 +283,19 @@ ltsWriteBlock(LogicalTapeSet *lts, long blocknum, void *buffer)
+ static void
+ ltsReadBlock(LogicalTapeSet *lts, long blocknum, void *buffer)
+ {
+-	if (BufFileSeekBlock(lts->pfile, blocknum) != 0 ||
+-		BufFileRead(lts->pfile, buffer, BLCKSZ) != BLCKSZ)
++	size_t		nread;
++
++	if (BufFileSeekBlock(lts->pfile, blocknum) != 0)
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not read block %ld of temporary file: %m",
++				 errmsg("could not seek to block %ld of temporary file",
+ 						blocknum)));
++	nread = BufFileRead(lts->pfile, buffer, BLCKSZ);
++	if (nread != BLCKSZ)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not read block %ld of temporary file: read only %zu of %zu bytes",
++						blocknum, nread, (size_t) BLCKSZ)));
+ }
+ 
+ /*
+diff --git a/src/backend/utils/sort/sharedtuplestore.c b/src/backend/utils/sort/sharedtuplestore.c
+index c3ab494a45ea..6537a4303b12 100644
+--- a/src/backend/utils/sort/sharedtuplestore.c
++++ b/src/backend/utils/sort/sharedtuplestore.c
+@@ -196,14 +196,9 @@ static void
+ sts_flush_chunk(SharedTuplestoreAccessor *accessor)
+ {
+ 	size_t		size;
+-	size_t		written;
+ 
+ 	size = STS_CHUNK_PAGES * BLCKSZ;
+-	written = BufFileWrite(accessor->write_file, accessor->write_chunk, size);
+-	if (written != size)
+-		ereport(ERROR,
+-				(errcode_for_file_access(),
+-				 errmsg("could not write to temporary file: %m")));
++	BufFileWrite(accessor->write_file, accessor->write_chunk, size);
+ 	memset(accessor->write_chunk, 0, size);
+ 	accessor->write_pointer = &accessor->write_chunk->data[0];
+ 	accessor->sts->participants[accessor->participant].npages +=
+@@ -555,6 +550,7 @@ sts_parallel_scan_next(SharedTuplestoreAccessor *accessor, void *meta_data)
+ 		if (!eof)
+ 		{
+ 			SharedTuplestoreChunk chunk_header;
++			size_t		nread;
+ 
+ 			/* Make sure we have the file open. */
+ 			if (accessor->read_file == NULL)
+@@ -570,14 +566,15 @@ sts_parallel_scan_next(SharedTuplestoreAccessor *accessor, void *meta_data)
+ 			if (BufFileSeekBlock(accessor->read_file, read_page) != 0)
+ 				ereport(ERROR,
+ 						(errcode_for_file_access(),
+-						 errmsg("could not read from shared tuplestore temporary file"),
+-						 errdetail_internal("Could not seek to next block.")));
+-			if (BufFileRead(accessor->read_file, &chunk_header,
+-							STS_CHUNK_HEADER_SIZE) != STS_CHUNK_HEADER_SIZE)
++						 errmsg("could not seek block %u in shared tuplestore temporary file",
++								read_page)));
++			nread = BufFileRead(accessor->read_file, &chunk_header,
++								STS_CHUNK_HEADER_SIZE);
++			if (nread != STS_CHUNK_HEADER_SIZE)
+ 				ereport(ERROR,
+ 						(errcode_for_file_access(),
+-						 errmsg("could not read from shared tuplestore temporary file"),
+-						 errdetail_internal("Short read while reading chunk header.")));
++						 errmsg("could not read from shared tuplestore temporary file: read only %zu of %zu bytes",
++								nread, STS_CHUNK_HEADER_SIZE)));
+ 
+ 			/*
+ 			 * If this is an overflow chunk, we skip it and any following
+diff --git a/src/backend/utils/sort/tuplestore.c b/src/backend/utils/sort/tuplestore.c
+index ebb1da07461c..452a85a423bd 100644
+--- a/src/backend/utils/sort/tuplestore.c
++++ b/src/backend/utils/sort/tuplestore.c
+@@ -515,7 +515,7 @@ tuplestore_select_read_pointer(Tuplestorestate *state, int ptr)
+ 								SEEK_SET) != 0)
+ 					ereport(ERROR,
+ 							(errcode_for_file_access(),
+-							 errmsg("could not seek in tuplestore temporary file: %m")));
++							 errmsg("could not seek in tuplestore temporary file")));
+ 			}
+ 			else
+ 			{
+@@ -525,7 +525,7 @@ tuplestore_select_read_pointer(Tuplestorestate *state, int ptr)
+ 								SEEK_SET) != 0)
+ 					ereport(ERROR,
+ 							(errcode_for_file_access(),
+-							 errmsg("could not seek in tuplestore temporary file: %m")));
++							 errmsg("could not seek in tuplestore temporary file")));
+ 			}
+ 			break;
+ 		default:
+@@ -866,7 +866,7 @@ tuplestore_puttuple_common(Tuplestorestate *state, void *tuple)
+ 							SEEK_SET) != 0)
+ 				ereport(ERROR,
+ 						(errcode_for_file_access(),
+-						 errmsg("could not seek in tuplestore temporary file: %m")));
++						 errmsg("could not seek in tuplestore temporary file")));
+ 			state->status = TSS_WRITEFILE;
+ 
+ 			/*
+@@ -970,7 +970,7 @@ tuplestore_gettuple(Tuplestorestate *state, bool forward,
+ 								SEEK_SET) != 0)
+ 					ereport(ERROR,
+ 							(errcode_for_file_access(),
+-							 errmsg("could not seek in tuplestore temporary file: %m")));
++							 errmsg("could not seek in tuplestore temporary file")));
+ 			state->status = TSS_READFILE;
+ 			/* FALLTHROUGH */
+ 
+@@ -1034,7 +1034,7 @@ tuplestore_gettuple(Tuplestorestate *state, bool forward,
+ 									SEEK_CUR) != 0)
+ 						ereport(ERROR,
+ 								(errcode_for_file_access(),
+-								 errmsg("could not seek in tuplestore temporary file: %m")));
++								 errmsg("could not seek in tuplestore temporary file")));
+ 					Assert(!state->truncated);
+ 					return NULL;
+ 				}
+@@ -1051,7 +1051,7 @@ tuplestore_gettuple(Tuplestorestate *state, bool forward,
+ 							SEEK_CUR) != 0)
+ 				ereport(ERROR,
+ 						(errcode_for_file_access(),
+-						 errmsg("could not seek in tuplestore temporary file: %m")));
++						 errmsg("could not seek in tuplestore temporary file")));
+ 			tup = READTUP(state, tuplen);
+ 			return tup;
+ 
+@@ -1253,7 +1253,7 @@ tuplestore_rescan(Tuplestorestate *state)
+ 			if (BufFileSeek(state->myfile, 0, 0L, SEEK_SET) != 0)
+ 				ereport(ERROR,
+ 						(errcode_for_file_access(),
+-						 errmsg("could not seek in tuplestore temporary file: %m")));
++						 errmsg("could not seek in tuplestore temporary file")));
+ 			break;
+ 		default:
+ 			elog(ERROR, "invalid tuplestore state");
+@@ -1318,7 +1318,7 @@ tuplestore_copy_read_pointer(Tuplestorestate *state,
+ 									SEEK_SET) != 0)
+ 						ereport(ERROR,
+ 								(errcode_for_file_access(),
+-								 errmsg("could not seek in tuplestore temporary file: %m")));
++								 errmsg("could not seek in tuplestore temporary file")));
+ 				}
+ 				else
+ 				{
+@@ -1327,7 +1327,7 @@ tuplestore_copy_read_pointer(Tuplestorestate *state,
+ 									SEEK_SET) != 0)
+ 						ereport(ERROR,
+ 								(errcode_for_file_access(),
+-								 errmsg("could not seek in tuplestore temporary file: %m")));
++								 errmsg("could not seek in tuplestore temporary file")));
+ 				}
+ 			}
+ 			else if (srcptr == state->activeptr)
+@@ -1474,7 +1474,8 @@ getlen(Tuplestorestate *state, bool eofOK)
+ 	if (nbytes != 0 || !eofOK)
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not read from tuplestore temporary file: %m")));
++				 errmsg("could not read from tuplestore temporary file: read only %zu of %zu bytes",
++						nbytes, sizeof(len))));
+ 	return 0;
+ }
+ 
+@@ -1511,22 +1512,10 @@ writetup_heap(Tuplestorestate *state, void *tup)
+ 	/* total on-disk footprint: */
+ 	unsigned int tuplen = tupbodylen + sizeof(int);
+ 
+-	if (BufFileWrite(state->myfile, (void *) &tuplen,
+-					 sizeof(tuplen)) != sizeof(tuplen))
+-		ereport(ERROR,
+-				(errcode_for_file_access(),
+-				 errmsg("could not write to tuplestore temporary file: %m")));
+-	if (BufFileWrite(state->myfile, (void *) tupbody,
+-					 tupbodylen) != (size_t) tupbodylen)
+-		ereport(ERROR,
+-				(errcode_for_file_access(),
+-				 errmsg("could not write to tuplestore temporary file: %m")));
++	BufFileWrite(state->myfile, (void *) &tuplen, sizeof(tuplen));
++	BufFileWrite(state->myfile, (void *) tupbody, tupbodylen);
+ 	if (state->backward)		/* need trailing length word? */
+-		if (BufFileWrite(state->myfile, (void *) &tuplen,
+-						 sizeof(tuplen)) != sizeof(tuplen))
+-			ereport(ERROR,
+-					(errcode_for_file_access(),
+-					 errmsg("could not write to tuplestore temporary file: %m")));
++		BufFileWrite(state->myfile, (void *) &tuplen, sizeof(tuplen));
+ 
+ 	FREEMEM(state, GetMemoryChunkSpace(tuple));
+ 	heap_free_minimal_tuple(tuple);
+@@ -1539,20 +1528,25 @@ readtup_heap(Tuplestorestate *state, unsigned int len)
+ 	unsigned int tuplen = tupbodylen + MINIMAL_TUPLE_DATA_OFFSET;
+ 	MinimalTuple tuple = (MinimalTuple) palloc(tuplen);
+ 	char	   *tupbody = (char *) tuple + MINIMAL_TUPLE_DATA_OFFSET;
++	size_t		nread;
+ 
+ 	USEMEM(state, GetMemoryChunkSpace(tuple));
+ 	/* read in the tuple proper */
+ 	tuple->t_len = tuplen;
+-	if (BufFileRead(state->myfile, (void *) tupbody,
+-					tupbodylen) != (size_t) tupbodylen)
++	nread = BufFileRead(state->myfile, (void *) tupbody, tupbodylen);
++	if (nread != (size_t) tupbodylen)
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not read from tuplestore temporary file: %m")));
++				 errmsg("could not read from tuplestore temporary file: read only %zu of %zu bytes",
++						nread, (size_t) tupbodylen)));
+ 	if (state->backward)		/* need trailing length word? */
+-		if (BufFileRead(state->myfile, (void *) &tuplen,
+-						sizeof(tuplen)) != sizeof(tuplen))
++	{
++		nread = BufFileRead(state->myfile, (void *) &tuplen, sizeof(tuplen));
++		if (nread != sizeof(tuplen))
+ 			ereport(ERROR,
+ 					(errcode_for_file_access(),
+-					 errmsg("could not read from tuplestore temporary file: %m")));
++					 errmsg("could not read from tuplestore temporary file: read only %zu of %zu bytes",
++							nread, sizeof(tuplen))));
++	}
+ 	return (void *) tuple;
+ }

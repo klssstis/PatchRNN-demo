@@ -1,0 +1,232 @@
+From 4879a5172af01dc05b6350dfa97ea1ac9a4c603c Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 4 Jan 2019 12:16:19 -0500
+Subject: [PATCH] Support plpgsql variable names that conflict with unreserved
+ SQL keywords.
+
+A variable name matching a statement-introducing keyword, such as
+"comment" or "update", caused parse failures if one tried to write
+a statement using that keyword.  Commit bb1b8f69 already addressed
+this scenario for the case of variable names matching unreserved
+plpgsql keywords, but we didn't think about unreserved core-grammar
+keywords.  The same heuristic (viz, it can't be a variable name
+unless the next token is assignment or '[') should work fine for
+that case too, and as a bonus the code gets shorter and less
+duplicative.
+
+Per bug #15555 from Feike Steenbergen.  Since this hasn't been
+complained of before, and is easily worked around anyway,
+I won't risk a back-patch.
+
+Discussion: https://postgr.es/m/15555-149bbd70ddc7b4b6@postgresql.org
+---
+ src/pl/plpgsql/src/pl_comp.c          | 13 +++--
+ src/pl/plpgsql/src/pl_scanner.c       | 74 +++++++++++----------------
+ src/pl/plpgsql/src/plpgsql.h          |  2 +-
+ src/test/regress/expected/plpgsql.out | 21 ++++++++
+ src/test/regress/sql/plpgsql.sql      | 14 +++++
+ 5 files changed, 75 insertions(+), 49 deletions(-)
+
+diff --git a/src/pl/plpgsql/src/pl_comp.c b/src/pl/plpgsql/src/pl_comp.c
+index 0e9ea105964b..2454386af845 100644
+--- a/src/pl/plpgsql/src/pl_comp.c
++++ b/src/pl/plpgsql/src/pl_comp.c
+@@ -1353,6 +1353,9 @@ make_datum_param(PLpgSQL_expr *expr, int dno, int location)
+  * yytxt is the original token text; we need this to check for quoting,
+  * so that later checks for unreserved keywords work properly.
+  *
++ * We attempt to recognize the token as a variable only if lookup is true
++ * and the plpgsql_IdentifierLookup context permits it.
++ *
+  * If recognized as a variable, fill in *wdatum and return true;
+  * if not recognized, fill in *word and return false.
+  * (Note: those two pointers actually point to members of the same union,
+@@ -1360,17 +1363,17 @@ make_datum_param(PLpgSQL_expr *expr, int dno, int location)
+  * ----------
+  */
+ bool
+-plpgsql_parse_word(char *word1, const char *yytxt,
++plpgsql_parse_word(char *word1, const char *yytxt, bool lookup,
+ 				   PLwdatum *wdatum, PLword *word)
+ {
+ 	PLpgSQL_nsitem *ns;
+ 
+ 	/*
+-	 * We should do nothing in DECLARE sections.  In SQL expressions, there's
+-	 * no need to do anything either --- lookup will happen when the
+-	 * expression is compiled.
++	 * We should not lookup variables in DECLARE sections.  In SQL
++	 * expressions, there's no need to do so either --- lookup will happen
++	 * when the expression is compiled.
+ 	 */
+-	if (plpgsql_IdentifierLookup == IDENTIFIER_LOOKUP_NORMAL)
++	if (lookup && plpgsql_IdentifierLookup == IDENTIFIER_LOOKUP_NORMAL)
+ 	{
+ 		/*
+ 		 * Do a lookup in the current namespace stack
+diff --git a/src/pl/plpgsql/src/pl_scanner.c b/src/pl/plpgsql/src/pl_scanner.c
+index 394d4658cd31..8340628de3c8 100644
+--- a/src/pl/plpgsql/src/pl_scanner.c
++++ b/src/pl/plpgsql/src/pl_scanner.c
+@@ -328,6 +328,7 @@ plpgsql_yylex(void)
+ 				push_back_token(tok2, &aux2);
+ 				if (plpgsql_parse_word(aux1.lval.str,
+ 									   core_yy.scanbuf + aux1.lloc,
++									   true,
+ 									   &aux1.lval.wdatum,
+ 									   &aux1.lval.word))
+ 					tok1 = T_DATUM;
+@@ -349,53 +350,40 @@ plpgsql_yylex(void)
+ 			push_back_token(tok2, &aux2);
+ 
+ 			/*
+-			 * If we are at start of statement, prefer unreserved keywords
+-			 * over variable names, unless the next token is assignment or
+-			 * '[', in which case prefer variable names.  (Note we need not
+-			 * consider '.' as the next token; that case was handled above,
+-			 * and we always prefer variable names in that case.)  If we are
+-			 * not at start of statement, always prefer variable names over
+-			 * unreserved keywords.
++			 * See if it matches a variable name, except in the context where
++			 * we are at start of statement and the next token isn't
++			 * assignment or '['.  In that case, it couldn't validly be a
++			 * variable name, and skipping the lookup allows variable names to
++			 * be used that would conflict with plpgsql or core keywords that
++			 * introduce statements (e.g., "comment").  Without this special
++			 * logic, every statement-introducing keyword would effectively be
++			 * reserved in PL/pgSQL, which would be unpleasant.
++			 *
++			 * If it isn't a variable name, try to match against unreserved
++			 * plpgsql keywords.  If not one of those either, it's T_WORD.
++			 *
++			 * Note: we must call plpgsql_parse_word even if we don't want to
++			 * do variable lookup, because it sets up aux1.lval.word for the
++			 * non-variable cases.
+ 			 */
+-			if (AT_STMT_START(plpgsql_yytoken) &&
+-				!(tok2 == '=' || tok2 == COLON_EQUALS || tok2 == '['))
++			if (plpgsql_parse_word(aux1.lval.str,
++								   core_yy.scanbuf + aux1.lloc,
++								   (!AT_STMT_START(plpgsql_yytoken) ||
++									(tok2 == '=' || tok2 == COLON_EQUALS ||
++									 tok2 == '[')),
++								   &aux1.lval.wdatum,
++								   &aux1.lval.word))
++				tok1 = T_DATUM;
++			else if (!aux1.lval.word.quoted &&
++					 (kw = ScanKeywordLookup(aux1.lval.word.ident,
++											 unreserved_keywords,
++											 num_unreserved_keywords)))
+ 			{
+-				/* try for unreserved keyword, then for variable name */
+-				if (core_yy.scanbuf[aux1.lloc] != '"' &&
+-					(kw = ScanKeywordLookup(aux1.lval.str,
+-											unreserved_keywords,
+-											num_unreserved_keywords)))
+-				{
+-					aux1.lval.keyword = kw->name;
+-					tok1 = kw->value;
+-				}
+-				else if (plpgsql_parse_word(aux1.lval.str,
+-											core_yy.scanbuf + aux1.lloc,
+-											&aux1.lval.wdatum,
+-											&aux1.lval.word))
+-					tok1 = T_DATUM;
+-				else
+-					tok1 = T_WORD;
++				aux1.lval.keyword = kw->name;
++				tok1 = kw->value;
+ 			}
+ 			else
+-			{
+-				/* try for variable name, then for unreserved keyword */
+-				if (plpgsql_parse_word(aux1.lval.str,
+-									   core_yy.scanbuf + aux1.lloc,
+-									   &aux1.lval.wdatum,
+-									   &aux1.lval.word))
+-					tok1 = T_DATUM;
+-				else if (!aux1.lval.word.quoted &&
+-						 (kw = ScanKeywordLookup(aux1.lval.word.ident,
+-												 unreserved_keywords,
+-												 num_unreserved_keywords)))
+-				{
+-					aux1.lval.keyword = kw->name;
+-					tok1 = kw->value;
+-				}
+-				else
+-					tok1 = T_WORD;
+-			}
++				tok1 = T_WORD;
+ 		}
+ 	}
+ 	else
+diff --git a/src/pl/plpgsql/src/plpgsql.h b/src/pl/plpgsql/src/plpgsql.h
+index 2dca49334af5..a7118b838610 100644
+--- a/src/pl/plpgsql/src/plpgsql.h
++++ b/src/pl/plpgsql/src/plpgsql.h
+@@ -1175,7 +1175,7 @@ extern PLpgSQL_function *plpgsql_compile(FunctionCallInfo fcinfo,
+ extern PLpgSQL_function *plpgsql_compile_inline(char *proc_source);
+ extern void plpgsql_parser_setup(struct ParseState *pstate,
+ 					 PLpgSQL_expr *expr);
+-extern bool plpgsql_parse_word(char *word1, const char *yytxt,
++extern bool plpgsql_parse_word(char *word1, const char *yytxt, bool lookup,
+ 				   PLwdatum *wdatum, PLword *word);
+ extern bool plpgsql_parse_dblword(char *word1, char *word2,
+ 					  PLwdatum *wdatum, PLcword *cword);
+diff --git a/src/test/regress/expected/plpgsql.out b/src/test/regress/expected/plpgsql.out
+index b9a987dbcfa9..d2f68e1e4cb1 100644
+--- a/src/test/regress/expected/plpgsql.out
++++ b/src/test/regress/expected/plpgsql.out
+@@ -4781,6 +4781,27 @@ select unreserved_test();
+               43
+ (1 row)
+ 
++create or replace function unreserved_test() returns int as $$
++declare
++  comment int := 21;
++begin
++  comment := comment * 2;
++  comment on function unreserved_test() is 'this is a test';
++  return comment;
++end
++$$ language plpgsql;
++select unreserved_test();
++ unreserved_test 
++-----------------
++              42
++(1 row)
++
++select obj_description('unreserved_test()'::regprocedure, 'pg_proc');
++ obj_description 
++-----------------
++ this is a test
++(1 row)
++
+ drop function unreserved_test();
+ --
+ -- Test FOREACH over arrays
+diff --git a/src/test/regress/sql/plpgsql.sql b/src/test/regress/sql/plpgsql.sql
+index 01239e26bed0..9c8cf752adbe 100644
+--- a/src/test/regress/sql/plpgsql.sql
++++ b/src/test/regress/sql/plpgsql.sql
+@@ -3892,6 +3892,20 @@ $$ language plpgsql;
+ 
+ select unreserved_test();
+ 
++create or replace function unreserved_test() returns int as $$
++declare
++  comment int := 21;
++begin
++  comment := comment * 2;
++  comment on function unreserved_test() is 'this is a test';
++  return comment;
++end
++$$ language plpgsql;
++
++select unreserved_test();
++
++select obj_description('unreserved_test()'::regprocedure, 'pg_proc');
++
+ drop function unreserved_test();
+ 
+ --

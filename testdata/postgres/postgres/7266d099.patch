@@ -1,0 +1,996 @@
+From 7266d0997dd2a0632da38a594c78e25ff21df67e Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 1 Aug 2019 18:50:22 -0400
+Subject: [PATCH] Allow functions-in-FROM to be pulled up if they reduce to
+ constants.
+
+This allows simplification of the plan tree in some common usage
+patterns: we can get rid of a join to the function RTE.
+
+In principle we could pull up any immutable expression, but restricting
+it to Consts avoids the risk that multiple evaluations of the expression
+might cost more than we can save.  (Possibly this could be improved in
+future --- but we've more or less promised people that putting a function
+in FROM guarantees single evaluation, so we'd have to tread carefully.)
+
+To do this, we need to rearrange when eval_const_expressions()
+happens for expressions in function RTEs.  I moved it to
+inline_set_returning_functions(), which already has to iterate over
+every function RTE, and in consequence renamed that function to
+preprocess_function_rtes().  A useful consequence is that
+inline_set_returning_function() no longer has to do this for itself,
+simplifying that code.
+
+In passing, break out pull_up_simple_subquery's code that knows where
+everything that needs pullup_replace_vars() processing is, so that
+the new pull_up_constant_function() routine can share it.  We'd
+gotten away with one-and-a-half copies of that code so far, since
+pull_up_simple_values() could assume that a lot of cases didn't apply
+to it --- but I don't think pull_up_constant_function() can make any
+simplifying assumptions.  Might as well make pull_up_simple_values()
+use it too.
+
+(Possibly this refactoring should go further: maybe we could share
+some of the code to fill in the pullup_replace_vars_context struct?
+For now, I left it that the callers fill that completely.)
+
+Note: the one existing test case that this patch changes has to be
+changed because inlining its function RTEs would destroy the point
+of the test, namely to check join order.
+
+Alexander Kuzmenkov and Aleksandr Parfenov, reviewed by
+Antonin Houska and Anastasia Lubennikova, and whacked around
+some more by me
+
+Discussion: https://postgr.es/m/402356c32eeb93d4fed01f66d6c7fe2d@postgrespro.ru
+---
+ src/backend/optimizer/plan/planner.c      |  17 +-
+ src/backend/optimizer/prep/prepjointree.c | 356 +++++++++++++++-------
+ src/backend/optimizer/util/clauses.c      |  41 +--
+ src/include/optimizer/prep.h              |   2 +-
+ src/test/regress/expected/join.out        | 141 ++++++++-
+ src/test/regress/expected/tsearch.out     |  22 ++
+ src/test/regress/sql/join.sql             |  65 +++-
+ src/test/regress/sql/tsearch.sql          |  11 +
+ 8 files changed, 499 insertions(+), 156 deletions(-)
+
+diff --git a/src/backend/optimizer/plan/planner.c b/src/backend/optimizer/plan/planner.c
+index 36fefd96a4da..8f51f59f8acb 100644
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -659,11 +659,12 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
+ 		pull_up_sublinks(root);
+ 
+ 	/*
+-	 * Scan the rangetable for set-returning functions, and inline them if
+-	 * possible (producing subqueries that might get pulled up next).
+-	 * Recursion issues here are handled in the same way as for SubLinks.
++	 * Scan the rangetable for function RTEs, do const-simplification on them,
++	 * and then inline them if possible (producing subqueries that might get
++	 * pulled up next).  Recursion issues here are handled in the same way as
++	 * for SubLinks.
+ 	 */
+-	inline_set_returning_functions(root);
++	preprocess_function_rtes(root);
+ 
+ 	/*
+ 	 * Check to see if any subqueries in the jointree can be merged into this
+@@ -1071,7 +1072,9 @@ preprocess_expression(PlannerInfo *root, Node *expr, int kind)
+ 		expr = flatten_join_alias_vars(root->parse, expr);
+ 
+ 	/*
+-	 * Simplify constant expressions.
++	 * Simplify constant expressions.  For function RTEs, this was already
++	 * done by preprocess_function_rtes ... but we have to do it again if the
++	 * RTE is LATERAL and might have contained join alias variables.
+ 	 *
+ 	 * Note: an essential effect of this is to convert named-argument function
+ 	 * calls to positional notation and insert the current actual values of
+@@ -1085,7 +1088,9 @@ preprocess_expression(PlannerInfo *root, Node *expr, int kind)
+ 	 * careful to maintain AND/OR flatness --- that is, do not generate a tree
+ 	 * with AND directly under AND, nor OR directly under OR.
+ 	 */
+-	expr = eval_const_expressions(root, expr);
++	if (!(kind == EXPRKIND_RTFUNC ||
++		  (kind == EXPRKIND_RTFUNC_LATERAL && !root->hasJoinRTEs)))
++		expr = eval_const_expressions(root, expr);
+ 
+ 	/*
+ 	 * If it's a qual or havingQual, canonicalize it.
+diff --git a/src/backend/optimizer/prep/prepjointree.c b/src/backend/optimizer/prep/prepjointree.c
+index 4fbc03fe5418..ccb32530ad2f 100644
+--- a/src/backend/optimizer/prep/prepjointree.c
++++ b/src/backend/optimizer/prep/prepjointree.c
+@@ -6,7 +6,7 @@
+  * NOTE: the intended sequence for invoking these operations is
+  *		replace_empty_jointree
+  *		pull_up_sublinks
+- *		inline_set_returning_functions
++ *		preprocess_function_rtes
+  *		pull_up_subqueries
+  *		flatten_simple_union_all
+  *		do expression preprocessing (including flattening JOIN alias vars)
+@@ -86,12 +86,20 @@ static bool is_simple_subquery(Query *subquery, RangeTblEntry *rte,
+ static Node *pull_up_simple_values(PlannerInfo *root, Node *jtnode,
+ 								   RangeTblEntry *rte);
+ static bool is_simple_values(PlannerInfo *root, RangeTblEntry *rte);
++static Node *pull_up_constant_function(PlannerInfo *root, Node *jtnode,
++									   RangeTblEntry *rte,
++									   JoinExpr *lowest_nulling_outer_join,
++									   AppendRelInfo *containing_appendrel);
+ static bool is_simple_union_all(Query *subquery);
+ static bool is_simple_union_all_recurse(Node *setOp, Query *setOpQuery,
+ 										List *colTypes);
+ static bool is_safe_append_member(Query *subquery);
+ static bool jointree_contains_lateral_outer_refs(Node *jtnode, bool restricted,
+ 												 Relids safe_upper_varnos);
++static void perform_pullup_replace_vars(PlannerInfo *root,
++										pullup_replace_vars_context *rvcontext,
++										JoinExpr *lowest_nulling_outer_join,
++										AppendRelInfo *containing_appendrel);
+ static void replace_vars_in_jointree(Node *jtnode,
+ 									 pullup_replace_vars_context *context,
+ 									 JoinExpr *lowest_nulling_outer_join);
+@@ -597,8 +605,9 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
+ }
+ 
+ /*
+- * inline_set_returning_functions
+- *		Attempt to "inline" set-returning functions in the FROM clause.
++ * preprocess_function_rtes
++ *		Constant-simplify any FUNCTION RTEs in the FROM clause, and then
++ *		attempt to "inline" any that are set-returning functions.
+  *
+  * If an RTE_FUNCTION rtable entry invokes a set-returning function that
+  * contains just a simple SELECT, we can convert the rtable entry to an
+@@ -611,11 +620,18 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
+  * obtained via inlining.  However, we do it after pull_up_sublinks
+  * so that we can inline any functions used in SubLink subselects.
+  *
++ * The reason for applying const-simplification at this stage is that
++ * (a) we'd need to do it anyway to inline a SRF, and (b) by doing it now,
++ * we can be sure that pull_up_constant_function() will see constants
++ * if there are constants to be seen.  This approach also guarantees
++ * that every FUNCTION RTE has been const-simplified, allowing planner.c's
++ * preprocess_expression() to skip doing it again.
++ *
+  * Like most of the planner, this feels free to scribble on its input data
+  * structure.
+  */
+ void
+-inline_set_returning_functions(PlannerInfo *root)
++preprocess_function_rtes(PlannerInfo *root)
+ {
+ 	ListCell   *rt;
+ 
+@@ -627,6 +643,10 @@ inline_set_returning_functions(PlannerInfo *root)
+ 		{
+ 			Query	   *funcquery;
+ 
++			/* Apply const-simplification */
++			rte->functions = (List *)
++				eval_const_expressions(root, (Node *) rte->functions);
++
+ 			/* Check safety of expansion, and expand if possible */
+ 			funcquery = inline_set_returning_function(root, rte);
+ 			if (funcquery)
+@@ -754,6 +774,14 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
+ 			is_simple_values(root, rte))
+ 			return pull_up_simple_values(root, jtnode, rte);
+ 
++		/*
++		 * Or perhaps it's a FUNCTION RTE that we could inline?
++		 */
++		if (rte->rtekind == RTE_FUNCTION)
++			return pull_up_constant_function(root, jtnode, rte,
++											 lowest_nulling_outer_join,
++											 containing_appendrel);
++
+ 		/* Otherwise, do nothing at this node. */
+ 	}
+ 	else if (IsA(jtnode, FromExpr))
+@@ -917,9 +945,10 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
+ 		pull_up_sublinks(subroot);
+ 
+ 	/*
+-	 * Similarly, inline any set-returning functions in its rangetable.
++	 * Similarly, preprocess its function RTEs to inline any set-returning
++	 * functions in its rangetable.
+ 	 */
+-	inline_set_returning_functions(subroot);
++	preprocess_function_rtes(subroot);
+ 
+ 	/*
+ 	 * Recursively pull up the subquery's subqueries, so that
+@@ -1047,72 +1076,11 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
+ 	/*
+ 	 * Replace all of the top query's references to the subquery's outputs
+ 	 * with copies of the adjusted subtlist items, being careful not to
+-	 * replace any of the jointree structure. (This'd be a lot cleaner if we
+-	 * could use query_tree_mutator.)  We have to use PHVs in the targetList,
+-	 * returningList, and havingQual, since those are certainly above any
+-	 * outer join.  replace_vars_in_jointree tracks its location in the
+-	 * jointree and uses PHVs or not appropriately.
++	 * replace any of the jointree structure.
+ 	 */
+-	parse->targetList = (List *)
+-		pullup_replace_vars((Node *) parse->targetList, &rvcontext);
+-	parse->returningList = (List *)
+-		pullup_replace_vars((Node *) parse->returningList, &rvcontext);
+-	if (parse->onConflict)
+-	{
+-		parse->onConflict->onConflictSet = (List *)
+-			pullup_replace_vars((Node *) parse->onConflict->onConflictSet,
+-								&rvcontext);
+-		parse->onConflict->onConflictWhere =
+-			pullup_replace_vars(parse->onConflict->onConflictWhere,
+-								&rvcontext);
+-
+-		/*
+-		 * We assume ON CONFLICT's arbiterElems, arbiterWhere, exclRelTlist
+-		 * can't contain any references to a subquery
+-		 */
+-	}
+-	replace_vars_in_jointree((Node *) parse->jointree, &rvcontext,
+-							 lowest_nulling_outer_join);
+-	Assert(parse->setOperations == NULL);
+-	parse->havingQual = pullup_replace_vars(parse->havingQual, &rvcontext);
+-
+-	/*
+-	 * Replace references in the translated_vars lists of appendrels. When
+-	 * pulling up an appendrel member, we do not need PHVs in the list of the
+-	 * parent appendrel --- there isn't any outer join between. Elsewhere, use
+-	 * PHVs for safety.  (This analysis could be made tighter but it seems
+-	 * unlikely to be worth much trouble.)
+-	 */
+-	foreach(lc, root->append_rel_list)
+-	{
+-		AppendRelInfo *appinfo = (AppendRelInfo *) lfirst(lc);
+-		bool		save_need_phvs = rvcontext.need_phvs;
+-
+-		if (appinfo == containing_appendrel)
+-			rvcontext.need_phvs = false;
+-		appinfo->translated_vars = (List *)
+-			pullup_replace_vars((Node *) appinfo->translated_vars, &rvcontext);
+-		rvcontext.need_phvs = save_need_phvs;
+-	}
+-
+-	/*
+-	 * Replace references in the joinaliasvars lists of join RTEs.
+-	 *
+-	 * You might think that we could avoid using PHVs for alias vars of joins
+-	 * below lowest_nulling_outer_join, but that doesn't work because the
+-	 * alias vars could be referenced above that join; we need the PHVs to be
+-	 * present in such references after the alias vars get flattened.  (It
+-	 * might be worth trying to be smarter here, someday.)
+-	 */
+-	foreach(lc, parse->rtable)
+-	{
+-		RangeTblEntry *otherrte = (RangeTblEntry *) lfirst(lc);
+-
+-		if (otherrte->rtekind == RTE_JOIN)
+-			otherrte->joinaliasvars = (List *)
+-				pullup_replace_vars((Node *) otherrte->joinaliasvars,
+-									&rvcontext);
+-	}
++	perform_pullup_replace_vars(root, &rvcontext,
++								lowest_nulling_outer_join,
++								containing_appendrel);
+ 
+ 	/*
+ 	 * If the subquery had a LATERAL marker, propagate that to any of its
+@@ -1608,39 +1576,16 @@ pull_up_simple_values(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte)
+ 	/*
+ 	 * Replace all of the top query's references to the RTE's outputs with
+ 	 * copies of the adjusted VALUES expressions, being careful not to replace
+-	 * any of the jointree structure. (This'd be a lot cleaner if we could use
+-	 * query_tree_mutator.)  Much of this should be no-ops in the dummy Query
+-	 * that surrounds a VALUES RTE, but it's not enough code to be worth
+-	 * removing.
++	 * any of the jointree structure.  We can assume there's no outer joins or
++	 * appendrels in the dummy Query that surrounds a VALUES RTE.
+ 	 */
+-	parse->targetList = (List *)
+-		pullup_replace_vars((Node *) parse->targetList, &rvcontext);
+-	parse->returningList = (List *)
+-		pullup_replace_vars((Node *) parse->returningList, &rvcontext);
+-	if (parse->onConflict)
+-	{
+-		parse->onConflict->onConflictSet = (List *)
+-			pullup_replace_vars((Node *) parse->onConflict->onConflictSet,
+-								&rvcontext);
+-		parse->onConflict->onConflictWhere =
+-			pullup_replace_vars(parse->onConflict->onConflictWhere,
+-								&rvcontext);
+-
+-		/*
+-		 * We assume ON CONFLICT's arbiterElems, arbiterWhere, exclRelTlist
+-		 * can't contain any references to a subquery
+-		 */
+-	}
+-	replace_vars_in_jointree((Node *) parse->jointree, &rvcontext, NULL);
+-	Assert(parse->setOperations == NULL);
+-	parse->havingQual = pullup_replace_vars(parse->havingQual, &rvcontext);
++	perform_pullup_replace_vars(root, &rvcontext, NULL, NULL);
+ 
+ 	/*
+-	 * There should be no appendrels to fix, nor any join alias Vars, nor any
+-	 * outer joins and hence no PlaceHolderVars.
++	 * There should be no appendrels to fix, nor any outer joins and hence no
++	 * PlaceHolderVars.
+ 	 */
+ 	Assert(root->append_rel_list == NIL);
+-	Assert(list_length(parse->rtable) == 1);
+ 	Assert(root->join_info_list == NIL);
+ 	Assert(root->placeholder_list == NIL);
+ 
+@@ -1712,6 +1657,125 @@ is_simple_values(PlannerInfo *root, RangeTblEntry *rte)
+ 	return true;
+ }
+ 
++/*
++ * pull_up_constant_function
++ *		Pull up an RTE_FUNCTION expression that was simplified to a constant.
++ *
++ * jtnode is a RangeTblRef that has been identified as a FUNCTION RTE by
++ * pull_up_subqueries.  If its expression is just a Const, hoist that value
++ * up into the parent query, and replace the RTE_FUNCTION with RTE_RESULT.
++ *
++ * In principle we could pull up any immutable expression, but we don't.
++ * That might result in multiple evaluations of the expression, which could
++ * be costly if it's not just a Const.  Also, the main value of this is
++ * to let the constant participate in further const-folding, and of course
++ * that won't happen for a non-Const.
++ *
++ * The pulled-up value might need to be wrapped in a PlaceHolderVar if the
++ * RTE is below an outer join or is part of an appendrel; the extra
++ * parameters show whether that's needed.
++ */
++static Node *
++pull_up_constant_function(PlannerInfo *root, Node *jtnode,
++						  RangeTblEntry *rte,
++						  JoinExpr *lowest_nulling_outer_join,
++						  AppendRelInfo *containing_appendrel)
++{
++	Query	   *parse = root->parse;
++	RangeTblFunction *rtf;
++	pullup_replace_vars_context rvcontext;
++
++	/* Fail if the RTE has ORDINALITY - we don't implement that here. */
++	if (rte->funcordinality)
++		return jtnode;
++
++	/* Fail if RTE isn't a single, simple Const expr */
++	if (list_length(rte->functions) != 1)
++		return jtnode;
++	rtf = linitial_node(RangeTblFunction, rte->functions);
++	if (!IsA(rtf->funcexpr, Const))
++		return jtnode;
++
++	/* Create context for applying pullup_replace_vars */
++	rvcontext.root = root;
++	rvcontext.targetlist = list_make1(makeTargetEntry((Expr *) rtf->funcexpr,
++													  1,	/* resno */
++													  NULL, /* resname */
++													  false));	/* resjunk */
++	rvcontext.target_rte = rte;
++
++	/*
++	 * Since this function was reduced to a Const, it doesn't contain any
++	 * lateral references, even if it's marked as LATERAL.  This means we
++	 * don't need to fill relids.
++	 */
++	rvcontext.relids = NULL;
++
++	rvcontext.outer_hasSubLinks = &parse->hasSubLinks;
++	rvcontext.varno = ((RangeTblRef *) jtnode)->rtindex;
++	/* these flags will be set below, if needed */
++	rvcontext.need_phvs = false;
++	rvcontext.wrap_non_vars = false;
++	/* initialize cache array with indexes 0 .. length(tlist) */
++	rvcontext.rv_cache = palloc0((list_length(rvcontext.targetlist) + 1) *
++								 sizeof(Node *));
++
++	/*
++	 * If we are under an outer join then non-nullable items and lateral
++	 * references may have to be turned into PlaceHolderVars.
++	 */
++	if (lowest_nulling_outer_join != NULL)
++		rvcontext.need_phvs = true;
++
++	/*
++	 * If we are dealing with an appendrel member then anything that's not a
++	 * simple Var has to be turned into a PlaceHolderVar.  (See comments in
++	 * pull_up_simple_subquery().)
++	 */
++	if (containing_appendrel != NULL)
++	{
++		rvcontext.need_phvs = true;
++		rvcontext.wrap_non_vars = true;
++	}
++
++	/*
++	 * If the parent query uses grouping sets, we need a PlaceHolderVar for
++	 * anything that's not a simple Var.
++	 */
++	if (parse->groupingSets)
++	{
++		rvcontext.need_phvs = true;
++		rvcontext.wrap_non_vars = true;
++	}
++
++	/*
++	 * Replace all of the top query's references to the RTE's output with
++	 * copies of the funcexpr, being careful not to replace any of the
++	 * jointree structure.
++	 */
++	perform_pullup_replace_vars(root, &rvcontext,
++								lowest_nulling_outer_join,
++								containing_appendrel);
++
++	/*
++	 * We don't need to bother with changing PlaceHolderVars in the parent
++	 * query.  Their references to the RT index are still good for now, and
++	 * will get removed later if we're able to drop the RTE_RESULT.
++	 */
++
++	/*
++	 * Convert the RTE to be RTE_RESULT type, signifying that we don't need to
++	 * scan it anymore, and zero out RTE_FUNCTION-specific fields.
++	 */
++	rte->rtekind = RTE_RESULT;
++	rte->functions = NIL;
++
++	/*
++	 * We can reuse the RangeTblRef node.
++	 */
++	return jtnode;
++}
++
+ /*
+  * is_simple_union_all
+  *	  Check a subquery to see if it's a simple UNION ALL.
+@@ -1901,9 +1965,97 @@ jointree_contains_lateral_outer_refs(Node *jtnode, bool restricted,
+ }
+ 
+ /*
+- * Helper routine for pull_up_subqueries: do pullup_replace_vars on every
+- * expression in the jointree, without changing the jointree structure itself.
+- * Ugly, but there's no other way...
++ * Perform pullup_replace_vars everyplace it's needed in the query tree.
++ *
++ * Caller has already filled *rvcontext with data describing what to
++ * substitute for Vars referencing the target subquery.  In addition
++ * we need the identity of the lowest outer join that can null the
++ * target subquery, and its containing appendrel if any.
++ */
++static void
++perform_pullup_replace_vars(PlannerInfo *root,
++							pullup_replace_vars_context *rvcontext,
++							JoinExpr *lowest_nulling_outer_join,
++							AppendRelInfo *containing_appendrel)
++{
++	Query	   *parse = root->parse;
++	ListCell   *lc;
++
++	/*
++	 * Replace all of the top query's references to the subquery's outputs
++	 * with copies of the adjusted subtlist items, being careful not to
++	 * replace any of the jointree structure.  (This'd be a lot cleaner if we
++	 * could use query_tree_mutator.)  We have to use PHVs in the targetList,
++	 * returningList, and havingQual, since those are certainly above any
++	 * outer join.  replace_vars_in_jointree tracks its location in the
++	 * jointree and uses PHVs or not appropriately.
++	 */
++	parse->targetList = (List *)
++		pullup_replace_vars((Node *) parse->targetList, rvcontext);
++	parse->returningList = (List *)
++		pullup_replace_vars((Node *) parse->returningList, rvcontext);
++	if (parse->onConflict)
++	{
++		parse->onConflict->onConflictSet = (List *)
++			pullup_replace_vars((Node *) parse->onConflict->onConflictSet,
++								rvcontext);
++		parse->onConflict->onConflictWhere =
++			pullup_replace_vars(parse->onConflict->onConflictWhere,
++								rvcontext);
++
++		/*
++		 * We assume ON CONFLICT's arbiterElems, arbiterWhere, exclRelTlist
++		 * can't contain any references to a subquery.
++		 */
++	}
++	replace_vars_in_jointree((Node *) parse->jointree, rvcontext,
++							 lowest_nulling_outer_join);
++	Assert(parse->setOperations == NULL);
++	parse->havingQual = pullup_replace_vars(parse->havingQual, rvcontext);
++
++	/*
++	 * Replace references in the translated_vars lists of appendrels.  When
++	 * pulling up an appendrel member, we do not need PHVs in the list of the
++	 * parent appendrel --- there isn't any outer join between.  Elsewhere,
++	 * use PHVs for safety.  (This analysis could be made tighter but it seems
++	 * unlikely to be worth much trouble.)
++	 */
++	foreach(lc, root->append_rel_list)
++	{
++		AppendRelInfo *appinfo = (AppendRelInfo *) lfirst(lc);
++		bool		save_need_phvs = rvcontext->need_phvs;
++
++		if (appinfo == containing_appendrel)
++			rvcontext->need_phvs = false;
++		appinfo->translated_vars = (List *)
++			pullup_replace_vars((Node *) appinfo->translated_vars, rvcontext);
++		rvcontext->need_phvs = save_need_phvs;
++	}
++
++	/*
++	 * Replace references in the joinaliasvars lists of join RTEs.
++	 *
++	 * You might think that we could avoid using PHVs for alias vars of joins
++	 * below lowest_nulling_outer_join, but that doesn't work because the
++	 * alias vars could be referenced above that join; we need the PHVs to be
++	 * present in such references after the alias vars get flattened.  (It
++	 * might be worth trying to be smarter here, someday.)
++	 */
++	foreach(lc, parse->rtable)
++	{
++		RangeTblEntry *otherrte = (RangeTblEntry *) lfirst(lc);
++
++		if (otherrte->rtekind == RTE_JOIN)
++			otherrte->joinaliasvars = (List *)
++				pullup_replace_vars((Node *) otherrte->joinaliasvars,
++									rvcontext);
++	}
++}
++
++/*
++ * Helper routine for perform_pullup_replace_vars: do pullup_replace_vars on
++ * every expression in the jointree, without changing the jointree structure
++ * itself.  Ugly, but there's no other way...
+  *
+  * If we are at or below lowest_nulling_outer_join, we can suppress use of
+  * PlaceHolderVars wrapped around the replacement expressions.
+diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
+index 99dbf8da1891..7ad9d9ab79e7 100644
+--- a/src/backend/optimizer/util/clauses.c
++++ b/src/backend/optimizer/util/clauses.c
+@@ -4870,6 +4870,10 @@ evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
+  * set-returning SQL function that can safely be inlined, expand the function
+  * and return the substitute Query structure.  Otherwise, return NULL.
+  *
++ * We assume that the RTE's expression has already been put through
++ * eval_const_expressions(), which among other things will take care of
++ * default arguments and named-argument notation.
++ *
+  * This has a good deal of similarity to inline_function(), but that's
+  * for the non-set-returning case, and there are enough differences to
+  * justify separate functions.
+@@ -4888,7 +4892,6 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
+ 	bool		modifyTargetList;
+ 	MemoryContext oldcxt;
+ 	MemoryContext mycxt;
+-	List	   *saveInvalItems;
+ 	inline_error_callback_arg callback_arg;
+ 	ErrorContextCallback sqlerrcontext;
+ 	SQLFunctionParseInfoPtr pinfo;
+@@ -4966,7 +4969,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
+ 	 * sharing the snapshot of the calling query.  We also disallow returning
+ 	 * SETOF VOID, because inlining would result in exposing the actual result
+ 	 * of the function's last SELECT, which should not happen in that case.
+-	 * (Rechecking prokind and proretset is just paranoia.)
++	 * (Rechecking prokind, proretset, and pronargs is just paranoia.)
+ 	 */
+ 	if (funcform->prolang != SQLlanguageId ||
+ 		funcform->prokind != PROKIND_FUNCTION ||
+@@ -4975,6 +4978,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
+ 		funcform->prorettype == VOIDOID ||
+ 		funcform->prosecdef ||
+ 		!funcform->proretset ||
++		list_length(fexpr->args) != funcform->pronargs ||
+ 		!heap_attisnull(func_tuple, Anum_pg_proc_proconfig, NULL))
+ 	{
+ 		ReleaseSysCache(func_tuple);
+@@ -4990,16 +4994,6 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
+ 								  ALLOCSET_DEFAULT_SIZES);
+ 	oldcxt = MemoryContextSwitchTo(mycxt);
+ 
+-	/*
+-	 * When we call eval_const_expressions below, it might try to add items to
+-	 * root->glob->invalItems.  Since it is running in the temp context, those
+-	 * items will be in that context, and will need to be copied out if we're
+-	 * successful.  Temporarily reset the list so that we can keep those items
+-	 * separate from the pre-existing list contents.
+-	 */
+-	saveInvalItems = root->glob->invalItems;
+-	root->glob->invalItems = NIL;
+-
+ 	/* Fetch the function body */
+ 	tmp = SysCacheGetAttr(PROCOID,
+ 						  func_tuple,
+@@ -5021,24 +5015,6 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
+ 	sqlerrcontext.previous = error_context_stack;
+ 	error_context_stack = &sqlerrcontext;
+ 
+-	/*
+-	 * Run eval_const_expressions on the function call.  This is necessary to
+-	 * ensure that named-argument notation is converted to positional notation
+-	 * and any default arguments are inserted.  It's a bit of overkill for the
+-	 * arguments, since they'll get processed again later, but no harm will be
+-	 * done.
+-	 */
+-	fexpr = (FuncExpr *) eval_const_expressions(root, (Node *) fexpr);
+-
+-	/* It should still be a call of the same function, but let's check */
+-	if (!IsA(fexpr, FuncExpr) ||
+-		fexpr->funcid != func_oid)
+-		goto fail;
+-
+-	/* Arg list length should now match the function */
+-	if (list_length(fexpr->args) != funcform->pronargs)
+-		goto fail;
+-
+ 	/*
+ 	 * Set up to handle parameters while parsing the function body.  We can
+ 	 * use the FuncExpr just created as the input for
+@@ -5129,10 +5105,6 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
+ 
+ 	querytree = copyObject(querytree);
+ 
+-	/* copy up any new invalItems, too */
+-	root->glob->invalItems = list_concat(saveInvalItems,
+-										 copyObject(root->glob->invalItems));
+-
+ 	MemoryContextDelete(mycxt);
+ 	error_context_stack = sqlerrcontext.previous;
+ 	ReleaseSysCache(func_tuple);
+@@ -5153,7 +5125,6 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
+ 	/* Here if func is not inlinable: release temp memory and return NULL */
+ fail:
+ 	MemoryContextSwitchTo(oldcxt);
+-	root->glob->invalItems = saveInvalItems;
+ 	MemoryContextDelete(mycxt);
+ 	error_context_stack = sqlerrcontext.previous;
+ 	ReleaseSysCache(func_tuple);
+diff --git a/src/include/optimizer/prep.h b/src/include/optimizer/prep.h
+index a9b2c9026cbe..9018160d80b9 100644
+--- a/src/include/optimizer/prep.h
++++ b/src/include/optimizer/prep.h
+@@ -23,7 +23,7 @@
+  */
+ extern void replace_empty_jointree(Query *parse);
+ extern void pull_up_sublinks(PlannerInfo *root);
+-extern void inline_set_returning_functions(PlannerInfo *root);
++extern void preprocess_function_rtes(PlannerInfo *root);
+ extern void pull_up_subqueries(PlannerInfo *root);
+ extern void flatten_simple_union_all(PlannerInfo *root);
+ extern void reduce_outer_joins(PlannerInfo *root);
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index 07e631d45e69..9b407bc48549 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -3060,11 +3060,14 @@ select * from int4_tbl a full join int4_tbl b on false;
+ --
+ -- test for ability to use a cartesian join when necessary
+ --
++create temp table q1 as select 1 as q1;
++create temp table q2 as select 0 as q2;
++analyze q1;
++analyze q2;
+ explain (costs off)
+ select * from
+   tenk1 join int4_tbl on f1 = twothousand,
+-  int4(sin(1)) q1,
+-  int4(sin(0)) q2
++  q1, q2
+ where q1 = thousand or q2 = thousand;
+                                QUERY PLAN                               
+ ------------------------------------------------------------------------
+@@ -3072,8 +3075,8 @@ where q1 = thousand or q2 = thousand;
+    Hash Cond: (tenk1.twothousand = int4_tbl.f1)
+    ->  Nested Loop
+          ->  Nested Loop
+-               ->  Function Scan on q1
+-               ->  Function Scan on q2
++               ->  Seq Scan on q1
++               ->  Seq Scan on q2
+          ->  Bitmap Heap Scan on tenk1
+                Recheck Cond: ((q1.q1 = thousand) OR (q2.q2 = thousand))
+                ->  BitmapOr
+@@ -3088,8 +3091,7 @@ where q1 = thousand or q2 = thousand;
+ explain (costs off)
+ select * from
+   tenk1 join int4_tbl on f1 = twothousand,
+-  int4(sin(1)) q1,
+-  int4(sin(0)) q2
++  q1, q2
+ where thousand = (q1 + q2);
+                           QUERY PLAN                          
+ --------------------------------------------------------------
+@@ -3097,8 +3099,8 @@ where thousand = (q1 + q2);
+    Hash Cond: (tenk1.twothousand = int4_tbl.f1)
+    ->  Nested Loop
+          ->  Nested Loop
+-               ->  Function Scan on q1
+-               ->  Function Scan on q2
++               ->  Seq Scan on q1
++               ->  Seq Scan on q2
+          ->  Bitmap Heap Scan on tenk1
+                Recheck Cond: (thousand = (q1.q1 + q2.q2))
+                ->  Bitmap Index Scan on tenk1_thous_tenthous
+@@ -3240,6 +3242,129 @@ where t1.unique2 < 42 and t1.stringu1 > t2.stringu2;
+       11 | WFAAAA   |       3 | LKIAAA
+ (1 row)
+ 
++--
++-- test inlining of immutable functions
++--
++create function f_immutable_int4(i integer) returns integer as
++$$ begin return i; end; $$ language plpgsql immutable;
++-- check optimization of function scan with join
++explain (costs off)
++select unique1 from tenk1, (select * from f_immutable_int4(1) x) x
++where x = unique1;
++                  QUERY PLAN                  
++----------------------------------------------
++ Index Only Scan using tenk1_unique1 on tenk1
++   Index Cond: (unique1 = 1)
++(2 rows)
++
++explain (verbose, costs off)
++select unique1, x.*
++from tenk1, (select *, random() from f_immutable_int4(1) x) x
++where x = unique1;
++                        QUERY PLAN                         
++-----------------------------------------------------------
++ Nested Loop
++   Output: tenk1.unique1, (1), (random())
++   ->  Result
++         Output: 1, random()
++   ->  Index Only Scan using tenk1_unique1 on public.tenk1
++         Output: tenk1.unique1
++         Index Cond: (tenk1.unique1 = (1))
++(7 rows)
++
++explain (costs off)
++select unique1 from tenk1, f_immutable_int4(1) x where x = unique1;
++                  QUERY PLAN                  
++----------------------------------------------
++ Index Only Scan using tenk1_unique1 on tenk1
++   Index Cond: (unique1 = 1)
++(2 rows)
++
++explain (costs off)
++select unique1 from tenk1, lateral f_immutable_int4(1) x where x = unique1;
++                  QUERY PLAN                  
++----------------------------------------------
++ Index Only Scan using tenk1_unique1 on tenk1
++   Index Cond: (unique1 = 1)
++(2 rows)
++
++explain (costs off)
++select unique1, x from tenk1 join f_immutable_int4(1) x on unique1 = x;
++                  QUERY PLAN                  
++----------------------------------------------
++ Index Only Scan using tenk1_unique1 on tenk1
++   Index Cond: (unique1 = 1)
++(2 rows)
++
++explain (costs off)
++select unique1, x from tenk1 left join f_immutable_int4(1) x on unique1 = x;
++                     QUERY PLAN                     
++----------------------------------------------------
++ Nested Loop Left Join
++   Join Filter: (tenk1.unique1 = 1)
++   ->  Index Only Scan using tenk1_unique1 on tenk1
++   ->  Materialize
++         ->  Result
++(5 rows)
++
++explain (costs off)
++select unique1, x from tenk1 right join f_immutable_int4(1) x on unique1 = x;
++                     QUERY PLAN                     
++----------------------------------------------------
++ Nested Loop Left Join
++   ->  Result
++   ->  Index Only Scan using tenk1_unique1 on tenk1
++         Index Cond: (unique1 = 1)
++(4 rows)
++
++explain (costs off)
++select unique1, x from tenk1 full join f_immutable_int4(1) x on unique1 = x;
++                     QUERY PLAN                     
++----------------------------------------------------
++ Merge Full Join
++   Merge Cond: (tenk1.unique1 = (1))
++   ->  Index Only Scan using tenk1_unique1 on tenk1
++   ->  Sort
++         Sort Key: (1)
++         ->  Result
++(6 rows)
++
++-- check that pullup of a const function allows further const-folding
++explain (costs off)
++select unique1 from tenk1, f_immutable_int4(1) x where x = 42;
++        QUERY PLAN        
++--------------------------
++ Result
++   One-Time Filter: false
++(2 rows)
++
++-- test inlining of immutable functions with PlaceHolderVars
++explain (costs off)
++select nt3.id
++from nt3 as nt3
++  left join
++    (select nt2.*, (nt2.b1 or i4 = 42) AS b3
++     from nt2 as nt2
++       left join
++         f_immutable_int4(0) i4
++         on i4 = nt2.nt1_id
++    ) as ss2
++    on ss2.id = nt3.nt2_id
++where nt3.id = 1 and ss2.b3;
++                  QUERY PLAN                  
++----------------------------------------------
++ Nested Loop Left Join
++   Filter: ((nt2.b1 OR ((0) = 42)))
++   ->  Index Scan using nt3_pkey on nt3
++         Index Cond: (id = 1)
++   ->  Nested Loop Left Join
++         Join Filter: (0 = nt2.nt1_id)
++         ->  Index Scan using nt2_pkey on nt2
++               Index Cond: (id = nt3.nt2_id)
++         ->  Result
++(9 rows)
++
++drop function f_immutable_int4(int);
+ --
+ -- test extraction of restriction OR clauses from join OR clause
+ -- (we used to only do this for indexable clauses)
+diff --git a/src/test/regress/expected/tsearch.out b/src/test/regress/expected/tsearch.out
+index 6f61acc1eda8..7af289927cc9 100644
+--- a/src/test/regress/expected/tsearch.out
++++ b/src/test/regress/expected/tsearch.out
+@@ -1625,6 +1625,28 @@ SELECT count(*) FROM test_tsvector WHERE a @@ to_tsquery('345&qwerty');
+      1
+ (1 row)
+ 
++-- Test inlining of immutable constant functions
++-- to_tsquery(text) is not immutable, so it won't be inlined
++explain (costs off)
++select * from test_tsquery, to_tsquery('new') q where txtsample @@ q;
++                   QUERY PLAN                   
++------------------------------------------------
++ Nested Loop
++   Join Filter: (test_tsquery.txtsample @@ q.q)
++   ->  Function Scan on to_tsquery q
++   ->  Seq Scan on test_tsquery
++(4 rows)
++
++-- to_tsquery(regconfig, text) is an immutable function.
++-- That allows us to get rid of using function scan and join at all.
++explain (costs off)
++select * from test_tsquery, to_tsquery('english', 'new') q where txtsample @@ q;
++                 QUERY PLAN                  
++---------------------------------------------
++ Seq Scan on test_tsquery
++   Filter: (txtsample @@ '''new'''::tsquery)
++(2 rows)
++
+ -- test finding items in GIN's pending list
+ create temp table pendtest (ts tsvector);
+ create index pendtest_idx on pendtest using gin(ts);
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index bf6d5c3ae415..145accca86fb 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -914,18 +914,21 @@ select * from int4_tbl a full join int4_tbl b on false;
+ -- test for ability to use a cartesian join when necessary
+ --
+ 
++create temp table q1 as select 1 as q1;
++create temp table q2 as select 0 as q2;
++analyze q1;
++analyze q2;
++
+ explain (costs off)
+ select * from
+   tenk1 join int4_tbl on f1 = twothousand,
+-  int4(sin(1)) q1,
+-  int4(sin(0)) q2
++  q1, q2
+ where q1 = thousand or q2 = thousand;
+ 
+ explain (costs off)
+ select * from
+   tenk1 join int4_tbl on f1 = twothousand,
+-  int4(sin(1)) q1,
+-  int4(sin(0)) q2
++  q1, q2
+ where thousand = (q1 + q2);
+ 
+ --
+@@ -1015,6 +1018,60 @@ select t1.unique2, t1.stringu1, t2.unique1, t2.stringu2 from
+   on (subq1.y1 = t2.unique1)
+ where t1.unique2 < 42 and t1.stringu1 > t2.stringu2;
+ 
++--
++-- test inlining of immutable functions
++--
++create function f_immutable_int4(i integer) returns integer as
++$$ begin return i; end; $$ language plpgsql immutable;
++
++-- check optimization of function scan with join
++explain (costs off)
++select unique1 from tenk1, (select * from f_immutable_int4(1) x) x
++where x = unique1;
++
++explain (verbose, costs off)
++select unique1, x.*
++from tenk1, (select *, random() from f_immutable_int4(1) x) x
++where x = unique1;
++
++explain (costs off)
++select unique1 from tenk1, f_immutable_int4(1) x where x = unique1;
++
++explain (costs off)
++select unique1 from tenk1, lateral f_immutable_int4(1) x where x = unique1;
++
++explain (costs off)
++select unique1, x from tenk1 join f_immutable_int4(1) x on unique1 = x;
++
++explain (costs off)
++select unique1, x from tenk1 left join f_immutable_int4(1) x on unique1 = x;
++
++explain (costs off)
++select unique1, x from tenk1 right join f_immutable_int4(1) x on unique1 = x;
++
++explain (costs off)
++select unique1, x from tenk1 full join f_immutable_int4(1) x on unique1 = x;
++
++-- check that pullup of a const function allows further const-folding
++explain (costs off)
++select unique1 from tenk1, f_immutable_int4(1) x where x = 42;
++
++-- test inlining of immutable functions with PlaceHolderVars
++explain (costs off)
++select nt3.id
++from nt3 as nt3
++  left join
++    (select nt2.*, (nt2.b1 or i4 = 42) AS b3
++     from nt2 as nt2
++       left join
++         f_immutable_int4(0) i4
++         on i4 = nt2.nt1_id
++    ) as ss2
++    on ss2.id = nt3.nt2_id
++where nt3.id = 1 and ss2.b3;
++
++drop function f_immutable_int4(int);
++
+ --
+ -- test extraction of restriction OR clauses from join OR clause
+ -- (we used to only do this for indexable clauses)
+diff --git a/src/test/regress/sql/tsearch.sql b/src/test/regress/sql/tsearch.sql
+index 637bfb301207..ece80b983c52 100644
+--- a/src/test/regress/sql/tsearch.sql
++++ b/src/test/regress/sql/tsearch.sql
+@@ -520,6 +520,17 @@ INSERT INTO test_tsvector (t) VALUES ('345 qwerty');
+ 
+ SELECT count(*) FROM test_tsvector WHERE a @@ to_tsquery('345&qwerty');
+ 
++-- Test inlining of immutable constant functions
++
++-- to_tsquery(text) is not immutable, so it won't be inlined
++explain (costs off)
++select * from test_tsquery, to_tsquery('new') q where txtsample @@ q;
++
++-- to_tsquery(regconfig, text) is an immutable function.
++-- That allows us to get rid of using function scan and join at all.
++explain (costs off)
++select * from test_tsquery, to_tsquery('english', 'new') q where txtsample @@ q;
++
+ -- test finding items in GIN's pending list
+ create temp table pendtest (ts tsvector);
+ create index pendtest_idx on pendtest using gin(ts);

@@ -1,0 +1,167 @@
+From 7618eaf5f315f53619b718e571cd2a2020fb0226 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 13 Nov 2019 13:41:04 -0500
+Subject: [PATCH] Avoid downcasing/truncation of RADIUS authentication
+ parameters.
+
+Commit 6b76f1bb5 changed all the RADIUS auth parameters to be lists
+rather than single values.  But its use of SplitIdentifierString
+to parse the list format was not very carefully thought through,
+because that function thinks it's parsing SQL identifiers, which
+means it will (a) downcase the strings and (b) truncate them to
+be shorter than NAMEDATALEN.  While downcasing should be harmless
+for the server names and ports, it's just wrong for the shared
+secrets, and probably for the NAS Identifier strings as well.
+The truncation aspect is at least potentially a problem too,
+though typical values for these parameters would fit in 63 bytes.
+
+Fortunately, we now have a function SplitGUCList that is exactly
+the same except for not doing the two unwanted things, so fixing
+this is a trivial matter of calling that function instead.
+
+While here, improve the documentation to show how to double-quote
+the parameter values.  I failed to resist the temptation to do
+some copy-editing as well.
+
+Report and patch from Marcos David (bug #16106); doc changes by me.
+Back-patch to v10 where the aforesaid commit came in, since this is
+arguably a regression from our previous behavior with RADIUS auth.
+
+Discussion: https://postgr.es/m/16106-7d319e4295d08e70@postgresql.org
+---
+ doc/src/sgml/client-auth.sgml | 39 ++++++++++++++++++++++-------------
+ src/backend/libpq/hba.c       |  8 +++----
+ 2 files changed, 29 insertions(+), 18 deletions(-)
+
+diff --git a/doc/src/sgml/client-auth.sgml b/doc/src/sgml/client-auth.sgml
+index 9236fc014c4f..36e5a5d9a863 100644
+--- a/doc/src/sgml/client-auth.sgml
++++ b/doc/src/sgml/client-auth.sgml
+@@ -1824,7 +1824,7 @@ host ... ldap ldapbasedn="dc=example,dc=net"
+     <literal>user name</literal>, <literal>password</literal> (encrypted) and
+     <literal>NAS Identifier</literal>. The request will be encrypted using
+     a secret shared with the server. The RADIUS server will respond to
+-    this server with either <literal>Access Accept</literal> or
++    this request with either <literal>Access Accept</literal> or
+     <literal>Access Reject</literal>. There is no support for RADIUS accounting.
+    </para>
+ 
+@@ -1833,11 +1833,11 @@ host ... ldap ldapbasedn="dc=example,dc=net"
+     be tried sequentially. If a negative response is received from
+     a server, the authentication will fail. If no response is received,
+     the next server in the list will be tried. To specify multiple
+-    servers, put the names within quotes and separate the server names
+-    with a comma. If multiple servers are specified, all other RADIUS
+-    options can also be given as a comma separate list, to apply
+-    individual values to each server. They can also be specified as
+-    a single value, in which case this value will apply to all servers.
++    servers, separate the server names with commas and surround the list
++    with double quotes. If multiple servers are specified, the other
++    RADIUS options can also be given as comma-separated lists, to provide
++    individual values for each server. They can also be specified as
++    a single value, in which case that value will apply to all servers.
+    </para>
+ 
+    <para>
+@@ -1847,7 +1847,7 @@ host ... ldap ldapbasedn="dc=example,dc=net"
+        <term><literal>radiusservers</literal></term>
+        <listitem>
+         <para>
+-         The name or IP addresses of the RADIUS servers to connect to.
++         The DNS names or IP addresses of the RADIUS servers to connect to.
+          This parameter is required.
+         </para>
+        </listitem>
+@@ -1858,7 +1858,7 @@ host ... ldap ldapbasedn="dc=example,dc=net"
+        <listitem>
+         <para>
+          The shared secrets used when talking securely to the RADIUS
+-         server. This must have exactly the same value on the PostgreSQL
++         servers. This must have exactly the same value on the PostgreSQL
+          and RADIUS servers. It is recommended that this be a string of
+          at least 16 characters. This parameter is required.
+          <note>
+@@ -1878,8 +1878,9 @@ host ... ldap ldapbasedn="dc=example,dc=net"
+        <term><literal>radiusports</literal></term>
+        <listitem>
+         <para>
+-         The port number on the RADIUS servers to connect to. If no port
+-         is specified, the default port <literal>1812</literal> will be used.
++         The port numbers to connect to on the RADIUS servers. If no port
++         is specified, the default RADIUS port (<literal>1812</literal>)
++         will be used.
+         </para>
+        </listitem>
+       </varlistentry>
+@@ -1888,10 +1889,10 @@ host ... ldap ldapbasedn="dc=example,dc=net"
+        <term><literal>radiusidentifiers</literal></term>
+        <listitem>
+         <para>
+-         The string used as <literal>NAS Identifier</literal> in the RADIUS
+-         requests. This parameter can be used as a second parameter
+-         identifying for example which database user the user is attempting
+-         to authenticate as, which can be used for policy matching on
++         The strings to be used as <literal>NAS Identifier</literal> in the
++         RADIUS requests. This parameter can be used, for example, to
++         identify which database cluster the user is attempting to connect
++         to, which can be useful for policy matching on
+          the RADIUS server. If no identifier is specified, the default
+          <literal>postgresql</literal> will be used.
+         </para>
+@@ -1900,6 +1901,16 @@ host ... ldap ldapbasedn="dc=example,dc=net"
+ 
+      </variablelist>
+    </para>
++
++   <para>
++    If it is necessary to have a comma or whitespace in a RADIUS parameter
++    value, that can be done by putting double quotes around the value, but
++    it is tedious because two layers of double-quoting are now required.
++    An example of putting whitespace into RADIUS secret strings is:
++<programlisting>
++host ... radius radiusservers="server1,server2" radiussecrets="""secret one"",""secret two"""
++</programlisting>
++   </para>
+   </sect1>
+ 
+   <sect1 id="auth-cert">
+diff --git a/src/backend/libpq/hba.c b/src/backend/libpq/hba.c
+index 7f59a294a4d3..cc4b661433f5 100644
+--- a/src/backend/libpq/hba.c
++++ b/src/backend/libpq/hba.c
+@@ -1927,7 +1927,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
+ 
+ 		REQUIRE_AUTH_OPTION(uaRADIUS, "radiusservers", "radius");
+ 
+-		if (!SplitIdentifierString(dupval, ',', &parsed_servers))
++		if (!SplitGUCList(dupval, ',', &parsed_servers))
+ 		{
+ 			/* syntax error in list */
+ 			ereport(elevel,
+@@ -1976,7 +1976,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
+ 
+ 		REQUIRE_AUTH_OPTION(uaRADIUS, "radiusports", "radius");
+ 
+-		if (!SplitIdentifierString(dupval, ',', &parsed_ports))
++		if (!SplitGUCList(dupval, ',', &parsed_ports))
+ 		{
+ 			ereport(elevel,
+ 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+@@ -2011,7 +2011,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
+ 
+ 		REQUIRE_AUTH_OPTION(uaRADIUS, "radiussecrets", "radius");
+ 
+-		if (!SplitIdentifierString(dupval, ',', &parsed_secrets))
++		if (!SplitGUCList(dupval, ',', &parsed_secrets))
+ 		{
+ 			/* syntax error in list */
+ 			ereport(elevel,
+@@ -2033,7 +2033,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
+ 
+ 		REQUIRE_AUTH_OPTION(uaRADIUS, "radiusidentifiers", "radius");
+ 
+-		if (!SplitIdentifierString(dupval, ',', &parsed_identifiers))
++		if (!SplitGUCList(dupval, ',', &parsed_identifiers))
+ 		{
+ 			/* syntax error in list */
+ 			ereport(elevel,

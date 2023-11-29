@@ -1,0 +1,167 @@
+From 8650d161ae4369ec64a6fc7b7cbd0e6e55c3a7aa Mon Sep 17 00:00:00 2001
+From: Fujii Masao <fujii@postgresql.org>
+Date: Fri, 3 Jul 2015 11:53:58 +0900
+Subject: [PATCH] Make WAL-related utilities handle .partial WAL files
+ properly.
+
+Commit de76884 changed an archive recovery so that the last WAL
+segment with old timeline was renamed with suffix .partial. It should
+have updated WAL-related utilities so that they can handle such
+.paritial WAL files, but we forgot that.
+
+This patch changes pg_archivecleanup so that it can clean up even
+archived WAL files with .partial suffix. Also it allows us to specify
+.partial WAL file name as the command-line argument "oldestkeptwalfile".
+
+This patch also changes pg_resetxlog so that it can remove .partial
+WAL files in pg_xlog directory.
+
+pg_xlogdump cannot handle .partial WAL files. Per discussion,
+we decided only to document that limitation instead of adding the fix.
+Because a user can easily work around the limitation (i.e., just remove
+.partial suffix from the file name) and the fix seems complicated for
+very narrow use case.
+
+Back-patch to 9.5 where the problem existed.
+
+Review by Michael Paquier.
+Discussion: http://www.postgresql.org/message-id/CAHGQGwGxMKnVHGgTfiig2Bt_2djec0in3-DLJmtg7+nEiidFdQ@mail.gmail.com
+---
+ doc/src/sgml/ref/pg_xlogdump.sgml             |  6 ++++
+ doc/src/sgml/ref/pgarchivecleanup.sgml        |  6 ++--
+ src/bin/pg_archivecleanup/pg_archivecleanup.c | 31 ++++++++++++++++---
+ src/bin/pg_resetxlog/pg_resetxlog.c           | 10 ++++--
+ 4 files changed, 43 insertions(+), 10 deletions(-)
+
+diff --git a/doc/src/sgml/ref/pg_xlogdump.sgml b/doc/src/sgml/ref/pg_xlogdump.sgml
+index d9f4a6a499cc..1d78cf1a758a 100644
+--- a/doc/src/sgml/ref/pg_xlogdump.sgml
++++ b/doc/src/sgml/ref/pg_xlogdump.sgml
+@@ -215,6 +215,12 @@ PostgreSQL documentation
+     Only the specified timeline is displayed (or the default, if none is
+     specified). Records in other timelines are ignored.
+   </para>
++
++  <para>
++    <application>pg_xlogdump</> cannot read WAL files with suffix
++    <literal>.partial</>. If those files need to be read, <literal>.partial</>
++    suffix needs to be removed from the filename.
++  </para>
+  </refsect1>
+ 
+  <refsect1>
+diff --git a/doc/src/sgml/ref/pgarchivecleanup.sgml b/doc/src/sgml/ref/pgarchivecleanup.sgml
+index 779159d7fc2c..db39deaca16f 100644
+--- a/doc/src/sgml/ref/pgarchivecleanup.sgml
++++ b/doc/src/sgml/ref/pgarchivecleanup.sgml
+@@ -60,8 +60,10 @@ archive_cleanup_command = 'pg_archivecleanup <replaceable>archivelocation</> %r'
+   <para>
+    When used as a standalone program all WAL files logically preceding the
+    <replaceable>oldestkeptwalfile</> will be removed from <replaceable>archivelocation</>.
+-   In this mode, if you specify a <filename>.backup</> file name, then only the file prefix
+-   will be used as the <replaceable>oldestkeptwalfile</>. This allows you to remove
++   In this mode, if you specify a <filename>.partial</> or <filename>.backup</>
++   file name, then only the file prefix will be used as the
++   <replaceable>oldestkeptwalfile</>. This treatment of <filename>.backup</>
++   file name allows you to remove
+    all WAL files archived prior to a specific base backup without error.
+    For example, the following example will remove all files older than
+    WAL file name <filename>000000010000003700000010</>:
+diff --git a/src/bin/pg_archivecleanup/pg_archivecleanup.c b/src/bin/pg_archivecleanup/pg_archivecleanup.c
+index 579a9bb84307..c5569f32a336 100644
+--- a/src/bin/pg_archivecleanup/pg_archivecleanup.c
++++ b/src/bin/pg_archivecleanup/pg_archivecleanup.c
+@@ -125,7 +125,7 @@ CleanupPriorWALFiles(void)
+ 			 * file. Note that this means files are not removed in the order
+ 			 * they were originally written, in case this worries you.
+ 			 */
+-			if (IsXLogFileName(walfile) &&
++			if ((IsXLogFileName(walfile) || IsPartialXLogFileName(walfile)) &&
+ 				strcmp(walfile + 8, exclusiveCleanupFileName + 8) < 0)
+ 			{
+ 				/*
+@@ -181,7 +181,7 @@ CleanupPriorWALFiles(void)
+  * SetWALFileNameForCleanup()
+  *
+  *	  Set the earliest WAL filename that we want to keep on the archive
+- *	  and decide whether we need_cleanup
++ *	  and decide whether we need cleanup
+  */
+ static void
+ SetWALFileNameForCleanup(void)
+@@ -192,9 +192,10 @@ SetWALFileNameForCleanup(void)
+ 
+ 	/*
+ 	 * If restartWALFileName is a WAL file name then just use it directly. If
+-	 * restartWALFileName is a .backup filename, make sure we use the prefix
+-	 * of the filename, otherwise we will remove wrong files since
+-	 * 000000010000000000000010.00000020.backup is after
++	 * restartWALFileName is a .partial or .backup filename, make sure we use
++	 * the prefix of the filename, otherwise we will remove wrong files since
++	 * 000000010000000000000010.partial and
++	 * 000000010000000000000010.00000020.backup are after
+ 	 * 000000010000000000000010.
+ 	 */
+ 	if (IsXLogFileName(restartWALFileName))
+@@ -202,6 +203,26 @@ SetWALFileNameForCleanup(void)
+ 		strcpy(exclusiveCleanupFileName, restartWALFileName);
+ 		fnameOK = true;
+ 	}
++	else if (IsPartialXLogFileName(restartWALFileName))
++	{
++		int			args;
++		uint32		tli = 1,
++					log = 0,
++					seg = 0;
++
++		args = sscanf(restartWALFileName, "%08X%08X%08X.partial",
++					  &tli, &log, &seg);
++		if (args == 3)
++		{
++			fnameOK = true;
++
++			/*
++			 * Use just the prefix of the filename, ignore everything after
++			 * first period
++			 */
++			XLogFileNameById(exclusiveCleanupFileName, tli, log, seg);
++		}
++	}
+ 	else if (IsBackupHistoryFileName(restartWALFileName))
+ 	{
+ 		int			args;
+diff --git a/src/bin/pg_resetxlog/pg_resetxlog.c b/src/bin/pg_resetxlog/pg_resetxlog.c
+index e19a72b4c164..e7e8059a38df 100644
+--- a/src/bin/pg_resetxlog/pg_resetxlog.c
++++ b/src/bin/pg_resetxlog/pg_resetxlog.c
+@@ -906,7 +906,8 @@ FindEndOfXLOG(void)
+ 
+ 	while (errno = 0, (xlde = readdir(xldir)) != NULL)
+ 	{
+-		if (IsXLogFileName(xlde->d_name))
++		if (IsXLogFileName(xlde->d_name) ||
++			IsPartialXLogFileName(xlde->d_name))
+ 		{
+ 			unsigned int tli,
+ 						log,
+@@ -976,7 +977,8 @@ KillExistingXLOG(void)
+ 
+ 	while (errno = 0, (xlde = readdir(xldir)) != NULL)
+ 	{
+-		if (IsXLogFileName(xlde->d_name))
++		if (IsXLogFileName(xlde->d_name) ||
++			IsPartialXLogFileName(xlde->d_name))
+ 		{
+ 			snprintf(path, MAXPGPATH, "%s/%s", XLOGDIR, xlde->d_name);
+ 			if (unlink(path) < 0)
+@@ -1028,7 +1030,9 @@ KillExistingArchiveStatus(void)
+ 	{
+ 		if (strspn(xlde->d_name, "0123456789ABCDEF") == XLOG_FNAME_LEN &&
+ 			(strcmp(xlde->d_name + XLOG_FNAME_LEN, ".ready") == 0 ||
+-			 strcmp(xlde->d_name + XLOG_FNAME_LEN, ".done") == 0))
++			 strcmp(xlde->d_name + XLOG_FNAME_LEN, ".done") == 0 ||
++			 strcmp(xlde->d_name + XLOG_FNAME_LEN, ".partial.ready") == 0 ||
++			 strcmp(xlde->d_name + XLOG_FNAME_LEN, ".partial.done") == 0))
+ 		{
+ 			snprintf(path, MAXPGPATH, "%s/%s", ARCHSTATDIR, xlde->d_name);
+ 			if (unlink(path) < 0)

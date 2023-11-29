@@ -1,0 +1,399 @@
+From 6136e94dcb88c50b6156aa646746565400e373d4 Mon Sep 17 00:00:00 2001
+From: Andrew Dunstan <andrew@dunslane.net>
+Date: Fri, 20 Dec 2019 16:23:34 +1030
+Subject: [PATCH] Superuser can permit passwordless connections on postgres_fdw
+
+Currently postgres_fdw doesn't permit a non-superuser to connect to a
+foreign server without specifying a password, or to use an
+authentication mechanism that doesn't use the password. This is to avoid
+using the settings and identity of the user running Postgres.
+
+However, this doesn't make sense for all authentication methods. We
+therefore allow a superuser to set "password_required 'false'" for user
+mappings for the postgres_fdw. The superuser must ensure that the
+foreign server won't try to rely solely on the server identity (e.g.
+trust, peer, ident) or use an authentication mechanism that relies on the
+password settings (e.g. md5, scram-sha-256).
+
+This feature is a prelude to better support for sslcert and sslkey
+settings in user mappings.
+
+Author: Craig Ringer.
+Discussion: https://postgr.es/m/075135da-545c-f958-fed0-5dcb462d6dae@2ndQuadrant.com
+---
+ contrib/postgres_fdw/connection.c             | 42 +++++++--
+ .../postgres_fdw/expected/postgres_fdw.out    | 94 +++++++++++++++++++
+ contrib/postgres_fdw/option.c                 | 19 ++++
+ contrib/postgres_fdw/sql/postgres_fdw.sql     | 86 +++++++++++++++++
+ doc/src/sgml/postgres-fdw.sgml                | 24 +++++
+ 5 files changed, 257 insertions(+), 8 deletions(-)
+
+diff --git a/contrib/postgres_fdw/connection.c b/contrib/postgres_fdw/connection.c
+index 27b86a03f8f4..3618e41229f3 100644
+--- a/contrib/postgres_fdw/connection.c
++++ b/contrib/postgres_fdw/connection.c
+@@ -15,6 +15,7 @@
+ #include "access/htup_details.h"
+ #include "access/xact.h"
+ #include "catalog/pg_user_mapping.h"
++#include "commands/defrem.h"
+ #include "mb/pg_wchar.h"
+ #include "miscadmin.h"
+ #include "pgstat.h"
+@@ -89,7 +90,7 @@ static bool pgfdw_exec_cleanup_query(PGconn *conn, const char *query,
+ 									 bool ignore_errors);
+ static bool pgfdw_get_cleanup_result(PGconn *conn, TimestampTz endtime,
+ 									 PGresult **result);
+-
++static bool UserMappingPasswordRequired(UserMapping *user);
+ 
+ /*
+  * Get a PGconn which can be used to execute queries on the remote PostgreSQL
+@@ -272,14 +273,16 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
+ 		/*
+ 		 * Check that non-superuser has used password to establish connection;
+ 		 * otherwise, he's piggybacking on the postgres server's user
+-		 * identity. See also dblink_security_check() in contrib/dblink.
++		 * identity. See also dblink_security_check() in contrib/dblink
++		 * and check_conn_params.
+ 		 */
+-		if (!superuser_arg(user->userid) && !PQconnectionUsedPassword(conn))
++		if (!superuser_arg(user->userid) && UserMappingPasswordRequired(user) &&
++			!PQconnectionUsedPassword(conn))
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
+ 					 errmsg("password is required"),
+ 					 errdetail("Non-superuser cannot connect if the server does not request a password."),
+-					 errhint("Target server's authentication method must be changed.")));
++					 errhint("Target server's authentication method must be changed or password_required=false set in the user mapping attributes.")));
+ 
+ 		/* Prepare new session for use */
+ 		configure_remote_session(conn);
+@@ -312,12 +315,31 @@ disconnect_pg_server(ConnCacheEntry *entry)
+ 	}
+ }
+ 
++/*
++ * Return true if the password_required is defined and false for this user
++ * mapping, otherwise false. The mapping has been pre-validated.
++ */
++static bool
++UserMappingPasswordRequired(UserMapping *user)
++{
++	ListCell   *cell;
++
++	foreach(cell, user->options)
++	{
++		DefElem    *def = (DefElem *) lfirst(cell);
++		if (strcmp(def->defname, "password_required") == 0)
++			return defGetBoolean(def);
++	}
++
++	return true;
++}
++
+ /*
+  * For non-superusers, insist that the connstr specify a password.  This
+- * prevents a password from being picked up from .pgpass, a service file,
+- * the environment, etc.  We don't want the postgres user's passwords
+- * to be accessible to non-superusers.  (See also dblink_connstr_check in
+- * contrib/dblink.)
++ * prevents a password from being picked up from .pgpass, a service file, the
++ * environment, etc.  We don't want the postgres user's passwords,
++ * certificates, etc to be accessible to non-superusers.  (See also
++ * dblink_connstr_check in contrib/dblink.)
+  */
+ static void
+ check_conn_params(const char **keywords, const char **values, UserMapping *user)
+@@ -335,6 +357,10 @@ check_conn_params(const char **keywords, const char **values, UserMapping *user)
+ 			return;
+ 	}
+ 
++	/* ok if the superuser explicitly said so at user mapping creation time */
++	if (!UserMappingPasswordRequired(user))
++		return;
++
+ 	ereport(ERROR,
+ 			(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
+ 			 errmsg("password is required"),
+diff --git a/contrib/postgres_fdw/expected/postgres_fdw.out b/contrib/postgres_fdw/expected/postgres_fdw.out
+index 02e19828b563..3d6e4eeea0c0 100644
+--- a/contrib/postgres_fdw/expected/postgres_fdw.out
++++ b/contrib/postgres_fdw/expected/postgres_fdw.out
+@@ -8809,6 +8809,100 @@ SELECT b, avg(a), max(a), count(*) FROM pagg_tab GROUP BY b HAVING sum(a) < 700
+                      ->  Foreign Scan on fpagg_tab_p3 pagg_tab_2
+ (15 rows)
+ 
++-- ===================================================================
++-- access rights and superuser
++-- ===================================================================
++-- Non-superuser cannot create a FDW without a password in the connstr
++CREATE ROLE nosuper NOSUPERUSER;
++GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO nosuper;
++SET ROLE nosuper;
++SHOW is_superuser;
++ is_superuser 
++--------------
++ off
++(1 row)
++
++-- This will be OK, we can create the FDW
++DO $d$
++    BEGIN
++        EXECUTE $$CREATE SERVER loopback_nopw FOREIGN DATA WRAPPER postgres_fdw
++            OPTIONS (dbname '$$||current_database()||$$',
++                     port '$$||current_setting('port')||$$'
++            )$$;
++    END;
++$d$;
++-- But creation of user mappings for non-superusers should fail
++CREATE USER MAPPING FOR public SERVER loopback_nopw;
++CREATE USER MAPPING FOR CURRENT_USER SERVER loopback_nopw;
++CREATE FOREIGN TABLE ft1_nopw (
++	c1 int NOT NULL,
++	c2 int NOT NULL,
++	c3 text,
++	c4 timestamptz,
++	c5 timestamp,
++	c6 varchar(10),
++	c7 char(10) default 'ft1',
++	c8 user_enum
++) SERVER loopback_nopw OPTIONS (schema_name 'public', table_name 'ft1');
++SELECT * FROM ft1_nopw LIMIT 1;
++ERROR:  password is required
++DETAIL:  Non-superusers must provide a password in the user mapping.
++-- If we add a password to the connstr it'll fail, because we don't allow passwords
++-- in connstrs only in user mappings.
++DO $d$
++    BEGIN
++        EXECUTE $$ALTER SERVER loopback_nopw OPTIONS (ADD password 'dummypw')$$;
++    END;
++$d$;
++ERROR:  invalid option "password"
++HINT:  Valid options in this context are: service, passfile, channel_binding, connect_timeout, dbname, host, hostaddr, port, options, application_name, keepalives, keepalives_idle, keepalives_interval, keepalives_count, tcp_user_timeout, sslmode, sslcompression, sslcert, sslkey, sslrootcert, sslcrl, requirepeer, gssencmode, krbsrvname, target_session_attrs, use_remote_estimate, fdw_startup_cost, fdw_tuple_cost, extensions, updatable, fetch_size
++CONTEXT:  SQL statement "ALTER SERVER loopback_nopw OPTIONS (ADD password 'dummypw')"
++PL/pgSQL function inline_code_block line 3 at EXECUTE
++-- If we add a password for our user mapping instead, we should get a different
++-- error because the password wasn't actually *used* when we run with trust auth.
++--
++-- This won't work with installcheck, but neither will most of the FDW checks.
++ALTER USER MAPPING FOR CURRENT_USER SERVER loopback_nopw OPTIONS (ADD password 'dummypw');
++SELECT * FROM ft1_nopw LIMIT 1;
++ERROR:  password is required
++DETAIL:  Non-superuser cannot connect if the server does not request a password.
++HINT:  Target server's authentication method must be changed or password_required=false set in the user mapping attributes.
++-- Unpriv user cannot make the mapping passwordless
++ALTER USER MAPPING FOR CURRENT_USER SERVER loopback_nopw OPTIONS (ADD password_required 'false');
++ERROR:  password_required=false is superuser-only
++HINT:  User mappings with the password_required option set to false may only be created or modified by the superuser
++SELECT * FROM ft1_nopw LIMIT 1;
++ERROR:  password is required
++DETAIL:  Non-superuser cannot connect if the server does not request a password.
++HINT:  Target server's authentication method must be changed or password_required=false set in the user mapping attributes.
++RESET ROLE;
++-- But the superuser can
++ALTER USER MAPPING FOR nosuper SERVER loopback_nopw OPTIONS (ADD password_required 'false');
++SET ROLE nosuper;
++-- Should finally work now
++SELECT * FROM ft1_nopw LIMIT 1;
++  c1  | c2 | c3 | c4 | c5 | c6 |     c7     | c8 
++------+----+----+----+----+----+------------+----
++ 1111 |  2 |    |    |    |    | ft1        | 
++(1 row)
++
++-- We're done with the role named after a specific user and need to check the
++-- changes to the public mapping.
++DROP USER MAPPING FOR CURRENT_USER SERVER loopback_nopw;
++-- This will fail again as it'll resolve the user mapping for public, which
++-- lacks password_required=false
++SELECT * FROM ft1_nopw LIMIT 1;
++ERROR:  password is required
++DETAIL:  Non-superusers must provide a password in the user mapping.
++RESET ROLE;
++-- The user mapping for public is passwordless and lacks the password_required=false
++-- mapping option, but will work because the current user is a superuser.
++SELECT * FROM ft1_nopw LIMIT 1;
++  c1  | c2 | c3 | c4 | c5 | c6 |     c7     | c8 
++------+----+----+----+----+----+------------+----
++ 1111 |  2 |    |    |    |    | ft1        | 
++(1 row)
++
+ -- Clean-up
+ RESET enable_partitionwise_aggregate;
+ -- Two-phase transactions are not supported.
+diff --git a/contrib/postgres_fdw/option.c b/contrib/postgres_fdw/option.c
+index da175a626f28..f8b077d1116c 100644
+--- a/contrib/postgres_fdw/option.c
++++ b/contrib/postgres_fdw/option.c
+@@ -51,6 +51,7 @@ static void InitPgFdwOptions(void);
+ static bool is_valid_option(const char *keyword, Oid context);
+ static bool is_libpq_option(const char *keyword);
+ 
++#include "miscadmin.h"
+ 
+ /*
+  * Validate the generic options given to a FOREIGN DATA WRAPPER, SERVER,
+@@ -141,6 +142,23 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
+ 						 errmsg("%s requires a non-negative integer value",
+ 								def->defname)));
+ 		}
++		else if (strcmp(def->defname, "password_required") == 0)
++		{
++			bool pw_required = defGetBoolean(def);
++
++			/*
++			 * Only the superuser may set this option on a user mapping, or
++			 * alter a user mapping on which this option is set. We allow a
++			 * user to clear this option if it's set - in fact, we don't have a
++			 * choice since we can't see the old mapping when validating an
++			 * alter.
++			 */
++			if (!superuser() && !pw_required)
++				ereport(ERROR,
++						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
++						 errmsg("password_required=false is superuser-only"),
++						 errhint("User mappings with the password_required option set to false may only be created or modified by the superuser")));
++		}
+ 	}
+ 
+ 	PG_RETURN_VOID();
+@@ -175,6 +193,7 @@ InitPgFdwOptions(void)
+ 		/* fetch_size is available on both server and table */
+ 		{"fetch_size", ForeignServerRelationId, false},
+ 		{"fetch_size", ForeignTableRelationId, false},
++		{"password_required", UserMappingRelationId, false},
+ 		{NULL, InvalidOid, false}
+ 	};
+ 
+diff --git a/contrib/postgres_fdw/sql/postgres_fdw.sql b/contrib/postgres_fdw/sql/postgres_fdw.sql
+index ecfa43efc8fc..33307d67dafd 100644
+--- a/contrib/postgres_fdw/sql/postgres_fdw.sql
++++ b/contrib/postgres_fdw/sql/postgres_fdw.sql
+@@ -2493,6 +2493,92 @@ SELECT a, count(t1) FROM pagg_tab t1 GROUP BY a HAVING avg(b) < 22 ORDER BY 1;
+ EXPLAIN (COSTS OFF)
+ SELECT b, avg(a), max(a), count(*) FROM pagg_tab GROUP BY b HAVING sum(a) < 700 ORDER BY 1;
+ 
++-- ===================================================================
++-- access rights and superuser
++-- ===================================================================
++
++-- Non-superuser cannot create a FDW without a password in the connstr
++CREATE ROLE nosuper NOSUPERUSER;
++
++GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO nosuper;
++
++SET ROLE nosuper;
++
++SHOW is_superuser;
++
++-- This will be OK, we can create the FDW
++DO $d$
++    BEGIN
++        EXECUTE $$CREATE SERVER loopback_nopw FOREIGN DATA WRAPPER postgres_fdw
++            OPTIONS (dbname '$$||current_database()||$$',
++                     port '$$||current_setting('port')||$$'
++            )$$;
++    END;
++$d$;
++
++-- But creation of user mappings for non-superusers should fail
++CREATE USER MAPPING FOR public SERVER loopback_nopw;
++CREATE USER MAPPING FOR CURRENT_USER SERVER loopback_nopw;
++
++CREATE FOREIGN TABLE ft1_nopw (
++	c1 int NOT NULL,
++	c2 int NOT NULL,
++	c3 text,
++	c4 timestamptz,
++	c5 timestamp,
++	c6 varchar(10),
++	c7 char(10) default 'ft1',
++	c8 user_enum
++) SERVER loopback_nopw OPTIONS (schema_name 'public', table_name 'ft1');
++
++SELECT * FROM ft1_nopw LIMIT 1;
++
++-- If we add a password to the connstr it'll fail, because we don't allow passwords
++-- in connstrs only in user mappings.
++
++DO $d$
++    BEGIN
++        EXECUTE $$ALTER SERVER loopback_nopw OPTIONS (ADD password 'dummypw')$$;
++    END;
++$d$;
++
++-- If we add a password for our user mapping instead, we should get a different
++-- error because the password wasn't actually *used* when we run with trust auth.
++--
++-- This won't work with installcheck, but neither will most of the FDW checks.
++
++ALTER USER MAPPING FOR CURRENT_USER SERVER loopback_nopw OPTIONS (ADD password 'dummypw');
++
++SELECT * FROM ft1_nopw LIMIT 1;
++
++-- Unpriv user cannot make the mapping passwordless
++ALTER USER MAPPING FOR CURRENT_USER SERVER loopback_nopw OPTIONS (ADD password_required 'false');
++
++SELECT * FROM ft1_nopw LIMIT 1;
++
++RESET ROLE;
++
++-- But the superuser can
++ALTER USER MAPPING FOR nosuper SERVER loopback_nopw OPTIONS (ADD password_required 'false');
++
++SET ROLE nosuper;
++
++-- Should finally work now
++SELECT * FROM ft1_nopw LIMIT 1;
++
++-- We're done with the role named after a specific user and need to check the
++-- changes to the public mapping.
++DROP USER MAPPING FOR CURRENT_USER SERVER loopback_nopw;
++
++-- This will fail again as it'll resolve the user mapping for public, which
++-- lacks password_required=false
++SELECT * FROM ft1_nopw LIMIT 1;
++
++RESET ROLE;
++
++-- The user mapping for public is passwordless and lacks the password_required=false
++-- mapping option, but will work because the current user is a superuser.
++SELECT * FROM ft1_nopw LIMIT 1;
+ 
+ -- Clean-up
+ RESET enable_partitionwise_aggregate;
+diff --git a/doc/src/sgml/postgres-fdw.sgml b/doc/src/sgml/postgres-fdw.sgml
+index 1d4bafd9f064..4986b7f5b5d7 100644
+--- a/doc/src/sgml/postgres-fdw.sgml
++++ b/doc/src/sgml/postgres-fdw.sgml
+@@ -136,6 +136,30 @@
+     authentication, so always specify the <literal>password</literal> option
+     for user mappings belonging to non-superusers.
+    </para>
++   <para>
++    A superuser may override this check on a per-user-mapping basis by setting
++    the user mapping option <literal>password_required 'false'</literal>, e.g.
++    <programlisting>
++      ALTER USER MAPPING FOR some_non_superuser SERVER loopback_nopw
++      OPTIONS (ADD password_required 'false');
++    </programlisting>
++    To prevent unprivileged users from exploiting the authentication rights
++    of the unix user the postgres server is running as to escalate to superuser
++    rights, only the superuser may set this option on a user mapping.
++    </para>
++    <para>
++    Care is required to ensure that this does not allow the mapped
++    user the ability to connect as superuser to the mapped database per
++    CVE-2007-3278 and CVE-2007-6601. Don't set
++    <literal>password_required=false</literal>
++    on the <literal>public</literal> role. Keep in mind that the mapped
++    user can potentially use any client certificates,
++    <filename>.pgpass</filename>,
++    <filename>.pg_service.conf</filename> etc in the unix home directory of the
++    system user the postgres server runs as. They can also use any trust
++    relationship granted by authentication modes like <literal>peer</literal>
++    or <literal>ident</literal> authentication.
++   </para>
+   </sect3>
+ 
+   <sect3>

@@ -1,0 +1,261 @@
+From 7750fefdb2b81e0ee09c523d0a21cbd37edaf4b2 Mon Sep 17 00:00:00 2001
+From: Daniel Gustafsson <dgustafsson@postgresql.org>
+Date: Mon, 25 Sep 2023 12:41:49 +0200
+Subject: [PATCH] Add GUC for temporarily disabling event triggers
+
+In order to troubleshoot misbehaving or buggy event triggers, the
+documented advice is to enter single-user mode.  In an attempt to
+reduce the number of situations where single-user mode is required
+(or even recommended) for non-extraordinary maintenance, this GUC
+allows to temporarily suspend event triggers.
+
+This was originally extracted from a larger patchset which aimed
+at supporting event triggers on login events.
+
+Reviewed-by: Ted Yu <yuzhihong@gmail.com>
+Reviewed-by: Mikhail Gribkov <youzhick@gmail.com>
+Reviewed-by: Justin Pryzby <pryzby@telsasoft.com>
+Reviewed-by: Michael Paquier <michael@paquier.xyz
+Reviewed-by: Robert Haas <robertmhaas@gmail.com>
+Discussion: https://postgr.es/m/9140106E-F9BF-4D85-8FC8-F2D3C094A6D9@yesql.se
+Discussion: https://postgr.es/m/0d46d29f-4558-3af9-9c85-7774e14a7709@postgrespro.ru
+---
+ doc/src/sgml/config.sgml                      | 19 +++++++++++++++
+ doc/src/sgml/ref/create_event_trigger.sgml    |  9 ++++---
+ src/backend/commands/event_trigger.c          | 20 ++++++++++------
+ src/backend/utils/misc/guc_tables.c           | 11 +++++++++
+ src/backend/utils/misc/postgresql.conf.sample |  1 +
+ src/include/commands/event_trigger.h          |  2 ++
+ src/test/regress/expected/event_trigger.out   | 22 +++++++++++++++++
+ src/test/regress/sql/event_trigger.sql        | 24 +++++++++++++++++++
+ 8 files changed, 98 insertions(+), 10 deletions(-)
+
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index 6bc1b215db99..d42b7d63ee69 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -9425,6 +9425,25 @@ SET XML OPTION { DOCUMENT | CONTENT };
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry id="guc-event-triggers" xreflabel="event_triggers">
++      <term><varname>event_triggers</varname> (<type>boolean</type>)
++      <indexterm>
++       <primary><varname>event_triggers</varname></primary>
++       <secondary>configuration parameter</secondary>
++     </indexterm>
++     </term>
++     <listitem>
++      <para>
++       Allow temporarily disabling execution of event triggers in order to
++       troubleshoot and repair faulty event triggers. All event triggers will
++       be disabled by setting it to <literal>false</literal>. Setting the value
++       to <literal>true</literal> allows all event triggers to fire, this
++       is the default value. Only superusers and users with the appropriate
++       <literal>SET</literal> privilege can change this setting.
++      </para>
++     </listitem>
++     </varlistentry>
++
+      </variablelist>
+     </sect2>
+      <sect2 id="runtime-config-client-format">
+diff --git a/doc/src/sgml/ref/create_event_trigger.sgml b/doc/src/sgml/ref/create_event_trigger.sgml
+index 22c811919827..ef12cfa20d41 100644
+--- a/doc/src/sgml/ref/create_event_trigger.sgml
++++ b/doc/src/sgml/ref/create_event_trigger.sgml
+@@ -121,9 +121,12 @@ CREATE EVENT TRIGGER <replaceable class="parameter">name</replaceable>
+ 
+   <para>
+    Event triggers are disabled in single-user mode (see <xref
+-   linkend="app-postgres"/>).  If an erroneous event trigger disables the
+-   database so much that you can't even drop the trigger, restart in
+-   single-user mode and you'll be able to do that.
++   linkend="app-postgres"/>) as well as when
++   <xref linkend="guc-event-triggers"/> is set to <literal>false</literal>.
++   If an erroneous event trigger disables the database so much that you can't
++   even drop the trigger, restart with <xref linkend="guc-event-triggers"/>
++   set to <literal>false</literal> to temporarily disable event triggers, or
++   in single-user mode, and you'll be able to do that.
+   </para>
+  </refsect1>
+ 
+diff --git a/src/backend/commands/event_trigger.c b/src/backend/commands/event_trigger.c
+index d4b00d1a828a..bd812e42d943 100644
+--- a/src/backend/commands/event_trigger.c
++++ b/src/backend/commands/event_trigger.c
+@@ -72,6 +72,9 @@ typedef struct EventTriggerQueryState
+ 
+ static EventTriggerQueryState *currentEventTriggerState = NULL;
+ 
++/* GUC parameter */
++bool		event_triggers = true;
++
+ /* Support for dropped objects */
+ typedef struct SQLDropObject
+ {
+@@ -657,8 +660,11 @@ EventTriggerDDLCommandStart(Node *parsetree)
+ 	 * wherein event triggers are disabled.  (Or we could implement
+ 	 * heapscan-and-sort logic for that case, but having disaster recovery
+ 	 * scenarios depend on code that's otherwise untested isn't appetizing.)
++	 *
++	 * Additionally, event triggers can be disabled with a superuser-only GUC
++	 * to make fixing database easier as per 1 above.
+ 	 */
+-	if (!IsUnderPostmaster)
++	if (!IsUnderPostmaster || !event_triggers)
+ 		return;
+ 
+ 	runlist = EventTriggerCommonSetup(parsetree,
+@@ -692,9 +698,9 @@ EventTriggerDDLCommandEnd(Node *parsetree)
+ 
+ 	/*
+ 	 * See EventTriggerDDLCommandStart for a discussion about why event
+-	 * triggers are disabled in single user mode.
++	 * triggers are disabled in single user mode or via GUC.
+ 	 */
+-	if (!IsUnderPostmaster)
++	if (!IsUnderPostmaster || !event_triggers)
+ 		return;
+ 
+ 	/*
+@@ -740,9 +746,9 @@ EventTriggerSQLDrop(Node *parsetree)
+ 
+ 	/*
+ 	 * See EventTriggerDDLCommandStart for a discussion about why event
+-	 * triggers are disabled in single user mode.
++	 * triggers are disabled in single user mode or via a GUC.
+ 	 */
+-	if (!IsUnderPostmaster)
++	if (!IsUnderPostmaster || !event_triggers)
+ 		return;
+ 
+ 	/*
+@@ -811,9 +817,9 @@ EventTriggerTableRewrite(Node *parsetree, Oid tableOid, int reason)
+ 
+ 	/*
+ 	 * See EventTriggerDDLCommandStart for a discussion about why event
+-	 * triggers are disabled in single user mode.
++	 * triggers are disabled in single user mode or via a GUC.
+ 	 */
+-	if (!IsUnderPostmaster)
++	if (!IsUnderPostmaster || !event_triggers)
+ 		return;
+ 
+ 	/*
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index bdb26e2b77d6..16ec6c5ef029 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -37,6 +37,7 @@
+ #include "catalog/namespace.h"
+ #include "catalog/storage.h"
+ #include "commands/async.h"
++#include "commands/event_trigger.h"
+ #include "commands/tablespace.h"
+ #include "commands/trigger.h"
+ #include "commands/user.h"
+@@ -2000,6 +2001,16 @@ struct config_bool ConfigureNamesBool[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"event_triggers", PGC_SUSET, CLIENT_CONN_STATEMENT,
++			gettext_noop("Enables event triggers."),
++			gettext_noop("When enabled, event triggers will fire for all applicable statements."),
++		},
++		&event_triggers,
++		true,
++		NULL, NULL, NULL
++	},
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index 6bb39d39badf..d08d55c3fe49 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -706,6 +706,7 @@
+ #xmloption = 'content'
+ #gin_pending_list_limit = 4MB
+ #createrole_self_grant = ''		# set and/or inherit
++#event_triggers = on
+ 
+ # - Locale and Formatting -
+ 
+diff --git a/src/include/commands/event_trigger.h b/src/include/commands/event_trigger.h
+index 5ed6ece555d0..1c925dbf2570 100644
+--- a/src/include/commands/event_trigger.h
++++ b/src/include/commands/event_trigger.h
+@@ -29,6 +29,8 @@ typedef struct EventTriggerData
+ 	CommandTag	tag;
+ } EventTriggerData;
+ 
++extern PGDLLIMPORT bool event_triggers;
++
+ #define AT_REWRITE_ALTER_PERSISTENCE	0x01
+ #define AT_REWRITE_DEFAULT_VAL			0x02
+ #define AT_REWRITE_COLUMN_REWRITE		0x04
+diff --git a/src/test/regress/expected/event_trigger.out b/src/test/regress/expected/event_trigger.out
+index 2c8a6b221210..0b87a42d0a9a 100644
+--- a/src/test/regress/expected/event_trigger.out
++++ b/src/test/regress/expected/event_trigger.out
+@@ -616,3 +616,25 @@ SELECT
+ DROP EVENT TRIGGER start_rls_command;
+ DROP EVENT TRIGGER end_rls_command;
+ DROP EVENT TRIGGER sql_drop_command;
++-- Check the GUC for disabling event triggers
++CREATE FUNCTION test_event_trigger_guc() RETURNS event_trigger
++LANGUAGE plpgsql AS $$
++DECLARE
++	obj record;
++BEGIN
++	FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()
++	LOOP
++		RAISE NOTICE '% dropped %', tg_tag, obj.object_type;
++	END LOOP;
++END;
++$$;
++CREATE EVENT TRIGGER test_event_trigger_guc
++	ON sql_drop
++	WHEN TAG IN ('DROP POLICY') EXECUTE FUNCTION test_event_trigger_guc();
++SET event_triggers = 'on';
++CREATE POLICY pguc ON event_trigger_test USING (FALSE);
++DROP POLICY pguc ON event_trigger_test;
++NOTICE:  DROP POLICY dropped policy
++CREATE POLICY pguc ON event_trigger_test USING (FALSE);
++SET event_triggers = 'off';
++DROP POLICY pguc ON event_trigger_test;
+diff --git a/src/test/regress/sql/event_trigger.sql b/src/test/regress/sql/event_trigger.sql
+index 1aeaddbe7154..6f0933b9e88a 100644
+--- a/src/test/regress/sql/event_trigger.sql
++++ b/src/test/regress/sql/event_trigger.sql
+@@ -471,3 +471,27 @@ SELECT
+ DROP EVENT TRIGGER start_rls_command;
+ DROP EVENT TRIGGER end_rls_command;
+ DROP EVENT TRIGGER sql_drop_command;
++
++-- Check the GUC for disabling event triggers
++CREATE FUNCTION test_event_trigger_guc() RETURNS event_trigger
++LANGUAGE plpgsql AS $$
++DECLARE
++	obj record;
++BEGIN
++	FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()
++	LOOP
++		RAISE NOTICE '% dropped %', tg_tag, obj.object_type;
++	END LOOP;
++END;
++$$;
++CREATE EVENT TRIGGER test_event_trigger_guc
++	ON sql_drop
++	WHEN TAG IN ('DROP POLICY') EXECUTE FUNCTION test_event_trigger_guc();
++
++SET event_triggers = 'on';
++CREATE POLICY pguc ON event_trigger_test USING (FALSE);
++DROP POLICY pguc ON event_trigger_test;
++
++CREATE POLICY pguc ON event_trigger_test USING (FALSE);
++SET event_triggers = 'off';
++DROP POLICY pguc ON event_trigger_test;

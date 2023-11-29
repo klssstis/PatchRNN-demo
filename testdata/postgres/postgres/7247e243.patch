@@ -1,0 +1,91 @@
+From 7247e243a803044a79a2828ced51b05765e049a0 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sun, 7 Jun 2020 13:44:13 -0400
+Subject: [PATCH] Try to read data from the socket in pqSendSome's write_failed
+ paths.
+
+Even when we've concluded that we have a hard write failure on the
+socket, we should continue to try to read data.  This gives us an
+opportunity to collect any final error message that the backend might
+have sent before closing the connection; moreover it is the job of
+pqReadData not pqSendSome to close the socket once EOF is detected.
+
+Due to an oversight in 1f39a1c06, pqSendSome failed to try to collect
+data in the case where we'd already set write_failed.  The problem was
+masked for ordinary query operations (which really only make one write
+attempt anyway), but COPY to the server would continue to send data
+indefinitely after a mid-COPY connection loss.
+
+Hence, add pqReadData calls into the paths where pqSendSome drops data
+because of write_failed.  If we've lost the connection, this will
+eventually result in closing the socket and setting CONNECTION_BAD,
+which will cause PQputline and siblings to report failure, allowing
+the application to terminate the COPY sooner.  (Basically this restores
+what happened before 1f39a1c06.)
+
+There are related issues that this does not solve; for example, if the
+backend sends an error but doesn't drop the connection, we did and
+still will keep pumping COPY data as long as the application sends it.
+Fixing that will require application-visible behavior changes though,
+and anyway it's an ancient behavior that we've had few complaints about.
+For now I'm just trying to fix the regression from 1f39a1c06.
+
+Per a complaint from Andres Freund.  Back-patch into v12 where
+1f39a1c06 came in.
+
+Discussion: https://postgr.es/m/20200603201242.ofvm4jztpqytwfye@alap3.anarazel.de
+---
+ src/interfaces/libpq/fe-misc.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/src/interfaces/libpq/fe-misc.c b/src/interfaces/libpq/fe-misc.c
+index 9afa0533a627..9273984727a2 100644
+--- a/src/interfaces/libpq/fe-misc.c
++++ b/src/interfaces/libpq/fe-misc.c
+@@ -823,6 +823,10 @@ pqReadData(PGconn *conn)
+  * Return 0 on success, -1 on failure and 1 when not all data could be sent
+  * because the socket would block and the connection is non-blocking.
+  *
++ * Note that this is also responsible for consuming data from the socket
++ * (putting it in conn->inBuffer) in any situation where we can't send
++ * all the specified data immediately.
++ *
+  * Upon write failure, conn->write_failed is set and the error message is
+  * saved in conn->write_err_msg, but we clear the output buffer and return
+  * zero anyway; this is because callers should soldier on until it's possible
+@@ -842,12 +846,20 @@ pqSendSome(PGconn *conn, int len)
+ 	 * on that connection.  Even if the kernel would let us, we've probably
+ 	 * lost message boundary sync with the server.  conn->write_failed
+ 	 * therefore persists until the connection is reset, and we just discard
+-	 * all data presented to be written.
++	 * all data presented to be written.  However, as long as we still have a
++	 * valid socket, we should continue to absorb data from the backend, so
++	 * that we can collect any final error messages.
+ 	 */
+ 	if (conn->write_failed)
+ 	{
+ 		/* conn->write_err_msg should be set up already */
+ 		conn->outCount = 0;
++		/* Absorb input data if any, and detect socket closure */
++		if (conn->sock != PGINVALID_SOCKET)
++		{
++			if (pqReadData(conn) < 0)
++				return -1;
++		}
+ 		return 0;
+ 	}
+ 
+@@ -917,6 +929,13 @@ pqSendSome(PGconn *conn, int len)
+ 
+ 					/* Discard queued data; no chance it'll ever be sent */
+ 					conn->outCount = 0;
++
++					/* Absorb input data if any, and detect socket closure */
++					if (conn->sock != PGINVALID_SOCKET)
++					{
++						if (pqReadData(conn) < 0)
++							return -1;
++					}
+ 					return 0;
+ 			}
+ 		}

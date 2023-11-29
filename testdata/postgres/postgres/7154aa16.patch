@@ -1,0 +1,98 @@
+From 7154aa16a64dd4afc2cbf02e7ce86dc6711a1087 Mon Sep 17 00:00:00 2001
+From: Peter Geoghegan <pg@bowt.ie>
+Date: Sat, 25 Apr 2020 16:45:20 -0700
+Subject: [PATCH] Fix another minor page deletion buffer lock issue.
+
+Avoid accessing the leaf page's top parent tuple without a buffer lock
+held during the second phase of nbtree page deletion.  The old approach
+was safe, though only because VACUUM never drops its buffer pin (and
+because only VACUUM itself can modify a half-dead page).  Even still, it
+seems like a good idea to be strict here.  Tighten things up by copying
+the top parent page's block number to a local variable before releasing
+the buffer lock on the leaf page -- not after.
+
+This is a follow-up to commit fa7ff642, which fixed a similar issue in
+the first phase of nbtree page deletion.
+
+Update some related comments in passing.
+
+Discussion: https://postgr.es/m/CAH2-WzkLgyN3zBvRZ1pkNJThC=xi_0gpWRUb_45eexLH1+k2_Q@mail.gmail.com
+---
+ src/backend/access/nbtree/nbtpage.c | 33 +++++++++++++++++------------
+ 1 file changed, 20 insertions(+), 13 deletions(-)
+
+diff --git a/src/backend/access/nbtree/nbtpage.c b/src/backend/access/nbtree/nbtpage.c
+index 321d887ff77e..f5962f616333 100644
+--- a/src/backend/access/nbtree/nbtpage.c
++++ b/src/backend/access/nbtree/nbtpage.c
+@@ -1951,6 +1951,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
+ 	 */
+ 	itemid = PageGetItemId(page, P_HIKEY);
+ 	leafhikey = (IndexTuple) PageGetItem(page, itemid);
++	target = BTreeTupleGetTopParent(leafhikey);
+ 	leafleftsib = opaque->btpo_prev;
+ 	leafrightsib = opaque->btpo_next;
+ 
+@@ -1965,21 +1966,29 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
+ 	/*
+ 	 * If the leaf page still has a parent pointing to it (or a chain of
+ 	 * parents), we don't unlink the leaf page yet, but the topmost remaining
+-	 * parent in the branch.  Set 'target' and 'buf' to reference the page
+-	 * actually being unlinked.
++	 * parent in the branch (i.e. the "top parent")
+ 	 */
+-	target = BTreeTupleGetTopParent(leafhikey);
++	if (!BlockNumberIsValid(target))
++	{
++		/* No top parent, so target is leaf page */
++		target = leafblkno;
+ 
+-	if (target != InvalidBlockNumber)
++		buf = leafbuf;
++		leftsib = leafleftsib;
++		targetlevel = 0;
++	}
++	else
+ 	{
++		/* Target is the internal page taken from leaf's top parent */
+ 		Assert(target != leafblkno);
+ 
+-		/* fetch the block number of the topmost parent's left sibling */
++		/* Fetch the block number of the target's left sibling */
+ 		buf = _bt_getbuf(rel, target, BT_READ);
+ 		page = BufferGetPage(buf);
+ 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+ 		leftsib = opaque->btpo_prev;
+ 		targetlevel = opaque->btpo.level;
++		Assert(targetlevel > 0);
+ 
+ 		/*
+ 		 * To avoid deadlocks, we'd better drop the target page lock before
+@@ -1987,14 +1996,6 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
+ 		 */
+ 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+ 	}
+-	else
+-	{
+-		target = leafblkno;
+-
+-		buf = leafbuf;
+-		leftsib = leafleftsib;
+-		targetlevel = 0;
+-	}
+ 
+ 	/*
+ 	 * We have to lock the pages we need to modify in the standard order:
+@@ -2181,6 +2182,12 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
+ 	 * If we deleted a parent of the targeted leaf page, instead of the leaf
+ 	 * itself, update the leaf to point to the next remaining child in the
+ 	 * branch.
++	 *
++	 * Note: We rely on the fact that a buffer pin on the leaf page has been
++	 * held since leafhikey was initialized.  This is safe, though only
++	 * because the page was already half-dead at that point.  The leaf page
++	 * cannot have been modified by any other backend during the period when
++	 * no lock was held.
+ 	 */
+ 	if (target != leafblkno)
+ 		BTreeTupleSetTopParent(leafhikey, nextchild);

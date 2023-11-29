@@ -1,0 +1,85 @@
+From 5076f88bc985a7728eea337cbabae0e034b064b1 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 1 Feb 2021 14:34:59 -0500
+Subject: [PATCH] Remove incidental dependencies on partitioned_rels lists.
+
+It turns out that the calculation of [Merge]AppendPath.partitioned_rels
+in allpaths.c is faulty and sometimes omits relevant non-leaf partitions,
+allowing an assertion added by commit a929e17e5a8 to trigger.  Rather
+than fix that, it seems better to get rid of those fields altogether.
+We don't really need the info until create_plan time, and calculating
+it once for the selected plan should be cheaper than calculating it
+for each append path we consider.
+
+This patch undoes a couple of very minor uses of the partitioned_rels
+values.
+
+createplan.c was testing for nil-ness to optimize away the preparatory
+work for make_partition_pruneinfo().  That is worth doing if the check
+is nigh free, but it's not worth going to any great lengths to avoid.
+
+create_append_path() was testing for nil-ness as part of deciding how
+to set up ParamPathInfo for an AppendPath.  I replaced that with a
+check for the appendrel's parent rel being partitioned.  That's not
+quite the same thing but should cover most cases.  If we note any
+interesting loss of optimizations, we can dumb this down to just
+always use the more expensive method when the parent is a baserel.
+
+Discussion: https://postgr.es/m/87sg8tqhsl.fsf@aurora.ydns.eu
+Discussion: https://postgr.es/m/CAJKUy5gCXDSmFs2c=R+VGgn7FiYcLCsEFEuDNNLGfoha=pBE_g@mail.gmail.com
+---
+ src/backend/optimizer/plan/createplan.c |  6 ++----
+ src/backend/optimizer/util/pathnode.c   | 15 +++++++--------
+ 2 files changed, 9 insertions(+), 12 deletions(-)
+
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index 25d4750ca66a..181387480a14 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -1227,8 +1227,7 @@ create_append_plan(PlannerInfo *root, AppendPath *best_path, int flags)
+ 	 * pruning during execution.  Gather information needed by the executor to
+ 	 * do partition pruning.
+ 	 */
+-	if (enable_partition_pruning &&
+-		best_path->partitioned_rels != NIL)
++	if (enable_partition_pruning)
+ 	{
+ 		List	   *prunequal;
+ 
+@@ -1393,8 +1392,7 @@ create_merge_append_plan(PlannerInfo *root, MergeAppendPath *best_path,
+ 	 * pruning during execution.  Gather information needed by the executor to
+ 	 * do partition pruning.
+ 	 */
+-	if (enable_partition_pruning &&
+-		best_path->partitioned_rels != NIL)
++	if (enable_partition_pruning)
+ 	{
+ 		List	   *prunequal;
+ 
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index d465b9e21373..7aea30b306dc 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -1230,15 +1230,14 @@ create_append_path(PlannerInfo *root,
+ 
+ 	/*
+ 	 * When generating an Append path for a partitioned table, there may be
+-	 * parameters that are useful so we can eliminate certain partitions
+-	 * during execution.  Here we'll go all the way and fully populate the
+-	 * parameter info data as we do for normal base relations.  However, we
+-	 * need only bother doing this for RELOPT_BASEREL rels, as
+-	 * RELOPT_OTHER_MEMBER_REL's Append paths are merged into the base rel's
+-	 * Append subpaths.  It would do no harm to do this, we just avoid it to
+-	 * save wasting effort.
++	 * parameterized quals that are useful for run-time pruning.  Hence,
++	 * compute path.param_info the same way as for any other baserel, so that
++	 * such quals will be available for make_partition_pruneinfo().  (This
++	 * would not work right for a non-baserel, ie a scan on a non-leaf child
++	 * partition, and it's not necessary anyway in that case.  Must skip it if
++	 * we don't have "root", too.)
+ 	 */
+-	if (partitioned_rels != NIL && root && rel->reloptkind == RELOPT_BASEREL)
++	if (root && rel->reloptkind == RELOPT_BASEREL && IS_PARTITIONED_REL(rel))
+ 		pathnode->path.param_info = get_baserel_parampathinfo(root,
+ 															  rel,
+ 															  required_outer);

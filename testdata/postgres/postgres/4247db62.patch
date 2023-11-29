@@ -1,0 +1,123 @@
+From 4247db62522fafd1d4c045c5a432f50f2f05c0e0 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 19 Oct 2018 22:22:57 -0400
+Subject: [PATCH] Client-side fixes for delayed NOTIFY receipt.
+
+PQnotifies() is defined to just process already-read data, not try to read
+any more from the socket.  (This is a debatable decision, perhaps, but I'm
+hesitant to change longstanding library behavior.)  The documentation has
+long recommended calling PQconsumeInput() before PQnotifies() to ensure
+that any already-arrived message would get absorbed and processed.
+However, psql did not get that memo, which explains why it's not very
+reliable about reporting notifications promptly.
+
+Also, most (not quite all) callers called PQconsumeInput() just once before
+a PQnotifies() loop.  Taking this recommendation seriously implies that we
+should do PQconsumeInput() before each call.  This is more important now
+that we have "payload" strings in notification messages than it was before;
+that increases the probability of having more than one packet's worth
+of notify messages.  Hence, adjust code as well as documentation examples
+to do it like that.
+
+Back-patch to 9.5 to match related server fixes.  In principle we could
+probably go back further with these changes, but given lack of field
+complaints I doubt it's worthwhile.
+
+Discussion: https://postgr.es/m/CAOYf6ec-TmRYjKBXLLaGaB-jrd=mjG1Hzn1a1wufUAR39PQYhw@mail.gmail.com
+---
+ doc/src/sgml/libpq.sgml               | 3 ++-
+ src/bin/psql/common.c                 | 4 +++-
+ src/interfaces/ecpg/ecpglib/execute.c | 5 +++--
+ src/interfaces/libpq/fe-exec.c        | 3 +++
+ src/test/examples/testlibpq2.c        | 1 +
+ 5 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/doc/src/sgml/libpq.sgml b/doc/src/sgml/libpq.sgml
+index 06d909e80493..82a440531b51 100644
+--- a/doc/src/sgml/libpq.sgml
++++ b/doc/src/sgml/libpq.sgml
+@@ -5284,7 +5284,7 @@ typedef struct pgNotify
+   <para>
+    <function>PQnotifies</function> does not actually read data from the
+    server; it just returns messages previously absorbed by another
+-   <application>libpq</application> function.  In prior releases of
++   <application>libpq</application> function.  In ancient releases of
+    <application>libpq</application>, the only way to ensure timely receipt
+    of <command>NOTIFY</command> messages was to constantly submit commands, even
+    empty ones, and then check <function>PQnotifies</function> after each
+@@ -8711,6 +8711,7 @@ main(int argc, char **argv)
+                     notify->relname, notify->be_pid);
+             PQfreemem(notify);
+             nnotifies++;
++            PQconsumeInput(conn);
+         }
+     }
+ 
+diff --git a/src/bin/psql/common.c b/src/bin/psql/common.c
+index b56995925bd8..62c2928e6bbc 100644
+--- a/src/bin/psql/common.c
++++ b/src/bin/psql/common.c
+@@ -836,7 +836,8 @@ PrintNotifications(void)
+ {
+ 	PGnotify   *notify;
+ 
+-	while ((notify = PQnotifies(pset.db)))
++	PQconsumeInput(pset.db);
++	while ((notify = PQnotifies(pset.db)) != NULL)
+ 	{
+ 		/* for backward compatibility, only show payload if nonempty */
+ 		if (notify->extra[0])
+@@ -847,6 +848,7 @@ PrintNotifications(void)
+ 					notify->relname, notify->be_pid);
+ 		fflush(pset.queryFout);
+ 		PQfreemem(notify);
++		PQconsumeInput(pset.db);
+ 	}
+ }
+ 
+diff --git a/src/interfaces/ecpg/ecpglib/execute.c b/src/interfaces/ecpg/ecpglib/execute.c
+index ff244498da4b..42640ba9be1a 100644
+--- a/src/interfaces/ecpg/ecpglib/execute.c
++++ b/src/interfaces/ecpg/ecpglib/execute.c
+@@ -1722,12 +1722,13 @@ ecpg_process_output(struct statement *stmt, bool clear_result)
+ 	}
+ 
+ 	/* check for asynchronous returns */
+-	notify = PQnotifies(stmt->connection->connection);
+-	if (notify)
++	PQconsumeInput(stmt->connection->connection);
++	while ((notify = PQnotifies(stmt->connection->connection)) != NULL)
+ 	{
+ 		ecpg_log("ecpg_process_output on line %d: asynchronous notification of \"%s\" from backend PID %d received\n",
+ 				 stmt->lineno, notify->relname, notify->be_pid);
+ 		PQfreemem(notify);
++		PQconsumeInput(stmt->connection->connection);
+ 	}
+ 
+ 	return status;
+diff --git a/src/interfaces/libpq/fe-exec.c b/src/interfaces/libpq/fe-exec.c
+index e8b28d9ccf95..6aed8c87c7a2 100644
+--- a/src/interfaces/libpq/fe-exec.c
++++ b/src/interfaces/libpq/fe-exec.c
+@@ -2265,6 +2265,9 @@ PQsendDescribe(PGconn *conn, char desc_type, const char *desc_target)
+  * no unhandled async notification from the backend
+  *
+  * the CALLER is responsible for FREE'ing the structure returned
++ *
++ * Note that this function does not read any new data from the socket;
++ * so usually, caller should call PQconsumeInput() first.
+  */
+ PGnotify *
+ PQnotifies(PGconn *conn)
+diff --git a/src/test/examples/testlibpq2.c b/src/test/examples/testlibpq2.c
+index 62ecd68b55e3..6cdf8c8631ba 100644
+--- a/src/test/examples/testlibpq2.c
++++ b/src/test/examples/testlibpq2.c
+@@ -140,6 +140,7 @@ main(int argc, char **argv)
+ 					notify->relname, notify->be_pid);
+ 			PQfreemem(notify);
+ 			nnotifies++;
++			PQconsumeInput(conn);
+ 		}
+ 	}
+ 

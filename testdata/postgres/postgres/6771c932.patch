@@ -1,0 +1,179 @@
+From 6771c932cf5a8bbb8219461066987ad3b11688ff Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 17 Aug 2018 17:12:21 -0400
+Subject: [PATCH] Ensure schema qualification in pg_restore DISABLE/ENABLE
+ TRIGGER commands.
+
+Previously, this code blindly followed the common coding pattern of
+passing PQserverVersion(AH->connection) as the server-version parameter
+of fmtQualifiedId.  That works as long as we have a connection; but in
+pg_restore with text output, we don't.  Instead we got a zero from
+PQserverVersion, which fmtQualifiedId interpreted as "server is too old to
+have schemas", and so the name went unqualified.  That still accidentally
+managed to work in many cases, which is probably why this ancient bug went
+undetected for so long.  It only became obvious in the wake of the changes
+to force dump/restore to execute with restricted search_path.
+
+In HEAD/v11, let's deal with this by ripping out fmtQualifiedId's server-
+version behavioral dependency, and just making it schema-qualify all the
+time.  We no longer support pg_dump from servers old enough to need the
+ability to omit schema name, let alone restoring to them.  (Also, the few
+callers outside pg_dump already didn't work with pre-schema servers.)
+
+In older branches, that's not an acceptable solution, so instead just
+tweak the DISABLE/ENABLE TRIGGER logic to ensure it will schema-qualify
+its output regardless of server version.
+
+Per bug #15338 from Oleg somebody.  Back-patch to all supported branches.
+
+Discussion: https://postgr.es/m/153452458706.1316.5328079417086507743@wrigleys.postgresql.org
+---
+ src/bin/pg_dump/parallel.c           |  2 +-
+ src/bin/pg_dump/pg_backup_archiver.c | 12 +++---------
+ src/bin/pg_dump/pg_dump.c            |  4 +---
+ src/bin/scripts/common.c             |  3 +--
+ src/bin/scripts/vacuumdb.c           |  3 +--
+ src/fe_utils/string_utils.c          |  9 ++++-----
+ src/include/fe_utils/string_utils.h  |  3 +--
+ 7 files changed, 12 insertions(+), 24 deletions(-)
+
+diff --git a/src/bin/pg_dump/parallel.c b/src/bin/pg_dump/parallel.c
+index 02e79f2f275f..37f0d0d39a7b 100644
+--- a/src/bin/pg_dump/parallel.c
++++ b/src/bin/pg_dump/parallel.c
+@@ -1334,7 +1334,7 @@ lockTableForWorker(ArchiveHandle *AH, TocEntry *te)
+ 
+ 	query = createPQExpBuffer();
+ 
+-	qualId = fmtQualifiedId(AH->public.remoteVersion, te->namespace, te->tag);
++	qualId = fmtQualifiedId(te->namespace, te->tag);
+ 
+ 	appendPQExpBuffer(query, "LOCK TABLE %s IN ACCESS SHARE MODE NOWAIT",
+ 					  qualId);
+diff --git a/src/bin/pg_dump/pg_backup_archiver.c b/src/bin/pg_dump/pg_backup_archiver.c
+index 83c976eaf71a..45a391bffb2d 100644
+--- a/src/bin/pg_dump/pg_backup_archiver.c
++++ b/src/bin/pg_dump/pg_backup_archiver.c
+@@ -901,9 +901,7 @@ restore_toc_entry(ArchiveHandle *AH, TocEntry *te, bool is_parallel)
+ 						ahprintf(AH, "TRUNCATE TABLE %s%s;\n\n",
+ 								 (PQserverVersion(AH->connection) >= 80400 ?
+ 								  "ONLY " : ""),
+-								 fmtQualifiedId(PQserverVersion(AH->connection),
+-												te->namespace,
+-												te->tag));
++								 fmtQualifiedId(te->namespace, te->tag));
+ 					}
+ 
+ 					/*
+@@ -991,9 +989,7 @@ _disableTriggersIfNecessary(ArchiveHandle *AH, TocEntry *te)
+ 	 * Disable them.
+ 	 */
+ 	ahprintf(AH, "ALTER TABLE %s DISABLE TRIGGER ALL;\n\n",
+-			 fmtQualifiedId(PQserverVersion(AH->connection),
+-							te->namespace,
+-							te->tag));
++			 fmtQualifiedId(te->namespace, te->tag));
+ }
+ 
+ static void
+@@ -1019,9 +1015,7 @@ _enableTriggersIfNecessary(ArchiveHandle *AH, TocEntry *te)
+ 	 * Enable them.
+ 	 */
+ 	ahprintf(AH, "ALTER TABLE %s ENABLE TRIGGER ALL;\n\n",
+-			 fmtQualifiedId(PQserverVersion(AH->connection),
+-							te->namespace,
+-							te->tag));
++			 fmtQualifiedId(te->namespace, te->tag));
+ }
+ 
+ /*
+diff --git a/src/bin/pg_dump/pg_dump.c b/src/bin/pg_dump/pg_dump.c
+index 9baf7b2fded1..d5f1269f93de 100644
+--- a/src/bin/pg_dump/pg_dump.c
++++ b/src/bin/pg_dump/pg_dump.c
+@@ -135,11 +135,9 @@ static const CatalogId nilCatalogId = {0, 0};
+ 
+ /*
+  * Macro for producing quoted, schema-qualified name of a dumpable object.
+- * Note implicit dependence on "fout"; we should get rid of that argument.
+  */
+ #define fmtQualifiedDumpable(obj) \
+-	fmtQualifiedId(fout->remoteVersion, \
+-				   (obj)->dobj.namespace->dobj.name, \
++	fmtQualifiedId((obj)->dobj.namespace->dobj.name, \
+ 				   (obj)->dobj.name)
+ 
+ static void help(const char *progname);
+diff --git a/src/bin/scripts/common.c b/src/bin/scripts/common.c
+index db2b9f0d6832..29f5c97fafe9 100644
+--- a/src/bin/scripts/common.c
++++ b/src/bin/scripts/common.c
+@@ -356,8 +356,7 @@ appendQualifiedRelation(PQExpBuffer buf, const char *spec,
+ 		exit(1);
+ 	}
+ 	appendPQExpBufferStr(buf,
+-						 fmtQualifiedId(PQserverVersion(conn),
+-										PQgetvalue(res, 0, 1),
++						 fmtQualifiedId(PQgetvalue(res, 0, 1),
+ 										PQgetvalue(res, 0, 0)));
+ 	appendPQExpBufferStr(buf, columns);
+ 	PQclear(res);
+diff --git a/src/bin/scripts/vacuumdb.c b/src/bin/scripts/vacuumdb.c
+index 60f8b1c39487..6ab77b620638 100644
+--- a/src/bin/scripts/vacuumdb.c
++++ b/src/bin/scripts/vacuumdb.c
+@@ -406,8 +406,7 @@ vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
+ 		for (i = 0; i < ntups; i++)
+ 		{
+ 			appendPQExpBufferStr(&buf,
+-								 fmtQualifiedId(PQserverVersion(conn),
+-												PQgetvalue(res, i, 1),
++								 fmtQualifiedId(PQgetvalue(res, i, 1),
+ 												PQgetvalue(res, i, 0)));
+ 
+ 			simple_string_list_append(&dbtables, buf.data);
+diff --git a/src/fe_utils/string_utils.c b/src/fe_utils/string_utils.c
+index b47a396af15f..af0d9d5173e0 100644
+--- a/src/fe_utils/string_utils.c
++++ b/src/fe_utils/string_utils.c
+@@ -138,8 +138,7 @@ fmtId(const char *rawid)
+ }
+ 
+ /*
+- * fmtQualifiedId - convert a qualified name to the proper format for
+- * the source database.
++ * fmtQualifiedId - construct a schema-qualified name, with quoting as needed.
+  *
+  * Like fmtId, use the result before calling again.
+  *
+@@ -147,13 +146,13 @@ fmtId(const char *rawid)
+  * use that buffer until we're finished with calling fmtId().
+  */
+ const char *
+-fmtQualifiedId(int remoteVersion, const char *schema, const char *id)
++fmtQualifiedId(const char *schema, const char *id)
+ {
+ 	PQExpBuffer id_return;
+ 	PQExpBuffer lcl_pqexp = createPQExpBuffer();
+ 
+-	/* Suppress schema name if fetching from pre-7.3 DB */
+-	if (remoteVersion >= 70300 && schema && *schema)
++	/* Some callers might fail to provide a schema name */
++	if (schema && *schema)
+ 	{
+ 		appendPQExpBuffer(lcl_pqexp, "%s.", fmtId(schema));
+ 	}
+diff --git a/src/include/fe_utils/string_utils.h b/src/include/fe_utils/string_utils.h
+index 9a311e0f0fa8..8199682e6317 100644
+--- a/src/include/fe_utils/string_utils.h
++++ b/src/include/fe_utils/string_utils.h
+@@ -25,8 +25,7 @@ extern PQExpBuffer (*getLocalPQExpBuffer) (void);
+ 
+ /* Functions */
+ extern const char *fmtId(const char *identifier);
+-extern const char *fmtQualifiedId(int remoteVersion,
+-			   const char *schema, const char *id);
++extern const char *fmtQualifiedId(const char *schema, const char *id);
+ 
+ extern char *formatPGVersionNumber(int version_number, bool include_minor,
+ 					  char *buf, size_t buflen);
