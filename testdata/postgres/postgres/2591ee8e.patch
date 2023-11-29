@@ -1,0 +1,245 @@
+From 2591ee8ec44d8cbc8e1226550337a64c684746e4 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 21 Mar 2022 17:44:29 -0400
+Subject: [PATCH] Fix assorted missing logic for GroupingFunc nodes.
+
+The planner needs to treat GroupingFunc like Aggref for many purposes,
+in particular with respect to processing of the argument expressions,
+which are not to be evaluated at runtime.  A few places hadn't gotten
+that memo, notably including subselect.c's processing of outer-level
+aggregates.  This resulted in assertion failures or wrong plans for
+cases in which a GROUPING() construct references an outer aggregation
+level.
+
+Also fix missing special cases for GroupingFunc in cost_qual_eval
+(resulting in wrong cost estimates for GROUPING(), although it's
+not clear that that would affect plan shapes in practice) and in
+ruleutils.c (resulting in excess parentheses in pretty-print mode).
+
+Per bug #17088 from Yaoguang Chen.  Back-patch to all supported
+branches.
+
+Richard Guo, Tom Lane
+
+Discussion: https://postgr.es/m/17088-e33882b387de7f5c@postgresql.org
+---
+ src/backend/nodes/nodeFuncs.c              |  2 +
+ src/backend/optimizer/path/costsize.c      |  6 +++
+ src/backend/optimizer/plan/subselect.c     | 30 +++++++++------
+ src/backend/utils/adt/ruleutils.c          | 10 +++--
+ src/test/regress/expected/groupingsets.out | 45 ++++++++++++++++++++++
+ src/test/regress/sql/groupingsets.sql      |  9 +++++
+ 6 files changed, 88 insertions(+), 14 deletions(-)
+
+diff --git a/src/backend/nodes/nodeFuncs.c b/src/backend/nodes/nodeFuncs.c
+index 47d0564fa297..ec25aae6e38a 100644
+--- a/src/backend/nodes/nodeFuncs.c
++++ b/src/backend/nodes/nodeFuncs.c
+@@ -736,6 +736,8 @@ expression_returns_set_walker(Node *node, void *context)
+ 	/* Avoid recursion for some cases that parser checks not to return a set */
+ 	if (IsA(node, Aggref))
+ 		return false;
++	if (IsA(node, GroupingFunc))
++		return false;
+ 	if (IsA(node, WindowFunc))
+ 		return false;
+ 
+diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
+index 8dc7dd4ca264..4d9f3b4bb6bb 100644
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -4492,6 +4492,12 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
+ 		 */
+ 		return false;			/* don't recurse into children */
+ 	}
++	else if (IsA(node, GroupingFunc))
++	{
++		/* Treat this as having cost 1 */
++		context->total.per_tuple += cpu_operator_cost;
++		return false;			/* don't recurse into children */
++	}
+ 	else if (IsA(node, CoerceViaIO))
+ 	{
+ 		CoerceViaIO *iocoerce = (CoerceViaIO *) node;
+diff --git a/src/backend/optimizer/plan/subselect.c b/src/backend/optimizer/plan/subselect.c
+index 41bd1ae7d444..863e0e24a148 100644
+--- a/src/backend/optimizer/plan/subselect.c
++++ b/src/backend/optimizer/plan/subselect.c
+@@ -356,15 +356,17 @@ build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
+ 		Node	   *arg = pitem->item;
+ 
+ 		/*
+-		 * The Var, PlaceHolderVar, or Aggref has already been adjusted to
+-		 * have the correct varlevelsup, phlevelsup, or agglevelsup.
++		 * The Var, PlaceHolderVar, Aggref or GroupingFunc has already been
++		 * adjusted to have the correct varlevelsup, phlevelsup, or
++		 * agglevelsup.
+ 		 *
+-		 * If it's a PlaceHolderVar or Aggref, its arguments might contain
+-		 * SubLinks, which have not yet been processed (see the comments for
+-		 * SS_replace_correlation_vars).  Do that now.
++		 * If it's a PlaceHolderVar, Aggref or GroupingFunc, its arguments
++		 * might contain SubLinks, which have not yet been processed (see the
++		 * comments for SS_replace_correlation_vars).  Do that now.
+ 		 */
+ 		if (IsA(arg, PlaceHolderVar) ||
+-			IsA(arg, Aggref))
++			IsA(arg, Aggref) ||
++			IsA(arg, GroupingFunc))
+ 			arg = SS_process_sublinks(root, arg, false);
+ 
+ 		splan->parParam = lappend_int(splan->parParam, pitem->paramId);
+@@ -1957,10 +1959,11 @@ process_sublinks_mutator(Node *node, process_sublinks_context *context)
+ 	}
+ 
+ 	/*
+-	 * Don't recurse into the arguments of an outer PHV or aggregate here. Any
+-	 * SubLinks in the arguments have to be dealt with at the outer query
+-	 * level; they'll be handled when build_subplan collects the PHV or Aggref
+-	 * into the arguments to be passed down to the current subplan.
++	 * Don't recurse into the arguments of an outer PHV, Aggref or
++	 * GroupingFunc here.  Any SubLinks in the arguments have to be dealt with
++	 * at the outer query level; they'll be handled when build_subplan
++	 * collects the PHV, Aggref or GroupingFunc into the arguments to be
++	 * passed down to the current subplan.
+ 	 */
+ 	if (IsA(node, PlaceHolderVar))
+ 	{
+@@ -1972,6 +1975,11 @@ process_sublinks_mutator(Node *node, process_sublinks_context *context)
+ 		if (((Aggref *) node)->agglevelsup > 0)
+ 			return node;
+ 	}
++	else if (IsA(node, GroupingFunc))
++	{
++		if (((GroupingFunc *) node)->agglevelsup > 0)
++			return node;
++	}
+ 
+ 	/*
+ 	 * We should never see a SubPlan expression in the input (since this is
+@@ -2084,7 +2092,7 @@ SS_identify_outer_params(PlannerInfo *root)
+ 	outer_params = NULL;
+ 	for (proot = root->parent_root; proot != NULL; proot = proot->parent_root)
+ 	{
+-		/* Include ordinary Var/PHV/Aggref params */
++		/* Include ordinary Var/PHV/Aggref/GroupingFunc params */
+ 		foreach(l, proot->plan_params)
+ 		{
+ 			PlannerParamItem *pitem = (PlannerParamItem *) lfirst(l);
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index b16526e65e94..7f4f3f736991 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -7956,12 +7956,13 @@ get_parameter(Param *param, deparse_context *context)
+ 		context->varprefix = true;
+ 
+ 		/*
+-		 * A Param's expansion is typically a Var, Aggref, or upper-level
+-		 * Param, which wouldn't need extra parentheses.  Otherwise, insert
+-		 * parens to ensure the expression looks atomic.
++		 * A Param's expansion is typically a Var, Aggref, GroupingFunc, or
++		 * upper-level Param, which wouldn't need extra parentheses.
++		 * Otherwise, insert parens to ensure the expression looks atomic.
+ 		 */
+ 		need_paren = !(IsA(expr, Var) ||
+ 					   IsA(expr, Aggref) ||
++					   IsA(expr, GroupingFunc) ||
+ 					   IsA(expr, Param));
+ 		if (need_paren)
+ 			appendStringInfoChar(context->buf, '(');
+@@ -8089,6 +8090,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
+ 		case T_NextValueExpr:
+ 		case T_NullIfExpr:
+ 		case T_Aggref:
++		case T_GroupingFunc:
+ 		case T_WindowFunc:
+ 		case T_FuncExpr:
+ 			/* function-like: name(..) or name[..] */
+@@ -8205,6 +8207,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
+ 				case T_XmlExpr: /* own parentheses */
+ 				case T_NullIfExpr:	/* other separators */
+ 				case T_Aggref:	/* own parentheses */
++				case T_GroupingFunc:	/* own parentheses */
+ 				case T_WindowFunc:	/* own parentheses */
+ 				case T_CaseExpr:	/* other separators */
+ 					return true;
+@@ -8255,6 +8258,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
+ 				case T_XmlExpr: /* own parentheses */
+ 				case T_NullIfExpr:	/* other separators */
+ 				case T_Aggref:	/* own parentheses */
++				case T_GroupingFunc:	/* own parentheses */
+ 				case T_WindowFunc:	/* own parentheses */
+ 				case T_CaseExpr:	/* other separators */
+ 					return true;
+diff --git a/src/test/regress/expected/groupingsets.out b/src/test/regress/expected/groupingsets.out
+index 58a25b691acb..6a56f0b09c42 100644
+--- a/src/test/regress/expected/groupingsets.out
++++ b/src/test/regress/expected/groupingsets.out
+@@ -2042,4 +2042,49 @@ order by a, b, c;
+    |   |  
+ (11 rows)
+ 
++-- test handling of outer GroupingFunc within subqueries
++explain (costs off)
++select (select grouping(v1)) from (values ((select 1))) v(v1) group by cube(v1);
++        QUERY PLAN         
++---------------------------
++ MixedAggregate
++   Hash Key: $2
++   Group Key: ()
++   InitPlan 1 (returns $1)
++     ->  Result
++   InitPlan 3 (returns $2)
++     ->  Result
++   ->  Result
++   SubPlan 2
++     ->  Result
++(10 rows)
++
++select (select grouping(v1)) from (values ((select 1))) v(v1) group by cube(v1);
++ grouping 
++----------
++        1
++        0
++(2 rows)
++
++explain (costs off)
++select (select grouping(v1)) from (values ((select 1))) v(v1) group by v1;
++        QUERY PLAN         
++---------------------------
++ GroupAggregate
++   Group Key: $2
++   InitPlan 1 (returns $1)
++     ->  Result
++   InitPlan 3 (returns $2)
++     ->  Result
++   ->  Result
++   SubPlan 2
++     ->  Result
++(9 rows)
++
++select (select grouping(v1)) from (values ((select 1))) v(v1) group by v1;
++ grouping 
++----------
++        0
++(1 row)
++
+ -- end
+diff --git a/src/test/regress/sql/groupingsets.sql b/src/test/regress/sql/groupingsets.sql
+index 473d21f6b97a..8050dbf2609f 100644
+--- a/src/test/regress/sql/groupingsets.sql
++++ b/src/test/regress/sql/groupingsets.sql
+@@ -557,4 +557,13 @@ from (values (1, 2, 3), (4, null, 6), (7, 8, 9)) as t (a, b, c)
+ group by rollup(a, b), rollup(a, c)
+ order by a, b, c;
+ 
++-- test handling of outer GroupingFunc within subqueries
++explain (costs off)
++select (select grouping(v1)) from (values ((select 1))) v(v1) group by cube(v1);
++select (select grouping(v1)) from (values ((select 1))) v(v1) group by cube(v1);
++
++explain (costs off)
++select (select grouping(v1)) from (values ((select 1))) v(v1) group by v1;
++select (select grouping(v1)) from (values ((select 1))) v(v1) group by v1;
++
+ -- end

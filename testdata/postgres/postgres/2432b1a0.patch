@@ -1,0 +1,218 @@
+From 2432b1a04087edc2fd9536c7c9aa4ca03fd1b363 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 25 Nov 2020 11:40:44 -0500
+Subject: [PATCH] Avoid spamming the client with multiple ParameterStatus
+ messages.
+
+Up to now, we sent a ParameterStatus message to the client immediately
+upon any change in the active value of any GUC_REPORT variable.  This
+was only barely okay when the feature was designed; now that we have
+things like function SET clauses, there are very plausible use-cases
+where a GUC_REPORT variable might change many times within a query
+--- and even end up back at its original value, perhaps.  Fortunately
+most of our GUC_REPORT variables are unlikely to be changed often;
+but there are proposals in play to enlarge that set, or even make it
+user-configurable.
+
+Hence, let's fix things to not generate more than one ParameterStatus
+message per variable per query, and to not send any message at all
+unless the end-of-query value is different from what we last reported.
+
+Discussion: https://postgr.es/m/5708.1601145259@sss.pgh.pa.us
+---
+ src/backend/tcop/postgres.c    |  3 ++
+ src/backend/utils/misc/guc.c   | 78 +++++++++++++++++++++++++++++++---
+ src/include/utils/guc.h        |  1 +
+ src/include/utils/guc_tables.h |  5 ++-
+ 4 files changed, 80 insertions(+), 7 deletions(-)
+
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index 7c5f7c775b93..34ed0e7558c4 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -4229,6 +4229,9 @@ PostgresMain(int argc, char *argv[],
+ 				pgstat_report_activity(STATE_IDLE, NULL);
+ 			}
+ 
++			/* Report any recently-changed GUC options */
++			ReportChangedGUCOptions();
++
+ 			ReadyForQuery(whereToSendOutput);
+ 			send_ready_for_query = false;
+ 		}
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index bb34630e8e44..245a3472bc8e 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -4822,6 +4822,8 @@ static bool guc_dirty;			/* true if need to do commit/abort work */
+ 
+ static bool reporting_enabled;	/* true to enable GUC_REPORT */
+ 
++static bool report_needed;		/* true if any GUC_REPORT reports are needed */
++
+ static int	GUCNestLevel = 0;	/* 1 when in main transaction */
+ 
+ 
+@@ -5452,6 +5454,7 @@ InitializeOneGUCOption(struct config_generic *gconf)
+ 	gconf->reset_scontext = PGC_INTERNAL;
+ 	gconf->stack = NULL;
+ 	gconf->extra = NULL;
++	gconf->last_reported = NULL;
+ 	gconf->sourcefile = NULL;
+ 	gconf->sourceline = 0;
+ 
+@@ -5828,7 +5831,10 @@ ResetAllOptions(void)
+ 		gconf->scontext = gconf->reset_scontext;
+ 
+ 		if (gconf->flags & GUC_REPORT)
+-			ReportGUCOption(gconf);
++		{
++			gconf->status |= GUC_NEEDS_REPORT;
++			report_needed = true;
++		}
+ 	}
+ }
+ 
+@@ -6215,7 +6221,10 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
+ 
+ 			/* Report new value if we changed it */
+ 			if (changed && (gconf->flags & GUC_REPORT))
+-				ReportGUCOption(gconf);
++			{
++				gconf->status |= GUC_NEEDS_REPORT;
++				report_needed = true;
++			}
+ 		}						/* end of stack-popping loop */
+ 
+ 		if (stack != NULL)
+@@ -6257,17 +6266,60 @@ BeginReportingGUCOptions(void)
+ 		if (conf->flags & GUC_REPORT)
+ 			ReportGUCOption(conf);
+ 	}
++
++	report_needed = false;
++}
++
++/*
++ * ReportChangedGUCOptions: report recently-changed GUC_REPORT variables
++ *
++ * This is called just before we wait for a new client query.
++ *
++ * By handling things this way, we ensure that a ParameterStatus message
++ * is sent at most once per variable per query, even if the variable
++ * changed multiple times within the query.  That's quite possible when
++ * using features such as function SET clauses.  Function SET clauses
++ * also tend to cause values to change intraquery but eventually revert
++ * to their prevailing values; ReportGUCOption is responsible for avoiding
++ * redundant reports in such cases.
++ */
++void
++ReportChangedGUCOptions(void)
++{
++	/* Quick exit if not (yet) enabled */
++	if (!reporting_enabled)
++		return;
++
++	/* Quick exit if no values have been changed */
++	if (!report_needed)
++		return;
++
++	/* Transmit new values of interesting variables */
++	for (int i = 0; i < num_guc_variables; i++)
++	{
++		struct config_generic *conf = guc_variables[i];
++
++		if ((conf->flags & GUC_REPORT) && (conf->status & GUC_NEEDS_REPORT))
++			ReportGUCOption(conf);
++	}
++
++	report_needed = false;
+ }
+ 
+ /*
+  * ReportGUCOption: if appropriate, transmit option value to frontend
++ *
++ * We need not transmit the value if it's the same as what we last
++ * transmitted.  However, clear the NEEDS_REPORT flag in any case.
+  */
+ static void
+ ReportGUCOption(struct config_generic *record)
+ {
+-	if (reporting_enabled && (record->flags & GUC_REPORT))
++	char	   *val = _ShowOption(record, false);
++
++	if (record->last_reported == NULL ||
++		strcmp(val, record->last_reported) != 0)
+ 	{
+-		char	   *val = _ShowOption(record, false);
+ 		StringInfoData msgbuf;
+ 
+ 		pq_beginmessage(&msgbuf, 'S');
+@@ -6275,8 +6327,19 @@ ReportGUCOption(struct config_generic *record)
+ 		pq_sendstring(&msgbuf, val);
+ 		pq_endmessage(&msgbuf);
+ 
+-		pfree(val);
++		/*
++		 * We need a long-lifespan copy.  If strdup() fails due to OOM, we'll
++		 * set last_reported to NULL and thereby possibly make a duplicate
++		 * report later.
++		 */
++		if (record->last_reported)
++			free(record->last_reported);
++		record->last_reported = strdup(val);
+ 	}
++
++	pfree(val);
++
++	record->status &= ~GUC_NEEDS_REPORT;
+ }
+ 
+ /*
+@@ -7695,7 +7758,10 @@ set_config_option(const char *name, const char *value,
+ 	}
+ 
+ 	if (changeVal && (record->flags & GUC_REPORT))
+-		ReportGUCOption(record);
++	{
++		record->status |= GUC_NEEDS_REPORT;
++		report_needed = true;
++	}
+ 
+ 	return changeVal ? 1 : -1;
+ }
+diff --git a/src/include/utils/guc.h b/src/include/utils/guc.h
+index 073c8f3e0628..6a20a3bcece6 100644
+--- a/src/include/utils/guc.h
++++ b/src/include/utils/guc.h
+@@ -363,6 +363,7 @@ extern void AtStart_GUC(void);
+ extern int	NewGUCNestLevel(void);
+ extern void AtEOXact_GUC(bool isCommit, int nestLevel);
+ extern void BeginReportingGUCOptions(void);
++extern void ReportChangedGUCOptions(void);
+ extern void ParseLongOption(const char *string, char **name, char **value);
+ extern bool parse_int(const char *value, int *result, int flags,
+ 					  const char **hintmsg);
+diff --git a/src/include/utils/guc_tables.h b/src/include/utils/guc_tables.h
+index 04431d0eb25c..7f36e1146f21 100644
+--- a/src/include/utils/guc_tables.h
++++ b/src/include/utils/guc_tables.h
+@@ -161,6 +161,8 @@ struct config_generic
+ 	GucContext	reset_scontext; /* context that set the reset value */
+ 	GucStack   *stack;			/* stacked prior values */
+ 	void	   *extra;			/* "extra" pointer for current actual value */
++	char	   *last_reported;	/* if variable is GUC_REPORT, value last sent
++								 * to client (NULL if not yet sent) */
+ 	char	   *sourcefile;		/* file current setting is from (NULL if not
+ 								 * set in config file) */
+ 	int			sourceline;		/* line in source file */
+@@ -172,7 +174,8 @@ struct config_generic
+  * Caution: the GUC_IS_IN_FILE bit is transient state for ProcessConfigFile.
+  * Do not assume that its value represents useful information elsewhere.
+  */
+-#define GUC_PENDING_RESTART 0x0002
++#define GUC_PENDING_RESTART 0x0002	/* changed value cannot be applied yet */
++#define GUC_NEEDS_REPORT	0x0004	/* new value must be reported to client */
+ 
+ 
+ /* GUC records for specific variable types */

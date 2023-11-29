@@ -1,0 +1,398 @@
+From 1939d26282b27b4b264c6930830a7991ed83917a Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 9 Dec 2022 10:08:44 -0500
+Subject: [PATCH] Add test scaffolding for soft error reporting from input
+ functions.
+
+pg_input_is_valid() returns boolean, while pg_input_error_message()
+returns the primary error message if the input is bad, or NULL
+if the input is OK.  The main reason for having two functions is
+so that we can test both the details-wanted and the no-details-wanted
+code paths.
+
+Although these are primarily designed with testing in mind,
+it could well be that they'll be useful to end users as well.
+
+This patch is mostly by me, but it owes very substantial debt to
+earlier work by Nikita Glukhov, Andrew Dunstan, and Amul Sul.
+Thanks to Andres Freund for review.
+
+Discussion: https://postgr.es/m/3bbbb0df-7382-bf87-9737-340ba096e034@postgrespro.ru
+---
+ doc/src/sgml/func.sgml                    | 101 +++++++++++++++++
+ src/backend/utils/adt/misc.c              | 129 ++++++++++++++++++++++
+ src/include/catalog/catversion.h          |   2 +-
+ src/include/catalog/pg_proc.dat           |   8 ++
+ src/test/regress/expected/create_type.out |  25 +++++
+ src/test/regress/regress.c                |   5 +
+ src/test/regress/sql/create_type.sql      |   8 ++
+ 7 files changed, 277 insertions(+), 1 deletion(-)
+
+diff --git a/doc/src/sgml/func.sgml b/doc/src/sgml/func.sgml
+index e57ffce9713d..ad31fdb737c7 100644
+--- a/doc/src/sgml/func.sgml
++++ b/doc/src/sgml/func.sgml
+@@ -24683,6 +24683,107 @@ SELECT collation for ('foo' COLLATE "de_DE");
+ 
+   </sect2>
+ 
++  <sect2 id="functions-info-validity">
++   <title>Data Validity Checking Functions</title>
++
++   <para>
++    The functions shown in <xref linkend="functions-info-validity-table"/>
++    can be helpful for checking validity of proposed input data.
++   </para>
++
++   <table id="functions-info-validity-table">
++    <title>Data Validity Checking Functions</title>
++    <tgroup cols="1">
++     <thead>
++      <row>
++       <entry role="func_table_entry"><para role="func_signature">
++        Function
++       </para>
++       <para>
++        Description
++       </para>
++       <para>
++        Example(s)
++       </para></entry>
++      </row>
++     </thead>
++
++     <tbody>
++      <row>
++       <entry role="func_table_entry"><para role="func_signature">
++        <indexterm>
++         <primary>pg_input_is_valid</primary>
++        </indexterm>
++        <function>pg_input_is_valid</function> (
++          <parameter>string</parameter> <type>text</type>,
++          <parameter>type</parameter> <type>text</type>
++        )
++        <returnvalue>boolean</returnvalue>
++       </para>
++       <para>
++        Tests whether the given <parameter>string</parameter> is valid
++        input for the specified data type, returning true or false.
++       </para>
++       <para>
++        This function will only work as desired if the data type's input
++        function has been updated to report invalid input as
++        a <quote>soft</quote> error.  Otherwise, invalid input will abort
++        the transaction, just as if the string had been cast to the type
++        directly.
++        </para>
++        <para>
++         <literal>pg_input_is_valid('42', 'integer')</literal>
++         <returnvalue>t</returnvalue>
++        </para>
++        <para>
++         <literal>pg_input_is_valid('42000000000', 'integer')</literal>
++         <returnvalue>f</returnvalue>
++        </para>
++        <para>
++         <literal>pg_input_is_valid('1234.567', 'numeric(7,4)')</literal>
++         <returnvalue>f</returnvalue>
++       </para></entry>
++      </row>
++      <row>
++       <entry role="func_table_entry"><para role="func_signature">
++        <indexterm>
++         <primary>pg_input_error_message</primary>
++        </indexterm>
++        <function>pg_input_error_message</function> (
++          <parameter>string</parameter> <type>text</type>,
++          <parameter>type</parameter> <type>text</type>
++        )
++        <returnvalue>text</returnvalue>
++       </para>
++       <para>
++        Tests whether the given <parameter>string</parameter> is valid
++        input for the specified data type; if not, return the error
++        message that would have been thrown.  If the input is valid, the
++        result is NULL.  The inputs are the same as
++        for <function>pg_input_is_valid</function>.
++       </para>
++       <para>
++        This function will only work as desired if the data type's input
++        function has been updated to report invalid input as
++        a <quote>soft</quote> error.  Otherwise, invalid input will abort
++        the transaction, just as if the string had been cast to the type
++        directly.
++        </para>
++        <para>
++         <literal>pg_input_error_message('42000000000', 'integer')</literal>
++         <returnvalue>value "42000000000" is out of range for type integer</returnvalue>
++        </para>
++        <para>
++         <literal>pg_input_error_message('1234.567', 'numeric(7,4)')</literal>
++         <returnvalue>numeric field overflow</returnvalue>
++       </para></entry>
++      </row>
++     </tbody>
++    </tgroup>
++   </table>
++
++  </sect2>
++
+   <sect2 id="functions-info-snapshot">
+    <title>Transaction ID and Snapshot Information Functions</title>
+ 
+diff --git a/src/backend/utils/adt/misc.c b/src/backend/utils/adt/misc.c
+index 9c132512315e..d678d286009e 100644
+--- a/src/backend/utils/adt/misc.c
++++ b/src/backend/utils/adt/misc.c
+@@ -32,6 +32,8 @@
+ #include "common/keywords.h"
+ #include "funcapi.h"
+ #include "miscadmin.h"
++#include "nodes/miscnodes.h"
++#include "parser/parse_type.h"
+ #include "parser/scansup.h"
+ #include "pgstat.h"
+ #include "postmaster/syslogger.h"
+@@ -45,6 +47,25 @@
+ #include "utils/ruleutils.h"
+ #include "utils/timestamp.h"
+ 
++
++/*
++ * structure to cache metadata needed in pg_input_is_valid_common
++ */
++typedef struct ValidIOData
++{
++	Oid			typoid;
++	int32		typmod;
++	bool		typname_constant;
++	Oid			typiofunc;
++	Oid			typioparam;
++	FmgrInfo	inputproc;
++} ValidIOData;
++
++static bool pg_input_is_valid_common(FunctionCallInfo fcinfo,
++									 text *txt, text *typname,
++									 ErrorSaveContext *escontext);
++
++
+ /*
+  * Common subroutine for num_nulls() and num_nonnulls().
+  * Returns true if successful, false if function should return NULL.
+@@ -640,6 +661,114 @@ pg_column_is_updatable(PG_FUNCTION_ARGS)
+ }
+ 
+ 
++/*
++ * pg_input_is_valid - test whether string is valid input for datatype.
++ *
++ * Returns true if OK, false if not.
++ *
++ * This will only work usefully if the datatype's input function has been
++ * updated to return "soft" errors via errsave/ereturn.
++ */
++Datum
++pg_input_is_valid(PG_FUNCTION_ARGS)
++{
++	text	   *txt = PG_GETARG_TEXT_PP(0);
++	text	   *typname = PG_GETARG_TEXT_PP(1);
++	ErrorSaveContext escontext = {T_ErrorSaveContext};
++
++	PG_RETURN_BOOL(pg_input_is_valid_common(fcinfo, txt, typname,
++											&escontext));
++}
++
++/*
++ * pg_input_error_message - test whether string is valid input for datatype.
++ *
++ * Returns NULL if OK, else the primary message string from the error.
++ *
++ * This will only work usefully if the datatype's input function has been
++ * updated to return "soft" errors via errsave/ereturn.
++ */
++Datum
++pg_input_error_message(PG_FUNCTION_ARGS)
++{
++	text	   *txt = PG_GETARG_TEXT_PP(0);
++	text	   *typname = PG_GETARG_TEXT_PP(1);
++	ErrorSaveContext escontext = {T_ErrorSaveContext};
++
++	/* Enable details_wanted */
++	escontext.details_wanted = true;
++
++	if (pg_input_is_valid_common(fcinfo, txt, typname,
++								 &escontext))
++		PG_RETURN_NULL();
++
++	Assert(escontext.error_occurred);
++	Assert(escontext.error_data != NULL);
++	Assert(escontext.error_data->message != NULL);
++
++	PG_RETURN_TEXT_P(cstring_to_text(escontext.error_data->message));
++}
++
++/* Common subroutine for the above */
++static bool
++pg_input_is_valid_common(FunctionCallInfo fcinfo,
++						 text *txt, text *typname,
++						 ErrorSaveContext *escontext)
++{
++	char	   *str = text_to_cstring(txt);
++	ValidIOData *my_extra;
++	Datum		converted;
++
++	/*
++	 * We arrange to look up the needed I/O info just once per series of
++	 * calls, assuming the data type doesn't change underneath us.
++	 */
++	my_extra = (ValidIOData *) fcinfo->flinfo->fn_extra;
++	if (my_extra == NULL)
++	{
++		fcinfo->flinfo->fn_extra =
++			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
++							   sizeof(ValidIOData));
++		my_extra = (ValidIOData *) fcinfo->flinfo->fn_extra;
++		my_extra->typoid = InvalidOid;
++		/* Detect whether typname argument is constant. */
++		my_extra->typname_constant = get_fn_expr_arg_stable(fcinfo->flinfo, 1);
++	}
++
++	/*
++	 * If the typname argument is constant, we only need to parse it the first
++	 * time through.
++	 */
++	if (my_extra->typoid == InvalidOid || !my_extra->typname_constant)
++	{
++		char	   *typnamestr = text_to_cstring(typname);
++		Oid			typoid;
++
++		/* Parse type-name argument to obtain type OID and encoded typmod. */
++		parseTypeString(typnamestr, &typoid, &my_extra->typmod, false);
++
++		/* Update type-specific info if typoid changed. */
++		if (my_extra->typoid != typoid)
++		{
++			getTypeInputInfo(typoid,
++							 &my_extra->typiofunc,
++							 &my_extra->typioparam);
++			fmgr_info_cxt(my_extra->typiofunc, &my_extra->inputproc,
++						  fcinfo->flinfo->fn_mcxt);
++			my_extra->typoid = typoid;
++		}
++	}
++
++	/* Now we can try to perform the conversion. */
++	return InputFunctionCallSafe(&my_extra->inputproc,
++								 str,
++								 my_extra->typioparam,
++								 my_extra->typmod,
++								 (Node *) escontext,
++								 &converted);
++}
++
++
+ /*
+  * Is character a valid identifier start?
+  * Must match scan.l's {ident_start} character class.
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 17958aebf465..501a434b904b 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -57,6 +57,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202212091
++#define CATALOG_VERSION_NO	202212092
+ 
+ #endif
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index f9301b2627e6..719599649a96 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -7060,6 +7060,14 @@
+   prorettype => 'regnamespace', proargtypes => 'text',
+   prosrc => 'to_regnamespace' },
+ 
++{ oid => '8050', descr => 'test whether string is valid input for data type',
++  proname => 'pg_input_is_valid', provolatile => 's', prorettype => 'bool',
++  proargtypes => 'text text', prosrc => 'pg_input_is_valid' },
++{ oid => '8051',
++  descr => 'get error message if string is not valid input for data type',
++  proname => 'pg_input_error_message', provolatile => 's', prorettype => 'text',
++  proargtypes => 'text text', prosrc => 'pg_input_error_message' },
++
+ { oid => '1268',
+   descr => 'parse qualified identifier to array of identifiers',
+   proname => 'parse_ident', prorettype => '_text', proargtypes => 'text bool',
+diff --git a/src/test/regress/expected/create_type.out b/src/test/regress/expected/create_type.out
+index 0dfc88c1c880..7383fcdbb129 100644
+--- a/src/test/regress/expected/create_type.out
++++ b/src/test/regress/expected/create_type.out
+@@ -249,6 +249,31 @@ select format_type('bpchar'::regtype, -1);
+  bpchar
+ (1 row)
+ 
++-- Test non-error-throwing APIs using widget, which still throws errors
++SELECT pg_input_is_valid('(1,2,3)', 'widget');
++ pg_input_is_valid 
++-------------------
++ t
++(1 row)
++
++SELECT pg_input_is_valid('(1,2)', 'widget');  -- hard error expected
++ERROR:  invalid input syntax for type widget: "(1,2)"
++SELECT pg_input_is_valid('{"(1,2,3)"}', 'widget[]');
++ pg_input_is_valid 
++-------------------
++ t
++(1 row)
++
++SELECT pg_input_is_valid('{"(1,2)"}', 'widget[]');  -- hard error expected
++ERROR:  invalid input syntax for type widget: "(1,2)"
++SELECT pg_input_is_valid('("(1,2,3)")', 'mytab');
++ pg_input_is_valid 
++-------------------
++ t
++(1 row)
++
++SELECT pg_input_is_valid('("(1,2)")', 'mytab');  -- hard error expected
++ERROR:  invalid input syntax for type widget: "(1,2)"
+ -- Test creation of an operator over a user-defined type
+ CREATE FUNCTION pt_in_widget(point, widget)
+    RETURNS bool
+diff --git a/src/test/regress/regress.c b/src/test/regress/regress.c
+index 548afb4438e2..2977045cc7cc 100644
+--- a/src/test/regress/regress.c
++++ b/src/test/regress/regress.c
+@@ -183,6 +183,11 @@ widget_in(PG_FUNCTION_ARGS)
+ 			coord[i++] = p + 1;
+ 	}
+ 
++	/*
++	 * Note: DON'T convert this error to "soft" style (errsave/ereturn).  We
++	 * want this data type to stay permanently in the hard-error world so that
++	 * it can be used for testing that such cases still work reasonably.
++	 */
+ 	if (i < NARGS)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+diff --git a/src/test/regress/sql/create_type.sql b/src/test/regress/sql/create_type.sql
+index c6fc4f9029ca..c25018029c24 100644
+--- a/src/test/regress/sql/create_type.sql
++++ b/src/test/regress/sql/create_type.sql
+@@ -192,6 +192,14 @@ select format_type('bpchar'::regtype, null);
+ -- this behavior difference is intentional
+ select format_type('bpchar'::regtype, -1);
+ 
++-- Test non-error-throwing APIs using widget, which still throws errors
++SELECT pg_input_is_valid('(1,2,3)', 'widget');
++SELECT pg_input_is_valid('(1,2)', 'widget');  -- hard error expected
++SELECT pg_input_is_valid('{"(1,2,3)"}', 'widget[]');
++SELECT pg_input_is_valid('{"(1,2)"}', 'widget[]');  -- hard error expected
++SELECT pg_input_is_valid('("(1,2,3)")', 'mytab');
++SELECT pg_input_is_valid('("(1,2)")', 'mytab');  -- hard error expected
++
+ -- Test creation of an operator over a user-defined type
+ 
+ CREATE FUNCTION pt_in_widget(point, widget)

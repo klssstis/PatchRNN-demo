@@ -1,0 +1,110 @@
+From 2057a58d1629ebffce694e3cef7f714571a88dd7 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 1 May 2017 14:39:11 -0400
+Subject: [PATCH] Fix mis-optimization of semijoins with more than one LHS
+ relation.
+
+The inner-unique patch (commit 9c7f5229a) supposed that if we're
+considering a JOIN_UNIQUE_INNER join path, we can always set inner_unique
+for the join, because the inner path produced by create_unique_path should
+be unique relative to the outer relation.  However, that's true only if
+we're considering joining to the whole outer relation --- otherwise we may
+be applying only some of the join quals, and so the inner path might be
+non-unique from the perspective of this join.  Adjust the test to only
+believe that we can set inner_unique if we have the whole semijoin LHS on
+the outer side.
+
+There is more that can be done in this area, but this commit is only
+intended to provide the minimal fix needed to get correct plans.
+
+Per report from Teodor Sigaev.  Thanks to David Rowley for preliminary
+investigation.
+
+Discussion: https://postgr.es/m/f994fc98-389f-4a46-d1bc-c42e05cb43ed@sigaev.ru
+---
+ src/backend/optimizer/path/joinpath.c | 10 ++++++---
+ src/test/regress/expected/join.out    | 29 +++++++++++++++++++++++++++
+ src/test/regress/sql/join.sql         |  8 ++++++++
+ 3 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/optimizer/path/joinpath.c b/src/backend/optimizer/path/joinpath.c
+index 5aedcd154114..39e2ddda906f 100644
+--- a/src/backend/optimizer/path/joinpath.c
++++ b/src/backend/optimizer/path/joinpath.c
+@@ -126,8 +126,11 @@ add_paths_to_joinrel(PlannerInfo *root,
+ 	 *
+ 	 * We have some special cases: for JOIN_SEMI and JOIN_ANTI, it doesn't
+ 	 * matter since the executor can make the equivalent optimization anyway;
+-	 * we need not expend planner cycles on proofs.  For JOIN_UNIQUE_INNER, we
+-	 * know we're going to force uniqueness of the innerrel below.  For
++	 * we need not expend planner cycles on proofs.  For JOIN_UNIQUE_INNER, if
++	 * the LHS covers all of the associated semijoin's min_lefthand, then it's
++	 * appropriate to set inner_unique because the path produced by
++	 * create_unique_path will be unique relative to the LHS.  (If we have an
++	 * LHS that's only part of the min_lefthand, that is *not* true.)  For
+ 	 * JOIN_UNIQUE_OUTER, pass JOIN_INNER to avoid letting that value escape
+ 	 * this module.
+ 	 */
+@@ -138,7 +141,8 @@ add_paths_to_joinrel(PlannerInfo *root,
+ 			extra.inner_unique = false; /* well, unproven */
+ 			break;
+ 		case JOIN_UNIQUE_INNER:
+-			extra.inner_unique = true;
++			extra.inner_unique = bms_is_subset(sjinfo->min_lefthand,
++											   outerrel->relids);
+ 			break;
+ 		case JOIN_UNIQUE_OUTER:
+ 			extra.inner_unique = innerrel_is_unique(root, outerrel, innerrel,
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index 69ce7aa3b2f0..87ff3657a342 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -5634,3 +5634,32 @@ reset enable_sort;
+ drop table j1;
+ drop table j2;
+ drop table j3;
++-- check that semijoin inner is not seen as unique for a portion of the outerrel
++explain (verbose, costs off)
++select t1.unique1, t2.hundred
++from onek t1, tenk1 t2
++where exists (select 1 from tenk1 t3
++              where t3.thousand = t1.unique1 and t3.tenthous = t2.hundred)
++      and t1.unique1 < 1;
++                                   QUERY PLAN                                    
++---------------------------------------------------------------------------------
++ Nested Loop
++   Output: t1.unique1, t2.hundred
++   ->  Hash Join
++         Output: t1.unique1, t3.tenthous
++         Hash Cond: (t3.thousand = t1.unique1)
++         ->  HashAggregate
++               Output: t3.thousand, t3.tenthous
++               Group Key: t3.thousand, t3.tenthous
++               ->  Index Only Scan using tenk1_thous_tenthous on public.tenk1 t3
++                     Output: t3.thousand, t3.tenthous
++         ->  Hash
++               Output: t1.unique1
++               ->  Index Only Scan using onek_unique1 on public.onek t1
++                     Output: t1.unique1
++                     Index Cond: (t1.unique1 < 1)
++   ->  Index Only Scan using tenk1_hundred on public.tenk1 t2
++         Output: t2.hundred
++         Index Cond: (t2.hundred = t3.tenthous)
++(18 rows)
++
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index 4fc8fd50cd5e..a36e29f462e1 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -1856,3 +1856,11 @@ reset enable_sort;
+ drop table j1;
+ drop table j2;
+ drop table j3;
++
++-- check that semijoin inner is not seen as unique for a portion of the outerrel
++explain (verbose, costs off)
++select t1.unique1, t2.hundred
++from onek t1, tenk1 t2
++where exists (select 1 from tenk1 t3
++              where t3.thousand = t1.unique1 and t3.tenthous = t2.hundred)
++      and t1.unique1 < 1;

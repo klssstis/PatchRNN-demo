@@ -1,0 +1,118 @@
+From 1265a9c8f871cfa5aea4d607b1ab72b45b96dbb7 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sat, 6 Mar 2021 12:04:00 -0500
+Subject: [PATCH] Add binary I/O capability for cube datatype.
+
+We can adjust the not-yet-released cube--1.4--1.5.sql upgrade
+rather than making a whole new version.
+
+KaiGai Kohei
+
+Discussion: https://postgr.es/m/CAOP8fzZO4y60QPTK=RGDXeVeVHV9tLHKOsh7voUOoUouVCPV8A@mail.gmail.com
+---
+ contrib/cube/cube--1.4--1.5.sql | 13 ++++++++
+ contrib/cube/cube.c             | 56 +++++++++++++++++++++++++++++++++
+ 2 files changed, 69 insertions(+)
+
+diff --git a/contrib/cube/cube--1.4--1.5.sql b/contrib/cube/cube--1.4--1.5.sql
+index 54492e5d1815..4b5bf8d205e9 100644
+--- a/contrib/cube/cube--1.4--1.5.sql
++++ b/contrib/cube/cube--1.4--1.5.sql
+@@ -6,3 +6,16 @@
+ -- Remove @ and ~
+ DROP OPERATOR @ (cube, cube);
+ DROP OPERATOR ~ (cube, cube);
++
++-- Add binary input/output handlers
++CREATE FUNCTION cube_recv(internal)
++RETURNS cube
++AS 'MODULE_PATHNAME'
++LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
++
++CREATE FUNCTION cube_send(cube)
++RETURNS bytea
++AS 'MODULE_PATHNAME'
++LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
++
++ALTER TYPE cube SET ( RECEIVE = cube_recv, SEND = cube_send );
+diff --git a/contrib/cube/cube.c b/contrib/cube/cube.c
+index 6f810b26c5d6..a5d1ba673352 100644
+--- a/contrib/cube/cube.c
++++ b/contrib/cube/cube.c
+@@ -13,6 +13,7 @@
+ #include "access/gist.h"
+ #include "access/stratnum.h"
+ #include "cubedata.h"
++#include "libpq/pqformat.h"
+ #include "utils/array.h"
+ #include "utils/float.h"
+ 
+@@ -31,6 +32,8 @@ PG_FUNCTION_INFO_V1(cube_in);
+ PG_FUNCTION_INFO_V1(cube_a_f8_f8);
+ PG_FUNCTION_INFO_V1(cube_a_f8);
+ PG_FUNCTION_INFO_V1(cube_out);
++PG_FUNCTION_INFO_V1(cube_send);
++PG_FUNCTION_INFO_V1(cube_recv);
+ PG_FUNCTION_INFO_V1(cube_f8);
+ PG_FUNCTION_INFO_V1(cube_f8_f8);
+ PG_FUNCTION_INFO_V1(cube_c_f8);
+@@ -319,6 +322,59 @@ cube_out(PG_FUNCTION_ARGS)
+ 	PG_RETURN_CSTRING(buf.data);
+ }
+ 
++/*
++ * cube_send - a binary output handler for cube type
++ */
++Datum
++cube_send(PG_FUNCTION_ARGS)
++{
++	NDBOX	   *cube = PG_GETARG_NDBOX_P(0);
++	StringInfoData buf;
++	int32		i,
++				nitems = DIM(cube);
++
++	pq_begintypsend(&buf);
++	pq_sendint32(&buf, cube->header);
++	if (!IS_POINT(cube))
++		nitems += nitems;
++	/* for symmetry with cube_recv, we don't use LL_COORD/UR_COORD here */
++	for (i = 0; i < nitems; i++)
++		pq_sendfloat8(&buf, cube->x[i]);
++
++	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
++}
++
++/*
++ * cube_recv - a binary input handler for cube type
++ */
++Datum
++cube_recv(PG_FUNCTION_ARGS)
++{
++	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
++	int32		header;
++	int32		i,
++				nitems;
++	NDBOX	   *cube;
++
++	header = pq_getmsgint(buf, sizeof(int32));
++	nitems = (header & DIM_MASK);
++	if (nitems > CUBE_MAX_DIM)
++		ereport(ERROR,
++				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++				 errmsg("cube dimension is too large"),
++				 errdetail("A cube cannot have more than %d dimensions.",
++						   CUBE_MAX_DIM)));
++	if ((header & POINT_BIT) == 0)
++		nitems += nitems;
++	cube = palloc(offsetof(NDBOX, x) + sizeof(double) * nitems);
++	SET_VARSIZE(cube, offsetof(NDBOX, x) + sizeof(double) * nitems);
++	cube->header = header;
++	for (i = 0; i < nitems; i++)
++		cube->x[i] = pq_getmsgfloat8(buf);
++
++	PG_RETURN_NDBOX_P(cube);
++}
++
+ 
+ /*****************************************************************************
+  *						   GiST functions

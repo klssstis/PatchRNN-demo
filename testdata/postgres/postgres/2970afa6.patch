@@ -1,0 +1,231 @@
+From 2970afa6cf1057107c998bf3cdd1fbf6dc78cf6c Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 11 Sep 2018 18:45:02 -0400
+Subject: [PATCH] Add PQresultMemorySize function to report allocated size of a
+ PGresult.
+
+This number can be useful for application memory management, and the
+overhead to track it seems pretty trivial.
+
+Lars Kanis, reviewed by Pavel Stehule, some mods by me
+
+Discussion: https://postgr.es/m/fa16a288-9685-14f2-97c8-b8ac84365a4f@greiz-reinsdorf.de
+---
+ doc/src/sgml/libpq.sgml          | 34 ++++++++++++++++++++++++++++
+ src/interfaces/libpq/exports.txt |  1 +
+ src/interfaces/libpq/fe-exec.c   | 38 +++++++++++++++++++++++++++-----
+ src/interfaces/libpq/libpq-fe.h  |  1 +
+ src/interfaces/libpq/libpq-int.h |  2 ++
+ 5 files changed, 70 insertions(+), 6 deletions(-)
+
+diff --git a/doc/src/sgml/libpq.sgml b/doc/src/sgml/libpq.sgml
+index 5e7931ba901f..06d909e80493 100644
+--- a/doc/src/sgml/libpq.sgml
++++ b/doc/src/sgml/libpq.sgml
+@@ -6387,6 +6387,32 @@ void *PQresultAlloc(PGresult *res, size_t nBytes);
+     </listitem>
+    </varlistentry>
+ 
++   <varlistentry id="libpq-pqresultmemorysize">
++    <term>
++     <function>PQresultMemorySize</function>
++     <indexterm>
++      <primary>PQresultMemorySize</primary>
++     </indexterm>
++    </term>
++
++    <listitem>
++     <para>
++      Retrieves the number of bytes allocated for
++      a <structname>PGresult</structname> object.
++<synopsis>
++size_t PQresultMemorySize(const PGresult *res);
++</synopsis>
++     </para>
++
++     <para>
++      This value is the sum of all <function>malloc</function> requests
++      associated with the <structname>PGresult</structname> object, that is,
++      all the space that will be freed by <function>PQclear</function>.
++      This information can be useful for managing memory consumption.
++     </para>
++    </listitem>
++   </varlistentry>
++
+    <varlistentry id="libpq-pqlibversion">
+     <term>
+      <function>PQlibVersion</function>
+@@ -6960,6 +6986,14 @@ void *PQinstanceData(const PGconn *conn, PGEventProc proc);
+ int PQresultSetInstanceData(PGresult *res, PGEventProc proc, void *data);
+ </synopsis>
+       </para>
++
++      <para>
++       Beware that any storage represented by <parameter>data</parameter>
++       will not be accounted for by <function>PQresultMemorySize</function>,
++       unless it is allocated using <function>PQresultAlloc</function>.
++       (Doing so is recommendable because it eliminates the need to free
++       such storage explicitly when the result is destroyed.)
++      </para>
+      </listitem>
+     </varlistentry>
+ 
+diff --git a/src/interfaces/libpq/exports.txt b/src/interfaces/libpq/exports.txt
+index d6a38d0df85b..2f628800d3e3 100644
+--- a/src/interfaces/libpq/exports.txt
++++ b/src/interfaces/libpq/exports.txt
+@@ -172,3 +172,4 @@ PQsslAttribute            169
+ PQsetErrorContextVisibility 170
+ PQresultVerboseErrorMessage 171
+ PQencryptPasswordConn     172
++PQresultMemorySize        173
+diff --git a/src/interfaces/libpq/fe-exec.c b/src/interfaces/libpq/fe-exec.c
+index 4c0114c514d8..e8b28d9ccf95 100644
+--- a/src/interfaces/libpq/fe-exec.c
++++ b/src/interfaces/libpq/fe-exec.c
+@@ -51,7 +51,7 @@ static int	static_client_encoding = PG_SQL_ASCII;
+ static bool static_std_strings = false;
+ 
+ 
+-static PGEvent *dupEvents(PGEvent *events, int count);
++static PGEvent *dupEvents(PGEvent *events, int count, size_t *memSize);
+ static bool pqAddTuple(PGresult *res, PGresAttValue *tup,
+ 		   const char **errmsgp);
+ static bool PQsendQueryStart(PGconn *conn);
+@@ -166,6 +166,7 @@ PQmakeEmptyPGresult(PGconn *conn, ExecStatusType status)
+ 	result->curBlock = NULL;
+ 	result->curOffset = 0;
+ 	result->spaceLeft = 0;
++	result->memorySize = sizeof(PGresult);
+ 
+ 	if (conn)
+ 	{
+@@ -193,7 +194,8 @@ PQmakeEmptyPGresult(PGconn *conn, ExecStatusType status)
+ 		/* copy events last; result must be valid if we need to PQclear */
+ 		if (conn->nEvents > 0)
+ 		{
+-			result->events = dupEvents(conn->events, conn->nEvents);
++			result->events = dupEvents(conn->events, conn->nEvents,
++									   &result->memorySize);
+ 			if (!result->events)
+ 			{
+ 				PQclear(result);
+@@ -344,7 +346,8 @@ PQcopyResult(const PGresult *src, int flags)
+ 	/* Wants to copy PGEvents? */
+ 	if ((flags & PG_COPYRES_EVENTS) && src->nEvents > 0)
+ 	{
+-		dest->events = dupEvents(src->events, src->nEvents);
++		dest->events = dupEvents(src->events, src->nEvents,
++								 &dest->memorySize);
+ 		if (!dest->events)
+ 		{
+ 			PQclear(dest);
+@@ -379,17 +382,20 @@ PQcopyResult(const PGresult *src, int flags)
+  * Copy an array of PGEvents (with no extra space for more).
+  * Does not duplicate the event instance data, sets this to NULL.
+  * Also, the resultInitialized flags are all cleared.
++ * The total space allocated is added to *memSize.
+  */
+ static PGEvent *
+-dupEvents(PGEvent *events, int count)
++dupEvents(PGEvent *events, int count, size_t *memSize)
+ {
+ 	PGEvent    *newEvents;
++	size_t		msize;
+ 	int			i;
+ 
+ 	if (!events || count <= 0)
+ 		return NULL;
+ 
+-	newEvents = (PGEvent *) malloc(count * sizeof(PGEvent));
++	msize = count * sizeof(PGEvent);
++	newEvents = (PGEvent *) malloc(msize);
+ 	if (!newEvents)
+ 		return NULL;
+ 
+@@ -407,8 +413,10 @@ dupEvents(PGEvent *events, int count)
+ 			free(newEvents);
+ 			return NULL;
+ 		}
++		msize += strlen(events[i].name) + 1;
+ 	}
+ 
++	*memSize += msize;
+ 	return newEvents;
+ }
+ 
+@@ -567,9 +575,12 @@ pqResultAlloc(PGresult *res, size_t nBytes, bool isBinary)
+ 	 */
+ 	if (nBytes >= PGRESULT_SEP_ALLOC_THRESHOLD)
+ 	{
+-		block = (PGresult_data *) malloc(nBytes + PGRESULT_BLOCK_OVERHEAD);
++		size_t		alloc_size = nBytes + PGRESULT_BLOCK_OVERHEAD;
++
++		block = (PGresult_data *) malloc(alloc_size);
+ 		if (!block)
+ 			return NULL;
++		res->memorySize += alloc_size;
+ 		space = block->space + PGRESULT_BLOCK_OVERHEAD;
+ 		if (res->curBlock)
+ 		{
+@@ -594,6 +605,7 @@ pqResultAlloc(PGresult *res, size_t nBytes, bool isBinary)
+ 	block = (PGresult_data *) malloc(PGRESULT_DATA_BLOCKSIZE);
+ 	if (!block)
+ 		return NULL;
++	res->memorySize += PGRESULT_DATA_BLOCKSIZE;
+ 	block->next = res->curBlock;
+ 	res->curBlock = block;
+ 	if (isBinary)
+@@ -615,6 +627,18 @@ pqResultAlloc(PGresult *res, size_t nBytes, bool isBinary)
+ 	return space;
+ }
+ 
++/*
++ * PQresultMemorySize -
++ *		Returns total space allocated for the PGresult.
++ */
++size_t
++PQresultMemorySize(const PGresult *res)
++{
++	if (!res)
++		return 0;
++	return res->memorySize;
++}
++
+ /*
+  * pqResultStrdup -
+  *		Like strdup, but the space is subsidiary PGresult space.
+@@ -927,6 +951,8 @@ pqAddTuple(PGresult *res, PGresAttValue *tup, const char **errmsgp)
+ 				realloc(res->tuples, newSize * sizeof(PGresAttValue *));
+ 		if (!newTuples)
+ 			return false;		/* malloc or realloc failed */
++		res->memorySize +=
++			(newSize - res->tupArrSize) * sizeof(PGresAttValue *);
+ 		res->tupArrSize = newSize;
+ 		res->tuples = newTuples;
+ 	}
+diff --git a/src/interfaces/libpq/libpq-fe.h b/src/interfaces/libpq/libpq-fe.h
+index ed9c80686143..52bd5d2cd845 100644
+--- a/src/interfaces/libpq/libpq-fe.h
++++ b/src/interfaces/libpq/libpq-fe.h
+@@ -516,6 +516,7 @@ extern PGresult *PQmakeEmptyPGresult(PGconn *conn, ExecStatusType status);
+ extern PGresult *PQcopyResult(const PGresult *src, int flags);
+ extern int	PQsetResultAttrs(PGresult *res, int numAttributes, PGresAttDesc *attDescs);
+ extern void *PQresultAlloc(PGresult *res, size_t nBytes);
++extern size_t PQresultMemorySize(const PGresult *res);
+ extern int	PQsetvalue(PGresult *res, int tup_num, int field_num, char *value, int len);
+ 
+ /* Quoting strings before inclusion in queries. */
+diff --git a/src/interfaces/libpq/libpq-int.h b/src/interfaces/libpq/libpq-int.h
+index fb04c8c61dc3..bdd8f9d9b29f 100644
+--- a/src/interfaces/libpq/libpq-int.h
++++ b/src/interfaces/libpq/libpq-int.h
+@@ -208,6 +208,8 @@ struct pg_result
+ 	PGresult_data *curBlock;	/* most recently allocated block */
+ 	int			curOffset;		/* start offset of free space in block */
+ 	int			spaceLeft;		/* number of free bytes remaining in block */
++
++	size_t		memorySize;		/* total space allocated for this PGresult */
+ };
+ 
+ /* PGAsyncStatusType defines the state of the query-execution state machine */

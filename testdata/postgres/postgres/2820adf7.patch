@@ -1,0 +1,342 @@
+From 2820adf7755d2a377546d5b55f5b1a4a39889336 Mon Sep 17 00:00:00 2001
+From: Tomas Vondra <tomas.vondra@postgresql.org>
+Date: Thu, 6 Apr 2023 17:18:38 +0200
+Subject: [PATCH] Support long distance matching for zstd compression
+
+zstd compression supports a special mode for finding matched in distant
+past, which may result in better compression ratio, at the expense of
+using more memory (the window size is 128MB).
+
+To enable this optional mode, use the "long" keyword when specifying the
+compression method (--compress=zstd:long).
+
+Author: Justin Pryzby
+Reviewed-by: Tomas Vondra, Jacob Champion
+Discussion: https://postgr.es/m/20230224191840.GD1653@telsasoft.com
+Discussion: https://postgr.es/m/20220327205020.GM28503@telsasoft.com
+---
+ doc/src/sgml/protocol.sgml                    | 10 +++-
+ doc/src/sgml/ref/pg_basebackup.sgml           |  4 +-
+ doc/src/sgml/ref/pg_dump.sgml                 |  2 +
+ src/backend/backup/basebackup_zstd.c          | 12 ++++
+ src/bin/pg_basebackup/bbstreamer_zstd.c       | 13 +++++
+ src/bin/pg_basebackup/t/010_pg_basebackup.pl  |  9 ++-
+ src/bin/pg_dump/compress_zstd.c               |  5 ++
+ src/bin/pg_dump/t/002_pg_dump.pl              |  3 +-
+ src/bin/pg_verifybackup/t/008_untar.pl        |  8 +++
+ src/bin/pg_verifybackup/t/010_client_untar.pl |  8 +++
+ src/common/compression.c                      | 57 ++++++++++++++++++-
+ src/include/common/compression.h              |  2 +
+ 12 files changed, 127 insertions(+), 6 deletions(-)
+
+diff --git a/doc/src/sgml/protocol.sgml b/doc/src/sgml/protocol.sgml
+index 8b5e7b1ad7f2..b11d9a6ba355 100644
+--- a/doc/src/sgml/protocol.sgml
++++ b/doc/src/sgml/protocol.sgml
+@@ -2729,7 +2729,8 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
+            level.  Otherwise, it should be a comma-separated list of items,
+            each of the form <replaceable>keyword</replaceable> or
+            <replaceable>keyword=value</replaceable>. Currently, the supported
+-           keywords are <literal>level</literal> and <literal>workers</literal>.
++           keywords are <literal>level</literal>, <literal>long</literal> and
++           <literal>workers</literal>.
+           </para>
+ 
+           <para>
+@@ -2746,6 +2747,13 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
+            <literal>3</literal>).
+           </para>
+ 
++          <para>
++           The <literal>long</literal> keyword enables long-distance matching
++           mode, for improved compression ratio, at the expense of higher memory
++           use.  Long-distance mode is supported only for
++           <literal>zstd</literal>.
++          </para>
++
+           <para>
+            The <literal>workers</literal> keyword sets the number of threads
+            that should be used for parallel compression. Parallel compression
+diff --git a/doc/src/sgml/ref/pg_basebackup.sgml b/doc/src/sgml/ref/pg_basebackup.sgml
+index db3ad9cd5eba..79d3e657c32c 100644
+--- a/doc/src/sgml/ref/pg_basebackup.sgml
++++ b/doc/src/sgml/ref/pg_basebackup.sgml
+@@ -424,8 +424,8 @@ PostgreSQL documentation
+         level.  Otherwise, it should be a comma-separated list of items,
+         each of the form <literal>keyword</literal> or
+         <literal>keyword=value</literal>.
+-        Currently, the supported keywords are <literal>level</literal>
+-        and <literal>workers</literal>.
++        Currently, the supported keywords are <literal>level</literal>,
++        <literal>long</literal>, and <literal>workers</literal>.
+         The detail string cannot be used when the compression method
+         is specified as a plain integer.
+        </para>
+diff --git a/doc/src/sgml/ref/pg_dump.sgml b/doc/src/sgml/ref/pg_dump.sgml
+index 8de38e0fd0de..e81e35c13b35 100644
+--- a/doc/src/sgml/ref/pg_dump.sgml
++++ b/doc/src/sgml/ref/pg_dump.sgml
+@@ -681,6 +681,8 @@ PostgreSQL documentation
+         as though it had been fed through <application>gzip</application>,
+         <application>lz4</application>, or <application>zstd</application>;
+         but the default is not to compress.
++        With zstd compression, <literal>long</literal> mode may improve the
++        compression ratio, at the cost of increased memory use.
+        </para>
+        <para>
+         The tar archive format currently does not support compression at all.
+diff --git a/src/backend/backup/basebackup_zstd.c b/src/backend/backup/basebackup_zstd.c
+index ac6cac178a00..1bb5820c884f 100644
+--- a/src/backend/backup/basebackup_zstd.c
++++ b/src/backend/backup/basebackup_zstd.c
+@@ -118,6 +118,18 @@ bbsink_zstd_begin_backup(bbsink *sink)
+ 						   compress->workers, ZSTD_getErrorName(ret)));
+ 	}
+ 
++	if ((compress->options & PG_COMPRESSION_OPTION_LONG_DISTANCE) != 0)
++	{
++		ret = ZSTD_CCtx_setParameter(mysink->cctx,
++									 ZSTD_c_enableLongDistanceMatching,
++									 compress->long_distance);
++		if (ZSTD_isError(ret))
++			ereport(ERROR,
++					errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					errmsg("could not set compression flag for %s: %s",
++						   "long", ZSTD_getErrorName(ret)));
++	}
++
+ 	/*
+ 	 * We need our own buffer, because we're going to pass different data to
+ 	 * the next sink than what gets passed to us.
+diff --git a/src/bin/pg_basebackup/bbstreamer_zstd.c b/src/bin/pg_basebackup/bbstreamer_zstd.c
+index fe17d6df4ef7..fba391e2a0f0 100644
+--- a/src/bin/pg_basebackup/bbstreamer_zstd.c
++++ b/src/bin/pg_basebackup/bbstreamer_zstd.c
+@@ -106,6 +106,19 @@ bbstreamer_zstd_compressor_new(bbstreamer *next, pg_compress_specification *comp
+ 					 compress->workers, ZSTD_getErrorName(ret));
+ 	}
+ 
++	if ((compress->options & PG_COMPRESSION_OPTION_LONG_DISTANCE) != 0)
++	{
++		ret = ZSTD_CCtx_setParameter(streamer->cctx,
++									 ZSTD_c_enableLongDistanceMatching,
++									 compress->long_distance);
++		if (ZSTD_isError(ret))
++		{
++			pg_log_error("could not set compression flag for %s: %s",
++						 "long", ZSTD_getErrorName(ret));
++			exit(1);
++		}
++	}
++
+ 	/* Initialize the ZSTD output buffer. */
+ 	streamer->zstd_outBuf.dst = streamer->base.bbs_buffer.data;
+ 	streamer->zstd_outBuf.size = streamer->base.bbs_buffer.maxlen;
+diff --git a/src/bin/pg_basebackup/t/010_pg_basebackup.pl b/src/bin/pg_basebackup/t/010_pg_basebackup.pl
+index b60cb78a0d57..4d130a7f9446 100644
+--- a/src/bin/pg_basebackup/t/010_pg_basebackup.pl
++++ b/src/bin/pg_basebackup/t/010_pg_basebackup.pl
+@@ -139,7 +139,14 @@
+ 			'gzip:workers=3',
+ 			'invalid compression specification: compression algorithm "gzip" does not accept a worker count',
+ 			'failure on worker count for gzip'
+-		],);
++		],
++		[
++			'gzip:long',
++			'invalid compression specification: compression algorithm "gzip" does not support long-distance mode',
++			'failure on long mode for gzip'
++		],
++	);
++
+ 	for my $cft (@compression_failure_tests)
+ 	{
+ 		my $cfail = quotemeta($client_fails . $cft->[1]);
+diff --git a/src/bin/pg_dump/compress_zstd.c b/src/bin/pg_dump/compress_zstd.c
+index aa16822dffa0..001b4f151306 100644
+--- a/src/bin/pg_dump/compress_zstd.c
++++ b/src/bin/pg_dump/compress_zstd.c
+@@ -80,6 +80,11 @@ _ZstdCStreamParams(pg_compress_specification compress)
+ 	_Zstd_CCtx_setParam_or_die(cstream, ZSTD_c_compressionLevel,
+ 							   compress.level, "level");
+ 
++	if (compress.options & PG_COMPRESSION_OPTION_LONG_DISTANCE)
++		_Zstd_CCtx_setParam_or_die(cstream,
++								  ZSTD_c_enableLongDistanceMatching,
++								  compress.long_distance, "long");
++
+ 	return cstream;
+ }
+ 
+diff --git a/src/bin/pg_dump/t/002_pg_dump.pl b/src/bin/pg_dump/t/002_pg_dump.pl
+index b5c97694e32c..93e24d514572 100644
+--- a/src/bin/pg_dump/t/002_pg_dump.pl
++++ b/src/bin/pg_dump/t/002_pg_dump.pl
+@@ -267,11 +267,12 @@
+ 		],
+ 	},
+ 
++	# Exercise long mode for test coverage
+ 	compression_zstd_plain => {
+ 		test_key       => 'compression',
+ 		compile_option => 'zstd',
+ 		dump_cmd       => [
+-			'pg_dump', '--format=plain', '--compress=zstd',
++			'pg_dump', '--format=plain', '--compress=zstd:long',
+ 			"--file=$tempdir/compression_zstd_plain.sql.zst", 'postgres',
+ 		],
+ 		# Decompress the generated file to run through the tests.
+diff --git a/src/bin/pg_verifybackup/t/008_untar.pl b/src/bin/pg_verifybackup/t/008_untar.pl
+index 3007bbe8556a..05754bc8ec72 100644
+--- a/src/bin/pg_verifybackup/t/008_untar.pl
++++ b/src/bin/pg_verifybackup/t/008_untar.pl
+@@ -49,6 +49,14 @@
+ 		'decompress_program' => $ENV{'ZSTD'},
+ 		'decompress_flags'   => ['-d'],
+ 		'enabled'            => check_pg_config("#define USE_ZSTD 1")
++	},
++	{
++		'compression_method' => 'zstd',
++		'backup_flags'       => [ '--compress', 'server-zstd:level=1,long' ],
++		'backup_archive'     => 'base.tar.zst',
++		'decompress_program' => $ENV{'ZSTD'},
++		'decompress_flags'   => ['-d'],
++		'enabled'            => check_pg_config("#define USE_ZSTD 1")
+ 	});
+ 
+ for my $tc (@test_configuration)
+diff --git a/src/bin/pg_verifybackup/t/010_client_untar.pl b/src/bin/pg_verifybackup/t/010_client_untar.pl
+index f3aa0f59e29a..ac51a174d14e 100644
+--- a/src/bin/pg_verifybackup/t/010_client_untar.pl
++++ b/src/bin/pg_verifybackup/t/010_client_untar.pl
+@@ -50,6 +50,14 @@
+ 		'decompress_flags'   => ['-d'],
+ 		'enabled'            => check_pg_config("#define USE_ZSTD 1")
+ 	},
++	{
++		'compression_method' => 'zstd',
++		'backup_flags' => ['--compress', 'client-zstd:level=1,long'],
++		'backup_archive' => 'base.tar.zst',
++		'decompress_program' => $ENV{'ZSTD'},
++		'decompress_flags' => [ '-d' ],
++		'enabled' => check_pg_config("#define USE_ZSTD 1")
++	},
+ 	{
+ 		'compression_method' => 'parallel zstd',
+ 		'backup_flags'       => [ '--compress', 'client-zstd:workers=3' ],
+diff --git a/src/common/compression.c b/src/common/compression.c
+index 2d3e56b4d62d..35a7cade645c 100644
+--- a/src/common/compression.c
++++ b/src/common/compression.c
+@@ -12,7 +12,7 @@
+  * Otherwise, a compression specification is a comma-separated list of items,
+  * each having the form keyword or keyword=value.
+  *
+- * Currently, the only supported keywords are "level" and "workers".
++ * Currently, the supported keywords are "level", "long", and "workers".
+  *
+  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+  *
+@@ -38,6 +38,8 @@
+ 
+ static int	expect_integer_value(char *keyword, char *value,
+ 								 pg_compress_specification *result);
++static bool expect_boolean_value(char *keyword, char *value,
++								 pg_compress_specification *result);
+ 
+ /*
+  * Look up a compression algorithm by name. Returns true and sets *algorithm
+@@ -232,6 +234,11 @@ parse_compress_specification(pg_compress_algorithm algorithm, char *specificatio
+ 			result->workers = expect_integer_value(keyword, value, result);
+ 			result->options |= PG_COMPRESSION_OPTION_WORKERS;
+ 		}
++		else if (strcmp(keyword, "long") == 0)
++		{
++			result->long_distance = expect_boolean_value(keyword, value, result);
++			result->options |= PG_COMPRESSION_OPTION_LONG_DISTANCE;
++		}
+ 		else
+ 			result->parse_error =
+ 				psprintf(_("unrecognized compression option: \"%s\""), keyword);
+@@ -289,6 +296,43 @@ expect_integer_value(char *keyword, char *value, pg_compress_specification *resu
+ 	return ivalue;
+ }
+ 
++/*
++ * Parse 'value' as a boolean and return the result.
++ *
++ * If parsing fails, set result->parse_error to an appropriate message
++ * and return -1.  The caller must check result->parse_error to determine if
++ * the call was successful.
++ *
++ * Valid values are: yes, no, on, off, 1, 0.
++ *
++ * Inspired by ParseVariableBool().
++ */
++static bool
++expect_boolean_value(char *keyword, char *value, pg_compress_specification *result)
++{
++	if (value == NULL)
++		return true;
++
++	if (pg_strcasecmp(value, "yes") == 0)
++		return true;
++	if (pg_strcasecmp(value, "on") == 0)
++		return true;
++	if (pg_strcasecmp(value, "1") == 0)
++		return true;
++
++	if (pg_strcasecmp(value, "no") == 0)
++		return false;
++	if (pg_strcasecmp(value, "off") == 0)
++		return false;
++	if (pg_strcasecmp(value, "0") == 0)
++		return false;
++
++	result->parse_error =
++		psprintf(_("value for compression option \"%s\" must be a boolean"),
++				 keyword);
++	return false;
++}
++
+ /*
+  * Returns NULL if the compression specification string was syntactically
+  * valid and semantically sensible.  Otherwise, returns an error message.
+@@ -354,6 +398,17 @@ validate_compress_specification(pg_compress_specification *spec)
+ 						get_compress_algorithm_name(spec->algorithm));
+ 	}
+ 
++	/*
++	 * Of the compression algorithms that we currently support, only zstd
++	 * supports long-distance mode.
++	 */
++	if ((spec->options & PG_COMPRESSION_OPTION_LONG_DISTANCE) != 0 &&
++		(spec->algorithm != PG_COMPRESSION_ZSTD))
++	{
++		return psprintf(_("compression algorithm \"%s\" does not support long-distance mode"),
++						get_compress_algorithm_name(spec->algorithm));
++	}
++
+ 	return NULL;
+ }
+ 
+diff --git a/src/include/common/compression.h b/src/include/common/compression.h
+index b48c173022e0..38aae9dd8739 100644
+--- a/src/include/common/compression.h
++++ b/src/include/common/compression.h
+@@ -27,6 +27,7 @@ typedef enum pg_compress_algorithm
+ } pg_compress_algorithm;
+ 
+ #define PG_COMPRESSION_OPTION_WORKERS		(1 << 0)
++#define PG_COMPRESSION_OPTION_LONG_DISTANCE	(1 << 1)
+ 
+ typedef struct pg_compress_specification
+ {
+@@ -34,6 +35,7 @@ typedef struct pg_compress_specification
+ 	unsigned	options;		/* OR of PG_COMPRESSION_OPTION constants */
+ 	int			level;
+ 	int			workers;
++	bool		long_distance;
+ 	char	   *parse_error;	/* NULL if parsing was OK, else message */
+ } pg_compress_specification;
+ 

@@ -1,0 +1,247 @@
+From 2642df9fac09540c761441edd9bdd0a72c62f39c Mon Sep 17 00:00:00 2001
+From: Dean Rasheed <dean.a.rasheed@gmail.com>
+Date: Fri, 6 Aug 2021 21:29:15 +0100
+Subject: [PATCH] Adjust the integer overflow tests in the numeric code.
+
+Formerly, the numeric code tested whether an integer value of a larger
+type would fit in a smaller type by casting it to the smaller type and
+then testing if the reverse conversion produced the original value.
+That's perfectly fine, except that it caused a test failure on
+buildfarm animal castoroides, most likely due to a compiler bug.
+
+Instead, do these tests by comparing against PG_INT16/32_MIN/MAX. That
+matches existing code in other places, such as int84(), which is more
+widely tested, and so is less likely to go wrong.
+
+While at it, add regression tests covering the numeric-to-int8/4/2
+conversions, and adjust the recently added tests to the style of
+434ddfb79a (on the v11 branch) to make failures easier to diagnose.
+
+Per buildfarm via Tom Lane, reviewed by Tom Lane.
+
+Discussion: https://postgr.es/m/2394813.1628179479%40sss.pgh.pa.us
+---
+ src/backend/utils/adt/numeric.c       | 22 +++++----
+ src/test/regress/expected/numeric.out | 65 +++++++++++++++++++++++----
+ src/test/regress/sql/numeric.sql      | 22 +++++++--
+ 3 files changed, 85 insertions(+), 24 deletions(-)
+
+diff --git a/src/backend/utils/adt/numeric.c b/src/backend/utils/adt/numeric.c
+index 13bb9682a1b7..796f5173f1c4 100644
+--- a/src/backend/utils/adt/numeric.c
++++ b/src/backend/utils/adt/numeric.c
+@@ -4289,11 +4289,13 @@ numericvar_to_int32(const NumericVar *var, int32 *result)
+ 	if (!numericvar_to_int64(var, &val))
+ 		return false;
+ 
++	if (unlikely(val < PG_INT32_MIN) || unlikely(val > PG_INT32_MAX))
++		return false;
++
+ 	/* Down-convert to int4 */
+ 	*result = (int32) val;
+ 
+-	/* Test for overflow by reverse-conversion. */
+-	return ((int64) *result == val);
++	return true;
+ }
+ 
+ Datum
+@@ -4373,15 +4375,14 @@ numeric_int2(PG_FUNCTION_ARGS)
+ 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+ 				 errmsg("smallint out of range")));
+ 
+-	/* Down-convert to int2 */
+-	result = (int16) val;
+-
+-	/* Test for overflow by reverse-conversion. */
+-	if ((int64) result != val)
++	if (unlikely(val < PG_INT16_MIN) || unlikely(val > PG_INT16_MAX))
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+ 				 errmsg("smallint out of range")));
+ 
++	/* Down-convert to int2 */
++	result = (int16) val;
++
+ 	PG_RETURN_INT16(result);
+ }
+ 
+@@ -10186,10 +10187,7 @@ power_var(const NumericVar *base, const NumericVar *exp, NumericVar *result)
+ 
+ 		if (numericvar_to_int64(exp, &expval64))
+ 		{
+-			int			expval = (int) expval64;
+-
+-			/* Test for overflow by reverse-conversion. */
+-			if ((int64) expval == expval64)
++			if (expval64 >= PG_INT32_MIN && expval64 <= PG_INT32_MAX)
+ 			{
+ 				/* Okay, select rscale */
+ 				rscale = NUMERIC_MIN_SIG_DIGITS;
+@@ -10197,7 +10195,7 @@ power_var(const NumericVar *base, const NumericVar *exp, NumericVar *result)
+ 				rscale = Max(rscale, NUMERIC_MIN_DISPLAY_SCALE);
+ 				rscale = Min(rscale, NUMERIC_MAX_DISPLAY_SCALE);
+ 
+-				power_var_int(base, expval, result, rscale);
++				power_var_int(base, (int) expval64, result, rscale);
+ 				return;
+ 			}
+ 		}
+diff --git a/src/test/regress/expected/numeric.out b/src/test/regress/expected/numeric.out
+index 80b42f81b9da..efbb22a43f31 100644
+--- a/src/test/regress/expected/numeric.out
++++ b/src/test/regress/expected/numeric.out
+@@ -1154,6 +1154,55 @@ SELECT * FROM fract_only;
+ (7 rows)
+ 
+ DROP TABLE fract_only;
++-- Check conversion to integers
++SELECT (-9223372036854775808.5)::int8; -- should fail
++ERROR:  bigint out of range
++SELECT (-9223372036854775808.4)::int8; -- ok
++         int8         
++----------------------
++ -9223372036854775808
++(1 row)
++
++SELECT 9223372036854775807.4::int8; -- ok
++        int8         
++---------------------
++ 9223372036854775807
++(1 row)
++
++SELECT 9223372036854775807.5::int8; -- should fail
++ERROR:  bigint out of range
++SELECT (-2147483648.5)::int4; -- should fail
++ERROR:  integer out of range
++SELECT (-2147483648.4)::int4; -- ok
++    int4     
++-------------
++ -2147483648
++(1 row)
++
++SELECT 2147483647.4::int4; -- ok
++    int4    
++------------
++ 2147483647
++(1 row)
++
++SELECT 2147483647.5::int4; -- should fail
++ERROR:  integer out of range
++SELECT (-32768.5)::int2; -- should fail
++ERROR:  smallint out of range
++SELECT (-32768.4)::int2; -- ok
++  int2  
++--------
++ -32768
++(1 row)
++
++SELECT 32767.4::int2; -- ok
++ int2  
++-------
++ 32767
++(1 row)
++
++SELECT 32767.5::int2; -- should fail
++ERROR:  smallint out of range
+ -- Check inf/nan conversion behavior
+ SELECT 'NaN'::float8::numeric;
+  numeric 
+@@ -2428,10 +2477,10 @@ select 1.000000000123 ^ (-2147483648);
+  0.7678656556403084
+ (1 row)
+ 
+-select 0.9999999999 ^ 23300000000000 = 0 as rounds_to_zero;
++select coalesce(nullif(0.9999999999 ^ 23300000000000, 0), 0) as rounds_to_zero;
+  rounds_to_zero 
+ ----------------
+- t
++              0
+ (1 row)
+ 
+ -- cases that used to error out
+@@ -2447,10 +2496,10 @@ select 0.5678 ^ (-85);
+  782333637740774446257.7719390061997396
+ (1 row)
+ 
+-select 0.9999999999 ^ 70000000000000 = 0 as underflows;
++select coalesce(nullif(0.9999999999 ^ 70000000000000, 0), 0) as underflows;
+  underflows 
+ ------------
+- t
++          0
+ (1 row)
+ 
+ -- negative base to integer powers
+@@ -2620,16 +2669,16 @@ select exp('-inf'::numeric);
+    0
+ (1 row)
+ 
+-select exp(-5000::numeric) = 0 as rounds_to_zero;
++select coalesce(nullif(exp(-5000::numeric), 0), 0) as rounds_to_zero;
+  rounds_to_zero 
+ ----------------
+- t
++              0
+ (1 row)
+ 
+-select exp(-10000::numeric) = 0 as underflows;
++select coalesce(nullif(exp(-10000::numeric), 0), 0) as underflows;
+  underflows 
+ ------------
+- t
++          0
+ (1 row)
+ 
+ -- cases that used to generate inaccurate results
+diff --git a/src/test/regress/sql/numeric.sql b/src/test/regress/sql/numeric.sql
+index e643752dd504..0418ff0524f4 100644
+--- a/src/test/regress/sql/numeric.sql
++++ b/src/test/regress/sql/numeric.sql
+@@ -773,6 +773,20 @@ INSERT INTO fract_only VALUES (11, '-Inf');	-- should fail
+ SELECT * FROM fract_only;
+ DROP TABLE fract_only;
+ 
++-- Check conversion to integers
++SELECT (-9223372036854775808.5)::int8; -- should fail
++SELECT (-9223372036854775808.4)::int8; -- ok
++SELECT 9223372036854775807.4::int8; -- ok
++SELECT 9223372036854775807.5::int8; -- should fail
++SELECT (-2147483648.5)::int4; -- should fail
++SELECT (-2147483648.4)::int4; -- ok
++SELECT 2147483647.4::int4; -- ok
++SELECT 2147483647.5::int4; -- should fail
++SELECT (-32768.5)::int2; -- should fail
++SELECT (-32768.4)::int2; -- ok
++SELECT 32767.4::int2; -- ok
++SELECT 32767.5::int2; -- should fail
++
+ -- Check inf/nan conversion behavior
+ SELECT 'NaN'::float8::numeric;
+ SELECT 'Infinity'::float8::numeric;
+@@ -1133,12 +1147,12 @@ select 3.789 ^ 35;
+ select 1.2 ^ 345;
+ select 0.12 ^ (-20);
+ select 1.000000000123 ^ (-2147483648);
+-select 0.9999999999 ^ 23300000000000 = 0 as rounds_to_zero;
++select coalesce(nullif(0.9999999999 ^ 23300000000000, 0), 0) as rounds_to_zero;
+ 
+ -- cases that used to error out
+ select 0.12 ^ (-25);
+ select 0.5678 ^ (-85);
+-select 0.9999999999 ^ 70000000000000 = 0 as underflows;
++select coalesce(nullif(0.9999999999 ^ 70000000000000, 0), 0) as underflows;
+ 
+ -- negative base to integer powers
+ select (-1.0) ^ 2147483646;
+@@ -1188,8 +1202,8 @@ select exp(1.0::numeric(71,70));
+ select exp('nan'::numeric);
+ select exp('inf'::numeric);
+ select exp('-inf'::numeric);
+-select exp(-5000::numeric) = 0 as rounds_to_zero;
+-select exp(-10000::numeric) = 0 as underflows;
++select coalesce(nullif(exp(-5000::numeric), 0), 0) as rounds_to_zero;
++select coalesce(nullif(exp(-10000::numeric), 0), 0) as underflows;
+ 
+ -- cases that used to generate inaccurate results
+ select exp(32.999);

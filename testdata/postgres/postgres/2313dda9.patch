@@ -1,0 +1,133 @@
+From 2313dda9d493d3685ac7328b49dc6f5a87c1c295 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 18 Aug 2021 18:12:51 -0400
+Subject: [PATCH] Fix check_agg_arguments' examination of aggregate FILTER
+ clauses.
+
+Recursion into the FILTER clause was mis-implemented, such that a
+relevant Var or Aggref at the very top of the FILTER clause would
+be ignored.  (Of course, that'd have to be a plain boolean Var or
+boolean-returning aggregate.)  The consequence would be
+mis-identification of the correct semantic level of the aggregate,
+which could lead to not-per-spec query behavior.  If the FILTER
+expression is an aggregate, this could also lead to failure to issue
+an expected "aggregate function calls cannot be nested" error, which
+would likely result in a core dump later on, since the planner and
+executor aren't expecting such cases to appear.
+
+The root cause is that commit b560ec1b0 blindly copied some code
+that assumed it's recursing into a List, and thus didn't examine the
+top-level node.  To forestall questions about why this call doesn't
+look like the others, as well as possible future copy-and-paste
+mistakes, let's change all three check_agg_arguments_walker calls in
+check_agg_arguments, even though only the one for the filter clause
+is really broken.
+
+Per bug #17152 from Zhiyong Wu.  This has been wrong since we
+implemented FILTER, so back-patch to all supported versions.
+(Testing suggests that pre-v11 branches manage to avoid crashing
+in the bad-Aggref case, thanks to "redundant" checks in ExecInitAgg.
+But I'm not sure how thorough that protection is, and anyway the
+wrong-behavior issue remains, so fix 9.6 and 10 too.)
+
+Discussion: https://postgr.es/m/17152-c7f906cc1a88e61b@postgresql.org
+---
+ src/backend/parser/parse_agg.c           | 13 +++-------
+ src/test/regress/expected/aggregates.out | 30 ++++++++++++++++++++++++
+ src/test/regress/sql/aggregates.sql      | 11 +++++++++
+ 3 files changed, 44 insertions(+), 10 deletions(-)
+
+diff --git a/src/backend/parser/parse_agg.c b/src/backend/parser/parse_agg.c
+index 24268eb5024d..7d829a05a9b8 100644
+--- a/src/backend/parser/parse_agg.c
++++ b/src/backend/parser/parse_agg.c
+@@ -627,13 +627,8 @@ check_agg_arguments(ParseState *pstate,
+ 	context.min_agglevel = -1;
+ 	context.sublevels_up = 0;
+ 
+-	(void) expression_tree_walker((Node *) args,
+-								  check_agg_arguments_walker,
+-								  (void *) &context);
+-
+-	(void) expression_tree_walker((Node *) filter,
+-								  check_agg_arguments_walker,
+-								  (void *) &context);
++	(void) check_agg_arguments_walker((Node *) args, &context);
++	(void) check_agg_arguments_walker((Node *) filter, &context);
+ 
+ 	/*
+ 	 * If we found no vars nor aggs at all, it's a level-zero aggregate;
+@@ -680,9 +675,7 @@ check_agg_arguments(ParseState *pstate,
+ 	{
+ 		context.min_varlevel = -1;
+ 		context.min_agglevel = -1;
+-		(void) expression_tree_walker((Node *) directargs,
+-									  check_agg_arguments_walker,
+-									  (void *) &context);
++		(void) check_agg_arguments_walker((Node *) directargs, &context);
+ 		if (context.min_varlevel >= 0 && context.min_varlevel < agglevel)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_GROUPING_ERROR),
+diff --git a/src/test/regress/expected/aggregates.out b/src/test/regress/expected/aggregates.out
+index 23b112b2af84..5949996ebc02 100644
+--- a/src/test/regress/expected/aggregates.out
++++ b/src/test/regress/expected/aggregates.out
+@@ -1845,6 +1845,36 @@ select aggfns(distinct a,b,c order by a,c using ~<~,b) filter (where a > 1)
+  {"(2,2,bar)","(3,1,baz)"}
+ (1 row)
+ 
++-- check handling of bare boolean Var in FILTER
++select max(0) filter (where b1) from bool_test;
++ max 
++-----
++   0
++(1 row)
++
++select (select max(0) filter (where b1)) from bool_test;
++ max 
++-----
++   0
++(1 row)
++
++-- check for correct detection of nested-aggregate errors in FILTER
++select max(unique1) filter (where sum(ten) > 0) from tenk1;
++ERROR:  aggregate functions are not allowed in FILTER
++LINE 1: select max(unique1) filter (where sum(ten) > 0) from tenk1;
++                                          ^
++select (select max(unique1) filter (where sum(ten) > 0) from int8_tbl) from tenk1;
++ERROR:  aggregate function calls cannot be nested
++LINE 1: select (select max(unique1) filter (where sum(ten) > 0) from...
++                                                  ^
++select max(unique1) filter (where bool_or(ten > 0)) from tenk1;
++ERROR:  aggregate functions are not allowed in FILTER
++LINE 1: select max(unique1) filter (where bool_or(ten > 0)) from ten...
++                                          ^
++select (select max(unique1) filter (where bool_or(ten > 0)) from int8_tbl) from tenk1;
++ERROR:  aggregate function calls cannot be nested
++LINE 1: select (select max(unique1) filter (where bool_or(ten > 0)) ...
++                                                  ^
+ -- ordered-set aggregates
+ select p, percentile_cont(p) within group (order by x::float8)
+ from generate_series(1,5) x,
+diff --git a/src/test/regress/sql/aggregates.sql b/src/test/regress/sql/aggregates.sql
+index ed2d6b3bdfc2..7cf86465e947 100644
+--- a/src/test/regress/sql/aggregates.sql
++++ b/src/test/regress/sql/aggregates.sql
+@@ -682,6 +682,17 @@ select aggfns(distinct a,b,c order by a,c using ~<~,b) filter (where a > 1)
+     from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
+     generate_series(1,2) i;
+ 
++-- check handling of bare boolean Var in FILTER
++select max(0) filter (where b1) from bool_test;
++select (select max(0) filter (where b1)) from bool_test;
++
++-- check for correct detection of nested-aggregate errors in FILTER
++select max(unique1) filter (where sum(ten) > 0) from tenk1;
++select (select max(unique1) filter (where sum(ten) > 0) from int8_tbl) from tenk1;
++select max(unique1) filter (where bool_or(ten > 0)) from tenk1;
++select (select max(unique1) filter (where bool_or(ten > 0)) from int8_tbl) from tenk1;
++
++
+ -- ordered-set aggregates
+ 
+ select p, percentile_cont(p) within group (order by x::float8)

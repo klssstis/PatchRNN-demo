@@ -1,0 +1,274 @@
+From 1635e80d30b16df98aebead12f2b82f17efd9bc8 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 26 Sep 2017 13:12:03 -0400
+Subject: [PATCH] Use a blacklist to distinguish original from add-on enum
+ values.
+
+Commit 15bc038f9 allowed ALTER TYPE ADD VALUE to be executed inside
+transaction blocks, by disallowing the use of the added value later
+in the same transaction, except under limited circumstances.  However,
+the test for "limited circumstances" was heuristic and could reject
+references to enum values that were created during CREATE TYPE AS ENUM,
+not just later.  This breaks the use-case of restoring pg_dump scripts
+in a single transaction, as reported in bug #14825 from Balazs Szilfai.
+
+We can improve this by keeping a "blacklist" table of enum value OIDs
+created by ALTER TYPE ADD VALUE during the current transaction.  Any
+visible-but-uncommitted value whose OID is not in the blacklist must
+have been created by CREATE TYPE AS ENUM, and can be used safely
+because it could not have a lifespan shorter than its parent enum type.
+
+This change also removes the restriction that a renamed enum value
+can't be used before being committed (unless it was on the blacklist).
+
+Andrew Dunstan, with cosmetic improvements by me.
+Back-patch to v10.
+
+Discussion: https://postgr.es/m/20170922185904.1448.16585@wrigleys.postgresql.org
+---
+ doc/src/sgml/ref/alter_type.sgml   |  2 -
+ src/backend/access/transam/xact.c  |  4 ++
+ src/backend/catalog/pg_enum.c      | 64 ++++++++++++++++++++++++++++++
+ src/backend/utils/adt/enum.c       |  9 +++++
+ src/include/catalog/pg_enum.h      |  2 +
+ src/test/regress/expected/enum.out | 21 ++++++++++
+ src/test/regress/sql/enum.sql      | 13 ++++++
+ 7 files changed, 113 insertions(+), 2 deletions(-)
+
+diff --git a/doc/src/sgml/ref/alter_type.sgml b/doc/src/sgml/ref/alter_type.sgml
+index d65f70f67413..446e08b17593 100644
+--- a/doc/src/sgml/ref/alter_type.sgml
++++ b/doc/src/sgml/ref/alter_type.sgml
+@@ -294,8 +294,6 @@ ALTER TYPE <replaceable class="PARAMETER">name</replaceable> RENAME VALUE <repla
+    an enum type) is executed inside a transaction block, the new value cannot
+    be used until after the transaction has been committed, except in the case
+    that the enum type itself was created earlier in the same transaction.
+-   Likewise, when a pre-existing enum value is renamed, the transaction must
+-   be committed before the renamed value can be used.
+   </para>
+ 
+   <para>
+diff --git a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
+index 93dca7a72af5..52408fc6b06d 100644
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -32,6 +32,7 @@
+ #include "access/xlogutils.h"
+ #include "catalog/catalog.h"
+ #include "catalog/namespace.h"
++#include "catalog/pg_enum.h"
+ #include "catalog/storage.h"
+ #include "commands/async.h"
+ #include "commands/tablecmds.h"
+@@ -2128,6 +2129,7 @@ CommitTransaction(void)
+ 	AtCommit_Notify();
+ 	AtEOXact_GUC(true, 1);
+ 	AtEOXact_SPI(true);
++	AtEOXact_Enum();
+ 	AtEOXact_on_commit_actions(true);
+ 	AtEOXact_Namespace(true, is_parallel_worker);
+ 	AtEOXact_SMgr();
+@@ -2406,6 +2408,7 @@ PrepareTransaction(void)
+ 	/* PREPARE acts the same as COMMIT as far as GUC is concerned */
+ 	AtEOXact_GUC(true, 1);
+ 	AtEOXact_SPI(true);
++	AtEOXact_Enum();
+ 	AtEOXact_on_commit_actions(true);
+ 	AtEOXact_Namespace(true, false);
+ 	AtEOXact_SMgr();
+@@ -2608,6 +2611,7 @@ AbortTransaction(void)
+ 
+ 		AtEOXact_GUC(false, 1);
+ 		AtEOXact_SPI(false);
++		AtEOXact_Enum();
+ 		AtEOXact_on_commit_actions(false);
+ 		AtEOXact_Namespace(false, is_parallel_worker);
+ 		AtEOXact_SMgr();
+diff --git a/src/backend/catalog/pg_enum.c b/src/backend/catalog/pg_enum.c
+index fe61d4dacccd..0f7b36e11d88 100644
+--- a/src/backend/catalog/pg_enum.c
++++ b/src/backend/catalog/pg_enum.c
+@@ -28,6 +28,8 @@
+ #include "utils/builtins.h"
+ #include "utils/catcache.h"
+ #include "utils/fmgroids.h"
++#include "utils/hsearch.h"
++#include "utils/memutils.h"
+ #include "utils/syscache.h"
+ #include "utils/tqual.h"
+ 
+@@ -35,6 +37,17 @@
+ /* Potentially set by pg_upgrade_support functions */
+ Oid			binary_upgrade_next_pg_enum_oid = InvalidOid;
+ 
++/*
++ * Hash table of enum value OIDs created during the current transaction by
++ * AddEnumLabel.  We disallow using these values until the transaction is
++ * committed; otherwise, they might get into indexes where we can't clean
++ * them up, and then if the transaction rolls back we have a broken index.
++ * (See comments for check_safe_enum_use() in enum.c.)  Values created by
++ * EnumValuesCreate are *not* blacklisted; we assume those are created during
++ * CREATE TYPE, so they can't go away unless the enum type itself does.
++ */
++static HTAB *enum_blacklist = NULL;
++
+ static void RenumberEnumType(Relation pg_enum, HeapTuple *existing, int nelems);
+ static int	sort_order_cmp(const void *p1, const void *p2);
+ 
+@@ -460,6 +473,24 @@ AddEnumLabel(Oid enumTypeOid,
+ 	heap_freetuple(enum_tup);
+ 
+ 	heap_close(pg_enum, RowExclusiveLock);
++
++	/* Set up the blacklist hash if not already done in this transaction */
++	if (enum_blacklist == NULL)
++	{
++		HASHCTL		hash_ctl;
++
++		memset(&hash_ctl, 0, sizeof(hash_ctl));
++		hash_ctl.keysize = sizeof(Oid);
++		hash_ctl.entrysize = sizeof(Oid);
++		hash_ctl.hcxt = TopTransactionContext;
++		enum_blacklist = hash_create("Enum value blacklist",
++									 32,
++									 &hash_ctl,
++									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++	}
++
++	/* Add the new value to the blacklist */
++	(void) hash_search(enum_blacklist, &newOid, HASH_ENTER, NULL);
+ }
+ 
+ 
+@@ -547,6 +578,39 @@ RenameEnumLabel(Oid enumTypeOid,
+ }
+ 
+ 
++/*
++ * Test if the given enum value is on the blacklist
++ */
++bool
++EnumBlacklisted(Oid enum_id)
++{
++	bool		found;
++
++	/* If we've made no blacklist table, all values are safe */
++	if (enum_blacklist == NULL)
++		return false;
++
++	/* Else, is it in the table? */
++	(void) hash_search(enum_blacklist, &enum_id, HASH_FIND, &found);
++	return found;
++}
++
++
++/*
++ * Clean up enum stuff after end of top-level transaction.
++ */
++void
++AtEOXact_Enum(void)
++{
++	/*
++	 * Reset the blacklist table, as all our enum values are now committed.
++	 * The memory will go away automatically when TopTransactionContext is
++	 * freed; it's sufficient to clear our pointer.
++	 */
++	enum_blacklist = NULL;
++}
++
++
+ /*
+  * RenumberEnumType
+  *		Renumber existing enum elements to have sort positions 1..n.
+diff --git a/src/backend/utils/adt/enum.c b/src/backend/utils/adt/enum.c
+index 973397cc85b7..401e7299fa4c 100644
+--- a/src/backend/utils/adt/enum.c
++++ b/src/backend/utils/adt/enum.c
+@@ -76,6 +76,15 @@ check_safe_enum_use(HeapTuple enumval_tup)
+ 		TransactionIdDidCommit(xmin))
+ 		return;
+ 
++	/*
++	 * Check if the enum value is blacklisted.  If not, it's safe, because it
++	 * was made during CREATE TYPE AS ENUM and can't be shorter-lived than its
++	 * owning type.  (This'd also be false for values made by other
++	 * transactions; but the previous tests should have handled all of those.)
++	 */
++	if (!EnumBlacklisted(HeapTupleGetOid(enumval_tup)))
++		return;
++
+ 	/* It is a new enum value, so check to see if the whole enum is new */
+ 	en = (Form_pg_enum) GETSTRUCT(enumval_tup);
+ 	enumtyp_tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(en->enumtypid));
+diff --git a/src/include/catalog/pg_enum.h b/src/include/catalog/pg_enum.h
+index 5938ba5cac30..dff3d2f481ca 100644
+--- a/src/include/catalog/pg_enum.h
++++ b/src/include/catalog/pg_enum.h
+@@ -69,5 +69,7 @@ extern void AddEnumLabel(Oid enumTypeOid, const char *newVal,
+ 			 bool skipIfExists);
+ extern void RenameEnumLabel(Oid enumTypeOid,
+ 				const char *oldVal, const char *newVal);
++extern bool EnumBlacklisted(Oid enum_id);
++extern void AtEOXact_Enum(void);
+ 
+ #endif							/* PG_ENUM_H */
+diff --git a/src/test/regress/expected/enum.out b/src/test/regress/expected/enum.out
+index 0e6030443f91..6bbe488736de 100644
+--- a/src/test/regress/expected/enum.out
++++ b/src/test/regress/expected/enum.out
+@@ -633,8 +633,29 @@ ERROR:  unsafe use of new value "bad" of enum type bogon
+ LINE 1: SELECT 'bad'::bogon;
+                ^
+ HINT:  New enum values must be committed before they can be used.
++ROLLBACK;
++-- but a renamed value is safe to use later in same transaction
++BEGIN;
++ALTER TYPE bogus RENAME VALUE 'good' to 'bad';
++SELECT 'bad'::bogus;
++ bogus 
++-------
++ bad
++(1 row)
++
+ ROLLBACK;
+ DROP TYPE bogus;
++-- check that values created during CREATE TYPE can be used in any case
++BEGIN;
++CREATE TYPE bogus AS ENUM('good','bad','ugly');
++ALTER TYPE bogus RENAME TO bogon;
++select enum_range(null::bogon);
++   enum_range    
++-----------------
++ {good,bad,ugly}
++(1 row)
++
++ROLLBACK;
+ -- check that we can add new values to existing enums in a transaction
+ -- and use them, if the type is new as well
+ BEGIN;
+diff --git a/src/test/regress/sql/enum.sql b/src/test/regress/sql/enum.sql
+index d7e87143a010..eb464a72c5c7 100644
+--- a/src/test/regress/sql/enum.sql
++++ b/src/test/regress/sql/enum.sql
+@@ -300,8 +300,21 @@ ALTER TYPE bogon ADD VALUE 'bad';
+ SELECT 'bad'::bogon;
+ ROLLBACK;
+ 
++-- but a renamed value is safe to use later in same transaction
++BEGIN;
++ALTER TYPE bogus RENAME VALUE 'good' to 'bad';
++SELECT 'bad'::bogus;
++ROLLBACK;
++
+ DROP TYPE bogus;
+ 
++-- check that values created during CREATE TYPE can be used in any case
++BEGIN;
++CREATE TYPE bogus AS ENUM('good','bad','ugly');
++ALTER TYPE bogus RENAME TO bogon;
++select enum_range(null::bogon);
++ROLLBACK;
++
+ -- check that we can add new values to existing enums in a transaction
+ -- and use them, if the type is new as well
+ BEGIN;

@@ -1,0 +1,75 @@
+From 3097bde7dd1d9e7b1127b24935e70ca4609e22b2 Mon Sep 17 00:00:00 2001
+From: Peter Geoghegan <pg@bowt.ie>
+Date: Fri, 19 Aug 2022 09:26:08 -0700
+Subject: [PATCH] Avoid reltuples distortion in very small tables.
+
+Consistently avoid trusting a sample of only one page at the point that
+VACUUM determines a new reltuples for the target table (though only when
+the table is larger than a single page).  This is follow-up work to
+commit 74388a1a, which added a heuristic to prevent reltuples from
+becoming distorted by successive VACUUM operations that each scan only a
+single heap page (which was itself more or less a bugfix for an issue in
+commit 44fa8488, which simplified VACUUM's handling of scanned pages).
+
+The original bugfix commit did not account for certain remaining cases
+that where not affected by its "2% of total relpages" heuristic.  This
+happened with relations that are small enough that just one of its pages
+exceeded the 2% threshold, yet still big enough for VACUUM to deem
+skipping most of its pages via the visibility map worthwhile.  reltuples
+could still become distorted over time with such a table, at least in
+scenarios where the VACUUM command is run repeatedly and without the
+table itself ever changing.
+
+Author: Peter Geoghegan <pg@bowt.ie>
+Discussion: https://postgr.es/m/CAH2-Wzk7d4m3oEbEWkWQKd+gz-eD_peBvdXVk1a_KBygXadFeg@mail.gmail.com
+Backpatch: 15-, where the rules for scanned pages changed.
+---
+ src/backend/commands/vacuum.c | 26 ++++++++++----------------
+ 1 file changed, 10 insertions(+), 16 deletions(-)
+
+diff --git a/src/backend/commands/vacuum.c b/src/backend/commands/vacuum.c
+index 8df25f59d87d..dbdfe8bd2d41 100644
+--- a/src/backend/commands/vacuum.c
++++ b/src/backend/commands/vacuum.c
+@@ -1234,31 +1234,25 @@ vac_estimate_reltuples(Relation relation,
+ 	if (scanned_pages >= total_pages)
+ 		return scanned_tuples;
+ 
+-	/*
+-	 * If scanned_pages is zero but total_pages isn't, keep the existing value
+-	 * of reltuples.  (Note: we might be returning -1 in this case.)
+-	 */
+-	if (scanned_pages == 0)
+-		return old_rel_tuples;
+-
+ 	/*
+ 	 * When successive VACUUM commands scan the same few pages again and
+ 	 * again, without anything from the table really changing, there is a risk
+ 	 * that our beliefs about tuple density will gradually become distorted.
+-	 * It's particularly important to avoid becoming confused in this way due
+-	 * to vacuumlazy.c implementation details.  For example, the tendency for
+-	 * our caller to always scan the last heap page should not ever cause us
+-	 * to believe that every page in the table must be just like the last
+-	 * page.
++	 * This might be caused by vacuumlazy.c implementation details, such as
++	 * its tendency to always scan the last heap page.  Handle that here.
++	 *
++	 * If the relation is _exactly_ the same size according to the existing
++	 * pg_class entry, and only a few of its pages (less than 2%) were
++	 * scanned, keep the existing value of reltuples.  Also keep the existing
++	 * value when only a subset of rel's pages <= a single page were scanned.
+ 	 *
+-	 * We apply a heuristic to avoid these problems: if the relation is
+-	 * exactly the same size as it was at the end of the last VACUUM, and only
+-	 * a few of its pages (less than a quasi-arbitrary threshold of 2%) were
+-	 * scanned by this VACUUM, assume that reltuples has not changed at all.
++	 * (Note: we might be returning -1 here.)
+ 	 */
+ 	if (old_rel_pages == total_pages &&
+ 		scanned_pages < (double) total_pages * 0.02)
+ 		return old_rel_tuples;
++	if (scanned_pages <= 1)
++		return old_rel_tuples;
+ 
+ 	/*
+ 	 * If old density is unknown, we can't do much except scale up
