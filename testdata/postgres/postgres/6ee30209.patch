@@ -1,0 +1,1693 @@
+From 6ee30209a6f161d0a267a33f090c70c579c87c00 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Fri, 31 Mar 2023 22:34:04 +0200
+Subject: [PATCH] SQL/JSON: support the IS JSON predicate
+
+This patch introduces the SQL standard IS JSON predicate. It operates
+on text and bytea values representing JSON, as well as on the json and
+jsonb types. Each test has IS and IS NOT variants and supports a WITH
+UNIQUE KEYS flag. The tests are:
+
+IS JSON [VALUE]
+IS JSON ARRAY
+IS JSON OBJECT
+IS JSON SCALAR
+
+These should be self-explanatory.
+
+The WITH UNIQUE KEYS flag makes these return false when duplicate keys
+exist in any object within the value, not necessarily directly contained
+in the outermost object.
+
+Author: Nikita Glukhov <n.gluhov@postgrespro.ru>
+Author: Teodor Sigaev <teodor@sigaev.ru>
+Author: Oleg Bartunov <obartunov@gmail.com>
+Author: Alexander Korotkov <aekorotkov@gmail.com>
+Author: Amit Langote <amitlangote09@gmail.com>
+Author: Andrew Dunstan <andrew@dunslane.net>
+
+Reviewers have included (in no particular order) Andres Freund, Alexander
+Korotkov, Pavel Stehule, Andrew Alsup, Erik Rijkers, Zihong Yu,
+Himanshu Upadhyaya, Daniel Gustafsson, Justin Pryzby.
+
+Discussion: https://postgr.es/m/CAF4Au4w2x-5LTnN_bxky-mq4=WOqsGsxSpENCzHRAzSnEd8+WQ@mail.gmail.com
+Discussion: https://postgr.es/m/cd0bb935-0158-78a7-08b5-904886deac4b@postgrespro.ru
+Discussion: https://postgr.es/m/20220616233130.rparivafipt6doj3@alap3.anarazel.de
+Discussion: https://postgr.es/m/abd9b83b-aa66-f230-3d6d-734817f0995d%40postgresql.org
+---
+ doc/src/sgml/func.sgml                        |  80 +++++++
+ src/backend/executor/execExpr.c               |  13 ++
+ src/backend/executor/execExprInterp.c         |  99 +++++++++
+ src/backend/jit/llvm/llvmjit_expr.c           |   6 +
+ src/backend/jit/llvm/llvmjit_types.c          |   1 +
+ src/backend/nodes/makefuncs.c                 |  19 ++
+ src/backend/nodes/nodeFuncs.c                 |  26 +++
+ src/backend/parser/gram.y                     |  68 +++++-
+ src/backend/parser/parse_expr.c               |  76 +++++++
+ src/backend/utils/adt/json.c                  | 132 +++++++++++-
+ src/backend/utils/adt/jsonfuncs.c             |  20 ++
+ src/backend/utils/adt/ruleutils.c             |  37 ++++
+ src/include/catalog/catversion.h              |   2 +-
+ src/include/executor/execExpr.h               |   8 +
+ src/include/nodes/makefuncs.h                 |   3 +
+ src/include/nodes/primnodes.h                 |  26 +++
+ src/include/parser/kwlist.h                   |   1 +
+ src/include/utils/json.h                      |   1 +
+ src/include/utils/jsonfuncs.h                 |   3 +
+ .../ecpg/test/expected/sql-sqljson.c          |  71 +++++--
+ .../ecpg/test/expected/sql-sqljson.stderr     |  86 +++++---
+ .../ecpg/test/expected/sql-sqljson.stdout     |   8 +
+ src/interfaces/ecpg/test/sql/sqljson.pgc      |  17 ++
+ src/test/regress/expected/sqljson.out         | 198 ++++++++++++++++++
+ src/test/regress/sql/sqljson.sql              |  96 +++++++++
+ 25 files changed, 1030 insertions(+), 67 deletions(-)
+
+diff --git a/doc/src/sgml/func.sgml b/doc/src/sgml/func.sgml
+index 38e7f467605c..918a4922348f 100644
+--- a/doc/src/sgml/func.sgml
++++ b/doc/src/sgml/func.sgml
+@@ -16005,6 +16005,86 @@ table2-mapping
+     </tgroup>
+    </table>
+ 
++  <para>
++   <xref linkend="functions-sqljson-misc" /> details SQL/JSON
++   facilities for testing JSON.
++  </para>
++
++  <table id="functions-sqljson-misc">
++   <title>SQL/JSON Testing Functions</title>
++   <tgroup cols="1">
++    <thead>
++     <row>
++      <entry role="func_table_entry"><para role="func_signature">
++        Function signature
++       </para>
++       <para>
++        Description
++       </para>
++       <para>
++        Example(s)
++      </para></entry>
++     </row>
++    </thead>
++    <tbody>
++     <row>
++      <entry role="func_table_entry"><para role="func_signature">
++        <indexterm><primary>IS JSON</primary></indexterm>
++        <replaceable>expression</replaceable> <literal>IS</literal> <optional> <literal>NOT</literal> </optional> <literal>JSON</literal>
++        <optional> { <literal>VALUE</literal> | <literal>SCALAR</literal> | <literal>ARRAY</literal> | <literal>OBJECT</literal> } </optional>
++        <optional> { <literal>WITH</literal> | <literal>WITHOUT</literal> } <literal>UNIQUE</literal> <optional> <literal>KEYS</literal> </optional> </optional>
++       </para>
++       <para>
++        This predicate tests whether <replaceable>expression</replaceable> can be
++        parsed as JSON, possibly of a specified type.
++        If <literal>SCALAR</literal> or <literal>ARRAY</literal> or
++        <literal>OBJECT</literal> is specified, the
++        test is whether or not the JSON is of that particular type. If
++        <literal>WITH UNIQUE KEYS</literal> is specified, then any object in the
++        <replaceable>expression</replaceable> is also tested to see if it
++        has duplicate keys.
++       </para>
++       <para>
++<programlisting>
++SELECT js,
++  js IS JSON "json?",
++  js IS JSON SCALAR "scalar?",
++  js IS JSON OBJECT "object?",
++  js IS JSON ARRAY "array?"
++FROM (VALUES
++      ('123'), ('"abc"'), ('{"a": "b"}'), ('[1,2]'),('abc')) foo(js);
++     js     | json? | scalar? | object? | array? 
++------------+-------+---------+---------+--------
++ 123        | t     | t       | f       | f
++ "abc"      | t     | t       | f       | f
++ {"a": "b"} | t     | f       | t       | f
++ [1,2]      | t     | f       | f       | t
++ abc        | f     | f       | f       | f
++</programlisting>
++       </para>
++       <para>
++<programlisting>
++SELECT js,
++  js IS JSON OBJECT "object?",
++  js IS JSON ARRAY "array?",
++  js IS JSON ARRAY WITH UNIQUE KEYS "array w. UK?",
++  js IS JSON ARRAY WITHOUT UNIQUE KEYS "array w/o UK?"
++FROM (VALUES ('[{"a":"1"},
++ {"b":"2","b":"3"}]')) foo(js);
++-[ RECORD 1 ]-+--------------------
++js            | [{"a":"1"},        +
++              |  {"b":"2","b":"3"}]
++object?       | f
++array?        | t
++array w. UK?  | f
++array w/o UK? | t
++</programlisting>
++      </para></entry>
++     </row>
++    </tbody>
++   </tgroup>
++  </table>
++
+   <para>
+    <xref linkend="functions-json-processing-table"/> shows the functions that
+    are available for processing <type>json</type> and <type>jsonb</type> values.
+diff --git a/src/backend/executor/execExpr.c b/src/backend/executor/execExpr.c
+index 6c5a37802925..4c6700de0455 100644
+--- a/src/backend/executor/execExpr.c
++++ b/src/backend/executor/execExpr.c
+@@ -2370,6 +2370,19 @@ ExecInitExprRec(Expr *node, ExprState *state,
+ 			}
+ 			break;
+ 
++		case T_JsonIsPredicate:
++			{
++				JsonIsPredicate *pred = (JsonIsPredicate *) node;
++
++				ExecInitExprRec((Expr *) pred->expr, state, resv, resnull);
++
++				scratch.opcode = EEOP_IS_JSON;
++				scratch.d.is_json.pred = pred;
++
++				ExprEvalPushStep(state, &scratch);
++				break;
++			}
++
+ 		case T_NullTest:
+ 			{
+ 				NullTest   *ntest = (NullTest *) node;
+diff --git a/src/backend/executor/execExprInterp.c b/src/backend/executor/execExprInterp.c
+index 5e55592f8019..4cd46f171765 100644
+--- a/src/backend/executor/execExprInterp.c
++++ b/src/backend/executor/execExprInterp.c
+@@ -73,6 +73,7 @@
+ #include "utils/expandedrecord.h"
+ #include "utils/json.h"
+ #include "utils/jsonb.h"
++#include "utils/jsonfuncs.h"
+ #include "utils/lsyscache.h"
+ #include "utils/memutils.h"
+ #include "utils/timestamp.h"
+@@ -477,6 +478,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
+ 		&&CASE_EEOP_HASHED_SCALARARRAYOP,
+ 		&&CASE_EEOP_XMLEXPR,
+ 		&&CASE_EEOP_JSON_CONSTRUCTOR,
++		&&CASE_EEOP_IS_JSON,
+ 		&&CASE_EEOP_AGGREF,
+ 		&&CASE_EEOP_GROUPING_FUNC,
+ 		&&CASE_EEOP_WINDOW_FUNC,
+@@ -1521,6 +1523,14 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
+ 			EEO_NEXT();
+ 		}
+ 
++		EEO_CASE(EEOP_IS_JSON)
++		{
++			/* too complex for an inline implementation */
++			ExecEvalJsonIsPredicate(state, op);
++
++			EEO_NEXT();
++		}
++
+ 		EEO_CASE(EEOP_AGGREF)
+ 		{
+ 			/*
+@@ -3921,6 +3931,95 @@ ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
+ 	*op->resnull = isnull;
+ }
+ 
++/*
++ * Evaluate a IS JSON predicate.
++ */
++void
++ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
++{
++	JsonIsPredicate *pred = op->d.is_json.pred;
++	Datum		js = *op->resvalue;
++	Oid			exprtype;
++	bool		res;
++
++	if (*op->resnull)
++	{
++		*op->resvalue = BoolGetDatum(false);
++		return;
++	}
++
++	exprtype = exprType(pred->expr);
++
++	if (exprtype == TEXTOID || exprtype == JSONOID)
++	{
++		text	   *json = DatumGetTextP(js);
++
++		if (pred->item_type == JS_TYPE_ANY)
++			res = true;
++		else
++		{
++			switch (json_get_first_token(json, false))
++			{
++				case JSON_TOKEN_OBJECT_START:
++					res = pred->item_type == JS_TYPE_OBJECT;
++					break;
++				case JSON_TOKEN_ARRAY_START:
++					res = pred->item_type == JS_TYPE_ARRAY;
++					break;
++				case JSON_TOKEN_STRING:
++				case JSON_TOKEN_NUMBER:
++				case JSON_TOKEN_TRUE:
++				case JSON_TOKEN_FALSE:
++				case JSON_TOKEN_NULL:
++					res = pred->item_type == JS_TYPE_SCALAR;
++					break;
++				default:
++					res = false;
++					break;
++			}
++		}
++
++		/*
++		 * Do full parsing pass only for uniqueness check or for JSON text
++		 * validation.
++		 */
++		if (res && (pred->unique_keys || exprtype == TEXTOID))
++			res = json_validate(json, pred->unique_keys, false);
++	}
++	else if (exprtype == JSONBOID)
++	{
++		if (pred->item_type == JS_TYPE_ANY)
++			res = true;
++		else
++		{
++			Jsonb	   *jb = DatumGetJsonbP(js);
++
++			switch (pred->item_type)
++			{
++				case JS_TYPE_OBJECT:
++					res = JB_ROOT_IS_OBJECT(jb);
++					break;
++				case JS_TYPE_ARRAY:
++					res = JB_ROOT_IS_ARRAY(jb) && !JB_ROOT_IS_SCALAR(jb);
++					break;
++				case JS_TYPE_SCALAR:
++					res = JB_ROOT_IS_ARRAY(jb) && JB_ROOT_IS_SCALAR(jb);
++					break;
++				default:
++					res = false;
++					break;
++			}
++		}
++
++		/* Key uniqueness check is redundant for jsonb */
++	}
++	else
++		res = false;
++
++	*op->resvalue = BoolGetDatum(res);
++}
++
++
+ /*
+  * ExecEvalGroupingFunc
+  *
+diff --git a/src/backend/jit/llvm/llvmjit_expr.c b/src/backend/jit/llvm/llvmjit_expr.c
+index 12d39394b317..daefe66f40a6 100644
+--- a/src/backend/jit/llvm/llvmjit_expr.c
++++ b/src/backend/jit/llvm/llvmjit_expr.c
+@@ -1848,6 +1848,12 @@ llvm_compile_expr(ExprState *state)
+ 				LLVMBuildBr(b, opblocks[opno + 1]);
+ 				break;
+ 
++			case EEOP_IS_JSON:
++				build_EvalXFunc(b, mod, "ExecEvalJsonIsPredicate",
++								v_state, op);
++				LLVMBuildBr(b, opblocks[opno + 1]);
++				break;
++
+ 			case EEOP_AGGREF:
+ 				{
+ 					LLVMValueRef v_aggno;
+diff --git a/src/backend/jit/llvm/llvmjit_types.c b/src/backend/jit/llvm/llvmjit_types.c
+index 315eeb117209..f61d9390ee8b 100644
+--- a/src/backend/jit/llvm/llvmjit_types.c
++++ b/src/backend/jit/llvm/llvmjit_types.c
+@@ -133,6 +133,7 @@ void	   *referenced_functions[] =
+ 	ExecEvalWholeRowVar,
+ 	ExecEvalXmlExpr,
+ 	ExecEvalJsonConstructor,
++	ExecEvalJsonIsPredicate,
+ 	MakeExpandedObjectReadOnlyInternal,
+ 	slot_getmissingattrs,
+ 	slot_getsomeattrs_int,
+diff --git a/src/backend/nodes/makefuncs.c b/src/backend/nodes/makefuncs.c
+index 23c715280653..39e1884cf436 100644
+--- a/src/backend/nodes/makefuncs.c
++++ b/src/backend/nodes/makefuncs.c
+@@ -894,3 +894,22 @@ makeJsonKeyValue(Node *key, Node *value)
+ 
+ 	return (Node *) n;
+ }
++
++/*
++ * makeJsonIsPredicate -
++ *	  creates a JsonIsPredicate node
++ */
++Node *
++makeJsonIsPredicate(Node *expr, JsonFormat *format, JsonValueType item_type,
++					bool unique_keys, int location)
++{
++	JsonIsPredicate *n = makeNode(JsonIsPredicate);
++
++	n->expr = expr;
++	n->format = format;
++	n->item_type = item_type;
++	n->unique_keys = unique_keys;
++	n->location = location;
++
++	return (Node *) n;
++}
+diff --git a/src/backend/nodes/nodeFuncs.c b/src/backend/nodes/nodeFuncs.c
+index 69907fbcde83..fdb0c6b3fef0 100644
+--- a/src/backend/nodes/nodeFuncs.c
++++ b/src/backend/nodes/nodeFuncs.c
+@@ -261,6 +261,9 @@ exprType(const Node *expr)
+ 		case T_JsonConstructorExpr:
+ 			type = ((const JsonConstructorExpr *) expr)->returning->typid;
+ 			break;
++		case T_JsonIsPredicate:
++			type = BOOLOID;
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			type = InvalidOid;	/* keep compiler quiet */
+@@ -983,6 +986,9 @@ exprCollation(const Node *expr)
+ 					coll = InvalidOid;
+ 			}
+ 			break;
++		case T_JsonIsPredicate:
++			coll = InvalidOid;	/* result is always an boolean type */
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			coll = InvalidOid;	/* keep compiler quiet */
+@@ -1205,6 +1211,9 @@ exprSetCollation(Node *expr, Oid collation)
+ 													 * json[b] type */
+ 			}
+ 			break;
++		case T_JsonIsPredicate:
++			Assert(!OidIsValid(collation)); /* result is always boolean */
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			break;
+@@ -1653,6 +1662,9 @@ exprLocation(const Node *expr)
+ 		case T_JsonConstructorExpr:
+ 			loc = ((const JsonConstructorExpr *) expr)->location;
+ 			break;
++		case T_JsonIsPredicate:
++			loc = ((const JsonIsPredicate *) expr)->location;
++			break;
+ 		default:
+ 			/* for any other node type it's just unknown... */
+ 			loc = -1;
+@@ -2406,6 +2418,8 @@ expression_tree_walker_impl(Node *node,
+ 					return true;
+ 			}
+ 			break;
++		case T_JsonIsPredicate:
++			return walker(((JsonIsPredicate *) node)->expr, context);
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+@@ -3413,6 +3427,16 @@ expression_tree_mutator_impl(Node *node,
+ 				MUTATE(newnode->coercion, jve->coercion, Expr *);
+ 				MUTATE(newnode->returning, jve->returning, JsonReturning *);
+ 
++				return (Node *) newnode;
++			}
++		case T_JsonIsPredicate:
++			{
++				JsonIsPredicate *pred = (JsonIsPredicate *) node;
++				JsonIsPredicate *newnode;
++
++				FLATCOPY(newnode, pred, JsonIsPredicate);
++				MUTATE(newnode->expr, pred->expr, Node *);
++
+ 				return (Node *) newnode;
+ 			}
+ 		default:
+@@ -4261,6 +4285,8 @@ raw_expression_tree_walker_impl(Node *node,
+ 					return true;
+ 			}
+ 			break;
++		case T_JsonIsPredicate:
++			return walker(((JsonIsPredicate *) node)->expr, context);
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index f3ddc34afbe8..1b5daf6734b8 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -655,6 +655,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 					json_array_aggregate_order_by_clause_opt
+ 
+ %type <ival>		json_encoding_clause_opt
++					json_predicate_type_constraint
+ 
+ %type <boolean>		json_key_uniqueness_constraint_opt
+ 					json_object_constructor_null_clause_opt
+@@ -754,7 +755,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
+ 	ROUTINE ROUTINES ROW ROWS RULE
+ 
+-	SAVEPOINT SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT SEQUENCE SEQUENCES
++	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
++	SEQUENCE SEQUENCES
+ 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
+ 	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SQL_P STABLE STANDALONE_P
+ 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRIP_P
+@@ -818,6 +820,12 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ %nonassoc	'<' '>' '=' LESS_EQUALS GREATER_EQUALS NOT_EQUALS
+ %nonassoc	BETWEEN IN_P LIKE ILIKE SIMILAR NOT_LA
+ %nonassoc	ESCAPE			/* ESCAPE must be just above LIKE/ILIKE/SIMILAR */
++
++/* SQL/JSON related keywords */
++%nonassoc	UNIQUE JSON
++%nonassoc	KEYS OBJECT_P SCALAR VALUE_P
++%nonassoc	WITH WITHOUT_LA
++
+ /*
+  * To support target_el without AS, it used to be necessary to assign IDENT an
+  * explicit precedence just less than Op.  While that's not really necessary
+@@ -14850,6 +14858,44 @@ a_expr:		c_expr									{ $$ = $1; }
+ 														   @2),
+ 									 @2);
+ 				}
++			| a_expr IS json_predicate_type_constraint
++					json_key_uniqueness_constraint_opt		%prec IS
++				{
++					JsonFormat *format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
++
++					$$ = makeJsonIsPredicate($1, format, $3, $4, @1);
++				}
++			/*
++			 * Required by SQL/JSON, but there are conflicts
++			| a_expr
++				FORMAT_LA JSON json_encoding_clause_opt
++				IS  json_predicate_type_constraint
++					json_key_uniqueness_constraint_opt		%prec IS
++				{
++					$3.location = @2;
++					$$ = makeJsonIsPredicate($1, $3, $5, $6, @1);
++				}
++			*/
++			| a_expr IS NOT
++					json_predicate_type_constraint
++					json_key_uniqueness_constraint_opt		%prec IS
++				{
++					JsonFormat *format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
++
++					$$ = makeNotExpr(makeJsonIsPredicate($1, format, $4, $5, @1), @1);
++				}
++			/*
++			 * Required by SQL/JSON, but there are conflicts
++			| a_expr
++				FORMAT_LA JSON json_encoding_clause_opt
++				IS NOT
++					json_predicate_type_constraint
++					json_key_uniqueness_constraint_opt		%prec IS
++				{
++					$3.location = @2;
++					$$ = makeNotExpr(makeJsonIsPredicate($1, $3, $6, $7, @1), @1);
++				}
++			*/
+ 			| DEFAULT
+ 				{
+ 					/*
+@@ -16406,13 +16452,21 @@ json_output_clause_opt:
+ 			| /* EMPTY */							{ $$ = NULL; }
+ 		;
+ 
++json_predicate_type_constraint:
++			JSON									{ $$ = JS_TYPE_ANY; }
++			| JSON VALUE_P							{ $$ = JS_TYPE_ANY; }
++			| JSON ARRAY							{ $$ = JS_TYPE_ARRAY; }
++			| JSON OBJECT_P							{ $$ = JS_TYPE_OBJECT; }
++			| JSON SCALAR							{ $$ = JS_TYPE_SCALAR; }
++		;
++
+ /* KEYS is a noise word here */
+ json_key_uniqueness_constraint_opt:
+-			WITH UNIQUE KEYS				{ $$ = true; }
+-			| WITH UNIQUE				    { $$ = true; }
+-			| WITHOUT_LA UNIQUE KEYS		{ $$ = false; }
+-			| WITHOUT_LA UNIQUE			    { $$ = false; }
+-			| /* EMPTY */ 					{ $$ = false; }
++			WITH UNIQUE KEYS							{ $$ = true; }
++			| WITH UNIQUE								{ $$ = true; }
++			| WITHOUT_LA UNIQUE KEYS					{ $$ = false; }
++			| WITHOUT_LA UNIQUE							{ $$ = false; }
++			| /* EMPTY */ 				%prec KEYS		{ $$ = false; }
+ 		;
+ 
+ json_name_and_value_list:
+@@ -17182,6 +17236,7 @@ unreserved_keyword:
+ 			| ROWS
+ 			| RULE
+ 			| SAVEPOINT
++			| SCALAR
+ 			| SCHEMA
+ 			| SCHEMAS
+ 			| SCROLL
+@@ -17784,6 +17839,7 @@ bare_label_keyword:
+ 			| ROWS
+ 			| RULE
+ 			| SAVEPOINT
++			| SCALAR
+ 			| SCHEMA
+ 			| SCHEMAS
+ 			| SCROLL
+diff --git a/src/backend/parser/parse_expr.c b/src/backend/parser/parse_expr.c
+index 737b479f5418..4c99dd1dec3b 100644
+--- a/src/backend/parser/parse_expr.c
++++ b/src/backend/parser/parse_expr.c
+@@ -83,6 +83,7 @@ static Node *transformJsonArrayQueryConstructor(ParseState *pstate,
+ 												JsonArrayQueryConstructor *ctor);
+ static Node *transformJsonObjectAgg(ParseState *pstate, JsonObjectAgg *agg);
+ static Node *transformJsonArrayAgg(ParseState *pstate, JsonArrayAgg *agg);
++static Node *transformJsonIsPredicate(ParseState *pstate, JsonIsPredicate *p);
+ static Node *make_row_comparison_op(ParseState *pstate, List *opname,
+ 									List *largs, List *rargs, int location);
+ static Node *make_row_distinct_op(ParseState *pstate, List *opname,
+@@ -325,6 +326,10 @@ transformExprRecurse(ParseState *pstate, Node *expr)
+ 			result = transformJsonArrayAgg(pstate, (JsonArrayAgg *) expr);
+ 			break;
+ 
++		case T_JsonIsPredicate:
++			result = transformJsonIsPredicate(pstate, (JsonIsPredicate *) expr);
++			break;
++
+ 		default:
+ 			/* should not reach here */
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+@@ -3818,3 +3823,74 @@ transformJsonArrayConstructor(ParseState *pstate, JsonArrayConstructor *ctor)
+ 								   returning, false, ctor->absent_on_null,
+ 								   ctor->location);
+ }
++
++static Node *
++transformJsonParseArg(ParseState *pstate, Node *jsexpr, JsonFormat *format,
++					  Oid *exprtype)
++{
++	Node	   *raw_expr = transformExprRecurse(pstate, jsexpr);
++	Node	   *expr = raw_expr;
++
++	*exprtype = exprType(expr);
++
++	/* prepare input document */
++	if (*exprtype == BYTEAOID)
++	{
++		JsonValueExpr *jve;
++
++		expr = makeCaseTestExpr(raw_expr);
++		expr = makeJsonByteaToTextConversion(expr, format, exprLocation(expr));
++		*exprtype = TEXTOID;
++
++		jve = makeJsonValueExpr((Expr *) raw_expr, format);
++
++		jve->formatted_expr = (Expr *) expr;
++		expr = (Node *) jve;
++	}
++	else
++	{
++		char		typcategory;
++		bool		typispreferred;
++
++		get_type_category_preferred(*exprtype, &typcategory, &typispreferred);
++
++		if (*exprtype == UNKNOWNOID || typcategory == TYPCATEGORY_STRING)
++		{
++			expr = coerce_to_target_type(pstate, (Node *) expr, *exprtype,
++										 TEXTOID, -1,
++										 COERCION_IMPLICIT,
++										 COERCE_IMPLICIT_CAST, -1);
++			*exprtype = TEXTOID;
++		}
++
++		if (format->encoding != JS_ENC_DEFAULT)
++			ereport(ERROR,
++					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++					 parser_errposition(pstate, format->location),
++					 errmsg("cannot use JSON FORMAT ENCODING clause for non-bytea input types")));
++	}
++
++	return expr;
++}
++
++/*
++ * Transform IS JSON predicate.
++ */
++static Node *
++transformJsonIsPredicate(ParseState *pstate, JsonIsPredicate *pred)
++{
++	Oid			exprtype;
++	Node	   *expr = transformJsonParseArg(pstate, pred->expr, pred->format,
++											 &exprtype);
++
++	/* make resulting expression */
++	if (exprtype != TEXTOID && exprtype != JSONOID && exprtype != JSONBOID)
++		ereport(ERROR,
++				(errcode(ERRCODE_DATATYPE_MISMATCH),
++				 errmsg("cannot use type %s in IS JSON predicate",
++						format_type_be(exprtype))));
++
++	/* This intentionally(?) drops the format clause. */
++	return makeJsonIsPredicate(expr, NULL, pred->item_type,
++							   pred->unique_keys, pred->location);
++}
+diff --git a/src/backend/utils/adt/json.c b/src/backend/utils/adt/json.c
+index dcd2bb2234ab..49080e5fbfff 100644
+--- a/src/backend/utils/adt/json.c
++++ b/src/backend/utils/adt/json.c
+@@ -62,6 +62,23 @@ typedef struct JsonUniqueHashEntry
+ 	int			object_id;
+ } JsonUniqueHashEntry;
+ 
++/* Stack element for key uniqueness check during JSON parsing */
++typedef struct JsonUniqueStackEntry
++{
++	struct JsonUniqueStackEntry *parent;
++	int			object_id;
++} JsonUniqueStackEntry;
++
++/* Context struct for key uniqueness check during JSON parsing */
++typedef struct JsonUniqueParsingState
++{
++	JsonLexContext *lex;
++	JsonUniqueCheckState check;
++	JsonUniqueStackEntry *stack;
++	int			id_counter;
++	bool		unique;
++} JsonUniqueParsingState;
++
+ /* Context struct for key uniqueness check during JSON building */
+ typedef struct JsonUniqueBuilderState
+ {
+@@ -1648,6 +1665,110 @@ escape_json(StringInfo buf, const char *str)
+ 	appendStringInfoCharMacro(buf, '"');
+ }
+ 
++/* Semantic actions for key uniqueness check */
++static JsonParseErrorType
++json_unique_object_start(void *_state)
++{
++	JsonUniqueParsingState *state = _state;
++	JsonUniqueStackEntry *entry;
++
++	if (!state->unique)
++		return JSON_SUCCESS;
++
++	/* push object entry to stack */
++	entry = palloc(sizeof(*entry));
++	entry->object_id = state->id_counter++;
++	entry->parent = state->stack;
++	state->stack = entry;
++
++	return JSON_SUCCESS;
++}
++
++static JsonParseErrorType
++json_unique_object_end(void *_state)
++{
++	JsonUniqueParsingState *state = _state;
++	JsonUniqueStackEntry *entry;
++
++	if (!state->unique)
++		return JSON_SUCCESS;
++
++	entry = state->stack;
++	state->stack = entry->parent;	/* pop object from stack */
++	pfree(entry);
++	return JSON_SUCCESS;
++}
++
++static JsonParseErrorType
++json_unique_object_field_start(void *_state, char *field, bool isnull)
++{
++	JsonUniqueParsingState *state = _state;
++	JsonUniqueStackEntry *entry;
++
++	if (!state->unique)
++		return JSON_SUCCESS;
++
++	/* find key collision in the current object */
++	if (json_unique_check_key(&state->check, field, state->stack->object_id))
++		return JSON_SUCCESS;
++
++	state->unique = false;
++
++	/* pop all objects entries */
++	while ((entry = state->stack))
++	{
++		state->stack = entry->parent;
++		pfree(entry);
++	}
++	return JSON_SUCCESS;
++}
++
++/* Validate JSON text and additionally check key uniqueness */
++bool
++json_validate(text *json, bool check_unique_keys, bool throw_error)
++{
++	JsonLexContext *lex = makeJsonLexContext(json, check_unique_keys);
++	JsonSemAction uniqueSemAction = {0};
++	JsonUniqueParsingState state;
++	JsonParseErrorType result;
++
++	if (check_unique_keys)
++	{
++		state.lex = lex;
++		state.stack = NULL;
++		state.id_counter = 0;
++		state.unique = true;
++		json_unique_check_init(&state.check);
++
++		uniqueSemAction.semstate = &state;
++		uniqueSemAction.object_start = json_unique_object_start;
++		uniqueSemAction.object_field_start = json_unique_object_field_start;
++		uniqueSemAction.object_end = json_unique_object_end;
++	}
++
++	result = pg_parse_json(lex, check_unique_keys ? &uniqueSemAction : &nullSemAction);
++
++	if (result != JSON_SUCCESS)
++	{
++		if (throw_error)
++			json_errsave_error(result, lex, NULL);
++
++		return false;			/* invalid json */
++	}
++
++	if (check_unique_keys && !state.unique)
++	{
++		if (throw_error)
++			ereport(ERROR,
++					(errcode(ERRCODE_DUPLICATE_JSON_OBJECT_KEY_VALUE),
++					 errmsg("duplicate JSON object key value")));
++
++		return false;			/* not unique keys */
++	}
++
++	return true;				/* ok */
++}
++
+ /*
+  * SQL function json_typeof(json) -> text
+  *
+@@ -1663,21 +1784,18 @@ escape_json(StringInfo buf, const char *str)
+ Datum
+ json_typeof(PG_FUNCTION_ARGS)
+ {
+-	text	   *json;
+-
+-	JsonLexContext *lex;
+-	JsonTokenType tok;
++	text	   *json = PG_GETARG_TEXT_PP(0);
++	JsonLexContext *lex = makeJsonLexContext(json, false);
+ 	char	   *type;
++	JsonTokenType tok;
+ 	JsonParseErrorType result;
+ 
+-	json = PG_GETARG_TEXT_PP(0);
+-	lex = makeJsonLexContext(json, false);
+-
+ 	/* Lex exactly one token from the input and check its type. */
+ 	result = json_lex(lex);
+ 	if (result != JSON_SUCCESS)
+ 		json_errsave_error(result, lex, NULL);
+ 	tok = lex->token_type;
++
+ 	switch (tok)
+ 	{
+ 		case JSON_TOKEN_OBJECT_START:
+diff --git a/src/backend/utils/adt/jsonfuncs.c b/src/backend/utils/adt/jsonfuncs.c
+index 7a36f74dad45..4c5abaff257e 100644
+--- a/src/backend/utils/adt/jsonfuncs.c
++++ b/src/backend/utils/adt/jsonfuncs.c
+@@ -5665,3 +5665,23 @@ transform_string_values_scalar(void *state, char *token, JsonTokenType tokentype
+ 
+ 	return JSON_SUCCESS;
+ }
++
++JsonTokenType
++json_get_first_token(text *json, bool throw_error)
++{
++	JsonLexContext *lex;
++	JsonParseErrorType result;
++
++	lex = makeJsonLexContext(json, false);
++
++	/* Lex exactly one token from the input and check its type. */
++	result = json_lex(lex);
++
++	if (result == JSON_SUCCESS)
++		return lex->token_type;
++
++	if (throw_error)
++		json_errsave_error(result, lex, NULL);
++
++	return JSON_TOKEN_INVALID;	/* invalid json */
++}
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index 1c078d700d45..461735e84f0a 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -8227,6 +8227,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
+ 		case T_NullTest:
+ 		case T_BooleanTest:
+ 		case T_DistinctExpr:
++		case T_JsonIsPredicate:
+ 			switch (nodeTag(parentNode))
+ 			{
+ 				case T_FuncExpr:
+@@ -9530,6 +9531,42 @@ get_rule_expr(Node *node, deparse_context *context,
+ 			get_json_constructor((JsonConstructorExpr *) node, context, false);
+ 			break;
+ 
++		case T_JsonIsPredicate:
++			{
++				JsonIsPredicate *pred = (JsonIsPredicate *) node;
++
++				if (!PRETTY_PAREN(context))
++					appendStringInfoChar(context->buf, '(');
++
++				get_rule_expr_paren(pred->expr, context, true, node);
++
++				appendStringInfoString(context->buf, " IS JSON");
++
++				/* TODO: handle FORMAT clause */
++
++				switch (pred->item_type)
++				{
++					case JS_TYPE_SCALAR:
++						appendStringInfoString(context->buf, " SCALAR");
++						break;
++					case JS_TYPE_ARRAY:
++						appendStringInfoString(context->buf, " ARRAY");
++						break;
++					case JS_TYPE_OBJECT:
++						appendStringInfoString(context->buf, " OBJECT");
++						break;
++					default:
++						break;
++				}
++
++				if (pred->unique_keys)
++					appendStringInfoString(context->buf, " WITH UNIQUE KEYS");
++
++				if (!PRETTY_PAREN(context))
++					appendStringInfoChar(context->buf, ')');
++			}
++			break;
++
+ 		case T_List:
+ 			{
+ 				char	   *sep;
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 2419f2b11de2..81e78230e4e9 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -57,6 +57,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202303301
++#define CATALOG_VERSION_NO	202303311
+ 
+ #endif
+diff --git a/src/include/executor/execExpr.h b/src/include/executor/execExpr.h
+index 53e2c9a467aa..ea3ac10876fa 100644
+--- a/src/include/executor/execExpr.h
++++ b/src/include/executor/execExpr.h
+@@ -236,6 +236,7 @@ typedef enum ExprEvalOp
+ 	EEOP_HASHED_SCALARARRAYOP,
+ 	EEOP_XMLEXPR,
+ 	EEOP_JSON_CONSTRUCTOR,
++	EEOP_IS_JSON,
+ 	EEOP_AGGREF,
+ 	EEOP_GROUPING_FUNC,
+ 	EEOP_WINDOW_FUNC,
+@@ -675,6 +676,12 @@ typedef struct ExprEvalStep
+ 			int			setoff;
+ 		}			agg_trans;
+ 
++		/* for EEOP_IS_JSON */
++		struct
++		{
++			JsonIsPredicate *pred;	/* original expression node */
++		}			is_json;
++
+ 	}			d;
+ } ExprEvalStep;
+ 
+@@ -789,6 +796,7 @@ extern void ExecEvalConstraintCheck(ExprState *state, ExprEvalStep *op);
+ extern void ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op);
+ extern void ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
+ 									ExprContext *econtext);
++extern void ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op);
+ extern void ExecEvalGroupingFunc(ExprState *state, ExprEvalStep *op);
+ extern void ExecEvalSubPlan(ExprState *state, ExprEvalStep *op,
+ 							ExprContext *econtext);
+diff --git a/src/include/nodes/makefuncs.h b/src/include/nodes/makefuncs.h
+index 50aa00e0c1b4..06d991b7257f 100644
+--- a/src/include/nodes/makefuncs.h
++++ b/src/include/nodes/makefuncs.h
+@@ -112,6 +112,9 @@ extern JsonFormat *makeJsonFormat(JsonFormatType type, JsonEncoding encoding,
+ 								  int location);
+ extern JsonValueExpr *makeJsonValueExpr(Expr *expr, JsonFormat *format);
+ extern Node *makeJsonKeyValue(Node *key, Node *value);
++extern Node *makeJsonIsPredicate(Node *expr, JsonFormat *format,
++								 JsonValueType item_type, bool unique_keys,
++								 int location);
+ extern JsonEncoding makeJsonEncoding(char *name);
+ 
+ #endif							/* MAKEFUNC_H */
+diff --git a/src/include/nodes/primnodes.h b/src/include/nodes/primnodes.h
+index 1764b61cdbd7..be9c29f0bfb0 100644
+--- a/src/include/nodes/primnodes.h
++++ b/src/include/nodes/primnodes.h
+@@ -1583,6 +1583,32 @@ typedef struct JsonConstructorExpr
+ 	int			location;
+ } JsonConstructorExpr;
+ 
++/*
++ * JsonValueType -
++ *		representation of JSON item type in IS JSON predicate
++ */
++typedef enum JsonValueType
++{
++	JS_TYPE_ANY,				/* IS JSON [VALUE] */
++	JS_TYPE_OBJECT,				/* IS JSON OBJECT */
++	JS_TYPE_ARRAY,				/* IS JSON ARRAY */
++	JS_TYPE_SCALAR				/* IS JSON SCALAR */
++} JsonValueType;
++
++/*
++ * JsonIsPredicate -
++ *		representation of IS JSON predicate
++ */
++typedef struct JsonIsPredicate
++{
++	NodeTag		type;
++	Node	   *expr;			/* subject expression */
++	JsonFormat *format;			/* FORMAT clause, if specified */
++	JsonValueType item_type;	/* JSON item type */
++	bool		unique_keys;	/* check key uniqueness? */
++	int			location;		/* token location, or -1 if unknown */
++} JsonIsPredicate;
++
+ /* ----------------
+  * NullTest
+  *
+diff --git a/src/include/parser/kwlist.h b/src/include/parser/kwlist.h
+index 868f389a04dd..f5b2e61ca527 100644
+--- a/src/include/parser/kwlist.h
++++ b/src/include/parser/kwlist.h
+@@ -376,6 +376,7 @@ PG_KEYWORD("row", ROW, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("rows", ROWS, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("rule", RULE, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("savepoint", SAVEPOINT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("scalar", SCALAR, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("schema", SCHEMA, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("schemas", SCHEMAS, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("scroll", SCROLL, UNRESERVED_KEYWORD, BARE_LABEL)
+diff --git a/src/include/utils/json.h b/src/include/utils/json.h
+index b75f7d929dd4..35a9a5545d85 100644
+--- a/src/include/utils/json.h
++++ b/src/include/utils/json.h
+@@ -26,5 +26,6 @@ extern Datum json_build_object_worker(int nargs, Datum *args, bool *nulls,
+ 									  bool unique_keys);
+ extern Datum json_build_array_worker(int nargs, Datum *args, bool *nulls,
+ 									 Oid *types, bool absent_on_null);
++extern bool json_validate(text *json, bool check_unique_keys, bool throw_error);
+ 
+ #endif							/* JSON_H */
+diff --git a/src/include/utils/jsonfuncs.h b/src/include/utils/jsonfuncs.h
+index fc610f65031b..a85203d4a4ba 100644
+--- a/src/include/utils/jsonfuncs.h
++++ b/src/include/utils/jsonfuncs.h
+@@ -50,6 +50,9 @@ extern bool pg_parse_json_or_errsave(JsonLexContext *lex, JsonSemAction *sem,
+ extern void json_errsave_error(JsonParseErrorType error, JsonLexContext *lex,
+ 							   struct Node *escontext);
+ 
++/* get first JSON token */
++extern JsonTokenType json_get_first_token(text *json, bool throw_error);
++
+ extern uint32 parse_jsonb_index_flags(Jsonb *jb);
+ extern void iterate_jsonb_values(Jsonb *jb, uint32 flags, void *state,
+ 								 JsonIterateStringValuesAction action);
+diff --git a/src/interfaces/ecpg/test/expected/sql-sqljson.c b/src/interfaces/ecpg/test/expected/sql-sqljson.c
+index 64784542ed62..a2c49b54f99e 100644
+--- a/src/interfaces/ecpg/test/expected/sql-sqljson.c
++++ b/src/interfaces/ecpg/test/expected/sql-sqljson.c
+@@ -100,103 +100,132 @@ main ()
+ {
+ /* exec sql begin declare section */
+    
++   
+ 
+ #line 12 "sqljson.pgc"
+  char json [ 1024 ] ;
+-/* exec sql end declare section */
++ 
+ #line 13 "sqljson.pgc"
++ bool is_json [ 8 ] ;
++/* exec sql end declare section */
++#line 14 "sqljson.pgc"
+ 
+ 
+   ECPGdebug (1, stderr);
+ 
+   { ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); 
+-#line 17 "sqljson.pgc"
++#line 18 "sqljson.pgc"
+ 
+ if (sqlca.sqlcode < 0) sqlprint();}
+-#line 17 "sqljson.pgc"
++#line 18 "sqljson.pgc"
+ 
+   { ECPGsetcommit(__LINE__, "on", NULL);
+-#line 18 "sqljson.pgc"
++#line 19 "sqljson.pgc"
+ 
+ if (sqlca.sqlcode < 0) sqlprint();}
+-#line 18 "sqljson.pgc"
++#line 19 "sqljson.pgc"
+ 
+ 
+   { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select json_object ( returning text )", ECPGt_EOIT, 
+ 	ECPGt_char,(json),(long)1024,(long)1,(1024)*sizeof(char), 
+ 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
+-#line 20 "sqljson.pgc"
++#line 21 "sqljson.pgc"
+ 
+ if (sqlca.sqlcode < 0) sqlprint();}
+-#line 20 "sqljson.pgc"
++#line 21 "sqljson.pgc"
+ 
+   printf("Found json=%s\n", json);
+ 
+   { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select json_object ( returning text format json )", ECPGt_EOIT, 
+ 	ECPGt_char,(json),(long)1024,(long)1,(1024)*sizeof(char), 
+ 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
+-#line 23 "sqljson.pgc"
++#line 24 "sqljson.pgc"
+ 
+ if (sqlca.sqlcode < 0) sqlprint();}
+-#line 23 "sqljson.pgc"
++#line 24 "sqljson.pgc"
+ 
+   printf("Found json=%s\n", json);
+ 
+   { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select json_array ( returning jsonb )", ECPGt_EOIT, 
+ 	ECPGt_char,(json),(long)1024,(long)1,(1024)*sizeof(char), 
+ 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
+-#line 26 "sqljson.pgc"
++#line 27 "sqljson.pgc"
+ 
+ if (sqlca.sqlcode < 0) sqlprint();}
+-#line 26 "sqljson.pgc"
++#line 27 "sqljson.pgc"
+ 
+   printf("Found json=%s\n", json);
+ 
+   { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select json_array ( returning jsonb format json )", ECPGt_EOIT, 
+ 	ECPGt_char,(json),(long)1024,(long)1,(1024)*sizeof(char), 
+ 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
+-#line 29 "sqljson.pgc"
++#line 30 "sqljson.pgc"
+ 
+ if (sqlca.sqlcode < 0) sqlprint();}
+-#line 29 "sqljson.pgc"
++#line 30 "sqljson.pgc"
+ 
+   printf("Found json=%s\n", json);
+ 
+   { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select json_object ( 1 : 1 , '1' : null with unique )", ECPGt_EOIT, 
+ 	ECPGt_char,(json),(long)1024,(long)1,(1024)*sizeof(char), 
+ 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
+-#line 32 "sqljson.pgc"
++#line 33 "sqljson.pgc"
+ 
+ if (sqlca.sqlcode < 0) sqlprint();}
+-#line 32 "sqljson.pgc"
++#line 33 "sqljson.pgc"
+ 
+   // error
+ 
+   { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select json_object ( 1 : 1 , '2' : null , 1 : '2' absent on null without unique keys )", ECPGt_EOIT, 
+ 	ECPGt_char,(json),(long)1024,(long)1,(1024)*sizeof(char), 
+ 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
+-#line 35 "sqljson.pgc"
++#line 36 "sqljson.pgc"
+ 
+ if (sqlca.sqlcode < 0) sqlprint();}
+-#line 35 "sqljson.pgc"
++#line 36 "sqljson.pgc"
+ 
+   printf("Found json=%s\n", json);
+ 
+   { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select json_object ( 1 : 1 , '2' : null absent on null without unique returning jsonb )", ECPGt_EOIT, 
+ 	ECPGt_char,(json),(long)1024,(long)1,(1024)*sizeof(char), 
+ 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
+-#line 38 "sqljson.pgc"
++#line 39 "sqljson.pgc"
+ 
+ if (sqlca.sqlcode < 0) sqlprint();}
+-#line 38 "sqljson.pgc"
++#line 39 "sqljson.pgc"
+ 
+   printf("Found json=%s\n", json);
+ 
++  { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "with val ( js ) as ( values ( '{ \"a\": 1, \"b\": [{ \"a\": 1, \"b\": 0, \"a\": 2 }] }' ) ) select js is json \"IS JSON\" , js is not json \"IS NOT JSON\" , js is json value \"IS VALUE\" , js is json object \"IS OBJECT\" , js is json array \"IS ARRAY\" , js is json scalar \"IS SCALAR\" , js is json without unique keys \"WITHOUT UNIQUE\" , js is json with unique keys \"WITH UNIQUE\" from val", ECPGt_EOIT, 
++	ECPGt_bool,&(is_json[0]),(long)1,(long)1,sizeof(bool), 
++	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
++	ECPGt_bool,&(is_json[1]),(long)1,(long)1,sizeof(bool), 
++	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
++	ECPGt_bool,&(is_json[2]),(long)1,(long)1,sizeof(bool), 
++	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
++	ECPGt_bool,&(is_json[3]),(long)1,(long)1,sizeof(bool), 
++	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
++	ECPGt_bool,&(is_json[4]),(long)1,(long)1,sizeof(bool), 
++	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
++	ECPGt_bool,&(is_json[5]),(long)1,(long)1,sizeof(bool), 
++	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
++	ECPGt_bool,&(is_json[6]),(long)1,(long)1,sizeof(bool), 
++	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
++	ECPGt_bool,&(is_json[7]),(long)1,(long)1,sizeof(bool), 
++	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
++#line 54 "sqljson.pgc"
++
++if (sqlca.sqlcode < 0) sqlprint();}
++#line 54 "sqljson.pgc"
++
++	  for (int i = 0; i < sizeof(is_json); i++)
++		  printf("Found is_json[%d]: %s\n", i, is_json[i] ? "true" : "false");
++
+   { ECPGdisconnect(__LINE__, "CURRENT");
+-#line 41 "sqljson.pgc"
++#line 58 "sqljson.pgc"
+ 
+ if (sqlca.sqlcode < 0) sqlprint();}
+-#line 41 "sqljson.pgc"
++#line 58 "sqljson.pgc"
+ 
+ 
+   return 0;
+diff --git a/src/interfaces/ecpg/test/expected/sql-sqljson.stderr b/src/interfaces/ecpg/test/expected/sql-sqljson.stderr
+index 907f773eb980..1252cb3b66ac 100644
+--- a/src/interfaces/ecpg/test/expected/sql-sqljson.stderr
++++ b/src/interfaces/ecpg/test/expected/sql-sqljson.stderr
+@@ -2,68 +2,90 @@
+ [NO_PID]: sqlca: code: 0, state: 00000
+ [NO_PID]: ECPGconnect: opening database ecpg1_regression on <DEFAULT> port <DEFAULT>  
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ECPGsetcommit on line 18: action "on"; connection "ecpg1_regression"
++[NO_PID]: ECPGsetcommit on line 19: action "on"; connection "ecpg1_regression"
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 20: query: select json_object ( returning text ); with 0 parameter(s) on connection ecpg1_regression
++[NO_PID]: ecpg_execute on line 21: query: select json_object ( returning text ); with 0 parameter(s) on connection ecpg1_regression
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 20: using PQexec
++[NO_PID]: ecpg_execute on line 21: using PQexec
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_process_output on line 20: correctly got 1 tuples with 1 fields
++[NO_PID]: ecpg_process_output on line 21: correctly got 1 tuples with 1 fields
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_get_data on line 20: RESULT: {} offset: -1; array: no
++[NO_PID]: ecpg_get_data on line 21: RESULT: {} offset: -1; array: no
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 23: query: select json_object ( returning text format json ); with 0 parameter(s) on connection ecpg1_regression
++[NO_PID]: ecpg_execute on line 24: query: select json_object ( returning text format json ); with 0 parameter(s) on connection ecpg1_regression
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 23: using PQexec
++[NO_PID]: ecpg_execute on line 24: using PQexec
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_process_output on line 23: correctly got 1 tuples with 1 fields
++[NO_PID]: ecpg_process_output on line 24: correctly got 1 tuples with 1 fields
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_get_data on line 23: RESULT: {} offset: -1; array: no
++[NO_PID]: ecpg_get_data on line 24: RESULT: {} offset: -1; array: no
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 26: query: select json_array ( returning jsonb ); with 0 parameter(s) on connection ecpg1_regression
++[NO_PID]: ecpg_execute on line 27: query: select json_array ( returning jsonb ); with 0 parameter(s) on connection ecpg1_regression
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 26: using PQexec
++[NO_PID]: ecpg_execute on line 27: using PQexec
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_process_output on line 26: correctly got 1 tuples with 1 fields
++[NO_PID]: ecpg_process_output on line 27: correctly got 1 tuples with 1 fields
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_is_type_an_array on line 26: type (3802); C (1); array (no)
++[NO_PID]: ecpg_is_type_an_array on line 27: type (3802); C (1); array (no)
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_get_data on line 26: RESULT: [] offset: -1; array: no
++[NO_PID]: ecpg_get_data on line 27: RESULT: [] offset: -1; array: no
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 29: query: select json_array ( returning jsonb format json ); with 0 parameter(s) on connection ecpg1_regression
++[NO_PID]: ecpg_execute on line 30: query: select json_array ( returning jsonb format json ); with 0 parameter(s) on connection ecpg1_regression
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 29: using PQexec
++[NO_PID]: ecpg_execute on line 30: using PQexec
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_process_output on line 29: correctly got 1 tuples with 1 fields
++[NO_PID]: ecpg_process_output on line 30: correctly got 1 tuples with 1 fields
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_get_data on line 29: RESULT: [] offset: -1; array: no
++[NO_PID]: ecpg_get_data on line 30: RESULT: [] offset: -1; array: no
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 32: query: select json_object ( 1 : 1 , '1' : null with unique ); with 0 parameter(s) on connection ecpg1_regression
++[NO_PID]: ecpg_execute on line 33: query: select json_object ( 1 : 1 , '1' : null with unique ); with 0 parameter(s) on connection ecpg1_regression
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 32: using PQexec
++[NO_PID]: ecpg_execute on line 33: using PQexec
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_check_PQresult on line 32: bad response - ERROR:  duplicate JSON key "1"
++[NO_PID]: ecpg_check_PQresult on line 33: bad response - ERROR:  duplicate JSON key "1"
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: raising sqlstate 22030 (sqlcode -400): duplicate JSON key "1" on line 32
++[NO_PID]: raising sqlstate 22030 (sqlcode -400): duplicate JSON key "1" on line 33
+ [NO_PID]: sqlca: code: -400, state: 22030
+-SQL error: duplicate JSON key "1" on line 32
+-[NO_PID]: ecpg_execute on line 35: query: select json_object ( 1 : 1 , '2' : null , 1 : '2' absent on null without unique keys ); with 0 parameter(s) on connection ecpg1_regression
++SQL error: duplicate JSON key "1" on line 33
++[NO_PID]: ecpg_execute on line 36: query: select json_object ( 1 : 1 , '2' : null , 1 : '2' absent on null without unique keys ); with 0 parameter(s) on connection ecpg1_regression
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 35: using PQexec
++[NO_PID]: ecpg_execute on line 36: using PQexec
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_process_output on line 35: correctly got 1 tuples with 1 fields
++[NO_PID]: ecpg_process_output on line 36: correctly got 1 tuples with 1 fields
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_is_type_an_array on line 35: type (114); C (1); array (no)
++[NO_PID]: ecpg_is_type_an_array on line 36: type (114); C (1); array (no)
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_get_data on line 35: RESULT: {"1" : 1, "1" : "2"} offset: -1; array: no
++[NO_PID]: ecpg_get_data on line 36: RESULT: {"1" : 1, "1" : "2"} offset: -1; array: no
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 38: query: select json_object ( 1 : 1 , '2' : null absent on null without unique returning jsonb ); with 0 parameter(s) on connection ecpg1_regression
++[NO_PID]: ecpg_execute on line 39: query: select json_object ( 1 : 1 , '2' : null absent on null without unique returning jsonb ); with 0 parameter(s) on connection ecpg1_regression
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_execute on line 38: using PQexec
++[NO_PID]: ecpg_execute on line 39: using PQexec
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_process_output on line 38: correctly got 1 tuples with 1 fields
++[NO_PID]: ecpg_process_output on line 39: correctly got 1 tuples with 1 fields
+ [NO_PID]: sqlca: code: 0, state: 00000
+-[NO_PID]: ecpg_get_data on line 38: RESULT: {"1": 1} offset: -1; array: no
++[NO_PID]: ecpg_get_data on line 39: RESULT: {"1": 1} offset: -1; array: no
++[NO_PID]: sqlca: code: 0, state: 00000
++[NO_PID]: ecpg_execute on line 42: query: with val ( js ) as ( values ( '{ "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] }' ) ) select js is json "IS JSON" , js is not json "IS NOT JSON" , js is json value "IS VALUE" , js is json object "IS OBJECT" , js is json array "IS ARRAY" , js is json scalar "IS SCALAR" , js is json without unique keys "WITHOUT UNIQUE" , js is json with unique keys "WITH UNIQUE" from val; with 0 parameter(s) on connection ecpg1_regression
++[NO_PID]: sqlca: code: 0, state: 00000
++[NO_PID]: ecpg_execute on line 42: using PQexec
++[NO_PID]: sqlca: code: 0, state: 00000
++[NO_PID]: ecpg_process_output on line 42: correctly got 1 tuples with 8 fields
++[NO_PID]: sqlca: code: 0, state: 00000
++[NO_PID]: ecpg_get_data on line 42: RESULT: t offset: -1; array: no
++[NO_PID]: sqlca: code: 0, state: 00000
++[NO_PID]: ecpg_get_data on line 42: RESULT: f offset: -1; array: no
++[NO_PID]: sqlca: code: 0, state: 00000
++[NO_PID]: ecpg_get_data on line 42: RESULT: t offset: -1; array: no
++[NO_PID]: sqlca: code: 0, state: 00000
++[NO_PID]: ecpg_get_data on line 42: RESULT: t offset: -1; array: no
++[NO_PID]: sqlca: code: 0, state: 00000
++[NO_PID]: ecpg_get_data on line 42: RESULT: f offset: -1; array: no
++[NO_PID]: sqlca: code: 0, state: 00000
++[NO_PID]: ecpg_get_data on line 42: RESULT: f offset: -1; array: no
++[NO_PID]: sqlca: code: 0, state: 00000
++[NO_PID]: ecpg_get_data on line 42: RESULT: t offset: -1; array: no
++[NO_PID]: sqlca: code: 0, state: 00000
++[NO_PID]: ecpg_get_data on line 42: RESULT: f offset: -1; array: no
+ [NO_PID]: sqlca: code: 0, state: 00000
+ [NO_PID]: ecpg_finish: connection ecpg1_regression closed
+ [NO_PID]: sqlca: code: 0, state: 00000
+diff --git a/src/interfaces/ecpg/test/expected/sql-sqljson.stdout b/src/interfaces/ecpg/test/expected/sql-sqljson.stdout
+index aae052a2b9aa..558901c40680 100644
+--- a/src/interfaces/ecpg/test/expected/sql-sqljson.stdout
++++ b/src/interfaces/ecpg/test/expected/sql-sqljson.stdout
+@@ -4,3 +4,11 @@ Found json=[]
+ Found json=[]
+ Found json={"1" : 1, "1" : "2"}
+ Found json={"1": 1}
++Found is_json[0]: true
++Found is_json[1]: false
++Found is_json[2]: true
++Found is_json[3]: true
++Found is_json[4]: false
++Found is_json[5]: false
++Found is_json[6]: true
++Found is_json[7]: false
+diff --git a/src/interfaces/ecpg/test/sql/sqljson.pgc b/src/interfaces/ecpg/test/sql/sqljson.pgc
+index 6a582b5b1059..a00550383447 100644
+--- a/src/interfaces/ecpg/test/sql/sqljson.pgc
++++ b/src/interfaces/ecpg/test/sql/sqljson.pgc
+@@ -10,6 +10,7 @@ main ()
+ {
+ EXEC SQL BEGIN DECLARE SECTION;
+   char json[1024];
++  bool is_json[8];
+ EXEC SQL END DECLARE SECTION;
+ 
+   ECPGdebug (1, stderr);
+@@ -38,6 +39,22 @@ EXEC SQL END DECLARE SECTION;
+   EXEC SQL SELECT JSON_OBJECT(1: 1, '2': NULL ABSENT ON NULL WITHOUT UNIQUE RETURNING jsonb) INTO :json;
+   printf("Found json=%s\n", json);
+ 
++  EXEC SQL WITH val (js) AS (VALUES ('{ "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] }'))
++	  SELECT
++	  js IS JSON "IS JSON",
++	  js IS NOT JSON "IS NOT JSON",
++	  js IS JSON VALUE "IS VALUE",
++	  js IS JSON OBJECT "IS OBJECT",
++	  js IS JSON ARRAY "IS ARRAY",
++	  js IS JSON SCALAR "IS SCALAR",
++	  js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	  js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++		  INTO :is_json[0], :is_json[1], :is_json[2], :is_json[3], :is_json[4],
++		  :is_json[5], :is_json[6], :is_json[7]
++		  FROM val;
++	  for (int i = 0; i < sizeof(is_json); i++)
++		  printf("Found is_json[%d]: %s\n", i, is_json[i] ? "true" : "false");
++
+   EXEC SQL DISCONNECT;
+ 
+   return 0;
+diff --git a/src/test/regress/expected/sqljson.out b/src/test/regress/expected/sqljson.out
+index c4bfe80ba966..d73c7e2c6cc5 100644
+--- a/src/test/regress/expected/sqljson.out
++++ b/src/test/regress/expected/sqljson.out
+@@ -754,3 +754,201 @@ CREATE OR REPLACE VIEW public.json_array_subquery_view AS
+            FROM ( SELECT foo.i
+                    FROM ( VALUES (1), (2), (NULL::integer), (4)) foo(i)) q(a)) AS "json_array"
+ DROP VIEW json_array_subquery_view;
++-- IS JSON predicate
++SELECT NULL IS JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL IS NOT JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL::json IS JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL::jsonb IS JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL::text IS JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL::bytea IS JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL::int IS JSON;
++ERROR:  cannot use type integer in IS JSON predicate
++SELECT '' IS JSON;
++ ?column? 
++----------
++ f
++(1 row)
++
++SELECT bytea '\x00' IS JSON;
++ERROR:  invalid byte sequence for encoding "UTF8": 0x00
++CREATE TABLE test_is_json (js text);
++INSERT INTO test_is_json VALUES
++ (NULL),
++ (''),
++ ('123'),
++ ('"aaa "'),
++ ('true'),
++ ('null'),
++ ('[]'),
++ ('[1, "2", {}]'),
++ ('{}'),
++ ('{ "a": 1, "b": null }'),
++ ('{ "a": 1, "a": null }'),
++ ('{ "a": 1, "b": [{ "a": 1 }, { "a": 2 }] }'),
++ ('{ "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] }'),
++ ('aaa'),
++ ('{a:1}'),
++ ('["a",]');
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	test_is_json;
++                      js                       | IS JSON | IS NOT JSON | IS VALUE | IS OBJECT | IS ARRAY | IS SCALAR | WITHOUT UNIQUE | WITH UNIQUE 
++-----------------------------------------------+---------+-------------+----------+-----------+----------+-----------+----------------+-------------
++                                               |         |             |          |           |          |           |                | 
++                                               | f       | t           | f        | f         | f        | f         | f              | f
++ 123                                           | t       | f           | t        | f         | f        | t         | t              | t
++ "aaa "                                        | t       | f           | t        | f         | f        | t         | t              | t
++ true                                          | t       | f           | t        | f         | f        | t         | t              | t
++ null                                          | t       | f           | t        | f         | f        | t         | t              | t
++ []                                            | t       | f           | t        | f         | t        | f         | t              | t
++ [1, "2", {}]                                  | t       | f           | t        | f         | t        | f         | t              | t
++ {}                                            | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": null }                         | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "a": null }                         | t       | f           | t        | t         | f        | f         | t              | f
++ { "a": 1, "b": [{ "a": 1 }, { "a": 2 }] }     | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] } | t       | f           | t        | t         | f        | f         | t              | f
++ aaa                                           | f       | t           | f        | f         | f        | f         | f              | f
++ {a:1}                                         | f       | t           | f        | f         | f        | f         | f              | f
++ ["a",]                                        | f       | t           | f        | f         | f        | f         | f              | f
++(16 rows)
++
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js::json FROM test_is_json WHERE js IS JSON) foo(js);
++                      js                       | IS JSON | IS NOT JSON | IS VALUE | IS OBJECT | IS ARRAY | IS SCALAR | WITHOUT UNIQUE | WITH UNIQUE 
++-----------------------------------------------+---------+-------------+----------+-----------+----------+-----------+----------------+-------------
++ 123                                           | t       | f           | t        | f         | f        | t         | t              | t
++ "aaa "                                        | t       | f           | t        | f         | f        | t         | t              | t
++ true                                          | t       | f           | t        | f         | f        | t         | t              | t
++ null                                          | t       | f           | t        | f         | f        | t         | t              | t
++ []                                            | t       | f           | t        | f         | t        | f         | t              | t
++ [1, "2", {}]                                  | t       | f           | t        | f         | t        | f         | t              | t
++ {}                                            | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": null }                         | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "a": null }                         | t       | f           | t        | t         | f        | f         | t              | f
++ { "a": 1, "b": [{ "a": 1 }, { "a": 2 }] }     | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] } | t       | f           | t        | t         | f        | f         | t              | f
++(11 rows)
++
++SELECT
++	js0,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js, js::bytea FROM test_is_json WHERE js IS JSON) foo(js0, js);
++                      js0                      | IS JSON | IS NOT JSON | IS VALUE | IS OBJECT | IS ARRAY | IS SCALAR | WITHOUT UNIQUE | WITH UNIQUE 
++-----------------------------------------------+---------+-------------+----------+-----------+----------+-----------+----------------+-------------
++ 123                                           | t       | f           | t        | f         | f        | t         | t              | t
++ "aaa "                                        | t       | f           | t        | f         | f        | t         | t              | t
++ true                                          | t       | f           | t        | f         | f        | t         | t              | t
++ null                                          | t       | f           | t        | f         | f        | t         | t              | t
++ []                                            | t       | f           | t        | f         | t        | f         | t              | t
++ [1, "2", {}]                                  | t       | f           | t        | f         | t        | f         | t              | t
++ {}                                            | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": null }                         | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "a": null }                         | t       | f           | t        | t         | f        | f         | t              | f
++ { "a": 1, "b": [{ "a": 1 }, { "a": 2 }] }     | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] } | t       | f           | t        | t         | f        | f         | t              | f
++(11 rows)
++
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js::jsonb FROM test_is_json WHERE js IS JSON) foo(js);
++                 js                  | IS JSON | IS NOT JSON | IS VALUE | IS OBJECT | IS ARRAY | IS SCALAR | WITHOUT UNIQUE | WITH UNIQUE 
++-------------------------------------+---------+-------------+----------+-----------+----------+-----------+----------------+-------------
++ 123                                 | t       | f           | t        | f         | f        | t         | t              | t
++ "aaa "                              | t       | f           | t        | f         | f        | t         | t              | t
++ true                                | t       | f           | t        | f         | f        | t         | t              | t
++ null                                | t       | f           | t        | f         | f        | t         | t              | t
++ []                                  | t       | f           | t        | f         | t        | f         | t              | t
++ [1, "2", {}]                        | t       | f           | t        | f         | t        | f         | t              | t
++ {}                                  | t       | f           | t        | t         | f        | f         | t              | t
++ {"a": 1, "b": null}                 | t       | f           | t        | t         | f        | f         | t              | t
++ {"a": null}                         | t       | f           | t        | t         | f        | f         | t              | t
++ {"a": 1, "b": [{"a": 1}, {"a": 2}]} | t       | f           | t        | t         | f        | f         | t              | t
++ {"a": 1, "b": [{"a": 2, "b": 0}]}   | t       | f           | t        | t         | f        | f         | t              | t
++(11 rows)
++
++-- Test IS JSON deparsing
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT '1' IS JSON AS "any", ('1' || i) IS JSON SCALAR AS "scalar", '[]' IS NOT JSON ARRAY AS "array", '{}' IS JSON OBJECT WITH UNIQUE AS "object" FROM generate_series(1, 3) i;
++                                                                        QUERY PLAN                                                                        
++----------------------------------------------------------------------------------------------------------------------------------------------------------
++ Function Scan on pg_catalog.generate_series i
++   Output: ('1'::text IS JSON), (('1'::text || (i)::text) IS JSON SCALAR), (NOT ('[]'::text IS JSON ARRAY)), ('{}'::text IS JSON OBJECT WITH UNIQUE KEYS)
++   Function Call: generate_series(1, 3)
++(3 rows)
++
++CREATE VIEW is_json_view AS
++SELECT '1' IS JSON AS "any", ('1' || i) IS JSON SCALAR AS "scalar", '[]' IS NOT JSON ARRAY AS "array", '{}' IS JSON OBJECT WITH UNIQUE AS "object" FROM generate_series(1, 3) i;
++\sv is_json_view
++CREATE OR REPLACE VIEW public.is_json_view AS
++ SELECT '1'::text IS JSON AS "any",
++    ('1'::text || i) IS JSON SCALAR AS scalar,
++    NOT '[]'::text IS JSON ARRAY AS "array",
++    '{}'::text IS JSON OBJECT WITH UNIQUE KEYS AS object
++   FROM generate_series(1, 3) i(i)
++DROP VIEW is_json_view;
+diff --git a/src/test/regress/sql/sqljson.sql b/src/test/regress/sql/sqljson.sql
+index fbbf6a6d6e16..4fd820fd5153 100644
+--- a/src/test/regress/sql/sqljson.sql
++++ b/src/test/regress/sql/sqljson.sql
+@@ -282,3 +282,99 @@ SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING
+ \sv json_array_subquery_view
+ 
+ DROP VIEW json_array_subquery_view;
++
++-- IS JSON predicate
++SELECT NULL IS JSON;
++SELECT NULL IS NOT JSON;
++SELECT NULL::json IS JSON;
++SELECT NULL::jsonb IS JSON;
++SELECT NULL::text IS JSON;
++SELECT NULL::bytea IS JSON;
++SELECT NULL::int IS JSON;
++
++SELECT '' IS JSON;
++
++SELECT bytea '\x00' IS JSON;
++
++CREATE TABLE test_is_json (js text);
++
++INSERT INTO test_is_json VALUES
++ (NULL),
++ (''),
++ ('123'),
++ ('"aaa "'),
++ ('true'),
++ ('null'),
++ ('[]'),
++ ('[1, "2", {}]'),
++ ('{}'),
++ ('{ "a": 1, "b": null }'),
++ ('{ "a": 1, "a": null }'),
++ ('{ "a": 1, "b": [{ "a": 1 }, { "a": 2 }] }'),
++ ('{ "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] }'),
++ ('aaa'),
++ ('{a:1}'),
++ ('["a",]');
++
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	test_is_json;
++
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js::json FROM test_is_json WHERE js IS JSON) foo(js);
++
++SELECT
++	js0,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js, js::bytea FROM test_is_json WHERE js IS JSON) foo(js0, js);
++
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js::jsonb FROM test_is_json WHERE js IS JSON) foo(js);
++
++-- Test IS JSON deparsing
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT '1' IS JSON AS "any", ('1' || i) IS JSON SCALAR AS "scalar", '[]' IS NOT JSON ARRAY AS "array", '{}' IS JSON OBJECT WITH UNIQUE AS "object" FROM generate_series(1, 3) i;
++
++CREATE VIEW is_json_view AS
++SELECT '1' IS JSON AS "any", ('1' || i) IS JSON SCALAR AS "scalar", '[]' IS NOT JSON ARRAY AS "array", '{}' IS JSON OBJECT WITH UNIQUE AS "object" FROM generate_series(1, 3) i;
++
++\sv is_json_view
++
++DROP VIEW is_json_view;

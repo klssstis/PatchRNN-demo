@@ -1,0 +1,1965 @@
+From 06a7c3154f5bfad65549810cc84f0e3a77b408bf Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 18 Sep 2020 16:46:26 -0400
+Subject: [PATCH] Allow most keywords to be used as column labels without
+ requiring AS.
+
+Up to now, if you tried to omit "AS" before a column label in a SELECT
+list, it would only work if the column label was an IDENT, that is not
+any known keyword.  This is rather unfriendly considering that we have
+so many keywords and are constantly growing more.  In the wake of commit
+1ed6b8956 it's possible to improve matters quite a bit.
+
+We'd originally tried to make this work by having some of the existing
+keyword categories be allowed without AS, but that didn't work too well,
+because each category contains a few special cases that don't work
+without AS.  Instead, invent an entirely orthogonal keyword property
+"can be bare column label", and mark all keywords that way for which
+we don't get shift/reduce errors by doing so.
+
+It turns out that of our 450 current keywords, all but 39 can be made
+bare column labels, improving the situation by over 90%.  This number
+might move around a little depending on future grammar work, but it's
+a pretty nice improvement.
+
+Mark Dilger, based on work by myself and Robert Haas;
+review by John Naylor
+
+Discussion: https://postgr.es/m/38ca86db-42ab-9b48-2902-337a0d6b8311@2ndquadrant.com
+---
+ doc/src/sgml/func.sgml                  |  13 +-
+ doc/src/sgml/generate-keywords-table.pl |  13 +-
+ doc/src/sgml/keywords.sgml              |  24 +-
+ doc/src/sgml/queries.sgml               |  26 +-
+ src/backend/parser/check_keywords.pl    |  92 ++-
+ src/backend/parser/gram.y               | 440 +++++++++++-
+ src/backend/parser/scan.l               |   2 +-
+ src/backend/utils/adt/misc.c            |  31 +-
+ src/common/keywords.c                   |  17 +-
+ src/include/catalog/catversion.h        |   2 +-
+ src/include/catalog/pg_proc.dat         |   7 +-
+ src/include/common/keywords.h           |   2 +
+ src/include/parser/kwlist.h             | 904 ++++++++++++------------
+ src/interfaces/ecpg/preproc/keywords.c  |   2 +-
+ 14 files changed, 1055 insertions(+), 520 deletions(-)
+
+diff --git a/doc/src/sgml/func.sgml b/doc/src/sgml/func.sgml
+index d6283a35d84f..5d486258ed29 100644
+--- a/doc/src/sgml/func.sgml
++++ b/doc/src/sgml/func.sgml
+@@ -22173,7 +22173,9 @@ SELECT pg_type_is_visible('myschema.widget'::regtype);
+         <returnvalue>setof record</returnvalue>
+         ( <parameter>word</parameter> <type>text</type>,
+         <parameter>catcode</parameter> <type>"char"</type>,
+-        <parameter>catdesc</parameter> <type>text</type> )
++        <parameter>barelabel</parameter> <type>boolean</type>,
++        <parameter>catdesc</parameter> <type>text</type>,
++        <parameter>baredesc</parameter> <type>text</type> )
+        </para>
+        <para>
+         Returns a set of records describing the SQL keywords recognized by the
+@@ -22183,8 +22185,15 @@ SELECT pg_type_is_visible('myschema.widget'::regtype);
+         keyword, <literal>C</literal> for a keyword that can be a column
+         name, <literal>T</literal> for a keyword that can be a type or
+         function name, or <literal>R</literal> for a fully reserved keyword.
++        The <parameter>barelabel</parameter> column
++        contains <literal>true</literal> if the keyword can be used as
++        a <quote>bare</quote> column label in <command>SELECT</command> lists,
++        or <literal>false</literal> if it can only be used
++        after <literal>AS</literal>.
+         The <parameter>catdesc</parameter> column contains a
+-        possibly-localized string describing the category.
++        possibly-localized string describing the keyword's category.
++        The <parameter>baredesc</parameter> column contains a
++        possibly-localized string describing the keyword's column label status.
+        </para></entry>
+       </row>
+ 
+diff --git a/doc/src/sgml/generate-keywords-table.pl b/doc/src/sgml/generate-keywords-table.pl
+index 824b324ef78a..6332d65aadc7 100644
+--- a/doc/src/sgml/generate-keywords-table.pl
++++ b/doc/src/sgml/generate-keywords-table.pl
+@@ -1,6 +1,7 @@
+ #!/usr/bin/perl
+ #
+-# Generate the keywords table file
++# Generate the keywords table for the documentation's SQL Key Words appendix
++#
+ # Copyright (c) 2019-2020, PostgreSQL Global Development Group
+ 
+ use strict;
+@@ -11,8 +12,9 @@
+ my $srcdir = $ARGV[0];
+ 
+ my %keywords;
++my %as_keywords;
+ 
+-# read SQL keywords
++# read SQL-spec keywords
+ 
+ foreach my $ver (@sql_versions)
+ {
+@@ -39,9 +41,10 @@
+ 
+ while (<$fh>)
+ {
+-	if (/^PG_KEYWORD\("(\w+)", \w+, (\w+)_KEYWORD\)/)
++	if (/^PG_KEYWORD\("(\w+)", \w+, (\w+)_KEYWORD\, (\w+)\)/)
+ 	{
+ 		$keywords{ uc $1 }{'pg'}{ lc $2 } = 1;
++		$as_keywords{ uc $1 } = 1 if $3 eq 'AS_LABEL';
+ 	}
+ }
+ 
+@@ -107,6 +110,10 @@ END
+ 	{
+ 		print "reserved";
+ 	}
++	if ($as_keywords{$word})
++	{
++		print ", requires <literal>AS</literal>";
++	}
+ 	print "</entry>\n";
+ 
+ 	foreach my $ver (@sql_versions)
+diff --git a/doc/src/sgml/keywords.sgml b/doc/src/sgml/keywords.sgml
+index 57dcd6ae5c7b..a7bf30c50468 100644
+--- a/doc/src/sgml/keywords.sgml
++++ b/doc/src/sgml/keywords.sgml
+@@ -32,11 +32,11 @@
+  </para>
+ 
+  <para>
+-  In the <productname>PostgreSQL</productname> parser life is a bit
++  In the <productname>PostgreSQL</productname> parser, life is a bit
+   more complicated. There are several different classes of tokens
+   ranging from those that can never be used as an identifier to those
+-  that have absolutely no special status in the parser as compared to
+-  an ordinary identifier.  (The latter is usually the case for
++  that have absolutely no special status in the parser, but are considered
++  ordinary identifiers.  (The latter is usually the case for
+   functions specified by SQL.)  Even reserved key words are not
+   completely reserved in <productname>PostgreSQL</productname>, but
+   can be used as column labels (for example, <literal>SELECT 55 AS
+@@ -57,14 +57,24 @@
+   <quote>reserved</quote> are those tokens that are not allowed as
+   column or table names.  Some reserved key words are
+   allowable as names for functions or data types; this is also shown in the
+-  table.  If not so marked, a reserved key word is only allowed as an
+-  <quote>AS</quote> column label name.
++  table.  If not so marked, a reserved key word is only allowed as a
++  column label.
++  A blank entry in this column means that the word is treated as an
++  ordinary identifier by <productname>PostgreSQL</productname>.
++ </para>
++
++ <para>
++  Furthermore, while most key words can be used as <quote>bare</quote>
++  column labels without writing <literal>AS</literal> before them (as
++  described in <xref linkend="queries-column-labels"/>), there are a few
++  that require a leading <literal>AS</literal> to avoid ambiguity.  These
++  are marked in the table as <quote>requires <literal>AS</literal></quote>.
+  </para>
+ 
+  <para>
+   As a general rule, if you get spurious parser errors for commands
+-  that contain any of the listed key words as an identifier you should
+-  try to quote the identifier to see if the problem goes away.
++  that use any of the listed key words as an identifier, you should
++  try quoting the identifier to see if the problem goes away.
+  </para>
+ 
+  <para>
+diff --git a/doc/src/sgml/queries.sgml b/doc/src/sgml/queries.sgml
+index 67ca71e56490..0a643ef59705 100644
+--- a/doc/src/sgml/queries.sgml
++++ b/doc/src/sgml/queries.sgml
+@@ -1496,21 +1496,25 @@ SELECT a AS value, b + c AS sum FROM ...
+    </para>
+ 
+    <para>
+-    The <literal>AS</literal> keyword is optional, but only if the new column
+-    name does not match any
+-    <productname>PostgreSQL</productname> keyword (see <xref
+-    linkend="sql-keywords-appendix"/>).  To avoid an accidental match to
+-    a keyword, you can double-quote the column name.  For example,
+-    <literal>VALUE</literal> is a keyword, so this does not work:
++    The <literal>AS</literal> key word is usually optional, but in some
++    cases where the desired column name matches a
++    <productname>PostgreSQL</productname> key word, you must write
++    <literal>AS</literal> or double-quote the column name in order to
++    avoid ambiguity.
++    (<xref linkend="sql-keywords-appendix"/> shows which key words
++    require <literal>AS</literal> to be used as a column label.)
++    For example, <literal>FROM</literal> is one such key word, so this
++    does not work:
+ <programlisting>
+-SELECT a value, b + c AS sum FROM ...
++SELECT a from, b + c AS sum FROM ...
+ </programlisting>
+-    but this does:
++    but either of these do:
+ <programlisting>
+-SELECT a "value", b + c AS sum FROM ...
++SELECT a AS from, b + c AS sum FROM ...
++SELECT a "from", b + c AS sum FROM ...
+ </programlisting>
+-    For protection against possible
+-    future keyword additions, it is recommended that you always either
++    For greatest safety against possible
++    future key word additions, it is recommended that you always either
+     write <literal>AS</literal> or double-quote the output column name.
+    </para>
+ 
+diff --git a/src/backend/parser/check_keywords.pl b/src/backend/parser/check_keywords.pl
+index 702c97bba2aa..3862db072780 100644
+--- a/src/backend/parser/check_keywords.pl
++++ b/src/backend/parser/check_keywords.pl
+@@ -21,6 +21,28 @@ sub error
+ 	return;
+ }
+ 
++# Check alphabetical order of a set of keyword symbols
++# (note these are NOT the actual keyword strings)
++sub check_alphabetical_order
++{
++	my ($listname, $list) = @_;
++	my $prevkword = '';
++
++	foreach my $kword (@$list)
++	{
++		# Some symbols have a _P suffix. Remove it for the comparison.
++		my $bare_kword = $kword;
++		$bare_kword =~ s/_P$//;
++		if ($bare_kword le $prevkword)
++		{
++			error
++			  "'$bare_kword' after '$prevkword' in $listname list is misplaced";
++		}
++		$prevkword = $bare_kword;
++	}
++	return;
++}
++
+ $, = ' ';     # set output field separator
+ $\ = "\n";    # set output record separator
+ 
+@@ -33,9 +55,11 @@ sub error
+ open(my $gram, '<', $gram_filename) || die("Could not open : $gram_filename");
+ 
+ my $kcat;
++my $in_bare_labels;
+ my $comment;
+ my @arr;
+ my %keywords;
++my @bare_label_keywords;
+ 
+ line: while (my $S = <$gram>)
+ {
+@@ -51,7 +75,7 @@ sub error
+ 	$s = '[/][*]', $S =~ s#$s# /* #g;
+ 	$s = '[*][/]', $S =~ s#$s# */ #g;
+ 
+-	if (!($kcat))
++	if (!($kcat) && !($in_bare_labels))
+ 	{
+ 
+ 		# Is this the beginning of a keyword list?
+@@ -63,6 +87,10 @@ sub error
+ 				next line;
+ 			}
+ 		}
++
++		# Is this the beginning of the bare_label_keyword list?
++		$in_bare_labels = 1 if ($S =~ m/^bare_label_keyword:/);
++
+ 		next line;
+ 	}
+ 
+@@ -97,7 +125,8 @@ sub error
+ 		{
+ 
+ 			# end of keyword list
+-			$kcat = '';
++			undef $kcat;
++			undef $in_bare_labels;
+ 			next;
+ 		}
+ 
+@@ -107,31 +136,21 @@ sub error
+ 		}
+ 
+ 		# Put this keyword into the right list
+-		push @{ $keywords{$kcat} }, $arr[$fieldIndexer];
++		if ($in_bare_labels)
++		{
++			push @bare_label_keywords, $arr[$fieldIndexer];
++		}
++		else
++		{
++			push @{ $keywords{$kcat} }, $arr[$fieldIndexer];
++		}
+ 	}
+ }
+ close $gram;
+ 
+ # Check that each keyword list is in alphabetical order (just for neatnik-ism)
+-my ($prevkword, $bare_kword);
+-foreach my $kcat (keys %keyword_categories)
+-{
+-	$prevkword = '';
+-
+-	foreach my $kword (@{ $keywords{$kcat} })
+-	{
+-
+-		# Some keyword have a _P suffix. Remove it for the comparison.
+-		$bare_kword = $kword;
+-		$bare_kword =~ s/_P$//;
+-		if ($bare_kword le $prevkword)
+-		{
+-			error
+-			  "'$bare_kword' after '$prevkword' in $kcat list is misplaced";
+-		}
+-		$prevkword = $bare_kword;
+-	}
+-}
++check_alphabetical_order($_, $keywords{$_}) for (keys %keyword_categories);
++check_alphabetical_order('bare_label_keyword', \@bare_label_keywords);
+ 
+ # Transform the keyword lists into hashes.
+ # kwhashes is a hash of hashes, keyed by keyword category id,
+@@ -147,6 +166,7 @@ sub error
+ 
+ 	$kwhashes{$kcat_id} = $hash;
+ }
++my %bare_label_keywords = map { $_ => 1 } @bare_label_keywords;
+ 
+ # Now read in kwlist.h
+ 
+@@ -160,11 +180,12 @@ sub error
+ {
+ 	my ($line) = $_;
+ 
+-	if ($line =~ /^PG_KEYWORD\(\"(.*)\", (.*), (.*)\)/)
++	if ($line =~ /^PG_KEYWORD\(\"(.*)\", (.*), (.*), (.*)\)/)
+ 	{
+ 		my ($kwstring) = $1;
+ 		my ($kwname)   = $2;
+ 		my ($kwcat_id) = $3;
++		my ($collabel) = $4;
+ 
+ 		# Check that the list is in alphabetical order (critical!)
+ 		if ($kwstring le $prevkwstring)
+@@ -197,7 +218,7 @@ sub error
+ 			  "keyword name '$kwname' doesn't match keyword string '$kwstring'";
+ 		}
+ 
+-		# Check that the keyword is present in the grammar
++		# Check that the keyword is present in the right category list
+ 		%kwhash = %{ $kwhashes{$kwcat_id} };
+ 
+ 		if (!(%kwhash))
+@@ -219,6 +240,29 @@ sub error
+ 				delete $kwhashes{$kwcat_id}->{$kwname};
+ 			}
+ 		}
++
++		# Check that the keyword's collabel property matches gram.y
++		if ($collabel eq 'BARE_LABEL')
++		{
++			unless ($bare_label_keywords{$kwname})
++			{
++				error
++				  "'$kwname' is marked as BARE_LABEL in kwlist.h, but it is missing from gram.y's bare_label_keyword rule";
++			}
++		}
++		elsif ($collabel eq 'AS_LABEL')
++		{
++			if ($bare_label_keywords{$kwname})
++			{
++				error
++				  "'$kwname' is marked as AS_LABEL in kwlist.h, but it is listed in gram.y's bare_label_keyword rule";
++			}
++		}
++		else
++		{
++			error
++			  "'$collabel' not recognized in kwlist.h.  Expected either 'BARE_LABEL' or 'AS_LABEL'";
++		}
+ 	}
+ }
+ close $kwlist;
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index b16ffb9bf7fd..017940bdcd62 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -540,14 +540,16 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ %type <str>		Sconst comment_text notify_payload
+ %type <str>		RoleId opt_boolean_or_string
+ %type <list>	var_list
+-%type <str>		ColId ColLabel var_name type_function_name param_name
++%type <str>		ColId ColLabel BareColLabel
+ %type <str>		NonReservedWord NonReservedWord_or_Sconst
++%type <str>		var_name type_function_name param_name
+ %type <str>		createdb_opt_name
+ %type <node>	var_value zone_value
+ %type <rolespec> auth_ident RoleSpec opt_granted_by
+ 
+ %type <keyword> unreserved_keyword type_func_name_keyword
+ %type <keyword> col_name_keyword reserved_keyword
++%type <keyword> bare_label_keyword
+ 
+ %type <node>	TableConstraint TableLikeClause
+ %type <ival>	TableLikeOptionList TableLikeOption
+@@ -14658,11 +14660,7 @@ target_el:	a_expr AS ColLabel
+ 					$$->val = (Node *)$1;
+ 					$$->location = @1;
+ 				}
+-			/*
+-			 * We support omitting AS only for column labels that aren't
+-			 * any known keyword.
+-			 */
+-			| a_expr IDENT
++			| a_expr BareColLabel
+ 				{
+ 					$$ = makeNode(ResTarget);
+ 					$$->name = $2;
+@@ -15011,6 +15009,13 @@ ColLabel:	IDENT									{ $$ = $1; }
+ 			| reserved_keyword						{ $$ = pstrdup($1); }
+ 		;
+ 
++/* Bare column label --- names that can be column labels without writing "AS".
++ * This classification is orthogonal to the other keyword categories.
++ */
++BareColLabel:	IDENT								{ $$ = $1; }
++			| bare_label_keyword					{ $$ = pstrdup($1); }
++		;
++
+ 
+ /*
+  * Keyword category lists.  Generally, every keyword present in
+@@ -15515,6 +15520,429 @@ reserved_keyword:
+ 			| WITH
+ 		;
+ 
++/*
++ * While all keywords can be used as column labels when preceded by AS,
++ * not all of them can be used as a "bare" column label without AS.
++ * Those that can be used as a bare label must be listed here,
++ * in addition to appearing in one of the category lists above.
++ *
++ * Always add a new keyword to this list if possible.  Mark it BARE_LABEL
++ * in kwlist.h if it is included here, or AS_LABEL if it is not.
++ */
++bare_label_keyword:
++			  ABORT_P
++			| ABSOLUTE_P
++			| ACCESS
++			| ACTION
++			| ADD_P
++			| ADMIN
++			| AFTER
++			| AGGREGATE
++			| ALL
++			| ALSO
++			| ALTER
++			| ALWAYS
++			| ANALYSE
++			| ANALYZE
++			| AND
++			| ANY
++			| ASC
++			| ASSERTION
++			| ASSIGNMENT
++			| ASYMMETRIC
++			| AT
++			| ATTACH
++			| ATTRIBUTE
++			| AUTHORIZATION
++			| BACKWARD
++			| BEFORE
++			| BEGIN_P
++			| BETWEEN
++			| BIGINT
++			| BINARY
++			| BIT
++			| BOOLEAN_P
++			| BOTH
++			| BY
++			| CACHE
++			| CALL
++			| CALLED
++			| CASCADE
++			| CASCADED
++			| CASE
++			| CAST
++			| CATALOG_P
++			| CHAIN
++			| CHARACTERISTICS
++			| CHECK
++			| CHECKPOINT
++			| CLASS
++			| CLOSE
++			| CLUSTER
++			| COALESCE
++			| COLLATE
++			| COLLATION
++			| COLUMN
++			| COLUMNS
++			| COMMENT
++			| COMMENTS
++			| COMMIT
++			| COMMITTED
++			| CONCURRENTLY
++			| CONFIGURATION
++			| CONFLICT
++			| CONNECTION
++			| CONSTRAINT
++			| CONSTRAINTS
++			| CONTENT_P
++			| CONTINUE_P
++			| CONVERSION_P
++			| COPY
++			| COST
++			| CROSS
++			| CSV
++			| CUBE
++			| CURRENT_P
++			| CURRENT_CATALOG
++			| CURRENT_DATE
++			| CURRENT_ROLE
++			| CURRENT_SCHEMA
++			| CURRENT_TIME
++			| CURRENT_TIMESTAMP
++			| CURRENT_USER
++			| CURSOR
++			| CYCLE
++			| DATA_P
++			| DATABASE
++			| DEALLOCATE
++			| DEC
++			| DECIMAL_P
++			| DECLARE
++			| DEFAULT
++			| DEFAULTS
++			| DEFERRABLE
++			| DEFERRED
++			| DEFINER
++			| DELETE_P
++			| DELIMITER
++			| DELIMITERS
++			| DEPENDS
++			| DESC
++			| DETACH
++			| DICTIONARY
++			| DISABLE_P
++			| DISCARD
++			| DISTINCT
++			| DO
++			| DOCUMENT_P
++			| DOMAIN_P
++			| DOUBLE_P
++			| DROP
++			| EACH
++			| ELSE
++			| ENABLE_P
++			| ENCODING
++			| ENCRYPTED
++			| END_P
++			| ENUM_P
++			| ESCAPE
++			| EVENT
++			| EXCLUDE
++			| EXCLUDING
++			| EXCLUSIVE
++			| EXECUTE
++			| EXISTS
++			| EXPLAIN
++			| EXPRESSION
++			| EXTENSION
++			| EXTERNAL
++			| EXTRACT
++			| FALSE_P
++			| FAMILY
++			| FIRST_P
++			| FLOAT_P
++			| FOLLOWING
++			| FORCE
++			| FOREIGN
++			| FORWARD
++			| FREEZE
++			| FULL
++			| FUNCTION
++			| FUNCTIONS
++			| GENERATED
++			| GLOBAL
++			| GRANTED
++			| GREATEST
++			| GROUPING
++			| GROUPS
++			| HANDLER
++			| HEADER_P
++			| HOLD
++			| IDENTITY_P
++			| IF_P
++			| ILIKE
++			| IMMEDIATE
++			| IMMUTABLE
++			| IMPLICIT_P
++			| IMPORT_P
++			| IN_P
++			| INCLUDE
++			| INCLUDING
++			| INCREMENT
++			| INDEX
++			| INDEXES
++			| INHERIT
++			| INHERITS
++			| INITIALLY
++			| INLINE_P
++			| INNER_P
++			| INOUT
++			| INPUT_P
++			| INSENSITIVE
++			| INSERT
++			| INSTEAD
++			| INT_P
++			| INTEGER
++			| INTERVAL
++			| INVOKER
++			| IS
++			| ISOLATION
++			| JOIN
++			| KEY
++			| LABEL
++			| LANGUAGE
++			| LARGE_P
++			| LAST_P
++			| LATERAL_P
++			| LEADING
++			| LEAKPROOF
++			| LEAST
++			| LEFT
++			| LEVEL
++			| LIKE
++			| LISTEN
++			| LOAD
++			| LOCAL
++			| LOCALTIME
++			| LOCALTIMESTAMP
++			| LOCATION
++			| LOCK_P
++			| LOCKED
++			| LOGGED
++			| MAPPING
++			| MATCH
++			| MATERIALIZED
++			| MAXVALUE
++			| METHOD
++			| MINVALUE
++			| MODE
++			| MOVE
++			| NAME_P
++			| NAMES
++			| NATIONAL
++			| NATURAL
++			| NCHAR
++			| NEW
++			| NEXT
++			| NFC
++			| NFD
++			| NFKC
++			| NFKD
++			| NO
++			| NONE
++			| NORMALIZE
++			| NORMALIZED
++			| NOT
++			| NOTHING
++			| NOTIFY
++			| NOWAIT
++			| NULL_P
++			| NULLIF
++			| NULLS_P
++			| NUMERIC
++			| OBJECT_P
++			| OF
++			| OFF
++			| OIDS
++			| OLD
++			| ONLY
++			| OPERATOR
++			| OPTION
++			| OPTIONS
++			| OR
++			| ORDINALITY
++			| OTHERS
++			| OUT_P
++			| OUTER_P
++			| OVERLAY
++			| OVERRIDING
++			| OWNED
++			| OWNER
++			| PARALLEL
++			| PARSER
++			| PARTIAL
++			| PARTITION
++			| PASSING
++			| PASSWORD
++			| PLACING
++			| PLANS
++			| POLICY
++			| POSITION
++			| PRECEDING
++			| PREPARE
++			| PREPARED
++			| PRESERVE
++			| PRIMARY
++			| PRIOR
++			| PRIVILEGES
++			| PROCEDURAL
++			| PROCEDURE
++			| PROCEDURES
++			| PROGRAM
++			| PUBLICATION
++			| QUOTE
++			| RANGE
++			| READ
++			| REAL
++			| REASSIGN
++			| RECHECK
++			| RECURSIVE
++			| REF
++			| REFERENCES
++			| REFERENCING
++			| REFRESH
++			| REINDEX
++			| RELATIVE_P
++			| RELEASE
++			| RENAME
++			| REPEATABLE
++			| REPLACE
++			| REPLICA
++			| RESET
++			| RESTART
++			| RESTRICT
++			| RETURNS
++			| REVOKE
++			| RIGHT
++			| ROLE
++			| ROLLBACK
++			| ROLLUP
++			| ROUTINE
++			| ROUTINES
++			| ROW
++			| ROWS
++			| RULE
++			| SAVEPOINT
++			| SCHEMA
++			| SCHEMAS
++			| SCROLL
++			| SEARCH
++			| SECURITY
++			| SELECT
++			| SEQUENCE
++			| SEQUENCES
++			| SERIALIZABLE
++			| SERVER
++			| SESSION
++			| SESSION_USER
++			| SET
++			| SETOF
++			| SETS
++			| SHARE
++			| SHOW
++			| SIMILAR
++			| SIMPLE
++			| SKIP
++			| SMALLINT
++			| SNAPSHOT
++			| SOME
++			| SQL_P
++			| STABLE
++			| STANDALONE_P
++			| START
++			| STATEMENT
++			| STATISTICS
++			| STDIN
++			| STDOUT
++			| STORAGE
++			| STORED
++			| STRICT_P
++			| STRIP_P
++			| SUBSCRIPTION
++			| SUBSTRING
++			| SUPPORT
++			| SYMMETRIC
++			| SYSID
++			| SYSTEM_P
++			| TABLE
++			| TABLES
++			| TABLESAMPLE
++			| TABLESPACE
++			| TEMP
++			| TEMPLATE
++			| TEMPORARY
++			| TEXT_P
++			| THEN
++			| TIES
++			| TIME
++			| TIMESTAMP
++			| TRAILING
++			| TRANSACTION
++			| TRANSFORM
++			| TREAT
++			| TRIGGER
++			| TRIM
++			| TRUE_P
++			| TRUNCATE
++			| TRUSTED
++			| TYPE_P
++			| TYPES_P
++			| UESCAPE
++			| UNBOUNDED
++			| UNCOMMITTED
++			| UNENCRYPTED
++			| UNIQUE
++			| UNKNOWN
++			| UNLISTEN
++			| UNLOGGED
++			| UNTIL
++			| UPDATE
++			| USER
++			| USING
++			| VACUUM
++			| VALID
++			| VALIDATE
++			| VALIDATOR
++			| VALUE_P
++			| VALUES
++			| VARCHAR
++			| VARIADIC
++			| VERBOSE
++			| VERSION_P
++			| VIEW
++			| VIEWS
++			| VOLATILE
++			| WHEN
++			| WHITESPACE_P
++			| WORK
++			| WRAPPER
++			| WRITE
++			| XML_P
++			| XMLATTRIBUTES
++			| XMLCONCAT
++			| XMLELEMENT
++			| XMLEXISTS
++			| XMLFOREST
++			| XMLNAMESPACES
++			| XMLPARSE
++			| XMLPI
++			| XMLROOT
++			| XMLSERIALIZE
++			| XMLTABLE
++			| YES_P
++			| ZONE
++		;
++
+ %%
+ 
+ /*
+diff --git a/src/backend/parser/scan.l b/src/backend/parser/scan.l
+index b1ea0cb53846..4eab2980c990 100644
+--- a/src/backend/parser/scan.l
++++ b/src/backend/parser/scan.l
+@@ -73,7 +73,7 @@ bool		standard_conforming_strings = true;
+  * callers need to pass it to scanner_init, if they are using the
+  * standard keyword list ScanKeywords.
+  */
+-#define PG_KEYWORD(kwname, value, category) value,
++#define PG_KEYWORD(kwname, value, category, collabel) value,
+ 
+ const uint16 ScanKeywordTokens[] = {
+ #include "parser/kwlist.h"
+diff --git a/src/backend/utils/adt/misc.c b/src/backend/utils/adt/misc.c
+index 37c23c9155af..b2bf9fa8cbcf 100644
+--- a/src/backend/utils/adt/misc.c
++++ b/src/backend/utils/adt/misc.c
+@@ -416,12 +416,16 @@ pg_get_keywords(PG_FUNCTION_ARGS)
+ 		funcctx = SRF_FIRSTCALL_INIT();
+ 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+ 
+-		tupdesc = CreateTemplateTupleDesc(3);
++		tupdesc = CreateTemplateTupleDesc(5);
+ 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "word",
+ 						   TEXTOID, -1, 0);
+ 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "catcode",
+ 						   CHAROID, -1, 0);
+-		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "catdesc",
++		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "barelabel",
++						   BOOLOID, -1, 0);
++		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "catdesc",
++						   TEXTOID, -1, 0);
++		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "baredesc",
+ 						   TEXTOID, -1, 0);
+ 
+ 		funcctx->attinmeta = TupleDescGetAttInMetadata(tupdesc);
+@@ -433,7 +437,7 @@ pg_get_keywords(PG_FUNCTION_ARGS)
+ 
+ 	if (funcctx->call_cntr < ScanKeywords.num_keywords)
+ 	{
+-		char	   *values[3];
++		char	   *values[5];
+ 		HeapTuple	tuple;
+ 
+ 		/* cast-away-const is ugly but alternatives aren't much better */
+@@ -445,26 +449,37 @@ pg_get_keywords(PG_FUNCTION_ARGS)
+ 		{
+ 			case UNRESERVED_KEYWORD:
+ 				values[1] = "U";
+-				values[2] = _("unreserved");
++				values[3] = _("unreserved");
+ 				break;
+ 			case COL_NAME_KEYWORD:
+ 				values[1] = "C";
+-				values[2] = _("unreserved (cannot be function or type name)");
++				values[3] = _("unreserved (cannot be function or type name)");
+ 				break;
+ 			case TYPE_FUNC_NAME_KEYWORD:
+ 				values[1] = "T";
+-				values[2] = _("reserved (can be function or type name)");
++				values[3] = _("reserved (can be function or type name)");
+ 				break;
+ 			case RESERVED_KEYWORD:
+ 				values[1] = "R";
+-				values[2] = _("reserved");
++				values[3] = _("reserved");
+ 				break;
+ 			default:			/* shouldn't be possible */
+ 				values[1] = NULL;
+-				values[2] = NULL;
++				values[3] = NULL;
+ 				break;
+ 		}
+ 
++		if (ScanKeywordBareLabel[funcctx->call_cntr])
++		{
++			values[2] = "true";
++			values[4] = _("can be bare label");
++		}
++		else
++		{
++			values[2] = "false";
++			values[4] = _("requires AS");
++		}
++
+ 		tuple = BuildTupleFromCStrings(funcctx->attinmeta, values);
+ 
+ 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+diff --git a/src/common/keywords.c b/src/common/keywords.c
+index 54ed97709613..2de0c717a891 100644
+--- a/src/common/keywords.c
++++ b/src/common/keywords.c
+@@ -24,10 +24,25 @@
+ 
+ /* Keyword categories for SQL keywords */
+ 
+-#define PG_KEYWORD(kwname, value, category) category,
++#define PG_KEYWORD(kwname, value, category, collabel) category,
+ 
+ const uint8 ScanKeywordCategories[SCANKEYWORDS_NUM_KEYWORDS] = {
+ #include "parser/kwlist.h"
+ };
+ 
+ #undef PG_KEYWORD
++
++/* Keyword can-be-bare-label flags for SQL keywords */
++
++#define PG_KEYWORD(kwname, value, category, collabel) collabel,
++
++#define BARE_LABEL true
++#define AS_LABEL false
++
++const bool	ScanKeywordBareLabel[SCANKEYWORDS_NUM_KEYWORDS] = {
++#include "parser/kwlist.h"
++};
++
++#undef PG_KEYWORD
++#undef BARE_LABEL
++#undef AS_LABEL
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 365552635b84..650e1f733ed2 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202009172
++#define CATALOG_VERSION_NO	202009181
+ 
+ #endif
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index 1ae428814662..f48f5fb4d99b 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -3683,10 +3683,11 @@
+   prosrc => 'pg_get_function_arg_default' },
+ 
+ { oid => '1686', descr => 'list of SQL keywords',
+-  proname => 'pg_get_keywords', procost => '10', prorows => '400',
++  proname => 'pg_get_keywords', procost => '10', prorows => '500',
+   proretset => 't', provolatile => 's', prorettype => 'record',
+-  proargtypes => '', proallargtypes => '{text,char,text}',
+-  proargmodes => '{o,o,o}', proargnames => '{word,catcode,catdesc}',
++  proargtypes => '', proallargtypes => '{text,char,bool,text,text}',
++  proargmodes => '{o,o,o,o,o}',
++  proargnames => '{word,catcode,barelabel,catdesc,baredesc}',
+   prosrc => 'pg_get_keywords' },
+ 
+ { oid => '2289', descr => 'convert generic options array to name/value table',
+diff --git a/src/include/common/keywords.h b/src/include/common/keywords.h
+index 257c050903e3..c9f9a9f991a7 100644
+--- a/src/include/common/keywords.h
++++ b/src/include/common/keywords.h
+@@ -25,9 +25,11 @@
+ #ifndef FRONTEND
+ extern PGDLLIMPORT const ScanKeywordList ScanKeywords;
+ extern PGDLLIMPORT const uint8 ScanKeywordCategories[];
++extern PGDLLIMPORT const bool ScanKeywordBareLabel[];
+ #else
+ extern const ScanKeywordList ScanKeywords;
+ extern const uint8 ScanKeywordCategories[];
++extern const bool ScanKeywordBareLabel[];
+ #endif
+ 
+ #endif							/* KEYWORDS_H */
+diff --git a/src/include/parser/kwlist.h b/src/include/parser/kwlist.h
+index 08f22ce211dd..71dcdf28894d 100644
+--- a/src/include/parser/kwlist.h
++++ b/src/include/parser/kwlist.h
+@@ -19,459 +19,459 @@
+ /* there is deliberately not an #ifndef KWLIST_H here */
+ 
+ /*
+- * List of keyword (name, token-value, category) entries.
++ * List of keyword (name, token-value, category, bare-label-status) entries.
+  *
+  * Note: gen_keywordlist.pl requires the entries to appear in ASCII order.
+  */
+ 
+-/* name, value, category */
+-PG_KEYWORD("abort", ABORT_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("absolute", ABSOLUTE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("access", ACCESS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("action", ACTION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("add", ADD_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("admin", ADMIN, UNRESERVED_KEYWORD)
+-PG_KEYWORD("after", AFTER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("aggregate", AGGREGATE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("all", ALL, RESERVED_KEYWORD)
+-PG_KEYWORD("also", ALSO, UNRESERVED_KEYWORD)
+-PG_KEYWORD("alter", ALTER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("always", ALWAYS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("analyse", ANALYSE, RESERVED_KEYWORD)		/* British spelling */
+-PG_KEYWORD("analyze", ANALYZE, RESERVED_KEYWORD)
+-PG_KEYWORD("and", AND, RESERVED_KEYWORD)
+-PG_KEYWORD("any", ANY, RESERVED_KEYWORD)
+-PG_KEYWORD("array", ARRAY, RESERVED_KEYWORD)
+-PG_KEYWORD("as", AS, RESERVED_KEYWORD)
+-PG_KEYWORD("asc", ASC, RESERVED_KEYWORD)
+-PG_KEYWORD("assertion", ASSERTION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("assignment", ASSIGNMENT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("asymmetric", ASYMMETRIC, RESERVED_KEYWORD)
+-PG_KEYWORD("at", AT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("attach", ATTACH, UNRESERVED_KEYWORD)
+-PG_KEYWORD("attribute", ATTRIBUTE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("authorization", AUTHORIZATION, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("backward", BACKWARD, UNRESERVED_KEYWORD)
+-PG_KEYWORD("before", BEFORE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("begin", BEGIN_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("between", BETWEEN, COL_NAME_KEYWORD)
+-PG_KEYWORD("bigint", BIGINT, COL_NAME_KEYWORD)
+-PG_KEYWORD("binary", BINARY, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("bit", BIT, COL_NAME_KEYWORD)
+-PG_KEYWORD("boolean", BOOLEAN_P, COL_NAME_KEYWORD)
+-PG_KEYWORD("both", BOTH, RESERVED_KEYWORD)
+-PG_KEYWORD("by", BY, UNRESERVED_KEYWORD)
+-PG_KEYWORD("cache", CACHE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("call", CALL, UNRESERVED_KEYWORD)
+-PG_KEYWORD("called", CALLED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("cascade", CASCADE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("cascaded", CASCADED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("case", CASE, RESERVED_KEYWORD)
+-PG_KEYWORD("cast", CAST, RESERVED_KEYWORD)
+-PG_KEYWORD("catalog", CATALOG_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("chain", CHAIN, UNRESERVED_KEYWORD)
+-PG_KEYWORD("char", CHAR_P, COL_NAME_KEYWORD)
+-PG_KEYWORD("character", CHARACTER, COL_NAME_KEYWORD)
+-PG_KEYWORD("characteristics", CHARACTERISTICS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("check", CHECK, RESERVED_KEYWORD)
+-PG_KEYWORD("checkpoint", CHECKPOINT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("class", CLASS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("close", CLOSE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("cluster", CLUSTER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("coalesce", COALESCE, COL_NAME_KEYWORD)
+-PG_KEYWORD("collate", COLLATE, RESERVED_KEYWORD)
+-PG_KEYWORD("collation", COLLATION, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("column", COLUMN, RESERVED_KEYWORD)
+-PG_KEYWORD("columns", COLUMNS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("comment", COMMENT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("comments", COMMENTS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("commit", COMMIT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("committed", COMMITTED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("concurrently", CONCURRENTLY, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("configuration", CONFIGURATION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("conflict", CONFLICT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("connection", CONNECTION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("constraint", CONSTRAINT, RESERVED_KEYWORD)
+-PG_KEYWORD("constraints", CONSTRAINTS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("content", CONTENT_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("continue", CONTINUE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("conversion", CONVERSION_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("copy", COPY, UNRESERVED_KEYWORD)
+-PG_KEYWORD("cost", COST, UNRESERVED_KEYWORD)
+-PG_KEYWORD("create", CREATE, RESERVED_KEYWORD)
+-PG_KEYWORD("cross", CROSS, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("csv", CSV, UNRESERVED_KEYWORD)
+-PG_KEYWORD("cube", CUBE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("current", CURRENT_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("current_catalog", CURRENT_CATALOG, RESERVED_KEYWORD)
+-PG_KEYWORD("current_date", CURRENT_DATE, RESERVED_KEYWORD)
+-PG_KEYWORD("current_role", CURRENT_ROLE, RESERVED_KEYWORD)
+-PG_KEYWORD("current_schema", CURRENT_SCHEMA, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("current_time", CURRENT_TIME, RESERVED_KEYWORD)
+-PG_KEYWORD("current_timestamp", CURRENT_TIMESTAMP, RESERVED_KEYWORD)
+-PG_KEYWORD("current_user", CURRENT_USER, RESERVED_KEYWORD)
+-PG_KEYWORD("cursor", CURSOR, UNRESERVED_KEYWORD)
+-PG_KEYWORD("cycle", CYCLE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("data", DATA_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("database", DATABASE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("day", DAY_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("deallocate", DEALLOCATE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("dec", DEC, COL_NAME_KEYWORD)
+-PG_KEYWORD("decimal", DECIMAL_P, COL_NAME_KEYWORD)
+-PG_KEYWORD("declare", DECLARE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("default", DEFAULT, RESERVED_KEYWORD)
+-PG_KEYWORD("defaults", DEFAULTS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("deferrable", DEFERRABLE, RESERVED_KEYWORD)
+-PG_KEYWORD("deferred", DEFERRED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("definer", DEFINER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("delete", DELETE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("delimiter", DELIMITER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("delimiters", DELIMITERS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("depends", DEPENDS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("desc", DESC, RESERVED_KEYWORD)
+-PG_KEYWORD("detach", DETACH, UNRESERVED_KEYWORD)
+-PG_KEYWORD("dictionary", DICTIONARY, UNRESERVED_KEYWORD)
+-PG_KEYWORD("disable", DISABLE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("discard", DISCARD, UNRESERVED_KEYWORD)
+-PG_KEYWORD("distinct", DISTINCT, RESERVED_KEYWORD)
+-PG_KEYWORD("do", DO, RESERVED_KEYWORD)
+-PG_KEYWORD("document", DOCUMENT_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("domain", DOMAIN_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("double", DOUBLE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("drop", DROP, UNRESERVED_KEYWORD)
+-PG_KEYWORD("each", EACH, UNRESERVED_KEYWORD)
+-PG_KEYWORD("else", ELSE, RESERVED_KEYWORD)
+-PG_KEYWORD("enable", ENABLE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("encoding", ENCODING, UNRESERVED_KEYWORD)
+-PG_KEYWORD("encrypted", ENCRYPTED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("end", END_P, RESERVED_KEYWORD)
+-PG_KEYWORD("enum", ENUM_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("escape", ESCAPE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("event", EVENT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("except", EXCEPT, RESERVED_KEYWORD)
+-PG_KEYWORD("exclude", EXCLUDE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("excluding", EXCLUDING, UNRESERVED_KEYWORD)
+-PG_KEYWORD("exclusive", EXCLUSIVE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("execute", EXECUTE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("exists", EXISTS, COL_NAME_KEYWORD)
+-PG_KEYWORD("explain", EXPLAIN, UNRESERVED_KEYWORD)
+-PG_KEYWORD("expression", EXPRESSION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("extension", EXTENSION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("external", EXTERNAL, UNRESERVED_KEYWORD)
+-PG_KEYWORD("extract", EXTRACT, COL_NAME_KEYWORD)
+-PG_KEYWORD("false", FALSE_P, RESERVED_KEYWORD)
+-PG_KEYWORD("family", FAMILY, UNRESERVED_KEYWORD)
+-PG_KEYWORD("fetch", FETCH, RESERVED_KEYWORD)
+-PG_KEYWORD("filter", FILTER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("first", FIRST_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("float", FLOAT_P, COL_NAME_KEYWORD)
+-PG_KEYWORD("following", FOLLOWING, UNRESERVED_KEYWORD)
+-PG_KEYWORD("for", FOR, RESERVED_KEYWORD)
+-PG_KEYWORD("force", FORCE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("foreign", FOREIGN, RESERVED_KEYWORD)
+-PG_KEYWORD("forward", FORWARD, UNRESERVED_KEYWORD)
+-PG_KEYWORD("freeze", FREEZE, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("from", FROM, RESERVED_KEYWORD)
+-PG_KEYWORD("full", FULL, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("function", FUNCTION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("functions", FUNCTIONS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("generated", GENERATED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("global", GLOBAL, UNRESERVED_KEYWORD)
+-PG_KEYWORD("grant", GRANT, RESERVED_KEYWORD)
+-PG_KEYWORD("granted", GRANTED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("greatest", GREATEST, COL_NAME_KEYWORD)
+-PG_KEYWORD("group", GROUP_P, RESERVED_KEYWORD)
+-PG_KEYWORD("grouping", GROUPING, COL_NAME_KEYWORD)
+-PG_KEYWORD("groups", GROUPS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("handler", HANDLER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("having", HAVING, RESERVED_KEYWORD)
+-PG_KEYWORD("header", HEADER_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("hold", HOLD, UNRESERVED_KEYWORD)
+-PG_KEYWORD("hour", HOUR_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("identity", IDENTITY_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("if", IF_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("ilike", ILIKE, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("immediate", IMMEDIATE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("immutable", IMMUTABLE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("implicit", IMPLICIT_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("import", IMPORT_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("in", IN_P, RESERVED_KEYWORD)
+-PG_KEYWORD("include", INCLUDE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("including", INCLUDING, UNRESERVED_KEYWORD)
+-PG_KEYWORD("increment", INCREMENT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("index", INDEX, UNRESERVED_KEYWORD)
+-PG_KEYWORD("indexes", INDEXES, UNRESERVED_KEYWORD)
+-PG_KEYWORD("inherit", INHERIT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("inherits", INHERITS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("initially", INITIALLY, RESERVED_KEYWORD)
+-PG_KEYWORD("inline", INLINE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("inner", INNER_P, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("inout", INOUT, COL_NAME_KEYWORD)
+-PG_KEYWORD("input", INPUT_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("insensitive", INSENSITIVE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("insert", INSERT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("instead", INSTEAD, UNRESERVED_KEYWORD)
+-PG_KEYWORD("int", INT_P, COL_NAME_KEYWORD)
+-PG_KEYWORD("integer", INTEGER, COL_NAME_KEYWORD)
+-PG_KEYWORD("intersect", INTERSECT, RESERVED_KEYWORD)
+-PG_KEYWORD("interval", INTERVAL, COL_NAME_KEYWORD)
+-PG_KEYWORD("into", INTO, RESERVED_KEYWORD)
+-PG_KEYWORD("invoker", INVOKER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("is", IS, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("isnull", ISNULL, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("isolation", ISOLATION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("join", JOIN, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("key", KEY, UNRESERVED_KEYWORD)
+-PG_KEYWORD("label", LABEL, UNRESERVED_KEYWORD)
+-PG_KEYWORD("language", LANGUAGE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("large", LARGE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("last", LAST_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("lateral", LATERAL_P, RESERVED_KEYWORD)
+-PG_KEYWORD("leading", LEADING, RESERVED_KEYWORD)
+-PG_KEYWORD("leakproof", LEAKPROOF, UNRESERVED_KEYWORD)
+-PG_KEYWORD("least", LEAST, COL_NAME_KEYWORD)
+-PG_KEYWORD("left", LEFT, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("level", LEVEL, UNRESERVED_KEYWORD)
+-PG_KEYWORD("like", LIKE, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("limit", LIMIT, RESERVED_KEYWORD)
+-PG_KEYWORD("listen", LISTEN, UNRESERVED_KEYWORD)
+-PG_KEYWORD("load", LOAD, UNRESERVED_KEYWORD)
+-PG_KEYWORD("local", LOCAL, UNRESERVED_KEYWORD)
+-PG_KEYWORD("localtime", LOCALTIME, RESERVED_KEYWORD)
+-PG_KEYWORD("localtimestamp", LOCALTIMESTAMP, RESERVED_KEYWORD)
+-PG_KEYWORD("location", LOCATION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("lock", LOCK_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("locked", LOCKED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("logged", LOGGED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("mapping", MAPPING, UNRESERVED_KEYWORD)
+-PG_KEYWORD("match", MATCH, UNRESERVED_KEYWORD)
+-PG_KEYWORD("materialized", MATERIALIZED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("maxvalue", MAXVALUE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("method", METHOD, UNRESERVED_KEYWORD)
+-PG_KEYWORD("minute", MINUTE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("minvalue", MINVALUE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("mode", MODE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("month", MONTH_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("move", MOVE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("name", NAME_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("names", NAMES, UNRESERVED_KEYWORD)
+-PG_KEYWORD("national", NATIONAL, COL_NAME_KEYWORD)
+-PG_KEYWORD("natural", NATURAL, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("nchar", NCHAR, COL_NAME_KEYWORD)
+-PG_KEYWORD("new", NEW, UNRESERVED_KEYWORD)
+-PG_KEYWORD("next", NEXT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("nfc", NFC, UNRESERVED_KEYWORD)
+-PG_KEYWORD("nfd", NFD, UNRESERVED_KEYWORD)
+-PG_KEYWORD("nfkc", NFKC, UNRESERVED_KEYWORD)
+-PG_KEYWORD("nfkd", NFKD, UNRESERVED_KEYWORD)
+-PG_KEYWORD("no", NO, UNRESERVED_KEYWORD)
+-PG_KEYWORD("none", NONE, COL_NAME_KEYWORD)
+-PG_KEYWORD("normalize", NORMALIZE, COL_NAME_KEYWORD)
+-PG_KEYWORD("normalized", NORMALIZED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("not", NOT, RESERVED_KEYWORD)
+-PG_KEYWORD("nothing", NOTHING, UNRESERVED_KEYWORD)
+-PG_KEYWORD("notify", NOTIFY, UNRESERVED_KEYWORD)
+-PG_KEYWORD("notnull", NOTNULL, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("nowait", NOWAIT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("null", NULL_P, RESERVED_KEYWORD)
+-PG_KEYWORD("nullif", NULLIF, COL_NAME_KEYWORD)
+-PG_KEYWORD("nulls", NULLS_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("numeric", NUMERIC, COL_NAME_KEYWORD)
+-PG_KEYWORD("object", OBJECT_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("of", OF, UNRESERVED_KEYWORD)
+-PG_KEYWORD("off", OFF, UNRESERVED_KEYWORD)
+-PG_KEYWORD("offset", OFFSET, RESERVED_KEYWORD)
+-PG_KEYWORD("oids", OIDS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("old", OLD, UNRESERVED_KEYWORD)
+-PG_KEYWORD("on", ON, RESERVED_KEYWORD)
+-PG_KEYWORD("only", ONLY, RESERVED_KEYWORD)
+-PG_KEYWORD("operator", OPERATOR, UNRESERVED_KEYWORD)
+-PG_KEYWORD("option", OPTION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("options", OPTIONS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("or", OR, RESERVED_KEYWORD)
+-PG_KEYWORD("order", ORDER, RESERVED_KEYWORD)
+-PG_KEYWORD("ordinality", ORDINALITY, UNRESERVED_KEYWORD)
+-PG_KEYWORD("others", OTHERS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("out", OUT_P, COL_NAME_KEYWORD)
+-PG_KEYWORD("outer", OUTER_P, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("over", OVER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("overlaps", OVERLAPS, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("overlay", OVERLAY, COL_NAME_KEYWORD)
+-PG_KEYWORD("overriding", OVERRIDING, UNRESERVED_KEYWORD)
+-PG_KEYWORD("owned", OWNED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("owner", OWNER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("parallel", PARALLEL, UNRESERVED_KEYWORD)
+-PG_KEYWORD("parser", PARSER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("partial", PARTIAL, UNRESERVED_KEYWORD)
+-PG_KEYWORD("partition", PARTITION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("passing", PASSING, UNRESERVED_KEYWORD)
+-PG_KEYWORD("password", PASSWORD, UNRESERVED_KEYWORD)
+-PG_KEYWORD("placing", PLACING, RESERVED_KEYWORD)
+-PG_KEYWORD("plans", PLANS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("policy", POLICY, UNRESERVED_KEYWORD)
+-PG_KEYWORD("position", POSITION, COL_NAME_KEYWORD)
+-PG_KEYWORD("preceding", PRECEDING, UNRESERVED_KEYWORD)
+-PG_KEYWORD("precision", PRECISION, COL_NAME_KEYWORD)
+-PG_KEYWORD("prepare", PREPARE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("prepared", PREPARED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("preserve", PRESERVE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("primary", PRIMARY, RESERVED_KEYWORD)
+-PG_KEYWORD("prior", PRIOR, UNRESERVED_KEYWORD)
+-PG_KEYWORD("privileges", PRIVILEGES, UNRESERVED_KEYWORD)
+-PG_KEYWORD("procedural", PROCEDURAL, UNRESERVED_KEYWORD)
+-PG_KEYWORD("procedure", PROCEDURE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("procedures", PROCEDURES, UNRESERVED_KEYWORD)
+-PG_KEYWORD("program", PROGRAM, UNRESERVED_KEYWORD)
+-PG_KEYWORD("publication", PUBLICATION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("quote", QUOTE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("range", RANGE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("read", READ, UNRESERVED_KEYWORD)
+-PG_KEYWORD("real", REAL, COL_NAME_KEYWORD)
+-PG_KEYWORD("reassign", REASSIGN, UNRESERVED_KEYWORD)
+-PG_KEYWORD("recheck", RECHECK, UNRESERVED_KEYWORD)
+-PG_KEYWORD("recursive", RECURSIVE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("ref", REF, UNRESERVED_KEYWORD)
+-PG_KEYWORD("references", REFERENCES, RESERVED_KEYWORD)
+-PG_KEYWORD("referencing", REFERENCING, UNRESERVED_KEYWORD)
+-PG_KEYWORD("refresh", REFRESH, UNRESERVED_KEYWORD)
+-PG_KEYWORD("reindex", REINDEX, UNRESERVED_KEYWORD)
+-PG_KEYWORD("relative", RELATIVE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("release", RELEASE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("rename", RENAME, UNRESERVED_KEYWORD)
+-PG_KEYWORD("repeatable", REPEATABLE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("replace", REPLACE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("replica", REPLICA, UNRESERVED_KEYWORD)
+-PG_KEYWORD("reset", RESET, UNRESERVED_KEYWORD)
+-PG_KEYWORD("restart", RESTART, UNRESERVED_KEYWORD)
+-PG_KEYWORD("restrict", RESTRICT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("returning", RETURNING, RESERVED_KEYWORD)
+-PG_KEYWORD("returns", RETURNS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("revoke", REVOKE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("right", RIGHT, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("role", ROLE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("rollback", ROLLBACK, UNRESERVED_KEYWORD)
+-PG_KEYWORD("rollup", ROLLUP, UNRESERVED_KEYWORD)
+-PG_KEYWORD("routine", ROUTINE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("routines", ROUTINES, UNRESERVED_KEYWORD)
+-PG_KEYWORD("row", ROW, COL_NAME_KEYWORD)
+-PG_KEYWORD("rows", ROWS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("rule", RULE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("savepoint", SAVEPOINT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("schema", SCHEMA, UNRESERVED_KEYWORD)
+-PG_KEYWORD("schemas", SCHEMAS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("scroll", SCROLL, UNRESERVED_KEYWORD)
+-PG_KEYWORD("search", SEARCH, UNRESERVED_KEYWORD)
+-PG_KEYWORD("second", SECOND_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("security", SECURITY, UNRESERVED_KEYWORD)
+-PG_KEYWORD("select", SELECT, RESERVED_KEYWORD)
+-PG_KEYWORD("sequence", SEQUENCE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("sequences", SEQUENCES, UNRESERVED_KEYWORD)
+-PG_KEYWORD("serializable", SERIALIZABLE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("server", SERVER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("session", SESSION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("session_user", SESSION_USER, RESERVED_KEYWORD)
+-PG_KEYWORD("set", SET, UNRESERVED_KEYWORD)
+-PG_KEYWORD("setof", SETOF, COL_NAME_KEYWORD)
+-PG_KEYWORD("sets", SETS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("share", SHARE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("show", SHOW, UNRESERVED_KEYWORD)
+-PG_KEYWORD("similar", SIMILAR, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("simple", SIMPLE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("skip", SKIP, UNRESERVED_KEYWORD)
+-PG_KEYWORD("smallint", SMALLINT, COL_NAME_KEYWORD)
+-PG_KEYWORD("snapshot", SNAPSHOT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("some", SOME, RESERVED_KEYWORD)
+-PG_KEYWORD("sql", SQL_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("stable", STABLE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("standalone", STANDALONE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("start", START, UNRESERVED_KEYWORD)
+-PG_KEYWORD("statement", STATEMENT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("statistics", STATISTICS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("stdin", STDIN, UNRESERVED_KEYWORD)
+-PG_KEYWORD("stdout", STDOUT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("storage", STORAGE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("stored", STORED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("strict", STRICT_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("strip", STRIP_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("subscription", SUBSCRIPTION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("substring", SUBSTRING, COL_NAME_KEYWORD)
+-PG_KEYWORD("support", SUPPORT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("symmetric", SYMMETRIC, RESERVED_KEYWORD)
+-PG_KEYWORD("sysid", SYSID, UNRESERVED_KEYWORD)
+-PG_KEYWORD("system", SYSTEM_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("table", TABLE, RESERVED_KEYWORD)
+-PG_KEYWORD("tables", TABLES, UNRESERVED_KEYWORD)
+-PG_KEYWORD("tablesample", TABLESAMPLE, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("tablespace", TABLESPACE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("temp", TEMP, UNRESERVED_KEYWORD)
+-PG_KEYWORD("template", TEMPLATE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("temporary", TEMPORARY, UNRESERVED_KEYWORD)
+-PG_KEYWORD("text", TEXT_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("then", THEN, RESERVED_KEYWORD)
+-PG_KEYWORD("ties", TIES, UNRESERVED_KEYWORD)
+-PG_KEYWORD("time", TIME, COL_NAME_KEYWORD)
+-PG_KEYWORD("timestamp", TIMESTAMP, COL_NAME_KEYWORD)
+-PG_KEYWORD("to", TO, RESERVED_KEYWORD)
+-PG_KEYWORD("trailing", TRAILING, RESERVED_KEYWORD)
+-PG_KEYWORD("transaction", TRANSACTION, UNRESERVED_KEYWORD)
+-PG_KEYWORD("transform", TRANSFORM, UNRESERVED_KEYWORD)
+-PG_KEYWORD("treat", TREAT, COL_NAME_KEYWORD)
+-PG_KEYWORD("trigger", TRIGGER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("trim", TRIM, COL_NAME_KEYWORD)
+-PG_KEYWORD("true", TRUE_P, RESERVED_KEYWORD)
+-PG_KEYWORD("truncate", TRUNCATE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("trusted", TRUSTED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("type", TYPE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("types", TYPES_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("uescape", UESCAPE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("unbounded", UNBOUNDED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("uncommitted", UNCOMMITTED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("unencrypted", UNENCRYPTED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("union", UNION, RESERVED_KEYWORD)
+-PG_KEYWORD("unique", UNIQUE, RESERVED_KEYWORD)
+-PG_KEYWORD("unknown", UNKNOWN, UNRESERVED_KEYWORD)
+-PG_KEYWORD("unlisten", UNLISTEN, UNRESERVED_KEYWORD)
+-PG_KEYWORD("unlogged", UNLOGGED, UNRESERVED_KEYWORD)
+-PG_KEYWORD("until", UNTIL, UNRESERVED_KEYWORD)
+-PG_KEYWORD("update", UPDATE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("user", USER, RESERVED_KEYWORD)
+-PG_KEYWORD("using", USING, RESERVED_KEYWORD)
+-PG_KEYWORD("vacuum", VACUUM, UNRESERVED_KEYWORD)
+-PG_KEYWORD("valid", VALID, UNRESERVED_KEYWORD)
+-PG_KEYWORD("validate", VALIDATE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("validator", VALIDATOR, UNRESERVED_KEYWORD)
+-PG_KEYWORD("value", VALUE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("values", VALUES, COL_NAME_KEYWORD)
+-PG_KEYWORD("varchar", VARCHAR, COL_NAME_KEYWORD)
+-PG_KEYWORD("variadic", VARIADIC, RESERVED_KEYWORD)
+-PG_KEYWORD("varying", VARYING, UNRESERVED_KEYWORD)
+-PG_KEYWORD("verbose", VERBOSE, TYPE_FUNC_NAME_KEYWORD)
+-PG_KEYWORD("version", VERSION_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("view", VIEW, UNRESERVED_KEYWORD)
+-PG_KEYWORD("views", VIEWS, UNRESERVED_KEYWORD)
+-PG_KEYWORD("volatile", VOLATILE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("when", WHEN, RESERVED_KEYWORD)
+-PG_KEYWORD("where", WHERE, RESERVED_KEYWORD)
+-PG_KEYWORD("whitespace", WHITESPACE_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("window", WINDOW, RESERVED_KEYWORD)
+-PG_KEYWORD("with", WITH, RESERVED_KEYWORD)
+-PG_KEYWORD("within", WITHIN, UNRESERVED_KEYWORD)
+-PG_KEYWORD("without", WITHOUT, UNRESERVED_KEYWORD)
+-PG_KEYWORD("work", WORK, UNRESERVED_KEYWORD)
+-PG_KEYWORD("wrapper", WRAPPER, UNRESERVED_KEYWORD)
+-PG_KEYWORD("write", WRITE, UNRESERVED_KEYWORD)
+-PG_KEYWORD("xml", XML_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("xmlattributes", XMLATTRIBUTES, COL_NAME_KEYWORD)
+-PG_KEYWORD("xmlconcat", XMLCONCAT, COL_NAME_KEYWORD)
+-PG_KEYWORD("xmlelement", XMLELEMENT, COL_NAME_KEYWORD)
+-PG_KEYWORD("xmlexists", XMLEXISTS, COL_NAME_KEYWORD)
+-PG_KEYWORD("xmlforest", XMLFOREST, COL_NAME_KEYWORD)
+-PG_KEYWORD("xmlnamespaces", XMLNAMESPACES, COL_NAME_KEYWORD)
+-PG_KEYWORD("xmlparse", XMLPARSE, COL_NAME_KEYWORD)
+-PG_KEYWORD("xmlpi", XMLPI, COL_NAME_KEYWORD)
+-PG_KEYWORD("xmlroot", XMLROOT, COL_NAME_KEYWORD)
+-PG_KEYWORD("xmlserialize", XMLSERIALIZE, COL_NAME_KEYWORD)
+-PG_KEYWORD("xmltable", XMLTABLE, COL_NAME_KEYWORD)
+-PG_KEYWORD("year", YEAR_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("yes", YES_P, UNRESERVED_KEYWORD)
+-PG_KEYWORD("zone", ZONE, UNRESERVED_KEYWORD)
++/* name, value, category, is-bare-label */
++PG_KEYWORD("abort", ABORT_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("absolute", ABSOLUTE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("access", ACCESS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("action", ACTION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("add", ADD_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("admin", ADMIN, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("after", AFTER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("aggregate", AGGREGATE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("all", ALL, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("also", ALSO, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("alter", ALTER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("always", ALWAYS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("analyse", ANALYSE, RESERVED_KEYWORD, BARE_LABEL)		/* British spelling */
++PG_KEYWORD("analyze", ANALYZE, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("and", AND, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("any", ANY, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("array", ARRAY, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("as", AS, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("asc", ASC, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("assertion", ASSERTION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("assignment", ASSIGNMENT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("asymmetric", ASYMMETRIC, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("at", AT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("attach", ATTACH, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("attribute", ATTRIBUTE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("authorization", AUTHORIZATION, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("backward", BACKWARD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("before", BEFORE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("begin", BEGIN_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("between", BETWEEN, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("bigint", BIGINT, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("binary", BINARY, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("bit", BIT, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("boolean", BOOLEAN_P, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("both", BOTH, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("by", BY, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("cache", CACHE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("call", CALL, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("called", CALLED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("cascade", CASCADE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("cascaded", CASCADED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("case", CASE, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("cast", CAST, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("catalog", CATALOG_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("chain", CHAIN, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("char", CHAR_P, COL_NAME_KEYWORD, AS_LABEL)
++PG_KEYWORD("character", CHARACTER, COL_NAME_KEYWORD, AS_LABEL)
++PG_KEYWORD("characteristics", CHARACTERISTICS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("check", CHECK, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("checkpoint", CHECKPOINT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("class", CLASS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("close", CLOSE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("cluster", CLUSTER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("coalesce", COALESCE, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("collate", COLLATE, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("collation", COLLATION, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("column", COLUMN, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("columns", COLUMNS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("comment", COMMENT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("comments", COMMENTS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("commit", COMMIT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("committed", COMMITTED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("concurrently", CONCURRENTLY, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("configuration", CONFIGURATION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("conflict", CONFLICT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("connection", CONNECTION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("constraint", CONSTRAINT, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("constraints", CONSTRAINTS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("content", CONTENT_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("continue", CONTINUE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("conversion", CONVERSION_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("copy", COPY, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("cost", COST, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("create", CREATE, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("cross", CROSS, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("csv", CSV, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("cube", CUBE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("current", CURRENT_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("current_catalog", CURRENT_CATALOG, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("current_date", CURRENT_DATE, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("current_role", CURRENT_ROLE, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("current_schema", CURRENT_SCHEMA, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("current_time", CURRENT_TIME, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("current_timestamp", CURRENT_TIMESTAMP, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("current_user", CURRENT_USER, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("cursor", CURSOR, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("cycle", CYCLE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("data", DATA_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("database", DATABASE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("day", DAY_P, UNRESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("deallocate", DEALLOCATE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("dec", DEC, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("decimal", DECIMAL_P, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("declare", DECLARE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("default", DEFAULT, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("defaults", DEFAULTS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("deferrable", DEFERRABLE, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("deferred", DEFERRED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("definer", DEFINER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("delete", DELETE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("delimiter", DELIMITER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("delimiters", DELIMITERS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("depends", DEPENDS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("desc", DESC, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("detach", DETACH, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("dictionary", DICTIONARY, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("disable", DISABLE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("discard", DISCARD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("distinct", DISTINCT, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("do", DO, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("document", DOCUMENT_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("domain", DOMAIN_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("double", DOUBLE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("drop", DROP, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("each", EACH, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("else", ELSE, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("enable", ENABLE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("encoding", ENCODING, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("encrypted", ENCRYPTED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("end", END_P, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("enum", ENUM_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("escape", ESCAPE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("event", EVENT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("except", EXCEPT, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("exclude", EXCLUDE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("excluding", EXCLUDING, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("exclusive", EXCLUSIVE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("execute", EXECUTE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("exists", EXISTS, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("explain", EXPLAIN, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("expression", EXPRESSION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("extension", EXTENSION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("external", EXTERNAL, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("extract", EXTRACT, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("false", FALSE_P, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("family", FAMILY, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("fetch", FETCH, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("filter", FILTER, UNRESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("first", FIRST_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("float", FLOAT_P, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("following", FOLLOWING, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("for", FOR, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("force", FORCE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("foreign", FOREIGN, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("forward", FORWARD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("freeze", FREEZE, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("from", FROM, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("full", FULL, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("function", FUNCTION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("functions", FUNCTIONS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("generated", GENERATED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("global", GLOBAL, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("grant", GRANT, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("granted", GRANTED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("greatest", GREATEST, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("group", GROUP_P, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("grouping", GROUPING, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("groups", GROUPS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("handler", HANDLER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("having", HAVING, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("header", HEADER_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("hold", HOLD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("hour", HOUR_P, UNRESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("identity", IDENTITY_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("if", IF_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("ilike", ILIKE, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("immediate", IMMEDIATE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("immutable", IMMUTABLE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("implicit", IMPLICIT_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("import", IMPORT_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("in", IN_P, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("include", INCLUDE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("including", INCLUDING, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("increment", INCREMENT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("index", INDEX, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("indexes", INDEXES, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("inherit", INHERIT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("inherits", INHERITS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("initially", INITIALLY, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("inline", INLINE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("inner", INNER_P, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("inout", INOUT, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("input", INPUT_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("insensitive", INSENSITIVE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("insert", INSERT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("instead", INSTEAD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("int", INT_P, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("integer", INTEGER, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("intersect", INTERSECT, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("interval", INTERVAL, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("into", INTO, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("invoker", INVOKER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("is", IS, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("isnull", ISNULL, TYPE_FUNC_NAME_KEYWORD, AS_LABEL)
++PG_KEYWORD("isolation", ISOLATION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("join", JOIN, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("key", KEY, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("label", LABEL, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("language", LANGUAGE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("large", LARGE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("last", LAST_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("lateral", LATERAL_P, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("leading", LEADING, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("leakproof", LEAKPROOF, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("least", LEAST, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("left", LEFT, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("level", LEVEL, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("like", LIKE, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("limit", LIMIT, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("listen", LISTEN, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("load", LOAD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("local", LOCAL, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("localtime", LOCALTIME, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("localtimestamp", LOCALTIMESTAMP, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("location", LOCATION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("lock", LOCK_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("locked", LOCKED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("logged", LOGGED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("mapping", MAPPING, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("match", MATCH, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("materialized", MATERIALIZED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("maxvalue", MAXVALUE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("method", METHOD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("minute", MINUTE_P, UNRESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("minvalue", MINVALUE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("mode", MODE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("month", MONTH_P, UNRESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("move", MOVE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("name", NAME_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("names", NAMES, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("national", NATIONAL, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("natural", NATURAL, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("nchar", NCHAR, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("new", NEW, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("next", NEXT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("nfc", NFC, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("nfd", NFD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("nfkc", NFKC, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("nfkd", NFKD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("no", NO, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("none", NONE, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("normalize", NORMALIZE, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("normalized", NORMALIZED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("not", NOT, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("nothing", NOTHING, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("notify", NOTIFY, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("notnull", NOTNULL, TYPE_FUNC_NAME_KEYWORD, AS_LABEL)
++PG_KEYWORD("nowait", NOWAIT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("null", NULL_P, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("nullif", NULLIF, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("nulls", NULLS_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("numeric", NUMERIC, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("object", OBJECT_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("of", OF, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("off", OFF, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("offset", OFFSET, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("oids", OIDS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("old", OLD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("on", ON, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("only", ONLY, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("operator", OPERATOR, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("option", OPTION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("options", OPTIONS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("or", OR, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("order", ORDER, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("ordinality", ORDINALITY, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("others", OTHERS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("out", OUT_P, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("outer", OUTER_P, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("over", OVER, UNRESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("overlaps", OVERLAPS, TYPE_FUNC_NAME_KEYWORD, AS_LABEL)
++PG_KEYWORD("overlay", OVERLAY, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("overriding", OVERRIDING, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("owned", OWNED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("owner", OWNER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("parallel", PARALLEL, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("parser", PARSER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("partial", PARTIAL, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("partition", PARTITION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("passing", PASSING, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("password", PASSWORD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("placing", PLACING, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("plans", PLANS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("policy", POLICY, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("position", POSITION, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("preceding", PRECEDING, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("precision", PRECISION, COL_NAME_KEYWORD, AS_LABEL)
++PG_KEYWORD("prepare", PREPARE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("prepared", PREPARED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("preserve", PRESERVE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("primary", PRIMARY, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("prior", PRIOR, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("privileges", PRIVILEGES, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("procedural", PROCEDURAL, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("procedure", PROCEDURE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("procedures", PROCEDURES, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("program", PROGRAM, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("publication", PUBLICATION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("quote", QUOTE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("range", RANGE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("read", READ, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("real", REAL, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("reassign", REASSIGN, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("recheck", RECHECK, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("recursive", RECURSIVE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("ref", REF, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("references", REFERENCES, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("referencing", REFERENCING, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("refresh", REFRESH, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("reindex", REINDEX, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("relative", RELATIVE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("release", RELEASE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("rename", RENAME, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("repeatable", REPEATABLE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("replace", REPLACE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("replica", REPLICA, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("reset", RESET, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("restart", RESTART, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("restrict", RESTRICT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("returning", RETURNING, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("returns", RETURNS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("revoke", REVOKE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("right", RIGHT, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("role", ROLE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("rollback", ROLLBACK, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("rollup", ROLLUP, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("routine", ROUTINE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("routines", ROUTINES, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("row", ROW, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("rows", ROWS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("rule", RULE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("savepoint", SAVEPOINT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("schema", SCHEMA, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("schemas", SCHEMAS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("scroll", SCROLL, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("search", SEARCH, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("second", SECOND_P, UNRESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("security", SECURITY, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("select", SELECT, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("sequence", SEQUENCE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("sequences", SEQUENCES, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("serializable", SERIALIZABLE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("server", SERVER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("session", SESSION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("session_user", SESSION_USER, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("set", SET, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("setof", SETOF, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("sets", SETS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("share", SHARE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("show", SHOW, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("similar", SIMILAR, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("simple", SIMPLE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("skip", SKIP, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("smallint", SMALLINT, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("snapshot", SNAPSHOT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("some", SOME, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("sql", SQL_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("stable", STABLE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("standalone", STANDALONE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("start", START, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("statement", STATEMENT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("statistics", STATISTICS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("stdin", STDIN, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("stdout", STDOUT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("storage", STORAGE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("stored", STORED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("strict", STRICT_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("strip", STRIP_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("subscription", SUBSCRIPTION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("substring", SUBSTRING, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("support", SUPPORT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("symmetric", SYMMETRIC, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("sysid", SYSID, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("system", SYSTEM_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("table", TABLE, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("tables", TABLES, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("tablesample", TABLESAMPLE, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("tablespace", TABLESPACE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("temp", TEMP, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("template", TEMPLATE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("temporary", TEMPORARY, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("text", TEXT_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("then", THEN, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("ties", TIES, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("time", TIME, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("timestamp", TIMESTAMP, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("to", TO, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("trailing", TRAILING, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("transaction", TRANSACTION, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("transform", TRANSFORM, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("treat", TREAT, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("trigger", TRIGGER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("trim", TRIM, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("true", TRUE_P, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("truncate", TRUNCATE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("trusted", TRUSTED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("type", TYPE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("types", TYPES_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("uescape", UESCAPE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("unbounded", UNBOUNDED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("uncommitted", UNCOMMITTED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("unencrypted", UNENCRYPTED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("union", UNION, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("unique", UNIQUE, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("unknown", UNKNOWN, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("unlisten", UNLISTEN, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("unlogged", UNLOGGED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("until", UNTIL, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("update", UPDATE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("user", USER, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("using", USING, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("vacuum", VACUUM, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("valid", VALID, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("validate", VALIDATE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("validator", VALIDATOR, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("value", VALUE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("values", VALUES, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("varchar", VARCHAR, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("variadic", VARIADIC, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("varying", VARYING, UNRESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("verbose", VERBOSE, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("version", VERSION_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("view", VIEW, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("views", VIEWS, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("volatile", VOLATILE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("when", WHEN, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("where", WHERE, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("whitespace", WHITESPACE_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("window", WINDOW, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("with", WITH, RESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("within", WITHIN, UNRESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("without", WITHOUT, UNRESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("work", WORK, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("wrapper", WRAPPER, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("write", WRITE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xml", XML_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xmlattributes", XMLATTRIBUTES, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xmlconcat", XMLCONCAT, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xmlelement", XMLELEMENT, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xmlexists", XMLEXISTS, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xmlforest", XMLFOREST, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xmlnamespaces", XMLNAMESPACES, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xmlparse", XMLPARSE, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xmlpi", XMLPI, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xmlroot", XMLROOT, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xmlserialize", XMLSERIALIZE, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("xmltable", XMLTABLE, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("year", YEAR_P, UNRESERVED_KEYWORD, AS_LABEL)
++PG_KEYWORD("yes", YES_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("zone", ZONE, UNRESERVED_KEYWORD, BARE_LABEL)
+diff --git a/src/interfaces/ecpg/preproc/keywords.c b/src/interfaces/ecpg/preproc/keywords.c
+index f82764aeb97d..f1640d0062b6 100644
+--- a/src/interfaces/ecpg/preproc/keywords.c
++++ b/src/interfaces/ecpg/preproc/keywords.c
+@@ -29,7 +29,7 @@
+ #include "preproc_extern.h"
+ #include "preproc.h"
+ 
+-#define PG_KEYWORD(kwname, value, category) value,
++#define PG_KEYWORD(kwname, value, category, collabel) value,
+ 
+ const uint16 SQLScanKeywordTokens[] = {
+ #include "parser/kwlist.h"

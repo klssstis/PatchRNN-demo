@@ -1,0 +1,691 @@
+From 6dfacbf72b53b775e8442a7fd2fca7c24b139773 Mon Sep 17 00:00:00 2001
+From: Dean Rasheed <dean.a.rasheed@gmail.com>
+Date: Mon, 23 Jan 2023 19:21:22 +0000
+Subject: [PATCH] Add non-decimal integer support to type numeric.
+
+This enhances the numeric type input function, adding support for
+hexadecimal, octal, and binary integers of any size, up to the limits
+of the numeric type.
+
+Since 6fcda9aba8, such non-decimal integers have been accepted by the
+parser as integer literals and passed through to numeric_in(). This
+commit gives numeric_in() the ability to handle them.
+
+While at it, simplify the handling of NaN and infinities, reducing the
+number of calls to pg_strncasecmp(), and arrange for pg_strncasecmp()
+to not be called at all for regular numbers. This gives a significant
+performance improvement for decimal inputs, more than offsetting the
+small performance hit of checking for non-decimal input.
+
+Discussion: https://postgr.es/m/CAEZATCV8XShnmT9HZy25C%2Bo78CVOFmUN5EM9FRAZ5xvYTggPMg%40mail.gmail.com
+---
+ src/backend/utils/adt/numeric.c          | 360 +++++++++++++++++++----
+ src/test/regress/expected/numeric.out    |  78 ++++-
+ src/test/regress/expected/numerology.out |  48 +--
+ src/test/regress/sql/numeric.sql         |  14 +
+ 4 files changed, 405 insertions(+), 95 deletions(-)
+
+diff --git a/src/backend/utils/adt/numeric.c b/src/backend/utils/adt/numeric.c
+index 67edb70ab820..898c52099bd4 100644
+--- a/src/backend/utils/adt/numeric.c
++++ b/src/backend/utils/adt/numeric.c
+@@ -500,6 +500,11 @@ static void zero_var(NumericVar *var);
+ static bool set_var_from_str(const char *str, const char *cp,
+ 							 NumericVar *dest, const char **endptr,
+ 							 Node *escontext);
++static bool set_var_from_non_decimal_integer_str(const char *str,
++												 const char *cp, int sign,
++												 int base, NumericVar *dest,
++												 const char **endptr,
++												 Node *escontext);
+ static void set_var_from_num(Numeric num, NumericVar *dest);
+ static void init_var_from_num(Numeric num, NumericVar *dest);
+ static void set_var_from_var(const NumericVar *value, NumericVar *dest);
+@@ -629,6 +634,8 @@ numeric_in(PG_FUNCTION_ARGS)
+ 	Node	   *escontext = fcinfo->context;
+ 	Numeric		res;
+ 	const char *cp;
++	const char *numstart;
++	int			sign;
+ 
+ 	/* Skip leading spaces */
+ 	cp = str;
+@@ -640,70 +647,130 @@ numeric_in(PG_FUNCTION_ARGS)
+ 	}
+ 
+ 	/*
+-	 * Check for NaN and infinities.  We recognize the same strings allowed by
+-	 * float8in().
++	 * Process the number's sign. This duplicates logic in set_var_from_str(),
++	 * but it's worth doing here, since it simplifies the handling of
++	 * infinities and non-decimal integers.
+ 	 */
+-	if (pg_strncasecmp(cp, "NaN", 3) == 0)
+-	{
+-		res = make_result(&const_nan);
+-		cp += 3;
+-	}
+-	else if (pg_strncasecmp(cp, "Infinity", 8) == 0)
+-	{
+-		res = make_result(&const_pinf);
+-		cp += 8;
+-	}
+-	else if (pg_strncasecmp(cp, "+Infinity", 9) == 0)
+-	{
+-		res = make_result(&const_pinf);
+-		cp += 9;
+-	}
+-	else if (pg_strncasecmp(cp, "-Infinity", 9) == 0)
+-	{
+-		res = make_result(&const_ninf);
+-		cp += 9;
+-	}
+-	else if (pg_strncasecmp(cp, "inf", 3) == 0)
+-	{
+-		res = make_result(&const_pinf);
+-		cp += 3;
+-	}
+-	else if (pg_strncasecmp(cp, "+inf", 4) == 0)
++	numstart = cp;
++	sign = NUMERIC_POS;
++
++	if (*cp == '+')
++		cp++;
++	else if (*cp == '-')
+ 	{
+-		res = make_result(&const_pinf);
+-		cp += 4;
++		sign = NUMERIC_NEG;
++		cp++;
+ 	}
+-	else if (pg_strncasecmp(cp, "-inf", 4) == 0)
++
++	/*
++	 * Check for NaN and infinities.  We recognize the same strings allowed by
++	 * float8in().
++	 *
++	 * Since all other legal inputs have a digit or a decimal point after the
++	 * sign, we need only check for NaN/infinity if that's not the case.
++	 */
++	if (!isdigit((unsigned char) *cp) && *cp != '.')
+ 	{
+-		res = make_result(&const_ninf);
+-		cp += 4;
++		/*
++		 * The number must be NaN or infinity; anything else can only be a
++		 * syntax error. Note that NaN mustn't have a sign.
++		 */
++		if (pg_strncasecmp(numstart, "NaN", 3) == 0)
++		{
++			res = make_result(&const_nan);
++			cp = numstart + 3;
++		}
++		else if (pg_strncasecmp(cp, "Infinity", 8) == 0)
++		{
++			res = make_result(sign == NUMERIC_POS ? &const_pinf : &const_ninf);
++			cp += 8;
++		}
++		else if (pg_strncasecmp(cp, "inf", 3) == 0)
++		{
++			res = make_result(sign == NUMERIC_POS ? &const_pinf : &const_ninf);
++			cp += 3;
++		}
++		else
++			goto invalid_syntax;
++
++		/*
++		 * Check for trailing junk; there should be nothing left but spaces.
++		 *
++		 * We intentionally do this check before applying the typmod because
++		 * we would like to throw any trailing-junk syntax error before any
++		 * semantic error resulting from apply_typmod_special().
++		 */
++		while (*cp)
++		{
++			if (!isspace((unsigned char) *cp))
++				goto invalid_syntax;
++			cp++;
++		}
++
++		if (!apply_typmod_special(res, typmod, escontext))
++			PG_RETURN_NULL();
+ 	}
+ 	else
+ 	{
+ 		/*
+-		 * Use set_var_from_str() to parse a normal numeric value
++		 * We have a normal numeric value, which may be a non-decimal integer
++		 * or a regular decimal number.
+ 		 */
+ 		NumericVar	value;
++		int			base;
+ 		bool		have_error;
+ 
+ 		init_var(&value);
+ 
+-		if (!set_var_from_str(str, cp, &value, &cp, escontext))
+-			PG_RETURN_NULL();
++		/*
++		 * Determine the number's base by looking for a non-decimal prefix
++		 * indicator ("0x", "0o", or "0b").
++		 */
++		if (cp[0] == '0')
++		{
++			switch (cp[1])
++			{
++				case 'x':
++				case 'X':
++					base = 16;
++					break;
++				case 'o':
++				case 'O':
++					base = 8;
++					break;
++				case 'b':
++				case 'B':
++					base = 2;
++					break;
++				default:
++					base = 10;
++			}
++		}
++		else
++			base = 10;
++
++		/* Parse the rest of the number and apply the sign */
++		if (base == 10)
++		{
++			if (!set_var_from_str(str, cp, &value, &cp, escontext))
++				PG_RETURN_NULL();
++			value.sign = sign;
++		}
++		else
++		{
++			if (!set_var_from_non_decimal_integer_str(str, cp + 2, sign, base,
++													  &value, &cp, escontext))
++				PG_RETURN_NULL();
++		}
+ 
+ 		/*
+-		 * We duplicate a few lines of code here because we would like to
+-		 * throw any trailing-junk syntax error before any semantic error
+-		 * resulting from apply_typmod.  We can't easily fold the two cases
+-		 * together because we mustn't apply apply_typmod to a NaN/Inf.
++		 * Should be nothing left but spaces. As above, throw any typmod error
++		 * after finishing syntax check.
+ 		 */
+ 		while (*cp)
+ 		{
+ 			if (!isspace((unsigned char) *cp))
+-				ereturn(escontext, (Datum) 0,
+-						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+-						 errmsg("invalid input syntax for type %s: \"%s\"",
+-								"numeric", str)));
++				goto invalid_syntax;
+ 			cp++;
+ 		}
+ 
+@@ -718,26 +785,15 @@ numeric_in(PG_FUNCTION_ARGS)
+ 					 errmsg("value overflows numeric format")));
+ 
+ 		free_var(&value);
+-
+-		PG_RETURN_NUMERIC(res);
+-	}
+-
+-	/* Should be nothing left but spaces */
+-	while (*cp)
+-	{
+-		if (!isspace((unsigned char) *cp))
+-			ereturn(escontext, (Datum) 0,
+-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+-					 errmsg("invalid input syntax for type %s: \"%s\"",
+-							"numeric", str)));
+-		cp++;
+ 	}
+ 
+-	/* As above, throw any typmod error after finishing syntax check */
+-	if (!apply_typmod_special(res, typmod, escontext))
+-		PG_RETURN_NULL();
+-
+ 	PG_RETURN_NUMERIC(res);
++
++invalid_syntax:
++	ereturn(escontext, (Datum) 0,
++			(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
++			 errmsg("invalid input syntax for type %s: \"%s\"",
++					"numeric", str)));
+ }
+ 
+ 
+@@ -6992,6 +7048,188 @@ set_var_from_str(const char *str, const char *cp,
+ }
+ 
+ 
++/*
++ * Return the numeric value of a single hex digit.
++ */
++static inline int
++xdigit_value(char dig)
++{
++	return dig >= '0' && dig <= '9' ? dig - '0' :
++		dig >= 'a' && dig <= 'f' ? dig - 'a' + 10 :
++		dig >= 'A' && dig <= 'F' ? dig - 'A' + 10 : -1;
++}
++
++/*
++ * set_var_from_non_decimal_integer_str()
++ *
++ *	Parse a string containing a non-decimal integer
++ *
++ * This function does not handle leading or trailing spaces.  It returns
++ * the end+1 position parsed into *endptr, so that caller can check for
++ * trailing spaces/garbage if deemed necessary.
++ *
++ * cp is the place to actually start parsing; str is what to use in error
++ * reports.  The number's sign and base prefix indicator (e.g., "0x") are
++ * assumed to have already been parsed, so cp should point to the number's
++ * first digit in the base specified.
++ *
++ * base is expected to be 2, 8 or 16.
++ *
++ * Returns true on success, false on failure (if escontext points to an
++ * ErrorSaveContext; otherwise errors are thrown).
++ */
++static bool
++set_var_from_non_decimal_integer_str(const char *str, const char *cp, int sign,
++									 int base, NumericVar *dest,
++									 const char **endptr, Node *escontext)
++{
++	const char *firstdigit = cp;
++	int64		tmp;
++	int64		mul;
++	NumericVar	tmp_var;
++
++	init_var(&tmp_var);
++
++	zero_var(dest);
++
++	/*
++	 * Process input digits in groups that fit in int64.  Here "tmp" is the
++	 * value of the digits in the group, and "mul" is base^n, where n is the
++	 * number of digits in the group.  Thus tmp < mul, and we must start a new
++	 * group when mul * base threatens to overflow PG_INT64_MAX.
++	 */
++	tmp = 0;
++	mul = 1;
++
++	if (base == 16)
++	{
++		while (*cp)
++		{
++			if (isxdigit((unsigned char) *cp))
++			{
++				if (mul > PG_INT64_MAX / 16)
++				{
++					/* Add the contribution from this group of digits */
++					int64_to_numericvar(mul, &tmp_var);
++					mul_var(dest, &tmp_var, dest, 0);
++					int64_to_numericvar(tmp, &tmp_var);
++					add_var(dest, &tmp_var, dest);
++
++					/* Result will overflow if weight overflows int16 */
++					if (dest->weight > SHRT_MAX)
++						goto out_of_range;
++
++					/* Begin a new group */
++					tmp = 0;
++					mul = 1;
++				}
++
++				tmp = tmp * 16 + xdigit_value(*cp++);
++				mul = mul * 16;
++			}
++			else
++				break;
++		}
++	}
++	else if (base == 8)
++	{
++		while (*cp)
++		{
++			if (*cp >= '0' && *cp <= '7')
++			{
++				if (mul > PG_INT64_MAX / 8)
++				{
++					/* Add the contribution from this group of digits */
++					int64_to_numericvar(mul, &tmp_var);
++					mul_var(dest, &tmp_var, dest, 0);
++					int64_to_numericvar(tmp, &tmp_var);
++					add_var(dest, &tmp_var, dest);
++
++					/* Result will overflow if weight overflows int16 */
++					if (dest->weight > SHRT_MAX)
++						goto out_of_range;
++
++					/* Begin a new group */
++					tmp = 0;
++					mul = 1;
++				}
++
++				tmp = tmp * 8 + (*cp++ - '0');
++				mul = mul * 8;
++			}
++			else
++				break;
++		}
++	}
++	else if (base == 2)
++	{
++		while (*cp)
++		{
++			if (*cp >= '0' && *cp <= '1')
++			{
++				if (mul > PG_INT64_MAX / 2)
++				{
++					/* Add the contribution from this group of digits */
++					int64_to_numericvar(mul, &tmp_var);
++					mul_var(dest, &tmp_var, dest, 0);
++					int64_to_numericvar(tmp, &tmp_var);
++					add_var(dest, &tmp_var, dest);
++
++					/* Result will overflow if weight overflows int16 */
++					if (dest->weight > SHRT_MAX)
++						goto out_of_range;
++
++					/* Begin a new group */
++					tmp = 0;
++					mul = 1;
++				}
++
++				tmp = tmp * 2 + (*cp++ - '0');
++				mul = mul * 2;
++			}
++			else
++				break;
++		}
++	}
++	else
++		/* Should never happen; treat as invalid input */
++		goto invalid_syntax;
++
++	/* Check that we got at least one digit */
++	if (unlikely(cp == firstdigit))
++		goto invalid_syntax;
++
++	/* Add the contribution from the final group of digits */
++	int64_to_numericvar(mul, &tmp_var);
++	mul_var(dest, &tmp_var, dest, 0);
++	int64_to_numericvar(tmp, &tmp_var);
++	add_var(dest, &tmp_var, dest);
++
++	if (dest->weight > SHRT_MAX)
++		goto out_of_range;
++
++	dest->sign = sign;
++
++	free_var(&tmp_var);
++
++	/* Return end+1 position for caller */
++	*endptr = cp;
++
++	return true;
++
++out_of_range:
++	ereturn(escontext, false,
++			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
++			 errmsg("value overflows numeric format")));
++
++invalid_syntax:
++	ereturn(escontext, false,
++			(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
++			 errmsg("invalid input syntax for type %s: \"%s\"",
++					"numeric", str)));
++}
++
++
+ /*
+  * set_var_from_num() -
+  *
+diff --git a/src/test/regress/expected/numeric.out b/src/test/regress/expected/numeric.out
+index 30a5613ed74b..94796522d99b 100644
+--- a/src/test/regress/expected/numeric.out
++++ b/src/test/regress/expected/numeric.out
+@@ -2144,6 +2144,12 @@ INSERT INTO num_input_test(n1) VALUES (' -inf ');
+ INSERT INTO num_input_test(n1) VALUES (' Infinity ');
+ INSERT INTO num_input_test(n1) VALUES (' +inFinity ');
+ INSERT INTO num_input_test(n1) VALUES (' -INFINITY ');
++INSERT INTO num_input_test(n1) VALUES ('0b10001110111100111100001001010');
++INSERT INTO num_input_test(n1) VALUES ('  -0B1010101101010100101010011000110011101011000111110000101011010010  ');
++INSERT INTO num_input_test(n1) VALUES ('  +0o112402761777 ');
++INSERT INTO num_input_test(n1) VALUES ('-0O001255245230633431670261');
++INSERT INTO num_input_test(n1) VALUES ('-0x0000000000000000000000000deadbeef');
++INSERT INTO num_input_test(n1) VALUES (' 0X30b1F33a6DF0bD4E64DF9BdA7D15 ');
+ -- bad inputs
+ INSERT INTO num_input_test(n1) VALUES ('     ');
+ ERROR:  invalid input syntax for type numeric: "     "
+@@ -2177,27 +2183,61 @@ INSERT INTO num_input_test(n1) VALUES (' N aN ');
+ ERROR:  invalid input syntax for type numeric: " N aN "
+ LINE 1: INSERT INTO num_input_test(n1) VALUES (' N aN ');
+                                                ^
++INSERT INTO num_input_test(n1) VALUES ('+NaN');
++ERROR:  invalid input syntax for type numeric: "+NaN"
++LINE 1: INSERT INTO num_input_test(n1) VALUES ('+NaN');
++                                               ^
++INSERT INTO num_input_test(n1) VALUES ('-NaN');
++ERROR:  invalid input syntax for type numeric: "-NaN"
++LINE 1: INSERT INTO num_input_test(n1) VALUES ('-NaN');
++                                               ^
+ INSERT INTO num_input_test(n1) VALUES ('+ infinity');
+ ERROR:  invalid input syntax for type numeric: "+ infinity"
+ LINE 1: INSERT INTO num_input_test(n1) VALUES ('+ infinity');
+                                                ^
++INSERT INTO num_input_test(n1) VALUES ('0b1112');
++ERROR:  invalid input syntax for type numeric: "0b1112"
++LINE 1: INSERT INTO num_input_test(n1) VALUES ('0b1112');
++                                               ^
++INSERT INTO num_input_test(n1) VALUES ('0c1112');
++ERROR:  invalid input syntax for type numeric: "0c1112"
++LINE 1: INSERT INTO num_input_test(n1) VALUES ('0c1112');
++                                               ^
++INSERT INTO num_input_test(n1) VALUES ('0o12345678');
++ERROR:  invalid input syntax for type numeric: "0o12345678"
++LINE 1: INSERT INTO num_input_test(n1) VALUES ('0o12345678');
++                                               ^
++INSERT INTO num_input_test(n1) VALUES ('0x1eg');
++ERROR:  invalid input syntax for type numeric: "0x1eg"
++LINE 1: INSERT INTO num_input_test(n1) VALUES ('0x1eg');
++                                               ^
++INSERT INTO num_input_test(n1) VALUES ('0x12.34');
++ERROR:  invalid input syntax for type numeric: "0x12.34"
++LINE 1: INSERT INTO num_input_test(n1) VALUES ('0x12.34');
++                                               ^
+ SELECT * FROM num_input_test;
+-    n1     
+------------
+-       123
+-   3245874
+-    -93853
+-    555.50
+-   -555.50
+-       NaN
+-       NaN
+-  Infinity
+-  Infinity
+- -Infinity
+-  Infinity
+-  Infinity
+- -Infinity
+-(13 rows)
++                n1                 
++-----------------------------------
++                               123
++                           3245874
++                            -93853
++                            555.50
++                           -555.50
++                               NaN
++                               NaN
++                          Infinity
++                          Infinity
++                         -Infinity
++                          Infinity
++                          Infinity
++                         -Infinity
++                         299792458
++             -12345678901234567890
++                        9999999999
++             -12345678900987654321
++                       -3735928559
++ 987654321234567898765432123456789
++(19 rows)
+ 
+ -- Also try it with non-error-throwing API
+ SELECT pg_input_is_valid('34.5', 'numeric');
+@@ -2242,6 +2282,12 @@ SELECT pg_input_error_message('1234.567', 'numeric(7,4)');
+  numeric field overflow
+ (1 row)
+ 
++SELECT pg_input_error_message('0x1234.567', 'numeric');
++               pg_input_error_message                
++-----------------------------------------------------
++ invalid input syntax for type numeric: "0x1234.567"
++(1 row)
++
+ --
+ -- Test precision and scale typemods
+ --
+diff --git a/src/test/regress/expected/numerology.out b/src/test/regress/expected/numerology.out
+index 15cd6b167236..deb26d31c335 100644
+--- a/src/test/regress/expected/numerology.out
++++ b/src/test/regress/expected/numerology.out
+@@ -104,9 +104,11 @@ SELECT 0b111111111111111111111111111111111111111111111111111111111111111;
+ (1 row)
+ 
+ SELECT 0b1000000000000000000000000000000000000000000000000000000000000000;
+-ERROR:  invalid input syntax for type numeric: "0b1000000000000000000000000000000000000000000000000000000000000000"
+-LINE 1: SELECT 0b100000000000000000000000000000000000000000000000000...
+-               ^
++      ?column?       
++---------------------
++ 9223372036854775808
++(1 row)
++
+ SELECT 0o777777777777777777777;
+       ?column?       
+ ---------------------
+@@ -114,9 +116,11 @@ SELECT 0o777777777777777777777;
+ (1 row)
+ 
+ SELECT 0o1000000000000000000000;
+-ERROR:  invalid input syntax for type numeric: "0o1000000000000000000000"
+-LINE 1: SELECT 0o1000000000000000000000;
+-               ^
++      ?column?       
++---------------------
++ 9223372036854775808
++(1 row)
++
+ SELECT 0x7FFFFFFFFFFFFFFF;
+       ?column?       
+ ---------------------
+@@ -124,9 +128,11 @@ SELECT 0x7FFFFFFFFFFFFFFF;
+ (1 row)
+ 
+ SELECT 0x8000000000000000;
+-ERROR:  invalid input syntax for type numeric: "0x8000000000000000"
+-LINE 1: SELECT 0x8000000000000000;
+-               ^
++      ?column?       
++---------------------
++ 9223372036854775808
++(1 row)
++
+ SELECT -0b1000000000000000000000000000000000000000000000000000000000000000;
+        ?column?       
+ ----------------------
+@@ -134,9 +140,11 @@ SELECT -0b1000000000000000000000000000000000000000000000000000000000000000;
+ (1 row)
+ 
+ SELECT -0b1000000000000000000000000000000000000000000000000000000000000001;
+-ERROR:  invalid input syntax for type numeric: "-0b1000000000000000000000000000000000000000000000000000000000000001"
+-LINE 1: SELECT -0b10000000000000000000000000000000000000000000000000...
+-               ^
++       ?column?       
++----------------------
++ -9223372036854775809
++(1 row)
++
+ SELECT -0o1000000000000000000000;
+        ?column?       
+ ----------------------
+@@ -144,9 +152,11 @@ SELECT -0o1000000000000000000000;
+ (1 row)
+ 
+ SELECT -0o1000000000000000000001;
+-ERROR:  invalid input syntax for type numeric: "-0o1000000000000000000001"
+-LINE 1: SELECT -0o1000000000000000000001;
+-               ^
++       ?column?       
++----------------------
++ -9223372036854775809
++(1 row)
++
+ SELECT -0x8000000000000000;
+        ?column?       
+ ----------------------
+@@ -154,9 +164,11 @@ SELECT -0x8000000000000000;
+ (1 row)
+ 
+ SELECT -0x8000000000000001;
+-ERROR:  invalid input syntax for type numeric: "-0x8000000000000001"
+-LINE 1: SELECT -0x8000000000000001;
+-               ^
++       ?column?       
++----------------------
++ -9223372036854775809
++(1 row)
++
+ -- error cases
+ SELECT 123abc;
+ ERROR:  trailing junk after numeric literal at or near "123a"
+diff --git a/src/test/regress/sql/numeric.sql b/src/test/regress/sql/numeric.sql
+index 7bb34e5021aa..fe93714dd13d 100644
+--- a/src/test/regress/sql/numeric.sql
++++ b/src/test/regress/sql/numeric.sql
+@@ -1039,6 +1039,12 @@ INSERT INTO num_input_test(n1) VALUES (' -inf ');
+ INSERT INTO num_input_test(n1) VALUES (' Infinity ');
+ INSERT INTO num_input_test(n1) VALUES (' +inFinity ');
+ INSERT INTO num_input_test(n1) VALUES (' -INFINITY ');
++INSERT INTO num_input_test(n1) VALUES ('0b10001110111100111100001001010');
++INSERT INTO num_input_test(n1) VALUES ('  -0B1010101101010100101010011000110011101011000111110000101011010010  ');
++INSERT INTO num_input_test(n1) VALUES ('  +0o112402761777 ');
++INSERT INTO num_input_test(n1) VALUES ('-0O001255245230633431670261');
++INSERT INTO num_input_test(n1) VALUES ('-0x0000000000000000000000000deadbeef');
++INSERT INTO num_input_test(n1) VALUES (' 0X30b1F33a6DF0bD4E64DF9BdA7D15 ');
+ 
+ -- bad inputs
+ INSERT INTO num_input_test(n1) VALUES ('     ');
+@@ -1049,7 +1055,14 @@ INSERT INTO num_input_test(n1) VALUES ('5 . 0');
+ INSERT INTO num_input_test(n1) VALUES ('5. 0   ');
+ INSERT INTO num_input_test(n1) VALUES ('');
+ INSERT INTO num_input_test(n1) VALUES (' N aN ');
++INSERT INTO num_input_test(n1) VALUES ('+NaN');
++INSERT INTO num_input_test(n1) VALUES ('-NaN');
+ INSERT INTO num_input_test(n1) VALUES ('+ infinity');
++INSERT INTO num_input_test(n1) VALUES ('0b1112');
++INSERT INTO num_input_test(n1) VALUES ('0c1112');
++INSERT INTO num_input_test(n1) VALUES ('0o12345678');
++INSERT INTO num_input_test(n1) VALUES ('0x1eg');
++INSERT INTO num_input_test(n1) VALUES ('0x12.34');
+ 
+ SELECT * FROM num_input_test;
+ 
+@@ -1061,6 +1074,7 @@ SELECT pg_input_error_message('1e400000', 'numeric');
+ SELECT pg_input_is_valid('1234.567', 'numeric(8,4)');
+ SELECT pg_input_is_valid('1234.567', 'numeric(7,4)');
+ SELECT pg_input_error_message('1234.567', 'numeric(7,4)');
++SELECT pg_input_error_message('0x1234.567', 'numeric');
+ 
+ --
+ -- Test precision and scale typemods

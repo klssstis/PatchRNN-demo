@@ -1,0 +1,241 @@
+From 6b71c925cb817f79cb0d389edacdd033efaa301d Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 17 Aug 2021 14:29:22 -0400
+Subject: [PATCH] Prevent ALTER TYPE/DOMAIN/OPERATOR from changing extension
+ membership.
+
+If recordDependencyOnCurrentExtension is invoked on a pre-existing,
+free-standing object during an extension update script, that object
+will become owned by the extension.  In our current code this is
+possible in three cases:
+
+* Replacing a "shell" type or operator.
+* CREATE OR REPLACE overwriting an existing object.
+* ALTER TYPE SET, ALTER DOMAIN SET, and ALTER OPERATOR SET.
+
+The first of these cases is intentional behavior, as noted by the
+existing comments for GenerateTypeDependencies.  It seems like
+appropriate behavior for CREATE OR REPLACE too; at least, the obvious
+alternatives are not better.  However, the fact that it happens during
+ALTER is an artifact of trying to share code (GenerateTypeDependencies
+and makeOperatorDependencies) between the CREATE and ALTER cases.
+Since an extension script would be unlikely to ALTER an object that
+didn't already belong to the extension, this behavior is not very
+troubling for the direct target object ... but ALTER TYPE SET will
+recurse to dependent domains, and it is very uncool for those to
+become owned by the extension if they were not already.
+
+Let's fix this by redefining the ALTER cases to never change extension
+membership, full stop.  We could minimize the behavioral change by
+only changing the behavior when ALTER TYPE SET is recursing to a
+domain, but that would complicate the code and it does not seem like
+a better definition.
+
+Per bug #17144 from Alex Kozhemyakin.  Back-patch to v13 where ALTER
+TYPE SET was added.  (The other cases are older, but since they only
+affect the directly-named object, there's not enough of a problem to
+justify changing the behavior further back.)
+
+Discussion: https://postgr.es/m/17144-e67d7a8f049de9af@postgresql.org
+---
+ src/backend/catalog/pg_depend.c     |  7 +++++++
+ src/backend/catalog/pg_operator.c   | 15 +++++++++++----
+ src/backend/catalog/pg_type.c       | 24 ++++++++++++++++--------
+ src/backend/commands/operatorcmds.c |  2 +-
+ src/backend/commands/typecmds.c     |  2 ++
+ src/include/catalog/pg_operator.h   |  4 +++-
+ src/include/catalog/pg_type.h       |  1 +
+ 7 files changed, 41 insertions(+), 14 deletions(-)
+
+diff --git a/src/backend/catalog/pg_depend.c b/src/backend/catalog/pg_depend.c
+index 10f311967008..07bcdc463a31 100644
+--- a/src/backend/catalog/pg_depend.c
++++ b/src/backend/catalog/pg_depend.c
+@@ -179,6 +179,13 @@ recordMultipleDependencies(const ObjectAddress *depender,
+  * existed), so we must check for a pre-existing extension membership entry.
+  * Passing false is a guarantee that the object is newly created, and so
+  * could not already be a member of any extension.
++ *
++ * Note: isReplace = true is typically used when updating a object in
++ * CREATE OR REPLACE and similar commands.  The net effect is that if an
++ * extension script uses such a command on a pre-existing free-standing
++ * object, the object will be absorbed into the extension.  If the object
++ * is already a member of some other extension, the command will fail.
++ * This behavior is desirable for cases such as replacing a shell type.
+  */
+ void
+ recordDependencyOnCurrentExtension(const ObjectAddress *object,
+diff --git a/src/backend/catalog/pg_operator.c b/src/backend/catalog/pg_operator.c
+index 6c270f933895..4c5a56cb094c 100644
+--- a/src/backend/catalog/pg_operator.c
++++ b/src/backend/catalog/pg_operator.c
+@@ -268,7 +268,7 @@ OperatorShellMake(const char *operatorName,
+ 	CatalogTupleInsert(pg_operator_desc, tup);
+ 
+ 	/* Add dependencies for the entry */
+-	makeOperatorDependencies(tup, false);
++	makeOperatorDependencies(tup, true, false);
+ 
+ 	heap_freetuple(tup);
+ 
+@@ -546,7 +546,7 @@ OperatorCreate(const char *operatorName,
+ 	}
+ 
+ 	/* Add dependencies for the entry */
+-	address = makeOperatorDependencies(tup, isUpdate);
++	address = makeOperatorDependencies(tup, true, isUpdate);
+ 
+ 	/* Post creation hook for new operator */
+ 	InvokeObjectPostCreateHook(OperatorRelationId, operatorObjectId, 0);
+@@ -766,11 +766,17 @@ OperatorUpd(Oid baseId, Oid commId, Oid negId, bool isDelete)
+  * complete operator, a new shell operator, a just-updated shell,
+  * or an operator that's being modified by ALTER OPERATOR).
+  *
++ * makeExtensionDep should be true when making a new operator or
++ * replacing a shell, false for ALTER OPERATOR.  Passing false
++ * will prevent any change in the operator's extension membership.
++ *
+  * NB: the OidIsValid tests in this routine are necessary, in case
+  * the given operator is a shell.
+  */
+ ObjectAddress
+-makeOperatorDependencies(HeapTuple tuple, bool isUpdate)
++makeOperatorDependencies(HeapTuple tuple,
++						 bool makeExtensionDep,
++						 bool isUpdate)
+ {
+ 	Form_pg_operator oper = (Form_pg_operator) GETSTRUCT(tuple);
+ 	ObjectAddress myself,
+@@ -857,7 +863,8 @@ makeOperatorDependencies(HeapTuple tuple, bool isUpdate)
+ 							oper->oprowner);
+ 
+ 	/* Dependency on extension */
+-	recordDependencyOnCurrentExtension(&myself, true);
++	if (makeExtensionDep)
++		recordDependencyOnCurrentExtension(&myself, true);
+ 
+ 	return myself;
+ }
+diff --git a/src/backend/catalog/pg_type.c b/src/backend/catalog/pg_type.c
+index 6f9b5471daf5..cdce22f394f2 100644
+--- a/src/backend/catalog/pg_type.c
++++ b/src/backend/catalog/pg_type.c
+@@ -167,6 +167,7 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
+ 								 0,
+ 								 false,
+ 								 false,
++								 true,	/* make extension dependency */
+ 								 false);
+ 
+ 	/* Post creation hook for new shell type */
+@@ -504,6 +505,7 @@ TypeCreate(Oid newTypeOid,
+ 								 relationKind,
+ 								 isImplicitArray,
+ 								 isDependentType,
++								 true,	/* make extension dependency */
+ 								 rebuildDeps);
+ 
+ 	/* Post creation hook for new type */
+@@ -537,13 +539,17 @@ TypeCreate(Oid newTypeOid,
+  * isDependentType is true if this is an implicit array or relation rowtype;
+  * that means it doesn't need its own dependencies on owner etc.
+  *
+- * If rebuild is true, we remove existing dependencies and rebuild them
+- * from scratch.  This is needed for ALTER TYPE, and also when replacing
+- * a shell type.  We don't remove an existing extension dependency, though.
+- * (That means an extension can't absorb a shell type created in another
+- * extension, nor ALTER a type created by another extension.  Also, if it
+- * replaces a free-standing shell type or ALTERs a free-standing type,
+- * that type will become a member of the extension.)
++ * We make an extension-membership dependency if we're in an extension
++ * script and makeExtensionDep is true (and isDependentType isn't true).
++ * makeExtensionDep should be true when creating a new type or replacing a
++ * shell type, but not for ALTER TYPE on an existing type.  Passing false
++ * causes the type's extension membership to be left alone.
++ *
++ * rebuild should be true if this is a pre-existing type.  We will remove
++ * existing dependencies and rebuild them from scratch.  This is needed for
++ * ALTER TYPE, and also when replacing a shell type.  We don't remove any
++ * existing extension dependency, though (hence, if makeExtensionDep is also
++ * true and the type belongs to some other extension, an error will occur).
+  */
+ void
+ GenerateTypeDependencies(HeapTuple typeTuple,
+@@ -553,6 +559,7 @@ GenerateTypeDependencies(HeapTuple typeTuple,
+ 						 char relationKind, /* only for relation rowtypes */
+ 						 bool isImplicitArray,
+ 						 bool isDependentType,
++						 bool makeExtensionDep,
+ 						 bool rebuild)
+ {
+ 	Form_pg_type typeForm = (Form_pg_type) GETSTRUCT(typeTuple);
+@@ -611,7 +618,8 @@ GenerateTypeDependencies(HeapTuple typeTuple,
+ 		recordDependencyOnNewAcl(TypeRelationId, typeObjectId, 0,
+ 								 typeForm->typowner, typacl);
+ 
+-		recordDependencyOnCurrentExtension(&myself, rebuild);
++		if (makeExtensionDep)
++			recordDependencyOnCurrentExtension(&myself, rebuild);
+ 	}
+ 
+ 	/* Normal dependencies on the I/O and support functions */
+diff --git a/src/backend/commands/operatorcmds.c b/src/backend/commands/operatorcmds.c
+index fbd7d8d062f7..eb50f60ed132 100644
+--- a/src/backend/commands/operatorcmds.c
++++ b/src/backend/commands/operatorcmds.c
+@@ -542,7 +542,7 @@ AlterOperator(AlterOperatorStmt *stmt)
+ 
+ 	CatalogTupleUpdate(catalog, &tup->t_self, tup);
+ 
+-	address = makeOperatorDependencies(tup, true);
++	address = makeOperatorDependencies(tup, false, true);
+ 
+ 	InvokeObjectPostAlterHook(OperatorRelationId, oprId, 0);
+ 
+diff --git a/src/backend/commands/typecmds.c b/src/backend/commands/typecmds.c
+index 93eeff950b15..6bdb1a1660c3 100644
+--- a/src/backend/commands/typecmds.c
++++ b/src/backend/commands/typecmds.c
+@@ -2675,6 +2675,7 @@ AlterDomainDefault(List *names, Node *defaultRaw)
+ 							 0, /* relation kind is n/a */
+ 							 false, /* a domain isn't an implicit array */
+ 							 false, /* nor is it any kind of dependent type */
++							 false, /* don't touch extension membership */
+ 							 true); /* We do need to rebuild dependencies */
+ 
+ 	InvokeObjectPostAlterHook(TypeRelationId, domainoid, 0);
+@@ -4415,6 +4416,7 @@ AlterTypeRecurse(Oid typeOid, bool isImplicitArray,
+ 							 0, /* we rejected composite types above */
+ 							 isImplicitArray,	/* it might be an array */
+ 							 isImplicitArray,	/* dependent iff it's array */
++							 false, /* don't touch extension membership */
+ 							 true);
+ 
+ 	InvokeObjectPostAlterHook(TypeRelationId, typeOid, 0);
+diff --git a/src/include/catalog/pg_operator.h b/src/include/catalog/pg_operator.h
+index ac6755746c67..6ab61517b1e7 100644
+--- a/src/include/catalog/pg_operator.h
++++ b/src/include/catalog/pg_operator.h
+@@ -98,7 +98,9 @@ extern ObjectAddress OperatorCreate(const char *operatorName,
+ 									bool canMerge,
+ 									bool canHash);
+ 
+-extern ObjectAddress makeOperatorDependencies(HeapTuple tuple, bool isUpdate);
++extern ObjectAddress makeOperatorDependencies(HeapTuple tuple,
++											  bool makeExtensionDep,
++											  bool isUpdate);
+ 
+ extern void OperatorUpd(Oid baseId, Oid commId, Oid negId, bool isDelete);
+ 
+diff --git a/src/include/catalog/pg_type.h b/src/include/catalog/pg_type.h
+index b05db9641aef..e568e21dee60 100644
+--- a/src/include/catalog/pg_type.h
++++ b/src/include/catalog/pg_type.h
+@@ -386,6 +386,7 @@ extern void GenerateTypeDependencies(HeapTuple typeTuple,
+ 														 * rowtypes */
+ 									 bool isImplicitArray,
+ 									 bool isDependentType,
++									 bool makeExtensionDep,
+ 									 bool rebuild);
+ 
+ extern void RenameTypeInternal(Oid typeOid, const char *newTypeName,

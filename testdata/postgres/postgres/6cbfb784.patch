@@ -1,0 +1,1145 @@
+From 6cbfb784c3c91146148a76d50cda6f69ae6a79fb Mon Sep 17 00:00:00 2001
+From: Tomas Vondra <tomas.vondra@postgresql.org>
+Date: Thu, 13 Jun 2019 17:19:21 +0200
+Subject: [PATCH] Rework the pg_statistic_ext catalog
+
+Since extended statistic got introduced in PostgreSQL 10, there was a
+single catalog pg_statistic_ext storing both the definitions and built
+statistic.  That's however problematic when a user is supposed to have
+access only to the definitions, but not to user data.
+
+Consider for example pg_dump on a database with RLS enabled - if the
+pg_statistic_ext catalog respects RLS (which it should, if it contains
+user data), pg_dump would not see any records and the result would not
+define any extended statistics.  That would be a surprising behavior.
+
+Until now this was not a pressing issue, because the existing types of
+extended statistic (functional dependencies and ndistinct coefficients)
+do not include any user data directly.  This changed with introduction
+of MCV lists, which do include most common combinations of values.
+
+The easiest way to fix this is to split the pg_statistic_ext catalog
+into two - one for definitions, one for the built statistic values.
+The new catalog is called pg_statistic_ext_data, and we're maintaining
+a 1:1 relationship with the old catalog - either there are matching
+records in both catalogs, or neither of them.
+
+Bumped CATVERSION due to changing system catalog definitions.
+
+Author: Dean Rasheed, with improvements by me
+Reviewed-by: Dean Rasheed, John Naylor
+Discussion: https://postgr.es/m/CAEZATCUhT9rt7Ui%3DVdx4N%3D%3DVV5XOK5dsXfnGgVOz_JhAicB%3DZA%40mail.gmail.com
+---
+ doc/src/sgml/catalogs.sgml                  | 70 ++++++++++++++++----
+ doc/src/sgml/func.sgml                      |  6 +-
+ doc/src/sgml/perform.sgml                   | 20 +++---
+ doc/src/sgml/planstats.sgml                 |  4 +-
+ src/backend/catalog/Makefile                |  2 +-
+ src/backend/commands/statscmds.c            | 73 ++++++++++++++++-----
+ src/backend/optimizer/util/plancat.c        | 12 +++-
+ src/backend/statistics/README.mcv           |  9 ++-
+ src/backend/statistics/dependencies.c       |  7 +-
+ src/backend/statistics/extended_stats.c     | 61 +++++++++--------
+ src/backend/statistics/mcv.c                |  7 +-
+ src/backend/statistics/mvdistinct.c         |  7 +-
+ src/backend/utils/cache/syscache.c          | 12 ++++
+ src/include/catalog/catversion.h            |  2 +-
+ src/include/catalog/indexing.h              | 17 +++--
+ src/include/catalog/pg_statistic_ext.h      |  9 +--
+ src/include/catalog/pg_statistic_ext_data.h | 52 +++++++++++++++
+ src/include/catalog/toasting.h              |  1 +
+ src/include/utils/syscache.h                |  1 +
+ src/test/regress/expected/oidjoins.out      |  8 +++
+ src/test/regress/expected/sanity_check.out  |  1 +
+ src/test/regress/expected/stats_ext.out     | 38 +++++++----
+ src/test/regress/sql/oidjoins.sql           |  4 ++
+ src/test/regress/sql/stats_ext.sql          | 30 ++++++---
+ src/tools/pgindent/typedefs.list            |  2 +
+ 25 files changed, 337 insertions(+), 118 deletions(-)
+ create mode 100644 src/include/catalog/pg_statistic_ext_data.h
+
+diff --git a/doc/src/sgml/catalogs.sgml b/doc/src/sgml/catalogs.sgml
+index 36193d149106..ef4345524ad4 100644
+--- a/doc/src/sgml/catalogs.sgml
++++ b/doc/src/sgml/catalogs.sgml
+@@ -297,7 +297,12 @@
+ 
+      <row>
+       <entry><link linkend="catalog-pg-statistic-ext"><structname>pg_statistic_ext</structname></link></entry>
+-      <entry>extended planner statistics</entry>
++      <entry>extended planner statistics (definition)</entry>
++     </row>
++
++     <row>
++      <entry><link linkend="catalog-pg-statistic-ext-data"><structname>pg_statistic_ext_data</structname></link></entry>
++      <entry>extended planner statistics (built statistics)</entry>
+      </row>
+ 
+      <row>
+@@ -6506,7 +6511,7 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
+ 
+   <para>
+    The catalog <structname>pg_statistic_ext</structname>
+-   holds extended planner statistics.
++   holds definitions of extended planner statistics.
+    Each row in this catalog corresponds to a <firstterm>statistics object</firstterm>
+    created with <xref linkend="sql-createstatistics"/>.
+   </para>
+@@ -6581,8 +6586,57 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
+       </entry>
+      </row>
+ 
++    </tbody>
++   </tgroup>
++  </table>
++
++  <para>
++   The <structfield>stxkind</structfield> field is filled at creation of the
++   statistics object, indicating which statistic type(s) are desired. The
++   statistics (once computed by <command>ANALYZE</command>) are stored in
++   <link linkend="catalog-pg-statistic-ext-data"><structname>pg_statistic_ext_data</structname></link>
++   catalog.
++  </para>
++ </sect1>
++
++ <sect1 id="catalog-pg-statistic-ext-data">
++  <title><structname>pg_statistic_ext_data</structname></title>
++
++  <indexterm zone="catalog-pg-statistic-ext">
++   <primary>pg_statistic_ext_data</primary>
++  </indexterm>
++
++  <para>
++   The catalog <structname>pg_statistic_ext_data</structname>
++   holds data for extended planner statistics defined in <structname>pg_statistic_ext</structname>.
++   Each row in this catalog corresponds to a <firstterm>statistics object</firstterm>
++   created with <xref linkend="sql-createstatistics"/>.
++  </para>
++
++  <table>
++   <title><structname>pg_statistic_ext_data</structname> Columns</title>
++
++   <tgroup cols="4">
++    <thead>
++     <row>
++      <entry>Name</entry>
++      <entry>Type</entry>
++      <entry>References</entry>
++      <entry>Description</entry>
++     </row>
++    </thead>
++
++    <tbody>
++
++     <row>
++      <entry><structfield>stxoid</structfield></entry>
++      <entry><type>oid</type></entry>
++      <entry><literal><link linkend="catalog-pg-statistic-ext"><structname>pg_statistic_ext</structname></link>.oid</literal></entry>
++      <entry>Extended statistic containing the definition for this data.</entry>
++     </row>
++
+      <row>
+-      <entry><structfield>stxndistinct</structfield></entry>
++      <entry><structfield>stxdndistinct</structfield></entry>
+       <entry><type>pg_ndistinct</type></entry>
+       <entry></entry>
+       <entry>
+@@ -6591,7 +6645,7 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
+      </row>
+ 
+      <row>
+-      <entry><structfield>stxdependencies</structfield></entry>
++      <entry><structfield>stxddependencies</structfield></entry>
+       <entry><type>pg_dependencies</type></entry>
+       <entry></entry>
+       <entry>
+@@ -6601,7 +6655,7 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
+      </row>
+ 
+      <row>
+-      <entry><structfield>stxmcv</structfield></entry>
++      <entry><structfield>stxdmcv</structfield></entry>
+       <entry><type>pg_mcv_list</type></entry>
+       <entry></entry>
+       <entry>
+@@ -6614,12 +6668,6 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
+    </tgroup>
+   </table>
+ 
+-  <para>
+-   The <structfield>stxkind</structfield> field is filled at creation of the
+-   statistics object, indicating which statistic type(s) are desired.
+-   The fields after it are initially NULL and are filled only when the
+-   corresponding statistic has been computed by <command>ANALYZE</command>.
+-  </para>
+  </sect1>
+ 
+  <sect1 id="catalog-pg-subscription">
+diff --git a/doc/src/sgml/func.sgml b/doc/src/sgml/func.sgml
+index a072b9761618..e91813387422 100644
+--- a/doc/src/sgml/func.sgml
++++ b/doc/src/sgml/func.sgml
+@@ -22427,12 +22427,12 @@ CREATE EVENT TRIGGER test_table_rewrite_oid
+     The <function>pg_mcv_list_items</function> function can be used like this:
+ 
+ <programlisting>
+-SELECT m.* FROM pg_statistic_ext,
+-                pg_mcv_list_items(stxmcv) m WHERE stxname = 'stts';
++SELECT m.* FROM pg_statistic_ext join pg_statistic_ext_data on (oid = stxoid),
++                pg_mcv_list_items(stxdmcv) m WHERE stxname = 'stts';
+ </programlisting>
+ 
+      Values of the <type>pg_mcv_list</type> can be obtained only from the
+-     <literal>pg_statistic_ext.stxmcv</literal> column.
++     <literal>pg_statistic_ext_data.stxdmcv</literal> column.
+    </para>
+   </sect2>
+ 
+diff --git a/doc/src/sgml/perform.sgml b/doc/src/sgml/perform.sgml
+index a84be8515935..8e165832b357 100644
+--- a/doc/src/sgml/perform.sgml
++++ b/doc/src/sgml/perform.sgml
+@@ -1076,6 +1076,10 @@ WHERE tablename = 'road';
+     <primary>pg_statistic_ext</primary>
+    </indexterm>
+ 
++   <indexterm>
++    <primary>pg_statistic_ext_data</primary>
++   </indexterm>
++
+    <para>
+     It is common to see slow queries running bad execution plans because
+     multiple columns used in the query clauses are correlated.
+@@ -1104,7 +1108,7 @@ WHERE tablename = 'road';
+     interest in the statistics.  Actual data collection is performed
+     by <command>ANALYZE</command> (either a manual command, or background
+     auto-analyze).  The collected values can be examined in the
+-    <link linkend="catalog-pg-statistic-ext"><structname>pg_statistic_ext</structname></link>
++    <link linkend="catalog-pg-statistic-ext-data"><structname>pg_statistic_ext_data</structname></link>
+     catalog.
+    </para>
+ 
+@@ -1172,10 +1176,10 @@ CREATE STATISTICS stts (dependencies) ON zip, city FROM zipcodes;
+ 
+ ANALYZE zipcodes;
+ 
+-SELECT stxname, stxkeys, stxdependencies
+-  FROM pg_statistic_ext
++SELECT stxname, stxkeys, stxddependencies
++  FROM pg_statistic_ext join pg_statistic_ext_data on (oid = stxoid)
+   WHERE stxname = 'stts';
+- stxname | stxkeys |             stxdependencies               
++ stxname | stxkeys |             stxddependencies             
+ ---------+---------+------------------------------------------
+  stts    | 1 5     | {"1 => 5": 1.000000, "5 => 1": 0.423130}
+ (1 row)
+@@ -1262,8 +1266,8 @@ CREATE STATISTICS stts2 (ndistinct) ON zip, state, city FROM zipcodes;
+ 
+ ANALYZE zipcodes;
+ 
+-SELECT stxkeys AS k, stxndistinct AS nd
+-  FROM pg_statistic_ext
++SELECT stxkeys AS k, stxdndistinct AS nd
++  FROM pg_statistic_ext join pg_statistic_ext_data on (oid = stxoid)
+   WHERE stxname = 'stts2';
+ -[ RECORD 1 ]--------------------------------------------------------
+ k  | 1 2 5
+@@ -1317,8 +1321,8 @@ CREATE STATISTICS stts3 (mcv) ON state, city FROM zipcodes;
+ 
+ ANALYZE zipcodes;
+ 
+-SELECT m.* FROM pg_statistic_ext,
+-                pg_mcv_list_items(stxmcv) m WHERE stxname = 'stts3';
++SELECT m.* FROM pg_statistic_ext join pg_statistic_ext_data on (oid = stxoid),
++                pg_mcv_list_items(stxdmcv) m WHERE stxname = 'stts3';
+ 
+  index |         values         | nulls | frequency | base_frequency 
+ -------+------------------------+-------+-----------+----------------
+diff --git a/doc/src/sgml/planstats.sgml b/doc/src/sgml/planstats.sgml
+index 4b1d3f4952e5..a25ce152ac25 100644
+--- a/doc/src/sgml/planstats.sgml
++++ b/doc/src/sgml/planstats.sgml
+@@ -635,8 +635,8 @@ EXPLAIN (ANALYZE, TIMING OFF) SELECT * FROM t WHERE a = 1 AND b = 1;
+     <function>pg_mcv_list_items</function> set-returning function.
+ 
+ <programlisting>
+-SELECT m.* FROM pg_statistic_ext,
+-                pg_mcv_list_items(stxmcv) m WHERE stxname = 'stts2';
++SELECT m.* FROM pg_statistic_ext join pg_statistic_ext_data on (oid = stxoid),
++                pg_mcv_list_items(stxdmcv) m WHERE stxname = 'stts2';
+  index |  values  | nulls | frequency | base_frequency 
+ -------+----------+-------+-----------+----------------
+      0 | {0, 0}   | {f,f} |      0.01 |         0.0001
+diff --git a/src/backend/catalog/Makefile b/src/backend/catalog/Makefile
+index f186198fc6cb..8bece078dd19 100644
+--- a/src/backend/catalog/Makefile
++++ b/src/backend/catalog/Makefile
+@@ -34,7 +34,7 @@ CATALOG_HEADERS := \
+ 	pg_attrdef.h pg_constraint.h pg_inherits.h pg_index.h pg_operator.h \
+ 	pg_opfamily.h pg_opclass.h pg_am.h pg_amop.h pg_amproc.h \
+ 	pg_language.h pg_largeobject_metadata.h pg_largeobject.h pg_aggregate.h \
+-	pg_statistic_ext.h \
++	pg_statistic_ext.h pg_statistic_ext_data.h \
+ 	pg_statistic.h pg_rewrite.h pg_trigger.h pg_event_trigger.h pg_description.h \
+ 	pg_cast.h pg_enum.h pg_namespace.h pg_conversion.h pg_depend.h \
+ 	pg_database.h pg_db_role_setting.h pg_tablespace.h pg_pltemplate.h \
+diff --git a/src/backend/commands/statscmds.c b/src/backend/commands/statscmds.c
+index 217d3a4533a1..cf406f6f96b8 100644
+--- a/src/backend/commands/statscmds.c
++++ b/src/backend/commands/statscmds.c
+@@ -23,6 +23,7 @@
+ #include "catalog/namespace.h"
+ #include "catalog/pg_namespace.h"
+ #include "catalog/pg_statistic_ext.h"
++#include "catalog/pg_statistic_ext_data.h"
+ #include "commands/comment.h"
+ #include "commands/defrem.h"
+ #include "miscadmin.h"
+@@ -67,8 +68,11 @@ CreateStatistics(CreateStatsStmt *stmt)
+ 	HeapTuple	htup;
+ 	Datum		values[Natts_pg_statistic_ext];
+ 	bool		nulls[Natts_pg_statistic_ext];
++	Datum		datavalues[Natts_pg_statistic_ext_data];
++	bool		datanulls[Natts_pg_statistic_ext_data];
+ 	int2vector *stxkeys;
+ 	Relation	statrel;
++	Relation	datarel;
+ 	Relation	rel = NULL;
+ 	Oid			relid;
+ 	ObjectAddress parentobject,
+@@ -336,11 +340,6 @@ CreateStatistics(CreateStatsStmt *stmt)
+ 	values[Anum_pg_statistic_ext_stxkeys - 1] = PointerGetDatum(stxkeys);
+ 	values[Anum_pg_statistic_ext_stxkind - 1] = PointerGetDatum(stxkind);
+ 
+-	/* no statistics built yet */
+-	nulls[Anum_pg_statistic_ext_stxndistinct - 1] = true;
+-	nulls[Anum_pg_statistic_ext_stxdependencies - 1] = true;
+-	nulls[Anum_pg_statistic_ext_stxmcv - 1] = true;
+-
+ 	/* insert it into pg_statistic_ext */
+ 	htup = heap_form_tuple(statrel->rd_att, values, nulls);
+ 	CatalogTupleInsert(statrel, htup);
+@@ -348,6 +347,29 @@ CreateStatistics(CreateStatsStmt *stmt)
+ 
+ 	relation_close(statrel, RowExclusiveLock);
+ 
++	/*
++	 * Also build the pg_statistic_ext_data tuple, to hold the actual
++	 * statistics data.
++	 */
++	datarel = table_open(StatisticExtDataRelationId, RowExclusiveLock);
++
++	memset(datavalues, 0, sizeof(datavalues));
++	memset(datanulls, false, sizeof(datanulls));
++
++	datavalues[Anum_pg_statistic_ext_data_stxoid - 1] = ObjectIdGetDatum(statoid);
++
++	/* no statistics built yet */
++	datanulls[Anum_pg_statistic_ext_data_stxdndistinct - 1] = true;
++	datanulls[Anum_pg_statistic_ext_data_stxddependencies - 1] = true;
++	datanulls[Anum_pg_statistic_ext_data_stxdmcv - 1] = true;
++
++	/* insert it into pg_statistic_ext_data */
++	htup = heap_form_tuple(datarel->rd_att, datavalues, datanulls);
++	CatalogTupleInsert(datarel, htup);
++	heap_freetuple(htup);
++
++	relation_close(datarel, RowExclusiveLock);
++
+ 	/*
+ 	 * Invalidate relcache so that others see the new statistics object.
+ 	 */
+@@ -403,6 +425,23 @@ RemoveStatisticsById(Oid statsOid)
+ 	Form_pg_statistic_ext statext;
+ 	Oid			relid;
+ 
++	/*
++	 * First delete the pg_statistic_ext_data tuple holding the actual
++	 * statistical data.
++	 */
++	relation = table_open(StatisticExtDataRelationId, RowExclusiveLock);
++
++	tup = SearchSysCache1(STATEXTDATASTXOID, ObjectIdGetDatum(statsOid));
++
++	if (!HeapTupleIsValid(tup)) /* should not happen */
++		elog(ERROR, "cache lookup failed for statistics data %u", statsOid);
++
++	CatalogTupleDelete(relation, &tup->t_self);
++
++	ReleaseSysCache(tup);
++
++	table_close(relation, RowExclusiveLock);
++
+ 	/*
+ 	 * Delete the pg_statistic_ext tuple.  Also send out a cache inval on the
+ 	 * associated table, so that dependent plans will be rebuilt.
+@@ -431,8 +470,8 @@ RemoveStatisticsById(Oid statsOid)
+  *
+  * This could throw an error if the type change can't be supported.
+  * If it can be supported, but the stats must be recomputed, a likely choice
+- * would be to set the relevant column(s) of the pg_statistic_ext tuple to
+- * null until the next ANALYZE.  (Note that the type change hasn't actually
++ * would be to set the relevant column(s) of the pg_statistic_ext_data tuple
++ * to null until the next ANALYZE.  (Note that the type change hasn't actually
+  * happened yet, so one option that's *not* on the table is to recompute
+  * immediately.)
+  *
+@@ -456,11 +495,11 @@ UpdateStatisticsForTypeChange(Oid statsOid, Oid relationOid, int attnum,
+ 
+ 	Relation	rel;
+ 
+-	Datum		values[Natts_pg_statistic_ext];
+-	bool		nulls[Natts_pg_statistic_ext];
+-	bool		replaces[Natts_pg_statistic_ext];
++	Datum		values[Natts_pg_statistic_ext_data];
++	bool		nulls[Natts_pg_statistic_ext_data];
++	bool		replaces[Natts_pg_statistic_ext_data];
+ 
+-	oldtup = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(statsOid));
++	oldtup = SearchSysCache1(STATEXTDATASTXOID, ObjectIdGetDatum(statsOid));
+ 	if (!HeapTupleIsValid(oldtup))
+ 		elog(ERROR, "cache lookup failed for statistics object %u", statsOid);
+ 
+@@ -479,14 +518,14 @@ UpdateStatisticsForTypeChange(Oid statsOid, Oid relationOid, int attnum,
+ 	 * OK, we need to reset some statistics. So let's build the new tuple,
+ 	 * replacing the affected statistics types with NULL.
+ 	 */
+-	memset(nulls, 0, Natts_pg_statistic_ext * sizeof(bool));
+-	memset(replaces, 0, Natts_pg_statistic_ext * sizeof(bool));
+-	memset(values, 0, Natts_pg_statistic_ext * sizeof(Datum));
++	memset(nulls, 0, Natts_pg_statistic_ext_data * sizeof(bool));
++	memset(replaces, 0, Natts_pg_statistic_ext_data * sizeof(bool));
++	memset(values, 0, Natts_pg_statistic_ext_data * sizeof(Datum));
+ 
+-	replaces[Anum_pg_statistic_ext_stxmcv - 1] = true;
+-	nulls[Anum_pg_statistic_ext_stxmcv - 1] = true;
++	replaces[Anum_pg_statistic_ext_data_stxdmcv - 1] = true;
++	nulls[Anum_pg_statistic_ext_data_stxdmcv - 1] = true;
+ 
+-	rel = heap_open(StatisticExtRelationId, RowExclusiveLock);
++	rel = heap_open(StatisticExtDataRelationId, RowExclusiveLock);
+ 
+ 	/* replace the old tuple */
+ 	stup = heap_modify_tuple(oldtup,
+diff --git a/src/backend/optimizer/util/plancat.c b/src/backend/optimizer/util/plancat.c
+index 2405acbf6fad..40f497660d1e 100644
+--- a/src/backend/optimizer/util/plancat.c
++++ b/src/backend/optimizer/util/plancat.c
+@@ -1308,6 +1308,7 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
+ 		Oid			statOid = lfirst_oid(l);
+ 		Form_pg_statistic_ext staForm;
+ 		HeapTuple	htup;
++		HeapTuple	dtup;
+ 		Bitmapset  *keys = NULL;
+ 		int			i;
+ 
+@@ -1316,6 +1317,10 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
+ 			elog(ERROR, "cache lookup failed for statistics object %u", statOid);
+ 		staForm = (Form_pg_statistic_ext) GETSTRUCT(htup);
+ 
++		dtup = SearchSysCache1(STATEXTDATASTXOID, ObjectIdGetDatum(statOid));
++		if (!HeapTupleIsValid(dtup))
++			elog(ERROR, "cache lookup failed for statistics object %u", statOid);
++
+ 		/*
+ 		 * First, build the array of columns covered.  This is ultimately
+ 		 * wasted if no stats within the object have actually been built, but
+@@ -1325,7 +1330,7 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
+ 			keys = bms_add_member(keys, staForm->stxkeys.values[i]);
+ 
+ 		/* add one StatisticExtInfo for each kind built */
+-		if (statext_is_kind_built(htup, STATS_EXT_NDISTINCT))
++		if (statext_is_kind_built(dtup, STATS_EXT_NDISTINCT))
+ 		{
+ 			StatisticExtInfo *info = makeNode(StatisticExtInfo);
+ 
+@@ -1337,7 +1342,7 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
+ 			stainfos = lcons(info, stainfos);
+ 		}
+ 
+-		if (statext_is_kind_built(htup, STATS_EXT_DEPENDENCIES))
++		if (statext_is_kind_built(dtup, STATS_EXT_DEPENDENCIES))
+ 		{
+ 			StatisticExtInfo *info = makeNode(StatisticExtInfo);
+ 
+@@ -1349,7 +1354,7 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
+ 			stainfos = lcons(info, stainfos);
+ 		}
+ 
+-		if (statext_is_kind_built(htup, STATS_EXT_MCV))
++		if (statext_is_kind_built(dtup, STATS_EXT_MCV))
+ 		{
+ 			StatisticExtInfo *info = makeNode(StatisticExtInfo);
+ 
+@@ -1362,6 +1367,7 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
+ 		}
+ 
+ 		ReleaseSysCache(htup);
++		ReleaseSysCache(dtup);
+ 		bms_free(keys);
+ 	}
+ 
+diff --git a/src/backend/statistics/README.mcv b/src/backend/statistics/README.mcv
+index c18878f5d2b1..8455b0d13f6f 100644
+--- a/src/backend/statistics/README.mcv
++++ b/src/backend/statistics/README.mcv
+@@ -86,11 +86,14 @@ So instead the MCV lists are stored in a custom data type (pg_mcv_list),
+ which however makes it more difficult to inspect the contents. To make that
+ easier, there's a SRF returning detailed information about the MCV lists.
+ 
+-    SELECT m.* FROM pg_statistic_ext,
+-                    pg_mcv_list_items(stxmcv) m WHERE stxname = 'stts2';
++    SELECT m.* FROM pg_statistic_ext s,
++                    pg_statistic_ext_data d,
++                    pg_mcv_list_items(stxdmcv) m
++              WHERE s.stxname = 'stts2'
++                AND d.stxoid = s.oid;
+ 
+ It accepts one parameter - a pg_mcv_list value (which can only be obtained
+-from pg_statistic_ext catalog, to defend against malicious input), and
++from pg_statistic_ext_data catalog, to defend against malicious input), and
+ returns these columns:
+ 
+     - item index (0, ..., (nitems-1))
+diff --git a/src/backend/statistics/dependencies.c b/src/backend/statistics/dependencies.c
+index cd318faf3b99..66c38ce2bc99 100644
+--- a/src/backend/statistics/dependencies.c
++++ b/src/backend/statistics/dependencies.c
+@@ -17,6 +17,7 @@
+ #include "access/sysattr.h"
+ #include "catalog/pg_operator.h"
+ #include "catalog/pg_statistic_ext.h"
++#include "catalog/pg_statistic_ext_data.h"
+ #include "lib/stringinfo.h"
+ #include "nodes/nodeFuncs.h"
+ #include "optimizer/clauses.h"
+@@ -637,12 +638,12 @@ statext_dependencies_load(Oid mvoid)
+ 	Datum		deps;
+ 	HeapTuple	htup;
+ 
+-	htup = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(mvoid));
++	htup = SearchSysCache1(STATEXTDATASTXOID, ObjectIdGetDatum(mvoid));
+ 	if (!HeapTupleIsValid(htup))
+ 		elog(ERROR, "cache lookup failed for statistics object %u", mvoid);
+ 
+-	deps = SysCacheGetAttr(STATEXTOID, htup,
+-						   Anum_pg_statistic_ext_stxdependencies, &isnull);
++	deps = SysCacheGetAttr(STATEXTDATASTXOID, htup,
++						   Anum_pg_statistic_ext_data_stxddependencies, &isnull);
+ 	if (isnull)
+ 		elog(ERROR,
+ 			 "requested statistic kind \"%c\" is not yet built for statistics object %u",
+diff --git a/src/backend/statistics/extended_stats.c b/src/backend/statistics/extended_stats.c
+index ab187915c1d6..96db32f0a0a5 100644
+--- a/src/backend/statistics/extended_stats.c
++++ b/src/backend/statistics/extended_stats.c
+@@ -23,6 +23,7 @@
+ #include "catalog/indexing.h"
+ #include "catalog/pg_collation.h"
+ #include "catalog/pg_statistic_ext.h"
++#include "catalog/pg_statistic_ext_data.h"
+ #include "nodes/nodeFuncs.h"
+ #include "optimizer/clauses.h"
+ #include "optimizer/optimizer.h"
+@@ -65,9 +66,9 @@ typedef struct StatExtEntry
+ static List *fetch_statentries_for_relation(Relation pg_statext, Oid relid);
+ static VacAttrStats **lookup_var_attr_stats(Relation rel, Bitmapset *attrs,
+ 											int nvacatts, VacAttrStats **vacatts);
+-static void statext_store(Relation pg_stext, Oid relid,
++static void statext_store(Oid relid,
+ 						  MVNDistinct *ndistinct, MVDependencies *dependencies,
+-						  MCVList *mcvlist, VacAttrStats **stats);
++						  MCVList *mcv, VacAttrStats **stats);
+ 
+ 
+ /*
+@@ -145,7 +146,7 @@ BuildRelationExtStatistics(Relation onerel, double totalrows,
+ 		}
+ 
+ 		/* store the statistics in the catalog */
+-		statext_store(pg_stext, stat->statOid, ndistinct, dependencies, mcv, stats);
++		statext_store(stat->statOid, ndistinct, dependencies, mcv, stats);
+ 	}
+ 
+ 	table_close(pg_stext, RowExclusiveLock);
+@@ -156,7 +157,7 @@ BuildRelationExtStatistics(Relation onerel, double totalrows,
+ 
+ /*
+  * statext_is_kind_built
+- *		Is this stat kind built in the given pg_statistic_ext tuple?
++ *		Is this stat kind built in the given pg_statistic_ext_data tuple?
+  */
+ bool
+ statext_is_kind_built(HeapTuple htup, char type)
+@@ -166,15 +167,15 @@ statext_is_kind_built(HeapTuple htup, char type)
+ 	switch (type)
+ 	{
+ 		case STATS_EXT_NDISTINCT:
+-			attnum = Anum_pg_statistic_ext_stxndistinct;
++			attnum = Anum_pg_statistic_ext_data_stxdndistinct;
+ 			break;
+ 
+ 		case STATS_EXT_DEPENDENCIES:
+-			attnum = Anum_pg_statistic_ext_stxdependencies;
++			attnum = Anum_pg_statistic_ext_data_stxddependencies;
+ 			break;
+ 
+ 		case STATS_EXT_MCV:
+-			attnum = Anum_pg_statistic_ext_stxmcv;
++			attnum = Anum_pg_statistic_ext_data_stxdmcv;
+ 			break;
+ 
+ 		default:
+@@ -312,70 +313,76 @@ lookup_var_attr_stats(Relation rel, Bitmapset *attrs,
+ 
+ /*
+  * statext_store
+- *	Serializes the statistics and stores them into the pg_statistic_ext tuple.
++ *	Serializes the statistics and stores them into the pg_statistic_ext_data
++ *	tuple.
+  */
+ static void
+-statext_store(Relation pg_stext, Oid statOid,
++statext_store(Oid statOid,
+ 			  MVNDistinct *ndistinct, MVDependencies *dependencies,
+ 			  MCVList *mcv, VacAttrStats **stats)
+ {
+ 	HeapTuple	stup,
+ 				oldtup;
+-	Datum		values[Natts_pg_statistic_ext];
+-	bool		nulls[Natts_pg_statistic_ext];
+-	bool		replaces[Natts_pg_statistic_ext];
++	Datum		values[Natts_pg_statistic_ext_data];
++	bool		nulls[Natts_pg_statistic_ext_data];
++	bool		replaces[Natts_pg_statistic_ext_data];
++	Relation	pg_stextdata;
+ 
+ 	memset(nulls, true, sizeof(nulls));
+ 	memset(replaces, false, sizeof(replaces));
+ 	memset(values, 0, sizeof(values));
+ 
+ 	/*
+-	 * Construct a new pg_statistic_ext tuple, replacing the calculated stats.
++	 * Construct a new pg_statistic_ext_data tuple, replacing the calculated
++	 * stats.
+ 	 */
+ 	if (ndistinct != NULL)
+ 	{
+ 		bytea	   *data = statext_ndistinct_serialize(ndistinct);
+ 
+-		nulls[Anum_pg_statistic_ext_stxndistinct - 1] = (data == NULL);
+-		values[Anum_pg_statistic_ext_stxndistinct - 1] = PointerGetDatum(data);
++		nulls[Anum_pg_statistic_ext_data_stxdndistinct - 1] = (data == NULL);
++		values[Anum_pg_statistic_ext_data_stxdndistinct - 1] = PointerGetDatum(data);
+ 	}
+ 
+ 	if (dependencies != NULL)
+ 	{
+ 		bytea	   *data = statext_dependencies_serialize(dependencies);
+ 
+-		nulls[Anum_pg_statistic_ext_stxdependencies - 1] = (data == NULL);
+-		values[Anum_pg_statistic_ext_stxdependencies - 1] = PointerGetDatum(data);
++		nulls[Anum_pg_statistic_ext_data_stxddependencies - 1] = (data == NULL);
++		values[Anum_pg_statistic_ext_data_stxddependencies - 1] = PointerGetDatum(data);
+ 	}
+-
+ 	if (mcv != NULL)
+ 	{
+ 		bytea	   *data = statext_mcv_serialize(mcv, stats);
+ 
+-		nulls[Anum_pg_statistic_ext_stxmcv - 1] = (data == NULL);
+-		values[Anum_pg_statistic_ext_stxmcv - 1] = PointerGetDatum(data);
++		nulls[Anum_pg_statistic_ext_data_stxdmcv - 1] = (data == NULL);
++		values[Anum_pg_statistic_ext_data_stxdmcv - 1] = PointerGetDatum(data);
+ 	}
+ 
+ 	/* always replace the value (either by bytea or NULL) */
+-	replaces[Anum_pg_statistic_ext_stxndistinct - 1] = true;
+-	replaces[Anum_pg_statistic_ext_stxdependencies - 1] = true;
+-	replaces[Anum_pg_statistic_ext_stxmcv - 1] = true;
++	replaces[Anum_pg_statistic_ext_data_stxdndistinct - 1] = true;
++	replaces[Anum_pg_statistic_ext_data_stxddependencies - 1] = true;
++	replaces[Anum_pg_statistic_ext_data_stxdmcv - 1] = true;
+ 
+-	/* there should already be a pg_statistic_ext tuple */
+-	oldtup = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(statOid));
++	/* there should already be a pg_statistic_ext_data tuple */
++	oldtup = SearchSysCache1(STATEXTDATASTXOID, ObjectIdGetDatum(statOid));
+ 	if (!HeapTupleIsValid(oldtup))
+ 		elog(ERROR, "cache lookup failed for statistics object %u", statOid);
+ 
+ 	/* replace it */
++	pg_stextdata = table_open(StatisticExtDataRelationId, RowExclusiveLock);
++
+ 	stup = heap_modify_tuple(oldtup,
+-							 RelationGetDescr(pg_stext),
++							 RelationGetDescr(pg_stextdata),
+ 							 values,
+ 							 nulls,
+ 							 replaces);
+ 	ReleaseSysCache(oldtup);
+-	CatalogTupleUpdate(pg_stext, &stup->t_self, stup);
++	CatalogTupleUpdate(pg_stextdata, &stup->t_self, stup);
+ 
+ 	heap_freetuple(stup);
++
++	table_close(pg_stextdata, RowExclusiveLock);
+ }
+ 
+ /* initialize multi-dimensional sort */
+diff --git a/src/backend/statistics/mcv.c b/src/backend/statistics/mcv.c
+index d1f0fd55e836..2feb17ed4478 100644
+--- a/src/backend/statistics/mcv.c
++++ b/src/backend/statistics/mcv.c
+@@ -19,6 +19,7 @@
+ #include "access/htup_details.h"
+ #include "catalog/pg_collation.h"
+ #include "catalog/pg_statistic_ext.h"
++#include "catalog/pg_statistic_ext_data.h"
+ #include "fmgr.h"
+ #include "funcapi.h"
+ #include "nodes/nodeFuncs.h"
+@@ -429,13 +430,13 @@ statext_mcv_load(Oid mvoid)
+ 	MCVList    *result;
+ 	bool		isnull;
+ 	Datum		mcvlist;
+-	HeapTuple	htup = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(mvoid));
++	HeapTuple	htup = SearchSysCache1(STATEXTDATASTXOID, ObjectIdGetDatum(mvoid));
+ 
+ 	if (!HeapTupleIsValid(htup))
+ 		elog(ERROR, "cache lookup failed for statistics object %u", mvoid);
+ 
+-	mcvlist = SysCacheGetAttr(STATEXTOID, htup,
+-							  Anum_pg_statistic_ext_stxmcv, &isnull);
++	mcvlist = SysCacheGetAttr(STATEXTDATASTXOID, htup,
++							  Anum_pg_statistic_ext_data_stxdmcv, &isnull);
+ 
+ 	if (isnull)
+ 		elog(ERROR,
+diff --git a/src/backend/statistics/mvdistinct.c b/src/backend/statistics/mvdistinct.c
+index 7432a6a39690..9ebf183d909c 100644
+--- a/src/backend/statistics/mvdistinct.c
++++ b/src/backend/statistics/mvdistinct.c
+@@ -27,6 +27,7 @@
+ 
+ #include "access/htup_details.h"
+ #include "catalog/pg_statistic_ext.h"
++#include "catalog/pg_statistic_ext_data.h"
+ #include "utils/fmgrprotos.h"
+ #include "utils/lsyscache.h"
+ #include "lib/stringinfo.h"
+@@ -145,12 +146,12 @@ statext_ndistinct_load(Oid mvoid)
+ 	Datum		ndist;
+ 	HeapTuple	htup;
+ 
+-	htup = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(mvoid));
++	htup = SearchSysCache1(STATEXTDATASTXOID, ObjectIdGetDatum(mvoid));
+ 	if (!HeapTupleIsValid(htup))
+ 		elog(ERROR, "cache lookup failed for statistics object %u", mvoid);
+ 
+-	ndist = SysCacheGetAttr(STATEXTOID, htup,
+-							Anum_pg_statistic_ext_stxndistinct, &isnull);
++	ndist = SysCacheGetAttr(STATEXTDATASTXOID, htup,
++							Anum_pg_statistic_ext_data_stxdndistinct, &isnull);
+ 	if (isnull)
+ 		elog(ERROR,
+ 			 "requested statistic kind \"%c\" is not yet built for statistics object %u",
+diff --git a/src/backend/utils/cache/syscache.c b/src/backend/utils/cache/syscache.c
+index 476538354ddf..99976468e5c1 100644
+--- a/src/backend/utils/cache/syscache.c
++++ b/src/backend/utils/cache/syscache.c
+@@ -62,6 +62,7 @@
+ #include "catalog/pg_replication_origin.h"
+ #include "catalog/pg_statistic.h"
+ #include "catalog/pg_statistic_ext.h"
++#include "catalog/pg_statistic_ext_data.h"
+ #include "catalog/pg_subscription.h"
+ #include "catalog/pg_subscription_rel.h"
+ #include "catalog/pg_tablespace.h"
+@@ -727,6 +728,17 @@ static const struct cachedesc cacheinfo[] = {
+ 		},
+ 		32
+ 	},
++	{StatisticExtDataRelationId, /* STATEXTDATASTXOID */
++		StatisticExtDataStxoidIndexId,
++		1,
++		{
++			Anum_pg_statistic_ext_data_stxoid,
++			0,
++			0,
++			0
++		},
++		4
++	},
+ 	{StatisticExtRelationId,	/* STATEXTNAMENSP */
+ 		StatisticExtNameIndexId,
+ 		2,
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 4b8ee1cbdb48..e034506751da 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	201906041
++#define CATALOG_VERSION_NO	201906151
+ 
+ #endif
+diff --git a/src/include/catalog/indexing.h b/src/include/catalog/indexing.h
+index 5f2aee8a4a97..ef4445b017a1 100644
+--- a/src/include/catalog/indexing.h
++++ b/src/include/catalog/indexing.h
+@@ -186,13 +186,6 @@ DECLARE_UNIQUE_INDEX(pg_largeobject_loid_pn_index, 2683, on pg_largeobject using
+ DECLARE_UNIQUE_INDEX(pg_largeobject_metadata_oid_index, 2996, on pg_largeobject_metadata using btree(oid oid_ops));
+ #define LargeObjectMetadataOidIndexId	2996
+ 
+-DECLARE_UNIQUE_INDEX(pg_statistic_ext_oid_index, 3380, on pg_statistic_ext using btree(oid oid_ops));
+-#define StatisticExtOidIndexId	3380
+-DECLARE_UNIQUE_INDEX(pg_statistic_ext_name_index, 3997, on pg_statistic_ext using btree(stxname name_ops, stxnamespace oid_ops));
+-#define StatisticExtNameIndexId 3997
+-DECLARE_INDEX(pg_statistic_ext_relid_index, 3379, on pg_statistic_ext using btree(stxrelid oid_ops));
+-#define StatisticExtRelidIndexId 3379
+-
+ DECLARE_UNIQUE_INDEX(pg_namespace_nspname_index, 2684, on pg_namespace using btree(nspname name_ops));
+ #define NamespaceNameIndexId  2684
+ DECLARE_UNIQUE_INDEX(pg_namespace_oid_index, 2685, on pg_namespace using btree(oid oid_ops));
+@@ -237,6 +230,16 @@ DECLARE_INDEX(pg_shdepend_reference_index, 1233, on pg_shdepend using btree(refc
+ DECLARE_UNIQUE_INDEX(pg_statistic_relid_att_inh_index, 2696, on pg_statistic using btree(starelid oid_ops, staattnum int2_ops, stainherit bool_ops));
+ #define StatisticRelidAttnumInhIndexId	2696
+ 
++DECLARE_UNIQUE_INDEX(pg_statistic_ext_oid_index, 3380, on pg_statistic_ext using btree(oid oid_ops));
++#define StatisticExtOidIndexId	3380
++DECLARE_UNIQUE_INDEX(pg_statistic_ext_name_index, 3997, on pg_statistic_ext using btree(stxname name_ops, stxnamespace oid_ops));
++#define StatisticExtNameIndexId 3997
++DECLARE_INDEX(pg_statistic_ext_relid_index, 3379, on pg_statistic_ext using btree(stxrelid oid_ops));
++#define StatisticExtRelidIndexId 3379
++
++DECLARE_UNIQUE_INDEX(pg_statistic_ext_data_stxoid_index, 3433, on pg_statistic_ext_data using btree(stxoid oid_ops));
++#define StatisticExtDataStxoidIndexId 3433
++
+ DECLARE_UNIQUE_INDEX(pg_tablespace_oid_index, 2697, on pg_tablespace using btree(oid oid_ops));
+ #define TablespaceOidIndexId  2697
+ DECLARE_UNIQUE_INDEX(pg_tablespace_spcname_index, 2698, on pg_tablespace using btree(spcname name_ops));
+diff --git a/src/include/catalog/pg_statistic_ext.h b/src/include/catalog/pg_statistic_ext.h
+index e449f9efe8b6..d8c5e0651ec7 100644
+--- a/src/include/catalog/pg_statistic_ext.h
++++ b/src/include/catalog/pg_statistic_ext.h
+@@ -1,8 +1,12 @@
+ /*-------------------------------------------------------------------------
+  *
+  * pg_statistic_ext.h
+- *	  definition of the "extended statistics" system catalog (pg_statistic_ext)
++ *	  definition of the "extended statistics" system catalog
++ *	  (pg_statistic_ext)
+  *
++ * Note that pg_statistic_ext contains the definitions of extended statistics
++ * objects, created by CREATE STATISTICS, but not the actual statistical data,
++ * created by running ANALYZE.
+  *
+  * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+  * Portions Copyright (c) 1994, Regents of the University of California
+@@ -47,9 +51,6 @@ CATALOG(pg_statistic_ext,3381,StatisticExtRelationId)
+ #ifdef CATALOG_VARLEN
+ 	char		stxkind[1] BKI_FORCE_NOT_NULL;	/* statistics kinds requested
+ 												 * to build */
+-	pg_ndistinct stxndistinct;	/* ndistinct coefficients (serialized) */
+-	pg_dependencies stxdependencies;	/* dependencies (serialized) */
+-	pg_mcv_list stxmcv;			/* MCV (serialized) */
+ #endif
+ 
+ } FormData_pg_statistic_ext;
+diff --git a/src/include/catalog/pg_statistic_ext_data.h b/src/include/catalog/pg_statistic_ext_data.h
+new file mode 100644
+index 000000000000..5da9bc8ae2cf
+--- /dev/null
++++ b/src/include/catalog/pg_statistic_ext_data.h
+@@ -0,0 +1,52 @@
++/*-------------------------------------------------------------------------
++ *
++ * pg_statistic_ext_data.h
++ *	  definition of the "extended statistics data" system catalog
++ *	  (pg_statistic_ext_data)
++ *
++ * This catalog stores the statistical data for extended statistics objects.
++ *
++ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * src/include/catalog/pg_statistic_ext_data.h
++ *
++ * NOTES
++ *	  The Catalog.pm module reads this file and derives schema
++ *	  information.
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef PG_STATISTIC_EXT_DATA_H
++#define PG_STATISTIC_EXT_DATA_H
++
++#include "catalog/genbki.h"
++#include "catalog/pg_statistic_ext_data_d.h"
++
++/* ----------------
++ *		pg_statistic_ext_data definition.  cpp turns this into
++ *		typedef struct FormData_pg_statistic_ext_data
++ * ----------------
++ */
++CATALOG(pg_statistic_ext_data,3429,StatisticExtDataRelationId)
++{
++	Oid			stxoid;			/* statistics object this data is for */
++
++#ifdef CATALOG_VARLEN			/* variable-length fields start here */
++
++	pg_ndistinct stxdndistinct;	/* ndistinct coefficients (serialized) */
++	pg_dependencies stxddependencies;	/* dependencies (serialized) */
++	pg_mcv_list stxdmcv;			/* MCV (serialized) */
++
++#endif
++
++} FormData_pg_statistic_ext_data;
++
++/* ----------------
++ *		Form_pg_statistic_ext_data corresponds to a pointer to a tuple with
++ *		the format of pg_statistic_ext_data relation.
++ * ----------------
++ */
++typedef FormData_pg_statistic_ext_data *Form_pg_statistic_ext_data;
++
++#endif							/* PG_STATISTIC_EXT_DATA_H */
+diff --git a/src/include/catalog/toasting.h b/src/include/catalog/toasting.h
+index a9e633d6bb5e..cc5dfed0bf6b 100644
+--- a/src/include/catalog/toasting.h
++++ b/src/include/catalog/toasting.h
+@@ -70,6 +70,7 @@ DECLARE_TOAST(pg_rewrite, 2838, 2839);
+ DECLARE_TOAST(pg_seclabel, 3598, 3599);
+ DECLARE_TOAST(pg_statistic, 2840, 2841);
+ DECLARE_TOAST(pg_statistic_ext, 3439, 3440);
++DECLARE_TOAST(pg_statistic_ext_data, 3430, 3431);
+ DECLARE_TOAST(pg_trigger, 2336, 2337);
+ DECLARE_TOAST(pg_ts_dict, 4169, 4170);
+ DECLARE_TOAST(pg_type, 4171, 4172);
+diff --git a/src/include/utils/syscache.h b/src/include/utils/syscache.h
+index a6307474eed4..918765cc993f 100644
+--- a/src/include/utils/syscache.h
++++ b/src/include/utils/syscache.h
+@@ -86,6 +86,7 @@ enum SysCacheIdentifier
+ 	REPLORIGNAME,
+ 	RULERELNAME,
+ 	SEQRELID,
++	STATEXTDATASTXOID,
+ 	STATEXTNAMENSP,
+ 	STATEXTOID,
+ 	STATRELATTINH,
+diff --git a/src/test/regress/expected/oidjoins.out b/src/test/regress/expected/oidjoins.out
+index 4edc8175aa21..1302cc271bac 100644
+--- a/src/test/regress/expected/oidjoins.out
++++ b/src/test/regress/expected/oidjoins.out
+@@ -985,6 +985,14 @@ WHERE	stxowner != 0 AND
+ ------+----------
+ (0 rows)
+ 
++SELECT	ctid, stxoid
++FROM	pg_catalog.pg_statistic_ext_data fk
++WHERE	stxoid != 0 AND
++	NOT EXISTS(SELECT 1 FROM pg_catalog.pg_statistic_ext pk WHERE pk.oid = fk.stxoid);
++ ctid | stxoid 
++------+--------
++(0 rows)
++
+ SELECT	ctid, spcowner
+ FROM	pg_catalog.pg_tablespace fk
+ WHERE	spcowner != 0 AND
+diff --git a/src/test/regress/expected/sanity_check.out b/src/test/regress/expected/sanity_check.out
+index 392e8a49574a..8ff0da185e3d 100644
+--- a/src/test/regress/expected/sanity_check.out
++++ b/src/test/regress/expected/sanity_check.out
+@@ -149,6 +149,7 @@ pg_shdescription|t
+ pg_shseclabel|t
+ pg_statistic|t
+ pg_statistic_ext|t
++pg_statistic_ext_data|t
+ pg_subscription|t
+ pg_subscription_rel|t
+ pg_tablespace|t
+diff --git a/src/test/regress/expected/stats_ext.out b/src/test/regress/expected/stats_ext.out
+index 046d0b172172..def95d80c9bd 100644
+--- a/src/test/regress/expected/stats_ext.out
++++ b/src/test/regress/expected/stats_ext.out
+@@ -199,9 +199,11 @@ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY b, c
+ -- correct command
+ CREATE STATISTICS s10 ON a, b, c FROM ndistinct;
+ ANALYZE ndistinct;
+-SELECT stxkind, stxndistinct
+-  FROM pg_statistic_ext WHERE stxrelid = 'ndistinct'::regclass;
+- stxkind |                    stxndistinct                     
++SELECT s.stxkind, d.stxdndistinct
++  FROM pg_statistic_ext s, pg_statistic_ext_data d
++ WHERE s.stxrelid = 'ndistinct'::regclass
++   AND d.stxoid = s.oid;
++ stxkind |                    stxdndistinct                    
+ ---------+-----------------------------------------------------
+  {d,f,m} | {"3, 4": 11, "3, 6": 11, "4, 6": 11, "3, 4, 6": 11}
+ (1 row)
+@@ -246,9 +248,11 @@ INSERT INTO ndistinct (a, b, c, filler1)
+             cash_words(mod(i,33)::int::money)
+        FROM generate_series(1,5000) s(i);
+ ANALYZE ndistinct;
+-SELECT stxkind, stxndistinct
+-  FROM pg_statistic_ext WHERE stxrelid = 'ndistinct'::regclass;
+- stxkind |                        stxndistinct                        
++SELECT s.stxkind, d.stxdndistinct
++  FROM pg_statistic_ext s, pg_statistic_ext_data d
++ WHERE s.stxrelid = 'ndistinct'::regclass
++   AND d.stxoid = s.oid;
++ stxkind |                       stxdndistinct                        
+ ---------+------------------------------------------------------------
+  {d,f,m} | {"3, 4": 2550, "3, 6": 800, "4, 6": 1632, "3, 4, 6": 5000}
+ (1 row)
+@@ -285,10 +289,12 @@ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, d
+ (1 row)
+ 
+ DROP STATISTICS s10;
+-SELECT stxkind, stxndistinct
+-  FROM pg_statistic_ext WHERE stxrelid = 'ndistinct'::regclass;
+- stxkind | stxndistinct 
+----------+--------------
++SELECT s.stxkind, d.stxdndistinct
++  FROM pg_statistic_ext s, pg_statistic_ext_data d
++ WHERE s.stxrelid = 'ndistinct'::regclass
++   AND d.stxoid = s.oid;
++ stxkind | stxdndistinct 
++---------+---------------
+ (0 rows)
+ 
+ -- dropping the statistics results in under-estimates
+@@ -537,7 +543,10 @@ SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists WHERE a <= 4 AND b <
+ 
+ -- check change of unrelated column type does not reset the MCV statistics
+ ALTER TABLE mcv_lists ALTER COLUMN d TYPE VARCHAR(64);
+-SELECT stxmcv IS NOT NULL FROM pg_statistic_ext WHERE stxname = 'mcv_lists_stats';
++SELECT d.stxdmcv IS NOT NULL
++  FROM pg_statistic_ext s, pg_statistic_ext_data d
++ WHERE s.stxname = 'mcv_lists_stats'
++   AND d.stxoid = s.oid;
+  ?column? 
+ ----------
+  t
+@@ -600,8 +609,11 @@ SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists WHERE a IS NULL AND
+ TRUNCATE mcv_lists;
+ INSERT INTO mcv_lists (a, b, c) SELECT 1, 2, 3 FROM generate_series(1,1000) s(i);
+ ANALYZE mcv_lists;
+-SELECT m.* FROM pg_statistic_ext,
+-              pg_mcv_list_items(stxmcv) m WHERE stxname = 'mcv_lists_stats';
++SELECT m.*
++  FROM pg_statistic_ext s, pg_statistic_ext_data d,
++       pg_mcv_list_items(d.stxdmcv) m
++ WHERE s.stxname = 'mcv_lists_stats'
++   AND d.stxoid = s.oid;
+  index |  values   |  nulls  | frequency | base_frequency 
+ -------+-----------+---------+-----------+----------------
+      0 | {1, 2, 3} | {f,f,f} |         1 |              1
+diff --git a/src/test/regress/sql/oidjoins.sql b/src/test/regress/sql/oidjoins.sql
+index dbe4a5857d9c..b774cbca5b63 100644
+--- a/src/test/regress/sql/oidjoins.sql
++++ b/src/test/regress/sql/oidjoins.sql
+@@ -493,6 +493,10 @@ SELECT	ctid, stxowner
+ FROM	pg_catalog.pg_statistic_ext fk
+ WHERE	stxowner != 0 AND
+ 	NOT EXISTS(SELECT 1 FROM pg_catalog.pg_authid pk WHERE pk.oid = fk.stxowner);
++SELECT	ctid, stxoid
++FROM	pg_catalog.pg_statistic_ext_data fk
++WHERE	stxoid != 0 AND
++	NOT EXISTS(SELECT 1 FROM pg_catalog.pg_statistic_ext pk WHERE pk.oid = fk.stxoid);
+ SELECT	ctid, spcowner
+ FROM	pg_catalog.pg_tablespace fk
+ WHERE	spcowner != 0 AND
+diff --git a/src/test/regress/sql/stats_ext.sql b/src/test/regress/sql/stats_ext.sql
+index d33373087243..3aa99d7bc816 100644
+--- a/src/test/regress/sql/stats_ext.sql
++++ b/src/test/regress/sql/stats_ext.sql
+@@ -144,8 +144,10 @@ CREATE STATISTICS s10 ON a, b, c FROM ndistinct;
+ 
+ ANALYZE ndistinct;
+ 
+-SELECT stxkind, stxndistinct
+-  FROM pg_statistic_ext WHERE stxrelid = 'ndistinct'::regclass;
++SELECT s.stxkind, d.stxdndistinct
++  FROM pg_statistic_ext s, pg_statistic_ext_data d
++ WHERE s.stxrelid = 'ndistinct'::regclass
++   AND d.stxoid = s.oid;
+ 
+ -- Hash Aggregate, thanks to estimates improved by the statistic
+ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b');
+@@ -170,8 +172,10 @@ INSERT INTO ndistinct (a, b, c, filler1)
+ 
+ ANALYZE ndistinct;
+ 
+-SELECT stxkind, stxndistinct
+-  FROM pg_statistic_ext WHERE stxrelid = 'ndistinct'::regclass;
++SELECT s.stxkind, d.stxdndistinct
++  FROM pg_statistic_ext s, pg_statistic_ext_data d
++ WHERE s.stxrelid = 'ndistinct'::regclass
++   AND d.stxoid = s.oid;
+ 
+ -- correct esimates
+ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b');
+@@ -186,8 +190,10 @@ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, d
+ 
+ DROP STATISTICS s10;
+ 
+-SELECT stxkind, stxndistinct
+-  FROM pg_statistic_ext WHERE stxrelid = 'ndistinct'::regclass;
++SELECT s.stxkind, d.stxdndistinct
++  FROM pg_statistic_ext s, pg_statistic_ext_data d
++ WHERE s.stxrelid = 'ndistinct'::regclass
++   AND d.stxoid = s.oid;
+ 
+ -- dropping the statistics results in under-estimates
+ SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b');
+@@ -335,7 +341,10 @@ SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists WHERE a <= 4 AND b <
+ -- check change of unrelated column type does not reset the MCV statistics
+ ALTER TABLE mcv_lists ALTER COLUMN d TYPE VARCHAR(64);
+ 
+-SELECT stxmcv IS NOT NULL FROM pg_statistic_ext WHERE stxname = 'mcv_lists_stats';
++SELECT d.stxdmcv IS NOT NULL
++  FROM pg_statistic_ext s, pg_statistic_ext_data d
++ WHERE s.stxname = 'mcv_lists_stats'
++   AND d.stxoid = s.oid;
+ 
+ -- check change of column type resets the MCV statistics
+ ALTER TABLE mcv_lists ALTER COLUMN c TYPE numeric;
+@@ -378,8 +387,11 @@ TRUNCATE mcv_lists;
+ INSERT INTO mcv_lists (a, b, c) SELECT 1, 2, 3 FROM generate_series(1,1000) s(i);
+ ANALYZE mcv_lists;
+ 
+-SELECT m.* FROM pg_statistic_ext,
+-              pg_mcv_list_items(stxmcv) m WHERE stxname = 'mcv_lists_stats';
++SELECT m.*
++  FROM pg_statistic_ext s, pg_statistic_ext_data d,
++       pg_mcv_list_items(d.stxdmcv) m
++ WHERE s.stxname = 'mcv_lists_stats'
++   AND d.stxoid = s.oid;
+ 
+ -- mcv with arrays
+ CREATE TABLE mcv_lists_arrays (
+diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list
+index 8cc033eb131b..bdcbc8d15e09 100644
+--- a/src/tools/pgindent/typedefs.list
++++ b/src/tools/pgindent/typedefs.list
+@@ -729,6 +729,7 @@ FormData_pg_sequence_data
+ FormData_pg_shdepend
+ FormData_pg_statistic
+ FormData_pg_statistic_ext
++FormData_pg_statistic_ext_data
+ FormData_pg_subscription
+ FormData_pg_subscription_rel
+ FormData_pg_tablespace
+@@ -786,6 +787,7 @@ Form_pg_sequence_data
+ Form_pg_shdepend
+ Form_pg_statistic
+ Form_pg_statistic_ext
++Form_pg_statistic_ext_data
+ Form_pg_subscription
+ Form_pg_subscription_rel
+ Form_pg_tablespace

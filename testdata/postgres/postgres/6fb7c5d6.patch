@@ -1,0 +1,122 @@
+From 6fb7c5d67cdd55454fe6317f939a191f85e96473 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Mon, 29 Nov 2021 13:36:13 +0900
+Subject: [PATCH] Centralize timestamp computation of control file on updates
+
+This commit moves the timestamp computation of the control file within
+the routine of src/common/ in charge of updating the backend's control
+file, which is shared by multiple frontend tools (pg_rewind,
+pg_checksums and pg_resetwal) and the backend itself.
+
+This change has as direct effect to update the control file's timestamp
+when writing the control file in pg_rewind and pg_checksums, something
+that is helpful to keep track of control file updates for those
+operations, something also tracked by the backend at startup within its
+logs.  This part is arguably a bug, as ControlFileData->time should be
+updated each time a new version of the control file is written, but this
+is a behavior change so no backpatch is done.
+
+Author: Amul Sul
+Reviewed-by: Nathan Bossart, Michael Paquier, Bharath Rupireddy
+Discussion: https://postgr.es/m/CAAJ_b97nd_ghRpyFV9Djf9RLXkoTbOUqnocq11WGq9TisX09Fw@mail.gmail.com
+---
+ src/backend/access/transam/xlog.c | 8 +-------
+ src/bin/pg_resetwal/pg_resetwal.c | 1 -
+ src/common/controldata_utils.c    | 4 ++++
+ 3 files changed, 5 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index b54ec5497055..b980c6ac21c7 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -7339,7 +7339,7 @@ StartupXLOG(void)
+ 				ControlFile->backupEndPoint = ControlFile->minRecoveryPoint;
+ 			}
+ 		}
+-		ControlFile->time = (pg_time_t) time(NULL);
++
+ 		/* No need to hold ControlFileLock yet, we aren't up far enough */
+ 		UpdateControlFile();
+ 
+@@ -8199,7 +8199,6 @@ StartupXLOG(void)
+ 	 */
+ 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+ 	ControlFile->state = DB_IN_PRODUCTION;
+-	ControlFile->time = (pg_time_t) time(NULL);
+ 
+ 	SpinLockAcquire(&XLogCtl->info_lck);
+ 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;
+@@ -9142,7 +9141,6 @@ CreateCheckPoint(int flags)
+ 	{
+ 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+ 		ControlFile->state = DB_SHUTDOWNING;
+-		ControlFile->time = (pg_time_t) time(NULL);
+ 		UpdateControlFile();
+ 		LWLockRelease(ControlFileLock);
+ 	}
+@@ -9412,7 +9410,6 @@ CreateCheckPoint(int flags)
+ 		ControlFile->state = DB_SHUTDOWNED;
+ 	ControlFile->checkPoint = ProcLastRecPtr;
+ 	ControlFile->checkPointCopy = checkPoint;
+-	ControlFile->time = (pg_time_t) time(NULL);
+ 	/* crash recovery should always recover to the end of WAL */
+ 	ControlFile->minRecoveryPoint = InvalidXLogRecPtr;
+ 	ControlFile->minRecoveryPointTLI = 0;
+@@ -9539,7 +9536,6 @@ CreateEndOfRecoveryRecord(void)
+ 	 * changes to this point.
+ 	 */
+ 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+-	ControlFile->time = (pg_time_t) time(NULL);
+ 	ControlFile->minRecoveryPoint = recptr;
+ 	ControlFile->minRecoveryPointTLI = xlrec.ThisTimeLineID;
+ 	UpdateControlFile();
+@@ -9740,7 +9736,6 @@ CreateRestartPoint(int flags)
+ 		{
+ 			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+ 			ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
+-			ControlFile->time = (pg_time_t) time(NULL);
+ 			UpdateControlFile();
+ 			LWLockRelease(ControlFileLock);
+ 		}
+@@ -9801,7 +9796,6 @@ CreateRestartPoint(int flags)
+ 	{
+ 		ControlFile->checkPoint = lastCheckPointRecPtr;
+ 		ControlFile->checkPointCopy = lastCheckPoint;
+-		ControlFile->time = (pg_time_t) time(NULL);
+ 
+ 		/*
+ 		 * Ensure minRecoveryPoint is past the checkpoint record.  Normally,
+diff --git a/src/bin/pg_resetwal/pg_resetwal.c b/src/bin/pg_resetwal/pg_resetwal.c
+index 84b6f70ad6a7..c0ab392c3a29 100644
+--- a/src/bin/pg_resetwal/pg_resetwal.c
++++ b/src/bin/pg_resetwal/pg_resetwal.c
+@@ -911,7 +911,6 @@ RewriteControlFile(void)
+ 	ControlFile.checkPointCopy.time = (pg_time_t) time(NULL);
+ 
+ 	ControlFile.state = DB_SHUTDOWNED;
+-	ControlFile.time = (pg_time_t) time(NULL);
+ 	ControlFile.checkPoint = ControlFile.checkPointCopy.redo;
+ 	ControlFile.minRecoveryPoint = 0;
+ 	ControlFile.minRecoveryPointTLI = 0;
+diff --git a/src/common/controldata_utils.c b/src/common/controldata_utils.c
+index 7d4af7881ea5..4ce097c05cea 100644
+--- a/src/common/controldata_utils.c
++++ b/src/common/controldata_utils.c
+@@ -23,6 +23,7 @@
+ #include <unistd.h>
+ #include <sys/stat.h>
+ #include <fcntl.h>
++#include <time.h>
+ 
+ #include "access/xlog_internal.h"
+ #include "catalog/pg_control.h"
+@@ -168,6 +169,9 @@ update_controlfile(const char *DataDir,
+ 	StaticAssertStmt(sizeof(ControlFileData) <= PG_CONTROL_FILE_SIZE,
+ 					 "sizeof(ControlFileData) exceeds PG_CONTROL_FILE_SIZE");
+ 
++	/* Update timestamp  */
++	ControlFile->time = (pg_time_t) time(NULL);
++
+ 	/* Recalculate CRC of control file */
+ 	INIT_CRC32C(ControlFile->crc);
+ 	COMP_CRC32C(ControlFile->crc,

@@ -1,0 +1,405 @@
+From 6aa5186146f15f8b78749b52caee1eabb3a1aa92 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 24 Jan 2022 15:33:34 -0500
+Subject: [PATCH] Fix limitations on what SQL commands can be issued to a
+ walsender.
+
+In logical replication mode, a WalSender is supposed to be able
+to execute any regular SQL command, as well as the special
+replication commands.  Poor design of the replication-command
+parser caused it to fail in various cases, notably:
+
+* semicolons embedded in a command, or multiple SQL commands
+sent in a single message;
+
+* dollar-quoted literals containing odd numbers of single
+or double quote marks;
+
+* commands starting with a comment.
+
+The basic problem here is that we're trying to run repl_scanner.l
+across the entire input string even when it's not a replication
+command.  Since repl_scanner.l does not understand all of the
+token types known to the core lexer, this is doomed to have
+failure modes.
+
+We certainly don't want to make repl_scanner.l as big as scan.l,
+so instead rejigger stuff so that we only lex the first token of
+a non-replication command.  That will usually look like an IDENT
+to repl_scanner.l, though a comment would end up getting reported
+as a '-' or '/' single-character token.  If the token is a replication
+command keyword, we push it back and proceed normally with repl_gram.y
+parsing.  Otherwise, we can drop out of exec_replication_command()
+without examining the rest of the string.
+
+(It's still theoretically possible for repl_scanner.l to fail on
+the first token; but that could only happen if it's an unterminated
+single- or double-quoted string, in which case you'd have gotten
+largely the same error from the core lexer too.)
+
+In this way, repl_gram.y isn't involved at all in handling general
+SQL commands, so we can get rid of the SQLCmd node type.  (In
+the back branches, we can't remove it because renumbering enum
+NodeTag would be an ABI break; so just leave it sit there unused.)
+
+I failed to resist the temptation to clean up some other sloppy
+coding in repl_scanner.l while at it.  The only externally-visible
+behavior change from that is it now accepts \r and \f as whitespace,
+same as the core lexer.
+
+Per bug #17379 from Greg Rychlewski.  Back-patch to all supported
+branches.
+
+Discussion: https://postgr.es/m/17379-6a5c6cfb3f1f5e77@postgresql.org
+---
+ src/backend/replication/repl_gram.y         | 26 +-----
+ src/backend/replication/repl_scanner.l      | 87 +++++++++++++++++----
+ src/backend/replication/walsender.c         | 43 ++++++----
+ src/include/nodes/nodes.h                   |  1 -
+ src/include/nodes/replnodes.h               |  9 ---
+ src/include/replication/walsender_private.h |  1 +
+ 6 files changed, 98 insertions(+), 69 deletions(-)
+
+diff --git a/src/backend/replication/repl_gram.y b/src/backend/replication/repl_gram.y
+index 6d1dbd72e911..3b92180e8cbf 100644
+--- a/src/backend/replication/repl_gram.y
++++ b/src/backend/replication/repl_gram.y
+@@ -25,8 +25,6 @@
+ /* Result of the parsing is returned here */
+ Node *replication_parse_result;
+ 
+-static SQLCmd *make_sqlcmd(void);
+-
+ 
+ /*
+  * Bison doesn't allocate anything that needs to live across parser calls,
+@@ -59,7 +57,6 @@ static SQLCmd *make_sqlcmd(void);
+ %token <str> SCONST IDENT
+ %token <uintval> UCONST
+ %token <recptr> RECPTR
+-%token T_WORD
+ 
+ /* Keyword tokens. */
+ %token K_BASE_BACKUP
+@@ -95,7 +92,7 @@ static SQLCmd *make_sqlcmd(void);
+ %type <node>	command
+ %type <node>	base_backup start_replication start_logical_replication
+ 				create_replication_slot drop_replication_slot identify_system
+-				read_replication_slot timeline_history show sql_cmd
++				read_replication_slot timeline_history show
+ %type <list>	base_backup_legacy_opt_list generic_option_list
+ %type <defelt>	base_backup_legacy_opt generic_option
+ %type <uintval>	opt_timeline
+@@ -129,7 +126,6 @@ command:
+ 			| read_replication_slot
+ 			| timeline_history
+ 			| show
+-			| sql_cmd
+ 			;
+ 
+ /*
+@@ -450,10 +446,6 @@ plugin_opt_arg:
+ 			| /* EMPTY */					{ $$ = NULL; }
+ 		;
+ 
+-sql_cmd:
+-			IDENT							{ $$ = (Node *) make_sqlcmd(); }
+-		;
+-
+ generic_option_list:
+ 			generic_option_list ',' generic_option
+ 				{ $$ = lappend($1, $3); }
+@@ -514,20 +506,4 @@ ident_or_keyword:
+ 
+ %%
+ 
+-static SQLCmd *
+-make_sqlcmd(void)
+-{
+-	SQLCmd *cmd = makeNode(SQLCmd);
+-	int tok;
+-
+-	/* Just move lexer to the end of command. */
+-	for (;;)
+-	{
+-		tok = yylex();
+-		if (tok == ';' || tok == 0)
+-			break;
+-	}
+-	return cmd;
+-}
+-
+ #include "repl_scanner.c"
+diff --git a/src/backend/replication/repl_scanner.l b/src/backend/replication/repl_scanner.l
+index 81ac41e9d451..d992bcc2e3c0 100644
+--- a/src/backend/replication/repl_scanner.l
++++ b/src/backend/replication/repl_scanner.l
+@@ -31,6 +31,10 @@ fprintf_to_ereport(const char *fmt, const char *msg)
+ /* Handle to the buffer that the lexer uses internally */
+ static YY_BUFFER_STATE scanbufhandle;
+ 
++/* Pushed-back token (we only handle one) */
++static int	repl_pushed_back_token;
++
++/* Work area for collecting literals */
+ static StringInfoData litbuf;
+ 
+ static void startlit(void);
+@@ -51,7 +55,18 @@ static void addlitchar(unsigned char ychar);
+ %option warn
+ %option prefix="replication_yy"
+ 
+-%x xq xd
++/*
++ * Exclusive states:
++ *  <xd> delimited identifiers (double-quoted identifiers)
++ *  <xq> standard single-quoted strings
++ */
++%x xd
++%x xq
++
++space			[ \t\n\r\f]
++
++quote			'
++quotestop		{quote}
+ 
+ /* Extended quote
+  * xqdouble implements embedded quote, ''''
+@@ -69,11 +84,8 @@ xdstop			{dquote}
+ xddouble		{dquote}{dquote}
+ xdinside		[^"]+
+ 
+-digit			[0-9]+
+-hexdigit		[0-9A-Za-z]+
+-
+-quote			'
+-quotestop		{quote}
++digit			[0-9]
++hexdigit		[0-9A-Fa-f]
+ 
+ ident_start		[A-Za-z\200-\377_]
+ ident_cont		[A-Za-z\200-\377_0-9\$]
+@@ -82,6 +94,19 @@ identifier		{ident_start}{ident_cont}*
+ 
+ %%
+ 
++%{
++	/* This code is inserted at the start of replication_yylex() */
++
++	/* If we have a pushed-back token, return that. */
++	if (repl_pushed_back_token)
++	{
++		int			result = repl_pushed_back_token;
++
++		repl_pushed_back_token = 0;
++		return result;
++	}
++%}
++
+ BASE_BACKUP			{ return K_BASE_BACKUP; }
+ FAST			{ return K_FAST; }
+ IDENTIFY_SYSTEM		{ return K_IDENTIFY_SYSTEM; }
+@@ -112,14 +137,7 @@ WAIT				{ return K_WAIT; }
+ MANIFEST			{ return K_MANIFEST; }
+ MANIFEST_CHECKSUMS	{ return K_MANIFEST_CHECKSUMS; }
+ 
+-","				{ return ','; }
+-";"				{ return ';'; }
+-"("				{ return '('; }
+-")"				{ return ')'; }
+-
+-[\n]			;
+-[\t]			;
+-" "				;
++{space}+		{ /* do nothing */ }
+ 
+ {digit}+		{
+ 					yylval.uintval = strtoul(yytext, NULL, 10);
+@@ -181,6 +199,11 @@ MANIFEST_CHECKSUMS	{ return K_MANIFEST_CHECKSUMS; }
+ 					return IDENT;
+ 				}
+ 
++.				{
++					/* Any char not recognized above is returned as itself */
++					return yytext[0];
++				}
++
+ <xq,xd><<EOF>>	{ yyerror("unterminated quoted string"); }
+ 
+ 
+@@ -188,9 +211,6 @@ MANIFEST_CHECKSUMS	{ return K_MANIFEST_CHECKSUMS; }
+ 					yyterminate();
+ 				}
+ 
+-.				{
+-					return T_WORD;
+-				}
+ %%
+ 
+ /* LCOV_EXCL_STOP */
+@@ -250,6 +270,7 @@ replication_scanner_init(const char *str)
+ 
+ 	/* Make sure we start in proper state */
+ 	BEGIN(INITIAL);
++	repl_pushed_back_token = 0;
+ }
+ 
+ void
+@@ -258,3 +279,35 @@ replication_scanner_finish(void)
+ 	yy_delete_buffer(scanbufhandle);
+ 	scanbufhandle = NULL;
+ }
++
++/*
++ * Check to see if the first token of a command is a WalSender keyword.
++ *
++ * To keep repl_scanner.l minimal, we don't ask it to know every construct
++ * that the core lexer knows.  Therefore, we daren't lex more than the
++ * first token of a general SQL command.  That will usually look like an
++ * IDENT token here, although some other cases are possible.
++ */
++bool
++replication_scanner_is_replication_command(void)
++{
++	int			first_token = replication_yylex();
++
++	switch (first_token)
++	{
++		case K_IDENTIFY_SYSTEM:
++		case K_BASE_BACKUP:
++		case K_START_REPLICATION:
++		case K_CREATE_REPLICATION_SLOT:
++		case K_DROP_REPLICATION_SLOT:
++		case K_READ_REPLICATION_SLOT:
++		case K_TIMELINE_HISTORY:
++		case K_SHOW:
++			/* Yes; push back the first token so we can parse later. */
++			repl_pushed_back_token = first_token;
++			return true;
++		default:
++			/* Nope; we don't bother to push back the token. */
++			return false;
++	}
++}
+diff --git a/src/backend/replication/walsender.c b/src/backend/replication/walsender.c
+index 4cf95ce4392c..655760fee3e6 100644
+--- a/src/backend/replication/walsender.c
++++ b/src/backend/replication/walsender.c
+@@ -1630,7 +1630,8 @@ exec_replication_command(const char *cmd_string)
+ 	 */
+ 	if (MyWalSnd->state == WALSNDSTATE_STOPPING)
+ 		ereport(ERROR,
+-				(errmsg("cannot execute new commands while WAL sender is in stopping mode")));
++				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++				 errmsg("cannot execute new commands while WAL sender is in stopping mode")));
+ 
+ 	/*
+ 	 * CREATE_REPLICATION_SLOT ... LOGICAL exports a snapshot until the next
+@@ -1641,7 +1642,7 @@ exec_replication_command(const char *cmd_string)
+ 	CHECK_FOR_INTERRUPTS();
+ 
+ 	/*
+-	 * Parse the command.
++	 * Prepare to parse and execute the command.
+ 	 */
+ 	cmd_context = AllocSetContextCreate(CurrentMemoryContext,
+ 										"Replication command context",
+@@ -1649,33 +1650,41 @@ exec_replication_command(const char *cmd_string)
+ 	old_context = MemoryContextSwitchTo(cmd_context);
+ 
+ 	replication_scanner_init(cmd_string);
+-	parse_rc = replication_yyparse();
+-	if (parse_rc != 0)
+-		ereport(ERROR,
+-				(errcode(ERRCODE_SYNTAX_ERROR),
+-				 errmsg_internal("replication command parser returned %d",
+-								 parse_rc)));
+-	replication_scanner_finish();
+-
+-	cmd_node = replication_parse_result;
+ 
+ 	/*
+-	 * If it's a SQL command, just clean up our mess and return false; the
+-	 * caller will take care of executing it.
++	 * Is it a WalSender command?
+ 	 */
+-	if (IsA(cmd_node, SQLCmd))
++	if (!replication_scanner_is_replication_command())
+ 	{
+-		if (MyDatabaseId == InvalidOid)
+-			ereport(ERROR,
+-					(errmsg("cannot execute SQL commands in WAL sender for physical replication")));
++		/* Nope; clean up and get out. */
++		replication_scanner_finish();
+ 
+ 		MemoryContextSwitchTo(old_context);
+ 		MemoryContextDelete(cmd_context);
+ 
++		/* XXX this is a pretty random place to make this check */
++		if (MyDatabaseId == InvalidOid)
++			ereport(ERROR,
++					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++					 errmsg("cannot execute SQL commands in WAL sender for physical replication")));
++
+ 		/* Tell the caller that this wasn't a WalSender command. */
+ 		return false;
+ 	}
+ 
++	/*
++	 * Looks like a WalSender command, so parse it.
++	 */
++	parse_rc = replication_yyparse();
++	if (parse_rc != 0)
++		ereport(ERROR,
++				(errcode(ERRCODE_SYNTAX_ERROR),
++				 errmsg_internal("replication command parser returned %d",
++								 parse_rc)));
++	replication_scanner_finish();
++
++	cmd_node = replication_parse_result;
++
+ 	/*
+ 	 * Report query to various monitoring facilities.  For this purpose, we
+ 	 * report replication commands just like SQL commands.
+diff --git a/src/include/nodes/nodes.h b/src/include/nodes/nodes.h
+index f9ddafd34594..da35f2c27228 100644
+--- a/src/include/nodes/nodes.h
++++ b/src/include/nodes/nodes.h
+@@ -501,7 +501,6 @@ typedef enum NodeTag
+ 	T_ReadReplicationSlotCmd,
+ 	T_StartReplicationCmd,
+ 	T_TimeLineHistoryCmd,
+-	T_SQLCmd,
+ 
+ 	/*
+ 	 * TAGS FOR RANDOM OTHER STUFF
+diff --git a/src/include/nodes/replnodes.h b/src/include/nodes/replnodes.h
+index a77234474009..8ae9c517ff21 100644
+--- a/src/include/nodes/replnodes.h
++++ b/src/include/nodes/replnodes.h
+@@ -108,13 +108,4 @@ typedef struct TimeLineHistoryCmd
+ 	TimeLineID	timeline;
+ } TimeLineHistoryCmd;
+ 
+-/* ----------------------
+- *		SQL commands
+- * ----------------------
+- */
+-typedef struct SQLCmd
+-{
+-	NodeTag		type;
+-} SQLCmd;
+-
+ #endif							/* REPLNODES_H */
+diff --git a/src/include/replication/walsender_private.h b/src/include/replication/walsender_private.h
+index e62ef965f70a..9631047c6c1b 100644
+--- a/src/include/replication/walsender_private.h
++++ b/src/include/replication/walsender_private.h
+@@ -121,6 +121,7 @@ extern int	replication_yylex(void);
+ extern void replication_yyerror(const char *str) pg_attribute_noreturn();
+ extern void replication_scanner_init(const char *query_string);
+ extern void replication_scanner_finish(void);
++extern bool replication_scanner_is_replication_command(void);
+ 
+ extern Node *replication_parse_result;
+ 

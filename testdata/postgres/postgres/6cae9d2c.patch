@@ -1,0 +1,653 @@
+From 6cae9d2c10e151f741e7bc64a8b70bb2615c367c Mon Sep 17 00:00:00 2001
+From: Alexander Korotkov <akorotkov@postgresql.org>
+Date: Thu, 19 Sep 2019 21:30:19 +0300
+Subject: [PATCH] Improve handling of NULLs in KNN-GiST and KNN-SP-GiST
+
+This commit improves subject in two ways:
+
+ * It removes ugliness of 02f90879e7, which stores distance values and null
+   flags in two separate arrays after GISTSearchItem struct.  Instead we pack
+   both distance value and null flag in IndexOrderByDistance struct.  Alignment
+   overhead should be negligible, because we typically deal with at most few
+   "col op const" expressions in ORDER BY clause.
+ * It fixes handling of "col op NULL" expression in KNN-SP-GiST.  Now, these
+   expression are not passed to support functions, which can't deal with them.
+   Instead, NULL result is implicitly assumed.  It future we may decide to
+   teach support functions to deal with NULL arguments, but current solution is
+   bugfix suitable for backpatch.
+
+Reported-by: Nikita Glukhov
+Discussion: https://postgr.es/m/826f57ee-afc7-8977-c44c-6111d18b02ec%40postgrespro.ru
+Author: Nikita Glukhov
+Reviewed-by: Alexander Korotkov
+Backpatch-through: 9.4
+---
+ src/backend/access/gist/gistget.c             | 68 ++++++-----------
+ src/backend/access/gist/gistscan.c            | 16 ++--
+ src/backend/access/index/indexam.c            | 22 +++---
+ src/backend/access/spgist/spgscan.c           | 74 ++++++++++++++++---
+ src/include/access/genam.h                    | 10 ++-
+ src/include/access/gist_private.h             | 27 ++-----
+ src/include/access/spgist_private.h           |  8 +-
+ .../regress/expected/create_index_spgist.out  | 10 +++
+ src/test/regress/sql/create_index_spgist.sql  |  5 ++
+ src/tools/pgindent/typedefs.list              |  1 +
+ 10 files changed, 140 insertions(+), 101 deletions(-)
+
+diff --git a/src/backend/access/gist/gistget.c b/src/backend/access/gist/gistget.c
+index db633a94757d..22d790d82214 100644
+--- a/src/backend/access/gist/gistget.c
++++ b/src/backend/access/gist/gistget.c
+@@ -112,9 +112,8 @@ gistkillitems(IndexScanDesc scan)
+  * Similarly, *recheck_distances_p is set to indicate whether the distances
+  * need to be rechecked, and it is also ignored for non-leaf entries.
+  *
+- * If we are doing an ordered scan, so->distancesValues[] and
+- * so->distancesNulls[] is filled with distance data from the distance()
+- * functions before returning success.
++ * If we are doing an ordered scan, so->distances[] is filled with distance
++ * data from the distance() functions before returning success.
+  *
+  * We must decompress the key in the IndexTuple before passing it to the
+  * sk_funcs (which actually are the opclass Consistent or Distance methods).
+@@ -135,8 +134,7 @@ gistindex_keytest(IndexScanDesc scan,
+ 	GISTSTATE  *giststate = so->giststate;
+ 	ScanKey		key = scan->keyData;
+ 	int			keySize = scan->numberOfKeys;
+-	double	   *distance_value_p;
+-	bool	   *distance_null_p;
++	IndexOrderByDistance *distance_p;
+ 	Relation	r = scan->indexRelation;
+ 
+ 	*recheck_p = false;
+@@ -155,8 +153,8 @@ gistindex_keytest(IndexScanDesc scan,
+ 			elog(ERROR, "invalid GiST tuple found on leaf page");
+ 		for (i = 0; i < scan->numberOfOrderBys; i++)
+ 		{
+-			so->distanceValues[i] = -get_float8_infinity();
+-			so->distanceNulls[i] = false;
++			so->distances[i].value = -get_float8_infinity();
++			so->distances[i].isnull = false;
+ 		}
+ 		return true;
+ 	}
+@@ -240,8 +238,7 @@ gistindex_keytest(IndexScanDesc scan,
+ 
+ 	/* OK, it passes --- now let's compute the distances */
+ 	key = scan->orderByData;
+-	distance_value_p = so->distanceValues;
+-	distance_null_p = so->distanceNulls;
++	distance_p = so->distances;
+ 	keySize = scan->numberOfOrderBys;
+ 	while (keySize > 0)
+ 	{
+@@ -256,8 +253,8 @@ gistindex_keytest(IndexScanDesc scan,
+ 		if ((key->sk_flags & SK_ISNULL) || isNull)
+ 		{
+ 			/* Assume distance computes as null */
+-			*distance_value_p = 0.0;
+-			*distance_null_p = true;
++			distance_p->value = 0.0;
++			distance_p->isnull = true;
+ 		}
+ 		else
+ 		{
+@@ -294,13 +291,12 @@ gistindex_keytest(IndexScanDesc scan,
+ 									 ObjectIdGetDatum(key->sk_subtype),
+ 									 PointerGetDatum(&recheck));
+ 			*recheck_distances_p |= recheck;
+-			*distance_value_p = DatumGetFloat8(dist);
+-			*distance_null_p = false;
++			distance_p->value = DatumGetFloat8(dist);
++			distance_p->isnull = false;
+ 		}
+ 
+ 		key++;
+-		distance_value_p++;
+-		distance_null_p++;
++		distance_p++;
+ 		keySize--;
+ 	}
+ 
+@@ -313,8 +309,7 @@ gistindex_keytest(IndexScanDesc scan,
+  *
+  * scan: index scan we are executing
+  * pageItem: search queue item identifying an index page to scan
+- * myDistanceValues: distances array associated with pageItem, or NULL at the root
+- * myDistanceNulls: null flags for myDistanceValues array, or NULL at the root
++ * myDistances: distances array associated with pageItem, or NULL at the root
+  * tbm: if not NULL, gistgetbitmap's output bitmap
+  * ntids: if not NULL, gistgetbitmap's output tuple counter
+  *
+@@ -332,8 +327,7 @@ gistindex_keytest(IndexScanDesc scan,
+  */
+ static void
+ gistScanPage(IndexScanDesc scan, GISTSearchItem *pageItem,
+-			 double *myDistanceValues, bool *myDistanceNulls,
+-			 TIDBitmap *tbm, int64 *ntids)
++			 IndexOrderByDistance *myDistances, TIDBitmap *tbm, int64 *ntids)
+ {
+ 	GISTScanOpaque so = (GISTScanOpaque) scan->opaque;
+ 	GISTSTATE  *giststate = so->giststate;
+@@ -370,7 +364,7 @@ gistScanPage(IndexScanDesc scan, GISTSearchItem *pageItem,
+ 		GISTSearchItem *item;
+ 
+ 		/* This can't happen when starting at the root */
+-		Assert(myDistanceValues != NULL && myDistanceNulls != NULL);
++		Assert(myDistances != NULL);
+ 
+ 		oldcxt = MemoryContextSwitchTo(so->queueCxt);
+ 
+@@ -380,10 +374,8 @@ gistScanPage(IndexScanDesc scan, GISTSearchItem *pageItem,
+ 		item->data.parentlsn = pageItem->data.parentlsn;
+ 
+ 		/* Insert it into the queue using same distances as for this page */
+-		memcpy(GISTSearchItemDistanceValues(item, scan->numberOfOrderBys),
+-			   myDistanceValues, sizeof(double) * scan->numberOfOrderBys);
+-		memcpy(GISTSearchItemDistanceNulls(item, scan->numberOfOrderBys),
+-			   myDistanceNulls, sizeof(bool) * scan->numberOfOrderBys);
++		memcpy(item->distances, myDistances,
++			   sizeof(item->distances[0]) * scan->numberOfOrderBys);
+ 
+ 		pairingheap_add(so->queue, &item->phNode);
+ 
+@@ -527,10 +519,8 @@ gistScanPage(IndexScanDesc scan, GISTSearchItem *pageItem,
+ 			}
+ 
+ 			/* Insert it into the queue using new distance data */
+-			memcpy(GISTSearchItemDistanceValues(item, nOrderBys),
+-				   so->distanceValues, sizeof(double) * nOrderBys);
+-			memcpy(GISTSearchItemDistanceNulls(item, nOrderBys),
+-				   so->distanceNulls, sizeof(bool) * nOrderBys);
++			memcpy(item->distances, so->distances,
++				   sizeof(item->distances[0]) * nOrderBys);
+ 
+ 			pairingheap_add(so->queue, &item->phNode);
+ 
+@@ -595,8 +585,7 @@ getNextNearest(IndexScanDesc scan)
+ 			scan->xs_recheck = item->data.heap.recheck;
+ 
+ 			index_store_float8_orderby_distances(scan, so->orderByTypes,
+-												 GISTSearchItemDistanceValues(item, scan->numberOfOrderBys),
+-												 GISTSearchItemDistanceNulls(item, scan->numberOfOrderBys),
++												 item->distances,
+ 												 item->data.heap.recheckDistances);
+ 
+ 			/* in an index-only scan, also return the reconstructed tuple. */
+@@ -609,10 +598,7 @@ getNextNearest(IndexScanDesc scan)
+ 			/* visit an index page, extract its items into queue */
+ 			CHECK_FOR_INTERRUPTS();
+ 
+-			gistScanPage(scan, item,
+-						 GISTSearchItemDistanceValues(item, scan->numberOfOrderBys),
+-						 GISTSearchItemDistanceNulls(item, scan->numberOfOrderBys),
+-						 NULL, NULL);
++			gistScanPage(scan, item, item->distances, NULL, NULL);
+ 		}
+ 
+ 		pfree(item);
+@@ -650,7 +636,7 @@ gistgettuple(IndexScanDesc scan, ScanDirection dir)
+ 
+ 		fakeItem.blkno = GIST_ROOT_BLKNO;
+ 		memset(&fakeItem.data.parentlsn, 0, sizeof(GistNSN));
+-		gistScanPage(scan, &fakeItem, NULL, NULL, NULL, NULL);
++		gistScanPage(scan, &fakeItem, NULL, NULL, NULL);
+ 	}
+ 
+ 	if (scan->numberOfOrderBys > 0)
+@@ -744,10 +730,7 @@ gistgettuple(IndexScanDesc scan, ScanDirection dir)
+ 				 * this page, we fall out of the inner "do" and loop around to
+ 				 * return them.
+ 				 */
+-				gistScanPage(scan, item,
+-							 GISTSearchItemDistanceValues(item, scan->numberOfOrderBys),
+-							 GISTSearchItemDistanceNulls(item, scan->numberOfOrderBys),
+-							 NULL, NULL);
++				gistScanPage(scan, item, item->distances, NULL, NULL);
+ 
+ 				pfree(item);
+ 			} while (so->nPageData == 0);
+@@ -778,7 +761,7 @@ gistgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
+ 
+ 	fakeItem.blkno = GIST_ROOT_BLKNO;
+ 	memset(&fakeItem.data.parentlsn, 0, sizeof(GistNSN));
+-	gistScanPage(scan, &fakeItem, NULL, NULL, tbm, &ntids);
++	gistScanPage(scan, &fakeItem, NULL, tbm, &ntids);
+ 
+ 	/*
+ 	 * While scanning a leaf page, ItemPointers of matching heap tuples will
+@@ -793,10 +776,7 @@ gistgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
+ 
+ 		CHECK_FOR_INTERRUPTS();
+ 
+-		gistScanPage(scan, item,
+-					 GISTSearchItemDistanceValues(item, scan->numberOfOrderBys),
+-					 GISTSearchItemDistanceNulls(item, scan->numberOfOrderBys),
+-					 tbm, &ntids);
++		gistScanPage(scan, item, item->distances, tbm, &ntids);
+ 
+ 		pfree(item);
+ 	}
+diff --git a/src/backend/access/gist/gistscan.c b/src/backend/access/gist/gistscan.c
+index e72bf08f952b..7d0d3524bb63 100644
+--- a/src/backend/access/gist/gistscan.c
++++ b/src/backend/access/gist/gistscan.c
+@@ -33,26 +33,23 @@ pairingheap_GISTSearchItem_cmp(const pairingheap_node *a, const pairingheap_node
+ 	const GISTSearchItem *sb = (const GISTSearchItem *) b;
+ 	IndexScanDesc scan = (IndexScanDesc) arg;
+ 	int			i;
+-	double	   *da = GISTSearchItemDistanceValues(sa, scan->numberOfOrderBys),
+-			   *db = GISTSearchItemDistanceValues(sb, scan->numberOfOrderBys);
+-	bool	   *na = GISTSearchItemDistanceNulls(sa, scan->numberOfOrderBys),
+-			   *nb = GISTSearchItemDistanceNulls(sb, scan->numberOfOrderBys);
+ 
+ 	/* Order according to distance comparison */
+ 	for (i = 0; i < scan->numberOfOrderBys; i++)
+ 	{
+-		if (na[i])
++		if (sa->distances[i].isnull)
+ 		{
+-			if (!nb[i])
++			if (!sb->distances[i].isnull)
+ 				return -1;
+ 		}
+-		else if (nb[i])
++		else if (sb->distances[i].isnull)
+ 		{
+ 			return 1;
+ 		}
+ 		else
+ 		{
+-			int			cmp = -float8_cmp_internal(da[i], db[i]);
++			int			cmp = -float8_cmp_internal(sa->distances[i].value,
++												   sb->distances[i].value);
+ 
+ 			if (cmp != 0)
+ 				return cmp;
+@@ -100,8 +97,7 @@ gistbeginscan(Relation r, int nkeys, int norderbys)
+ 	so->queueCxt = giststate->scanCxt;	/* see gistrescan */
+ 
+ 	/* workspaces with size dependent on numberOfOrderBys: */
+-	so->distanceValues = palloc(sizeof(double) * scan->numberOfOrderBys);
+-	so->distanceNulls = palloc(sizeof(bool) * scan->numberOfOrderBys);
++	so->distances = palloc(sizeof(so->distances[0]) * scan->numberOfOrderBys);
+ 	so->qual_ok = true;			/* in case there are zero keys */
+ 	if (scan->numberOfOrderBys > 0)
+ 	{
+diff --git a/src/backend/access/index/indexam.c b/src/backend/access/index/indexam.c
+index 2e8f53a37c84..442f41425d4b 100644
+--- a/src/backend/access/index/indexam.c
++++ b/src/backend/access/index/indexam.c
+@@ -847,14 +847,14 @@ index_getprocinfo(Relation irel,
+  */
+ void
+ index_store_float8_orderby_distances(IndexScanDesc scan, Oid *orderByTypes,
+-									 double *distanceValues,
+-									 bool *distanceNulls, bool recheckOrderBy)
++									 IndexOrderByDistance *distances,
++									 bool recheckOrderBy)
+ {
+ 	int			i;
+ 
+ 	scan->xs_recheckorderby = recheckOrderBy;
+ 
+-	if (!distanceValues)
++	if (!distances)
+ 	{
+ 		Assert(!scan->xs_recheckorderby);
+ 
+@@ -869,11 +869,11 @@ index_store_float8_orderby_distances(IndexScanDesc scan, Oid *orderByTypes,
+ 
+ 	for (i = 0; i < scan->numberOfOrderBys; i++)
+ 	{
+-		if (distanceNulls && distanceNulls[i])
+-		{
++		scan->xs_orderbynulls[i] = distances[i].isnull;
++
++		if (scan->xs_orderbynulls[i])
+ 			scan->xs_orderbyvals[i] = (Datum) 0;
+-			scan->xs_orderbynulls[i] = true;
+-		}
++
+ 		if (orderByTypes[i] == FLOAT8OID)
+ 		{
+ #ifndef USE_FLOAT8_BYVAL
+@@ -881,8 +881,8 @@ index_store_float8_orderby_distances(IndexScanDesc scan, Oid *orderByTypes,
+ 			if (!scan->xs_orderbynulls[i])
+ 				pfree(DatumGetPointer(scan->xs_orderbyvals[i]));
+ #endif
+-			scan->xs_orderbyvals[i] = Float8GetDatum(distanceValues[i]);
+-			scan->xs_orderbynulls[i] = false;
++			if (!scan->xs_orderbynulls[i])
++				scan->xs_orderbyvals[i] = Float8GetDatum(distances[i].value);
+ 		}
+ 		else if (orderByTypes[i] == FLOAT4OID)
+ 		{
+@@ -892,8 +892,8 @@ index_store_float8_orderby_distances(IndexScanDesc scan, Oid *orderByTypes,
+ 			if (!scan->xs_orderbynulls[i])
+ 				pfree(DatumGetPointer(scan->xs_orderbyvals[i]));
+ #endif
+-			scan->xs_orderbyvals[i] = Float4GetDatum((float4) distanceValues[i]);
+-			scan->xs_orderbynulls[i] = false;
++			if (!scan->xs_orderbynulls[i])
++				scan->xs_orderbyvals[i] = Float4GetDatum((float4) distances[i].value);
+ 		}
+ 		else
+ 		{
+diff --git a/src/backend/access/spgist/spgscan.c b/src/backend/access/spgist/spgscan.c
+index 2bd4037af9e0..cfba47067cc1 100644
+--- a/src/backend/access/spgist/spgscan.c
++++ b/src/backend/access/spgist/spgscan.c
+@@ -107,13 +107,13 @@ spgAllocSearchItem(SpGistScanOpaque so, bool isnull, double *distances)
+ {
+ 	/* allocate distance array only for non-NULL items */
+ 	SpGistSearchItem *item =
+-	palloc(SizeOfSpGistSearchItem(isnull ? 0 : so->numberOfOrderBys));
++	palloc(SizeOfSpGistSearchItem(isnull ? 0 : so->numberOfNonNullOrderBys));
+ 
+ 	item->isNull = isnull;
+ 
+-	if (!isnull && so->numberOfOrderBys > 0)
++	if (!isnull && so->numberOfNonNullOrderBys > 0)
+ 		memcpy(item->distances, distances,
+-			   so->numberOfOrderBys * sizeof(double));
++			   sizeof(item->distances[0]) * so->numberOfNonNullOrderBys);
+ 
+ 	return item;
+ }
+@@ -208,6 +208,34 @@ spgPrepareScanKeys(IndexScanDesc scan)
+ 	so->numberOfOrderBys = scan->numberOfOrderBys;
+ 	so->orderByData = scan->orderByData;
+ 
++	if (so->numberOfOrderBys <= 0)
++		so->numberOfNonNullOrderBys = 0;
++	else
++	{
++		int			j = 0;
++
++		/*
++		 * Remove all NULL keys, but remember their offsets in the original
++		 * array.
++		 */
++		for (i = 0; i < scan->numberOfOrderBys; i++)
++		{
++			ScanKey		skey = &so->orderByData[i];
++
++			if (skey->sk_flags & SK_ISNULL)
++				so->nonNullOrderByOffsets[i] = -1;
++			else
++			{
++				if (i != j)
++					so->orderByData[j] = *skey;
++
++				so->nonNullOrderByOffsets[i] = j++;
++			}
++		}
++
++		so->numberOfNonNullOrderBys = j;
++	}
++
+ 	if (scan->numberOfKeys <= 0)
+ 	{
+ 		/* If no quals, whole-index scan is required */
+@@ -295,6 +323,8 @@ spgbeginscan(Relation rel, int keysz, int orderbysz)
+ 		/* This will be filled in spgrescan, but allocate the space here */
+ 		so->orderByTypes = (Oid *)
+ 			palloc(sizeof(Oid) * scan->numberOfOrderBys);
++		so->nonNullOrderByOffsets = (int *)
++			palloc(sizeof(int) * scan->numberOfOrderBys);
+ 
+ 		/* These arrays have constant contents, so we can fill them now */
+ 		so->zeroDistances = (double *)
+@@ -394,6 +424,7 @@ spgendscan(IndexScanDesc scan)
+ 	if (scan->numberOfOrderBys > 0)
+ 	{
+ 		pfree(so->orderByTypes);
++		pfree(so->nonNullOrderByOffsets);
+ 		pfree(so->zeroDistances);
+ 		pfree(so->infDistances);
+ 		pfree(scan->xs_orderbyvals);
+@@ -465,7 +496,7 @@ spgLeafTest(SpGistScanOpaque so, SpGistSearchItem *item,
+ 		in.scankeys = so->keyData;
+ 		in.nkeys = so->numberOfKeys;
+ 		in.orderbys = so->orderByData;
+-		in.norderbys = so->numberOfOrderBys;
++		in.norderbys = so->numberOfNonNullOrderBys;
+ 		in.reconstructedValue = item->value;
+ 		in.traversalValue = item->traversalValue;
+ 		in.level = item->level;
+@@ -492,7 +523,7 @@ spgLeafTest(SpGistScanOpaque so, SpGistSearchItem *item,
+ 	if (result)
+ 	{
+ 		/* item passes the scankeys */
+-		if (so->numberOfOrderBys > 0)
++		if (so->numberOfNonNullOrderBys > 0)
+ 		{
+ 			/* the scan is ordered -> add the item to the queue */
+ 			MemoryContext oldCxt = MemoryContextSwitchTo(so->traversalCxt);
+@@ -531,7 +562,7 @@ spgInitInnerConsistentIn(spgInnerConsistentIn *in,
+ 	in->scankeys = so->keyData;
+ 	in->orderbys = so->orderByData;
+ 	in->nkeys = so->numberOfKeys;
+-	in->norderbys = so->numberOfOrderBys;
++	in->norderbys = so->numberOfNonNullOrderBys;
+ 	in->reconstructedValue = item->value;
+ 	in->traversalMemoryContext = so->traversalCxt;
+ 	in->traversalValue = item->traversalValue;
+@@ -751,7 +782,7 @@ spgWalk(Relation index, SpGistScanOpaque so, bool scanWholeIndex,
+ 		if (item->isLeaf)
+ 		{
+ 			/* We store heap items in the queue only in case of ordered search */
+-			Assert(so->numberOfOrderBys > 0);
++			Assert(so->numberOfNonNullOrderBys > 0);
+ 			storeRes(so, &item->heapPtr, item->value, item->isNull,
+ 					 item->recheck, item->recheckDistances, item->distances);
+ 			reportedSome = true;
+@@ -874,7 +905,7 @@ spggetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
+ static void
+ storeGettuple(SpGistScanOpaque so, ItemPointer heapPtr,
+ 			  Datum leafValue, bool isnull, bool recheck, bool recheckDistances,
+-			  double *distances)
++			  double *nonNullDistances)
+ {
+ 	Assert(so->nPtrs < MaxIndexTuplesPerPage);
+ 	so->heapPtrs[so->nPtrs] = *heapPtr;
+@@ -883,13 +914,33 @@ storeGettuple(SpGistScanOpaque so, ItemPointer heapPtr,
+ 
+ 	if (so->numberOfOrderBys > 0)
+ 	{
+-		if (isnull)
++		if (isnull || so->numberOfNonNullOrderBys <= 0)
+ 			so->distances[so->nPtrs] = NULL;
+ 		else
+ 		{
+-			Size		size = sizeof(double) * so->numberOfOrderBys;
++			IndexOrderByDistance *distances =
++			palloc(sizeof(distances[0]) * so->numberOfOrderBys);
++			int			i;
++
++			for (i = 0; i < so->numberOfOrderBys; i++)
++			{
++				int			offset = so->nonNullOrderByOffsets[i];
++
++				if (offset >= 0)
++				{
++					/* Copy non-NULL distance value */
++					distances[i].value = nonNullDistances[offset];
++					distances[i].isnull = false;
++				}
++				else
++				{
++					/* Set distance's NULL flag. */
++					distances[i].value = 0.0;
++					distances[i].isnull = true;
++				}
++			}
+ 
+-			so->distances[so->nPtrs] = memcpy(palloc(size), distances, size);
++			so->distances[so->nPtrs] = distances;
+ 		}
+ 	}
+ 
+@@ -929,7 +980,6 @@ spggettuple(IndexScanDesc scan, ScanDirection dir)
+ 			if (so->numberOfOrderBys > 0)
+ 				index_store_float8_orderby_distances(scan, so->orderByTypes,
+ 													 so->distances[so->iPtr],
+-													 NULL,
+ 													 so->recheckDistances[so->iPtr]);
+ 			so->iPtr++;
+ 			return true;
+diff --git a/src/include/access/genam.h b/src/include/access/genam.h
+index 6c56717ba776..a813b004be7d 100644
+--- a/src/include/access/genam.h
++++ b/src/include/access/genam.h
+@@ -118,6 +118,13 @@ typedef enum IndexUniqueCheck
+ } IndexUniqueCheck;
+ 
+ 
++/* Nullable "ORDER BY col op const" distance */
++typedef struct IndexOrderByDistance
++{
++	double		value;
++	bool		isnull;
++} IndexOrderByDistance;
++
+ /*
+  * generalized index_ interface routines (in indexam.c)
+  */
+@@ -179,8 +186,7 @@ extern FmgrInfo *index_getprocinfo(Relation irel, AttrNumber attnum,
+ 								   uint16 procnum);
+ extern void index_store_float8_orderby_distances(IndexScanDesc scan,
+ 												 Oid *orderByTypes,
+-												 double *distanceValues,
+-												 bool *distanceNulls,
++												 IndexOrderByDistance *distances,
+ 												 bool recheckOrderBy);
+ 
+ /*
+diff --git a/src/include/access/gist_private.h b/src/include/access/gist_private.h
+index ed5b643885dc..ab134c1a3940 100644
+--- a/src/include/access/gist_private.h
++++ b/src/include/access/gist_private.h
+@@ -138,29 +138,15 @@ typedef struct GISTSearchItem
+ 		GISTSearchHeapItem heap;	/* heap info, if heap tuple */
+ 	}			data;
+ 
+-	/*
+-	 * This data structure is followed by arrays of distance values and
+-	 * distance null flags.  Size of both arrays is
+-	 * IndexScanDesc->numberOfOrderBys. See macros below for accessing those
+-	 * arrays.
+-	 */
++	/* numberOfOrderBys entries */
++	IndexOrderByDistance distances[FLEXIBLE_ARRAY_MEMBER];
+ } GISTSearchItem;
+ 
+ #define GISTSearchItemIsHeap(item)	((item).blkno == InvalidBlockNumber)
+ 
+-#define SizeOfGISTSearchItem(n_distances) (DOUBLEALIGN(sizeof(GISTSearchItem)) + \
+-	(sizeof(double) + sizeof(bool)) * (n_distances))
+-
+-/*
+- * We actually don't need n_distances compute pointer to distance values.
+- * Nevertheless take n_distances as argument to have same arguments list for
+- * GISTSearchItemDistanceValues() and GISTSearchItemDistanceNulls().
+- */
+-#define GISTSearchItemDistanceValues(item, n_distances) \
+-	((double *) ((Pointer) (item) + DOUBLEALIGN(sizeof(GISTSearchItem))))
+-
+-#define GISTSearchItemDistanceNulls(item, n_distances) \
+-	((bool *) ((Pointer) (item) + DOUBLEALIGN(sizeof(GISTSearchItem)) + sizeof(double) * (n_distances)))
++#define SizeOfGISTSearchItem(n_distances) \
++	(offsetof(GISTSearchItem, distances) + \
++	 sizeof(IndexOrderByDistance) * (n_distances))
+ 
+ /*
+  * GISTScanOpaqueData: private state for a scan of a GiST index
+@@ -176,8 +162,7 @@ typedef struct GISTScanOpaqueData
+ 	bool		firstCall;		/* true until first gistgettuple call */
+ 
+ 	/* pre-allocated workspace arrays */
+-	double	   *distanceValues; /* output area for gistindex_keytest */
+-	bool	   *distanceNulls;
++	IndexOrderByDistance *distances;	/* output area for gistindex_keytest */
+ 
+ 	/* info about killed items if any (killedItems is NULL if never used) */
+ 	OffsetNumber *killedItems;	/* offset numbers of killed items */
+diff --git a/src/include/access/spgist_private.h b/src/include/access/spgist_private.h
+index e0d1178f2457..428e54bfbd2f 100644
+--- a/src/include/access/spgist_private.h
++++ b/src/include/access/spgist_private.h
+@@ -169,8 +169,12 @@ typedef struct SpGistScanOpaqueData
+ 	int			numberOfKeys;	/* number of index qualifier conditions */
+ 	ScanKey		keyData;		/* array of index qualifier descriptors */
+ 	int			numberOfOrderBys;	/* number of ordering operators */
++	int			numberOfNonNullOrderBys;	/* number of ordering operators
++											 * with non-NULL arguments */
+ 	ScanKey		orderByData;	/* array of ordering op descriptors */
+ 	Oid		   *orderByTypes;	/* array of ordering op return types */
++	int		   *nonNullOrderByOffsets;	/* array of offset of non-NULL
++										 * ordering keys in the original array */
+ 	Oid			indexCollation; /* collation of index column */
+ 
+ 	/* Opclass defined functions: */
+@@ -195,7 +199,9 @@ typedef struct SpGistScanOpaqueData
+ 	bool		recheckDistances[MaxIndexTuplesPerPage];	/* distance recheck
+ 															 * flags */
+ 	HeapTuple	reconTups[MaxIndexTuplesPerPage];	/* reconstructed tuples */
+-	double	   *distances[MaxIndexTuplesPerPage];	/* distances (for recheck) */
++
++	/* distances (for recheck) */
++	IndexOrderByDistance *distances[MaxIndexTuplesPerPage];
+ 
+ 	/*
+ 	 * Note: using MaxIndexTuplesPerPage above is a bit hokey since
+diff --git a/src/test/regress/expected/create_index_spgist.out b/src/test/regress/expected/create_index_spgist.out
+index 81b4a67c3909..5ccea9158677 100644
+--- a/src/test/regress/expected/create_index_spgist.out
++++ b/src/test/regress/expected/create_index_spgist.out
+@@ -555,6 +555,16 @@ WHERE seq.dist IS DISTINCT FROM idx.dist;
+ ---+------+---+---+------+---
+ (0 rows)
+ 
++-- check ORDER BY distance to NULL
++SELECT (SELECT p FROM kd_point_tbl ORDER BY p <-> pt LIMIT 1)
++FROM (VALUES (point '1,2'), (NULL), ('1234,5678')) pts(pt);
++      p      
++-------------
++ (59,21)
++ (9853,112)
++ (1239,5647)
++(3 rows)
++
+ EXPLAIN (COSTS OFF)
+ SELECT count(*) FROM radix_text_tbl WHERE t = 'P0123456789abcdef';
+                          QUERY PLAN                         
+diff --git a/src/test/regress/sql/create_index_spgist.sql b/src/test/regress/sql/create_index_spgist.sql
+index 8e6c45330767..629936fd3d49 100644
+--- a/src/test/regress/sql/create_index_spgist.sql
++++ b/src/test/regress/sql/create_index_spgist.sql
+@@ -225,6 +225,11 @@ SELECT * FROM quad_point_tbl_ord_seq3 seq FULL JOIN kd_point_tbl_ord_idx3 idx
+ ON seq.n = idx.n
+ WHERE seq.dist IS DISTINCT FROM idx.dist;
+ 
++-- check ORDER BY distance to NULL
++SELECT (SELECT p FROM kd_point_tbl ORDER BY p <-> pt LIMIT 1)
++FROM (VALUES (point '1,2'), (NULL), ('1234,5678')) pts(pt);
++
++
+ EXPLAIN (COSTS OFF)
+ SELECT count(*) FROM radix_text_tbl WHERE t = 'P0123456789abcdef';
+ SELECT count(*) FROM radix_text_tbl WHERE t = 'P0123456789abcdef';
+diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list
+index f3cdfa8a223f..fb652651750a 100644
+--- a/src/tools/pgindent/typedefs.list
++++ b/src/tools/pgindent/typedefs.list
+@@ -1043,6 +1043,7 @@ IndexList
+ IndexOnlyScan
+ IndexOnlyScanState
+ IndexOptInfo
++IndexOrderByDistance
+ IndexPath
+ IndexRuntimeKeyInfo
+ IndexScan

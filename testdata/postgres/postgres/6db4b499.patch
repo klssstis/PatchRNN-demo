@@ -1,0 +1,205 @@
+From 6db4b49986be3fe59a1f6ba6fabf9852864efc3e Mon Sep 17 00:00:00 2001
+From: Teodor Sigaev <teodor@sigaev.ru>
+Date: Mon, 23 Apr 2018 15:55:10 +0300
+Subject: [PATCH] Fix wrong validation of top-parent pointer during page
+ deletion in Btree.
+
+After introducing usage of t_tid of inner or page high key for storing
+number of attributes of tuple, validation of tuple's ItemPointer with
+ItemPointerIsValid becomes incorrect, it's need to validate only blocknumber of
+ItemPointer. Missing this causes a incorrect page deletion, fix that. Test is
+added.
+
+BTW, current contrib/amcheck doesn't fail on index corrupted by this way.
+
+Also introduce BTreeTupleGetTopParent/BTreeTupleSetTopParent macroses to improve
+code readability and to avoid possible confusion with page high key: high key
+is used to store top-parent link for branch to remove.
+
+Bug found by Michael Paquier, but bug doesn't exist in previous versions because
+t_tid was set to P_HIKEY.
+
+Author: Teodor Sigaev
+Reviewer: Peter Geoghegan
+Discussion: https://www.postgresql.org/message-id/flat/20180419052436.GA16000%40paquier.xyz
+---
+ src/backend/access/nbtree/nbtpage.c        | 21 ++++++++-------------
+ src/backend/access/nbtree/nbtxlog.c        | 12 ++----------
+ src/include/access/nbtree.h                | 14 ++++++++++++++
+ src/test/regress/expected/create_index.out | 10 ++++++++++
+ src/test/regress/expected/sanity_check.out |  1 +
+ src/test/regress/sql/create_index.sql      | 11 +++++++++++
+ 6 files changed, 46 insertions(+), 23 deletions(-)
+
+diff --git a/src/backend/access/nbtree/nbtpage.c b/src/backend/access/nbtree/nbtpage.c
+index beef089ba86a..3be229db1f00 100644
+--- a/src/backend/access/nbtree/nbtpage.c
++++ b/src/backend/access/nbtree/nbtpage.c
+@@ -1602,10 +1602,9 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
+ 	MemSet(&trunctuple, 0, sizeof(IndexTupleData));
+ 	trunctuple.t_info = sizeof(IndexTupleData);
+ 	if (target != leafblkno)
+-		ItemPointerSetBlockNumber(&trunctuple.t_tid, target);
++		BTreeTupleSetTopParent(&trunctuple, target);
+ 	else
+-		ItemPointerSetInvalid(&trunctuple.t_tid);
+-	BTreeTupleSetNAtts(&trunctuple, 0);
++		BTreeTupleSetTopParent(&trunctuple, InvalidBlockNumber);
+ 
+ 	if (PageAddItem(page, (Item) &trunctuple, sizeof(IndexTupleData), P_HIKEY,
+ 					false, false) == InvalidOffsetNumber)
+@@ -1690,7 +1689,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
+ 	BTPageOpaque opaque;
+ 	bool		rightsib_is_rightmost;
+ 	int			targetlevel;
+-	ItemPointer leafhikey;
++	IndexTuple	leafhikey;
+ 	BlockNumber nextchild;
+ 
+ 	page = BufferGetPage(leafbuf);
+@@ -1702,7 +1701,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
+ 	 * Remember some information about the leaf page.
+ 	 */
+ 	itemid = PageGetItemId(page, P_HIKEY);
+-	leafhikey = &((IndexTuple) PageGetItem(page, itemid))->t_tid;
++	leafhikey = (IndexTuple) PageGetItem(page, itemid);
+ 	leafleftsib = opaque->btpo_prev;
+ 	leafrightsib = opaque->btpo_next;
+ 
+@@ -1714,9 +1713,10 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
+ 	 * parent in the branch.  Set 'target' and 'buf' to reference the page
+ 	 * actually being unlinked.
+ 	 */
+-	if (ItemPointerIsValid(leafhikey))
++	target = BTreeTupleGetTopParent(leafhikey);
++
++	if (target != InvalidBlockNumber)
+ 	{
+-		target = ItemPointerGetBlockNumberNoCheck(leafhikey);
+ 		Assert(target != leafblkno);
+ 
+ 		/* fetch the block number of the topmost parent's left sibling */
+@@ -1919,12 +1919,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
+ 	 * branch.
+ 	 */
+ 	if (target != leafblkno)
+-	{
+-		if (nextchild == InvalidBlockNumber)
+-			ItemPointerSetInvalid(leafhikey);
+-		else
+-			ItemPointerSetBlockNumber(leafhikey, nextchild);
+-	}
++		BTreeTupleSetTopParent(leafhikey, nextchild);
+ 
+ 	/*
+ 	 * Mark the page itself deleted.  It can be recycled when all current
+diff --git a/src/backend/access/nbtree/nbtxlog.c b/src/backend/access/nbtree/nbtxlog.c
+index fb8c769df9ac..67a94cb80a2c 100644
+--- a/src/backend/access/nbtree/nbtxlog.c
++++ b/src/backend/access/nbtree/nbtxlog.c
+@@ -800,11 +800,7 @@ btree_xlog_mark_page_halfdead(uint8 info, XLogReaderState *record)
+ 	 */
+ 	MemSet(&trunctuple, 0, sizeof(IndexTupleData));
+ 	trunctuple.t_info = sizeof(IndexTupleData);
+-	if (xlrec->topparent != InvalidBlockNumber)
+-		ItemPointerSetBlockNumber(&trunctuple.t_tid, xlrec->topparent);
+-	else
+-		ItemPointerSetInvalid(&trunctuple.t_tid);
+-	BTreeTupleSetNAtts(&trunctuple, 0);
++	BTreeTupleSetTopParent(&trunctuple, xlrec->topparent);
+ 
+ 	if (PageAddItem(page, (Item) &trunctuple, sizeof(IndexTupleData), P_HIKEY,
+ 					false, false) == InvalidOffsetNumber)
+@@ -912,11 +908,7 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
+ 		/* Add a dummy hikey item */
+ 		MemSet(&trunctuple, 0, sizeof(IndexTupleData));
+ 		trunctuple.t_info = sizeof(IndexTupleData);
+-		if (xlrec->topparent != InvalidBlockNumber)
+-			ItemPointerSetBlockNumber(&trunctuple.t_tid, xlrec->topparent);
+-		else
+-			ItemPointerSetInvalid(&trunctuple.t_tid);
+-		BTreeTupleSetNAtts(&trunctuple, 0);
++		BTreeTupleSetTopParent(&trunctuple, xlrec->topparent);
+ 
+ 		if (PageAddItem(page, (Item) &trunctuple, sizeof(IndexTupleData), P_HIKEY,
+ 						false, false) == InvalidOffsetNumber)
+diff --git a/src/include/access/nbtree.h b/src/include/access/nbtree.h
+index 1194be928110..892aeca30039 100644
+--- a/src/include/access/nbtree.h
++++ b/src/include/access/nbtree.h
+@@ -226,6 +226,20 @@ typedef struct BTMetaPageData
+ #define BTreeInnerTupleSetDownLink(itup, blkno) \
+ 	ItemPointerSetBlockNumber(&((itup)->t_tid), (blkno))
+ 
++/*
++ * Get/set leaf page highkey's link. During the second phase of deletion, the
++ * target leaf page's high key may point to an ancestor page (at all other
++ * times, the leaf level high key's link is not used).  See the nbtree README
++ * for full details.
++ */
++#define BTreeTupleGetTopParent(itup) \
++	ItemPointerGetBlockNumberNoCheck(&((itup)->t_tid))
++#define BTreeTupleSetTopParent(itup, blkno)	\
++	do { \
++		ItemPointerSetBlockNumber(&((itup)->t_tid), (blkno)); \
++		BTreeTupleSetNAtts((itup), 0); \
++	} while(0)
++
+ /*
+  * Get/set number of attributes within B-tree index tuple. Asserts should be
+  * removed when BT_RESERVED_OFFSET_MASK bits will be used.
+diff --git a/src/test/regress/expected/create_index.out b/src/test/regress/expected/create_index.out
+index fe5b698669c4..fc81088d4b83 100644
+--- a/src/test/regress/expected/create_index.out
++++ b/src/test/regress/expected/create_index.out
+@@ -3052,6 +3052,16 @@ explain (costs off)
+          Filter: (NOT b)
+ (4 rows)
+ 
++--
++-- Test for multilevel page deletion
++--
++CREATE TABLE delete_test_table (a bigint, b bigint, c bigint, d bigint);
++INSERT INTO delete_test_table SELECT i, 1, 2, 3 FROM generate_series(1,80000) i;
++ALTER TABLE delete_test_table ADD PRIMARY KEY (a,b,c,d);
++DELETE FROM delete_test_table WHERE a > 40000;
++VACUUM delete_test_table;
++DELETE FROM delete_test_table WHERE a > 10;
++VACUUM delete_test_table;
+ --
+ -- REINDEX (VERBOSE)
+ --
+diff --git a/src/test/regress/expected/sanity_check.out b/src/test/regress/expected/sanity_check.out
+index 8afb1f2f7e3a..0aa535791753 100644
+--- a/src/test/regress/expected/sanity_check.out
++++ b/src/test/regress/expected/sanity_check.out
+@@ -38,6 +38,7 @@ d_star|f
+ date_tbl|f
+ default_tbl|f
+ defaultexpr_tbl|f
++delete_test_table|t
+ dept|f
+ dupindexcols|t
+ e_star|f
+diff --git a/src/test/regress/sql/create_index.sql b/src/test/regress/sql/create_index.sql
+index f7731265a08c..f9e7118f0d3d 100644
+--- a/src/test/regress/sql/create_index.sql
++++ b/src/test/regress/sql/create_index.sql
+@@ -1061,6 +1061,17 @@ explain (costs off)
+ explain (costs off)
+   select * from boolindex where not b order by i limit 10;
+ 
++--
++-- Test for multilevel page deletion
++--
++CREATE TABLE delete_test_table (a bigint, b bigint, c bigint, d bigint);
++INSERT INTO delete_test_table SELECT i, 1, 2, 3 FROM generate_series(1,80000) i;
++ALTER TABLE delete_test_table ADD PRIMARY KEY (a,b,c,d);
++DELETE FROM delete_test_table WHERE a > 40000;
++VACUUM delete_test_table;
++DELETE FROM delete_test_table WHERE a > 10;
++VACUUM delete_test_table;
++
+ --
+ -- REINDEX (VERBOSE)
+ --

@@ -1,0 +1,298 @@
+From 6b0faf723647a851eaaddfed11e14861f8d0f588 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 18 Dec 2018 12:48:15 -0500
+Subject: [PATCH] Make collation-aware system catalog columns use "C"
+ collation.
+
+Up to now we allowed text columns in system catalogs to use collation
+"default", but that isn't really safe because it might mean something
+different in template0 than it means in a database cloned from template0.
+In particular, this could mean that cloned pg_statistic entries for such
+columns weren't entirely valid, possibly leading to bogus planner
+estimates, though (probably) not any outright failures.
+
+In the wake of commit 5e0928005, a better solution is available: if we
+label such columns with "C" collation, then their pg_statistic entries
+will also use that collation and hence will be valid independently of
+the database collation.
+
+This also provides a cleaner solution for indexes on such columns than
+the hack added by commit 0b28ea79c: the indexes will naturally inherit
+"C" collation and don't have to be forced to use text_pattern_ops.
+
+Also, with the planned improvement of type "name" to be collation-aware,
+this policy will apply cleanly to both text and name columns.
+
+Because of the pg_statistic angle, we should also apply this policy
+to the tables in information_schema.  This patch does that by adjusting
+information_schema's textual domain types to specify "C" collation.
+That has the user-visible effect that order-sensitive comparisons to
+textual information_schema view columns will now use "C" collation
+by default.  The SQL standard says that the collation of those view
+columns is implementation-defined, so I think this is legal per spec.
+At some point this might allow for translation of such comparisons
+into indexable conditions on the underlying "name" columns, although
+additional work will be needed before that can happen.
+
+Discussion: https://postgr.es/m/19346.1544895309@sss.pgh.pa.us
+---
+ src/backend/access/common/scankey.c        |  8 ++++----
+ src/backend/bootstrap/bootstrap.c          |  9 +++++++++
+ src/backend/catalog/genbki.pl              |  8 +++++++-
+ src/backend/catalog/information_schema.sql |  6 +++---
+ src/backend/utils/cache/catcache.c         | 13 +++++++------
+ src/include/catalog/catversion.h           |  2 +-
+ src/include/catalog/indexing.h             |  6 +++---
+ src/test/regress/expected/opr_sanity.out   | 21 ++++++++++++++-------
+ src/test/regress/sql/opr_sanity.sql        | 19 ++++++++++++-------
+ 9 files changed, 60 insertions(+), 32 deletions(-)
+
+diff --git a/src/backend/access/common/scankey.c b/src/backend/access/common/scankey.c
+index 781516c56a56..5be4fe85eb1b 100644
+--- a/src/backend/access/common/scankey.c
++++ b/src/backend/access/common/scankey.c
+@@ -64,9 +64,9 @@ ScanKeyEntryInitialize(ScanKey entry,
+  * It cannot handle NULL arguments, unary operators, or nondefault operators,
+  * but we need none of those features for most hardwired lookups.
+  *
+- * We set collation to DEFAULT_COLLATION_OID always.  This is appropriate
+- * for textual columns in system catalogs, and it will be ignored for
+- * non-textual columns, so it's not worth trying to be more finicky.
++ * We set collation to C_COLLATION_OID always.  This is the correct value
++ * for all collation-aware columns in system catalogs, and it will be ignored
++ * for other column types, so it's not worth trying to be more finicky.
+  *
+  * Note: CurrentMemoryContext at call should be as long-lived as the ScanKey
+  * itself, because that's what will be used for any subsidiary info attached
+@@ -83,7 +83,7 @@ ScanKeyInit(ScanKey entry,
+ 	entry->sk_attno = attributeNumber;
+ 	entry->sk_strategy = strategy;
+ 	entry->sk_subtype = InvalidOid;
+-	entry->sk_collation = DEFAULT_COLLATION_OID;
++	entry->sk_collation = C_COLLATION_OID;
+ 	entry->sk_argument = argument;
+ 	fmgr_info(procedure, &entry->sk_func);
+ }
+diff --git a/src/backend/bootstrap/bootstrap.c b/src/backend/bootstrap/bootstrap.c
+index 7caab64ce780..8e42255e82f6 100644
+--- a/src/backend/bootstrap/bootstrap.c
++++ b/src/backend/bootstrap/bootstrap.c
+@@ -744,6 +744,15 @@ DefineAttr(char *name, char *type, int attnum, int nullness)
+ 			attrtypes[attnum]->attndims = 0;
+ 	}
+ 
++	/*
++	 * If a system catalog column is collation-aware, force it to use C
++	 * collation, so that its behavior is independent of the database's
++	 * collation.  This is essential to allow template0 to be cloned with a
++	 * different database collation.
++	 */
++	if (OidIsValid(attrtypes[attnum]->attcollation))
++		attrtypes[attnum]->attcollation = C_COLLATION_OID;
++
+ 	attrtypes[attnum]->attstattarget = -1;
+ 	attrtypes[attnum]->attcacheoff = -1;
+ 	attrtypes[attnum]->atttypmod = -1;
+diff --git a/src/backend/catalog/genbki.pl b/src/backend/catalog/genbki.pl
+index 8e2a2480be60..115e4c61bf05 100644
+--- a/src/backend/catalog/genbki.pl
++++ b/src/backend/catalog/genbki.pl
+@@ -167,6 +167,9 @@
+ my $BOOTSTRAP_SUPERUSERID =
+   Catalog::FindDefinedSymbolFromData($catalog_data{pg_authid},
+ 	'BOOTSTRAP_SUPERUSERID');
++my $C_COLLATION_OID =
++  Catalog::FindDefinedSymbolFromData($catalog_data{pg_collation},
++	'C_COLLATION_OID');
+ my $PG_CATALOG_NAMESPACE =
+   Catalog::FindDefinedSymbolFromData($catalog_data{pg_namespace},
+ 	'PG_CATALOG_NAMESPACE');
+@@ -693,7 +696,10 @@ sub morph_row_for_pgattr
+ 
+ 	# set attndims if it's an array type
+ 	$row->{attndims} = $type->{typcategory} eq 'A' ? '1' : '0';
+-	$row->{attcollation} = $type->{typcollation};
++
++	# collation-aware catalog columns must use C collation
++	$row->{attcollation} = $type->{typcollation} != 0 ?
++	    $C_COLLATION_OID : 0;
+ 
+ 	if (defined $attr->{forcenotnull})
+ 	{
+diff --git a/src/backend/catalog/information_schema.sql b/src/backend/catalog/information_schema.sql
+index 6227a8f3d0da..0fbcfa8bf132 100644
+--- a/src/backend/catalog/information_schema.sql
++++ b/src/backend/catalog/information_schema.sql
+@@ -208,7 +208,7 @@ CREATE DOMAIN cardinal_number AS integer
+  * CHARACTER_DATA domain
+  */
+ 
+-CREATE DOMAIN character_data AS character varying;
++CREATE DOMAIN character_data AS character varying COLLATE "C";
+ 
+ 
+ /*
+@@ -216,7 +216,7 @@ CREATE DOMAIN character_data AS character varying;
+  * SQL_IDENTIFIER domain
+  */
+ 
+-CREATE DOMAIN sql_identifier AS character varying;
++CREATE DOMAIN sql_identifier AS character varying COLLATE "C";
+ 
+ 
+ /*
+@@ -243,7 +243,7 @@ CREATE DOMAIN time_stamp AS timestamp(2) with time zone
+  * YES_OR_NO domain
+  */
+ 
+-CREATE DOMAIN yes_or_no AS character varying(3)
++CREATE DOMAIN yes_or_no AS character varying(3) COLLATE "C"
+     CONSTRAINT yes_or_no_check CHECK (value IN ('YES', 'NO'));
+ 
+ 
+diff --git a/src/backend/utils/cache/catcache.c b/src/backend/utils/cache/catcache.c
+index b31fd5acea7c..4176ced92377 100644
+--- a/src/backend/utils/cache/catcache.c
++++ b/src/backend/utils/cache/catcache.c
+@@ -22,6 +22,7 @@
+ #include "access/tuptoaster.h"
+ #include "access/valid.h"
+ #include "access/xact.h"
++#include "catalog/pg_collation.h"
+ #include "catalog/pg_operator.h"
+ #include "catalog/pg_type.h"
+ #include "miscadmin.h"
+@@ -1014,8 +1015,8 @@ CatalogCacheInitializeCache(CatCache *cache)
+ 		/* Fill in sk_strategy as well --- always standard equality */
+ 		cache->cc_skey[i].sk_strategy = BTEqualStrategyNumber;
+ 		cache->cc_skey[i].sk_subtype = InvalidOid;
+-		/* Currently, there are no catcaches on collation-aware data types */
+-		cache->cc_skey[i].sk_collation = InvalidOid;
++		/* If a catcache key requires a collation, it must be C collation */
++		cache->cc_skey[i].sk_collation = C_COLLATION_OID;
+ 
+ 		CACHE4_elog(DEBUG2, "CatalogCacheInitializeCache %s %d %p",
+ 					cache->cc_relname,
+@@ -1961,10 +1962,10 @@ CatCacheCopyKeys(TupleDesc tupdesc, int nkeys, int *attnos,
+ 		NameData	srcname;
+ 
+ 		/*
+-		 * Must be careful in case the caller passed a C string where a
+-		 * NAME is wanted: convert the given argument to a correctly
+-		 * padded NAME.  Otherwise the memcpy() done by datumCopy() could
+-		 * fall off the end of memory.
++		 * Must be careful in case the caller passed a C string where a NAME
++		 * is wanted: convert the given argument to a correctly padded NAME.
++		 * Otherwise the memcpy() done by datumCopy() could fall off the end
++		 * of memory.
+ 		 */
+ 		if (att->atttypid == NAMEOID)
+ 		{
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 3e38f2d9113b..aa27471437a7 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	201812181
++#define CATALOG_VERSION_NO	201812182
+ 
+ #endif
+diff --git a/src/include/catalog/indexing.h b/src/include/catalog/indexing.h
+index 2359b4c62912..f0c52d945a78 100644
+--- a/src/include/catalog/indexing.h
++++ b/src/include/catalog/indexing.h
+@@ -310,10 +310,10 @@ DECLARE_UNIQUE_INDEX(pg_default_acl_oid_index, 828, on pg_default_acl using btre
+ DECLARE_UNIQUE_INDEX(pg_db_role_setting_databaseid_rol_index, 2965, on pg_db_role_setting using btree(setdatabase oid_ops, setrole oid_ops));
+ #define DbRoleSettingDatidRolidIndexId	2965
+ 
+-DECLARE_UNIQUE_INDEX(pg_seclabel_object_index, 3597, on pg_seclabel using btree(objoid oid_ops, classoid oid_ops, objsubid int4_ops, provider text_pattern_ops));
++DECLARE_UNIQUE_INDEX(pg_seclabel_object_index, 3597, on pg_seclabel using btree(objoid oid_ops, classoid oid_ops, objsubid int4_ops, provider text_ops));
+ #define SecLabelObjectIndexId				3597
+ 
+-DECLARE_UNIQUE_INDEX(pg_shseclabel_object_index, 3593, on pg_shseclabel using btree(objoid oid_ops, classoid oid_ops, provider text_pattern_ops));
++DECLARE_UNIQUE_INDEX(pg_shseclabel_object_index, 3593, on pg_shseclabel using btree(objoid oid_ops, classoid oid_ops, provider text_ops));
+ #define SharedSecLabelObjectIndexId			3593
+ 
+ DECLARE_UNIQUE_INDEX(pg_extension_oid_index, 3080, on pg_extension using btree(oid oid_ops));
+@@ -333,7 +333,7 @@ DECLARE_UNIQUE_INDEX(pg_policy_polrelid_polname_index, 3258, on pg_policy using
+ DECLARE_UNIQUE_INDEX(pg_replication_origin_roiident_index, 6001, on pg_replication_origin using btree(roident oid_ops));
+ #define ReplicationOriginIdentIndex 6001
+ 
+-DECLARE_UNIQUE_INDEX(pg_replication_origin_roname_index, 6002, on pg_replication_origin using btree(roname text_pattern_ops));
++DECLARE_UNIQUE_INDEX(pg_replication_origin_roname_index, 6002, on pg_replication_origin using btree(roname text_ops));
+ #define ReplicationOriginNameIndex 6002
+ 
+ DECLARE_UNIQUE_INDEX(pg_partitioned_table_partrelid_index, 3351, on pg_partitioned_table using btree(partrelid oid_ops));
+diff --git a/src/test/regress/expected/opr_sanity.out b/src/test/regress/expected/opr_sanity.out
+index 6072f6bdb1fb..6dca1b7bf349 100644
+--- a/src/test/regress/expected/opr_sanity.out
++++ b/src/test/regress/expected/opr_sanity.out
+@@ -2060,18 +2060,25 @@ ORDER BY 1;
+ -- a representational error in pg_index, but simply wrong catalog design.
+ -- It's bad because we expect to be able to clone template0 and assign the
+ -- copy a different database collation.  It would especially not work for
+--- shared catalogs.  Note that although text columns will show a collation
+--- in indcollation, they're still okay to index with text_pattern_ops,
+--- so allow that case.
++-- shared catalogs.
++SELECT relname, attname, attcollation
++FROM pg_class c, pg_attribute a
++WHERE c.oid = attrelid AND c.oid < 16384 AND
++    c.relkind != 'v' AND  -- we don't care about columns in views
++    attcollation != 0 AND
++    attcollation != (SELECT oid FROM pg_collation WHERE collname = 'C');
++ relname | attname | attcollation 
++---------+---------+--------------
++(0 rows)
++
++-- Double-check that collation-sensitive indexes have "C" collation, too.
+ SELECT indexrelid::regclass, indrelid::regclass, iclass, icoll
+ FROM (SELECT indexrelid, indrelid,
+              unnest(indclass) as iclass, unnest(indcollation) as icoll
+       FROM pg_index
+       WHERE indrelid < 16384) ss
+-WHERE icoll != 0 AND iclass !=
+-    (SELECT oid FROM pg_opclass
+-     WHERE opcname = 'text_pattern_ops' AND opcmethod =
+-           (SELECT oid FROM pg_am WHERE amname = 'btree'));
++WHERE icoll != 0 AND
++    icoll != (SELECT oid FROM pg_collation WHERE collname = 'C');
+  indexrelid | indrelid | iclass | icoll 
+ ------------+----------+--------+-------
+ (0 rows)
+diff --git a/src/test/regress/sql/opr_sanity.sql b/src/test/regress/sql/opr_sanity.sql
+index 91c68f4204e3..64eca7e91538 100644
+--- a/src/test/regress/sql/opr_sanity.sql
++++ b/src/test/regress/sql/opr_sanity.sql
+@@ -1333,16 +1333,21 @@ ORDER BY 1;
+ -- a representational error in pg_index, but simply wrong catalog design.
+ -- It's bad because we expect to be able to clone template0 and assign the
+ -- copy a different database collation.  It would especially not work for
+--- shared catalogs.  Note that although text columns will show a collation
+--- in indcollation, they're still okay to index with text_pattern_ops,
+--- so allow that case.
++-- shared catalogs.
++
++SELECT relname, attname, attcollation
++FROM pg_class c, pg_attribute a
++WHERE c.oid = attrelid AND c.oid < 16384 AND
++    c.relkind != 'v' AND  -- we don't care about columns in views
++    attcollation != 0 AND
++    attcollation != (SELECT oid FROM pg_collation WHERE collname = 'C');
++
++-- Double-check that collation-sensitive indexes have "C" collation, too.
+ 
+ SELECT indexrelid::regclass, indrelid::regclass, iclass, icoll
+ FROM (SELECT indexrelid, indrelid,
+              unnest(indclass) as iclass, unnest(indcollation) as icoll
+       FROM pg_index
+       WHERE indrelid < 16384) ss
+-WHERE icoll != 0 AND iclass !=
+-    (SELECT oid FROM pg_opclass
+-     WHERE opcname = 'text_pattern_ops' AND opcmethod =
+-           (SELECT oid FROM pg_am WHERE amname = 'btree'));
++WHERE icoll != 0 AND
++    icoll != (SELECT oid FROM pg_collation WHERE collname = 'C');

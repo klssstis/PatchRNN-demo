@@ -1,0 +1,154 @@
+From 6fea65508a1aa6a1caa5f3e7b4d27bcccb0740d8 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 15 Apr 2022 17:50:01 -0400
+Subject: [PATCH] Tighten ComputeXidHorizons' handling of walsenders.
+
+ComputeXidHorizons (nee GetOldestXmin) thought that it could identify
+walsenders by checking for proc->databaseId == 0.  Perhaps that was
+safe when the code was written, but it's been wrong at least since
+autovacuum was invented.  Background processes that aren't connected
+to any particular database, such as the autovacuum launcher and
+logical replication launcher, look like that too.
+
+This imprecision is harmful because when such a process advertises an
+xmin, the result is to hold back dead-tuple cleanup in all databases,
+though it'd be sufficient to hold it back in shared catalogs (which
+are the only relations such a process can access).  Aside from being
+generally inefficient, this has recently been seen to cause regression
+test failures in the buildfarm, as a consequence of the logical
+replication launcher's startup transaction preventing VACUUM from
+marking pages of a user table as all-visible.
+
+We only want that global hold-back effect for the case where a
+walsender is advertising a hot standby feedback xmin.  Therefore,
+invent a new PGPROC flag that says that a process' xmin should be
+considered globally, and check that instead of using the incorrect
+databaseId == 0 test.  Currently only a walsender sets that flag,
+and only if it is not connected to any particular database.  (This is
+for bug-compatibility with the undocumented behavior of the existing
+code, namely that feedback sent by a client who has connected to a
+particular database would not be applied globally.  I'm not sure this
+is a great definition; however, such a client is capable of issuing
+plain SQL commands, and I don't think we want xmins advertised for
+such commands to be applied globally.  Perhaps this could do with
+refinement later.)
+
+While at it, I rewrote the comment in ComputeXidHorizons, and
+re-ordered the commented-upon if-tests, to make them match up
+for intelligibility's sake.
+
+This is arguably a back-patchable bug fix, but given the lack of
+complaints I think it prudent to let it age awhile in HEAD first.
+
+Discussion: https://postgr.es/m/1346227.1649887693@sss.pgh.pa.us
+---
+ src/backend/replication/walsender.c | 15 ++++++++++
+ src/backend/storage/ipc/procarray.c | 45 ++++++++++++++++++-----------
+ src/include/storage/proc.h          |  3 ++
+ 3 files changed, 46 insertions(+), 17 deletions(-)
+
+diff --git a/src/backend/replication/walsender.c b/src/backend/replication/walsender.c
+index be4026139361..63a818140bd6 100644
+--- a/src/backend/replication/walsender.c
++++ b/src/backend/replication/walsender.c
+@@ -285,6 +285,21 @@ InitWalSender(void)
+ 	MarkPostmasterChildWalSender();
+ 	SendPostmasterSignal(PMSIGNAL_ADVANCE_STATE_MACHINE);
+ 
++	/*
++	 * If the client didn't specify a database to connect to, show in PGPROC
++	 * that our advertised xmin should affect vacuum horizons in all
++	 * databases.  This allows physical replication clients to send hot
++	 * standby feedback that will delay vacuum cleanup in all databases.
++	 */
++	if (MyDatabaseId == InvalidOid)
++	{
++		Assert(MyProc->xmin == InvalidTransactionId);
++		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
++		MyProc->statusFlags |= PROC_AFFECTS_ALL_HORIZONS;
++		ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
++		LWLockRelease(ProcArrayLock);
++	}
++
+ 	/* Initialize empty timestamp buffer for lag tracking. */
+ 	lag_tracker = MemoryContextAllocZero(TopMemoryContext, sizeof(LagTracker));
+ }
+diff --git a/src/backend/storage/ipc/procarray.c b/src/backend/storage/ipc/procarray.c
+index f6e98aae2986..25c310f67570 100644
+--- a/src/backend/storage/ipc/procarray.c
++++ b/src/backend/storage/ipc/procarray.c
+@@ -1810,21 +1810,28 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
+ 			TransactionIdOlder(h->shared_oldest_nonremovable, xmin);
+ 
+ 		/*
+-		 * Normally queries in other databases are ignored for anything but
+-		 * the shared horizon. But in recovery we cannot compute an accurate
+-		 * per-database horizon as all xids are managed via the
+-		 * KnownAssignedXids machinery.
++		 * Normally sessions in other databases are ignored for anything but
++		 * the shared horizon.
+ 		 *
+-		 * Be careful to compute a pessimistic value when MyDatabaseId is not
+-		 * set. If this is a backend in the process of starting up, we may not
+-		 * use a "too aggressive" horizon (otherwise we could end up using it
+-		 * to prune still needed data away). If the current backend never
+-		 * connects to a database that is harmless, because
+-		 * data_oldest_nonremovable will never be utilized.
++		 * However, include them when MyDatabaseId is not (yet) set.  A
++		 * backend in the process of starting up must not compute a "too
++		 * aggressive" horizon, otherwise we could end up using it to prune
++		 * still-needed data away.  If the current backend never connects to a
++		 * database this is harmless, because data_oldest_nonremovable will
++		 * never be utilized.
++		 *
++		 * Also, sessions marked with PROC_AFFECTS_ALL_HORIZONS should always
++		 * be included.  (This flag is used for hot standby feedback, which
++		 * can't be tied to a specific database.)
++		 *
++		 * Also, while in recovery we cannot compute an accurate per-database
++		 * horizon, as all xids are managed via the KnownAssignedXids
++		 * machinery.
+ 		 */
+-		if (in_recovery ||
+-			MyDatabaseId == InvalidOid || proc->databaseId == MyDatabaseId ||
+-			proc->databaseId == 0)	/* always include WalSender */
++		if (proc->databaseId == MyDatabaseId ||
++			MyDatabaseId == InvalidOid ||
++			(statusFlags & PROC_AFFECTS_ALL_HORIZONS) ||
++			in_recovery)
+ 		{
+ 			/*
+ 			 * We can ignore this backend if it's running CREATE INDEX
+@@ -2681,10 +2688,14 @@ ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
+ 		/* Install xmin */
+ 		MyProc->xmin = TransactionXmin = xmin;
+ 
+-		/* Flags being copied must be valid copy-able flags. */
+-		Assert((proc->statusFlags & (~PROC_COPYABLE_FLAGS)) == 0);
+-		MyProc->statusFlags = proc->statusFlags;
+-		ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
++		/* walsender cheats by passing proc == MyProc, don't check its flags */
++		if (proc != MyProc)
++		{
++			/* Flags being copied must be valid copy-able flags. */
++			Assert((proc->statusFlags & (~PROC_COPYABLE_FLAGS)) == 0);
++			MyProc->statusFlags = proc->statusFlags;
++			ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
++		}
+ 
+ 		result = true;
+ 	}
+diff --git a/src/include/storage/proc.h b/src/include/storage/proc.h
+index 809b74db5e6c..15be21c00a6e 100644
+--- a/src/include/storage/proc.h
++++ b/src/include/storage/proc.h
+@@ -60,6 +60,9 @@ struct XidCache
+ #define		PROC_VACUUM_FOR_WRAPAROUND	0x08	/* set by autovac only */
+ #define		PROC_IN_LOGICAL_DECODING	0x10	/* currently doing logical
+ 												 * decoding outside xact */
++#define		PROC_AFFECTS_ALL_HORIZONS	0x20	/* this proc's xmin must be
++												 * included in vacuum horizons
++												 * in all databases */
+ 
+ /* flags reset at EOXact */
+ #define		PROC_VACUUM_STATE_MASK \

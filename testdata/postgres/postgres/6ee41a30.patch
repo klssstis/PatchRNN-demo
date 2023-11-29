@@ -1,0 +1,139 @@
+From 6ee41a301e70fc8e4ad383bad22d695f66ccb0ac Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 31 May 2021 12:03:00 -0400
+Subject: [PATCH] Fix mis-planning of repeated application of a projection.
+
+create_projection_plan contains a hidden assumption (here made
+explicit by an Assert) that a projection-capable Path will yield a
+projection-capable Plan.  Unfortunately, that assumption is violated
+only a few lines away, by create_projection_plan itself.  This means
+that two stacked ProjectionPaths can yield an outcome where we try to
+jam the upper path's tlist into a non-projection-capable child node,
+resulting in an invalid plan.
+
+There isn't any good reason to have stacked ProjectionPaths; indeed the
+whole concept is faulty, since the set of Vars/Aggs/etc needed by the
+upper one wouldn't necessarily be available in the output of the lower
+one, nor could the lower one create such values if they weren't
+available from its input.  Hence, we can fix this by adjusting
+create_projection_path to strip any top-level ProjectionPath from the
+subpath it's given.  (This amounts to saying "oh, we changed our
+minds about what we need to project here".)
+
+The test case added here only fails in v13 and HEAD; before that, we
+don't attempt to shove the Sort into the parallel part of the plan,
+for reasons that aren't entirely clear to me.  However, all the
+directly-related code looks generally the same as far back as v11,
+where the hazard was introduced (by d7c19e62a).  So I've got no faith
+that the same type of bug doesn't exist in v11 and v12, given the
+right test case.  Hence, back-patch the code changes, but not the
+irrelevant test case, into those branches.
+
+Per report from Bas Poot.
+
+Discussion: https://postgr.es/m/534fca83789c4a378c7de379e9067d4f@politie.nl
+---
+ src/backend/optimizer/plan/createplan.c       |  1 +
+ src/backend/optimizer/util/pathnode.c         | 19 ++++++++++++++-
+ src/test/regress/expected/select_parallel.out | 23 +++++++++++++++++++
+ src/test/regress/sql/select_parallel.sql      |  4 ++++
+ 4 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index b02f7809c966..439e6b6426c8 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -1976,6 +1976,7 @@ create_projection_plan(PlannerInfo *root, ProjectionPath *best_path, int flags)
+ 		 */
+ 		subplan = create_plan_recurse(root, best_path->subpath,
+ 									  CP_IGNORE_TLIST);
++		Assert(is_projection_capable_plan(subplan));
+ 		tlist = build_path_tlist(root, &best_path->path);
+ 	}
+ 	else
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index b248b038e034..9ce5f95e3b13 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -2632,7 +2632,23 @@ create_projection_path(PlannerInfo *root,
+ 					   PathTarget *target)
+ {
+ 	ProjectionPath *pathnode = makeNode(ProjectionPath);
+-	PathTarget *oldtarget = subpath->pathtarget;
++	PathTarget *oldtarget;
++
++	/*
++	 * We mustn't put a ProjectionPath directly above another; it's useless
++	 * and will confuse create_projection_plan.  Rather than making sure all
++	 * callers handle that, let's implement it here, by stripping off any
++	 * ProjectionPath in what we're given.  Given this rule, there won't be
++	 * more than one.
++	 */
++	if (IsA(subpath, ProjectionPath))
++	{
++		ProjectionPath *subpp = (ProjectionPath *) subpath;
++
++		Assert(subpp->path.parent == rel);
++		subpath = subpp->subpath;
++		Assert(!IsA(subpath, ProjectionPath));
++	}
+ 
+ 	pathnode->path.pathtype = T_Result;
+ 	pathnode->path.parent = rel;
+@@ -2658,6 +2674,7 @@ create_projection_path(PlannerInfo *root,
+ 	 * Note: in the latter case, create_projection_plan has to recheck our
+ 	 * conclusion; see comments therein.
+ 	 */
++	oldtarget = subpath->pathtarget;
+ 	if (is_projection_capable_path(subpath) ||
+ 		equal(oldtarget->exprs, target->exprs))
+ 	{
+diff --git a/src/test/regress/expected/select_parallel.out b/src/test/regress/expected/select_parallel.out
+index 05ebcb284a53..4ea1aa7dfd49 100644
+--- a/src/test/regress/expected/select_parallel.out
++++ b/src/test/regress/expected/select_parallel.out
+@@ -1126,6 +1126,29 @@ ORDER BY 1, 2, 3;
+ ------------------------------+---------------------------+-------------+--------------
+ (0 rows)
+ 
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT generate_series(1, two), array(select generate_series(1, two))
++  FROM tenk1 ORDER BY tenthous;
++                              QUERY PLAN                              
++----------------------------------------------------------------------
++ ProjectSet
++   Output: generate_series(1, tenk1.two), (SubPlan 1), tenk1.tenthous
++   ->  Gather Merge
++         Output: tenk1.two, tenk1.tenthous
++         Workers Planned: 4
++         ->  Result
++               Output: tenk1.two, tenk1.tenthous
++               ->  Sort
++                     Output: tenk1.tenthous, tenk1.two
++                     Sort Key: tenk1.tenthous
++                     ->  Parallel Seq Scan on public.tenk1
++                           Output: tenk1.tenthous, tenk1.two
++   SubPlan 1
++     ->  ProjectSet
++           Output: generate_series(1, tenk1.two)
++           ->  Result
++(16 rows)
++
+ -- test passing expanded-value representations to workers
+ CREATE FUNCTION make_some_array(int,int) returns int[] as
+ $$declare x int[];
+diff --git a/src/test/regress/sql/select_parallel.sql b/src/test/regress/sql/select_parallel.sql
+index d31e290ec227..f9247312484e 100644
+--- a/src/test/regress/sql/select_parallel.sql
++++ b/src/test/regress/sql/select_parallel.sql
+@@ -429,6 +429,10 @@ ORDER BY 1;
+ SELECT * FROM information_schema.foreign_data_wrapper_options
+ ORDER BY 1, 2, 3;
+ 
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT generate_series(1, two), array(select generate_series(1, two))
++  FROM tenk1 ORDER BY tenthous;
++
+ -- test passing expanded-value representations to workers
+ CREATE FUNCTION make_some_array(int,int) returns int[] as
+ $$declare x int[];

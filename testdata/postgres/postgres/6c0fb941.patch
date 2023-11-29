@@ -1,0 +1,68 @@
+From 6c0fb941892519ad6b8873e99c4001404fb9a128 Mon Sep 17 00:00:00 2001
+From: Thomas Munro <tmunro@postgresql.org>
+Date: Fri, 15 Feb 2019 10:19:11 +1300
+Subject: [PATCH] Fix race in dsm_attach() when handles are reused.
+
+DSM handle values can be reused as soon as the underlying shared memory
+object has been destroyed.  That means that for a brief moment we
+might have two DSM slots with the same handle.  While trying to attach,
+if we encounter a slot with refcnt == 1, meaning that it is currently
+being destroyed, we should continue our search in case the same handle
+exists in another slot.
+
+The race manifested as a rare "dsa_area could not attach to segment"
+error, and was more likely in 10 and 11 due to the lack of distinct
+seed for random() in parallel workers.  It was made very unlikely in
+in master by commit 197e4af9, and older releases don't usually create
+new DSM segments in background workers so it was also unlikely there.
+
+This fixes the root cause of bug report #15585, in which the error
+could also sometimes result in a self-deadlock in the error path.
+It's not yet clear if further changes are needed to avoid that failure
+mode.
+
+Back-patch to 9.4, where dsm.c arrived.
+
+Author: Thomas Munro
+Reported-by: Justin Pryzby, Sergei Kornilov
+Discussion: https://postgr.es/m/20190207014719.GJ29720@telsasoft.com
+Discussion: https://postgr.es/m/15585-324ff6a93a18da46@postgresql.org
+---
+ src/backend/storage/ipc/dsm.c | 18 ++++++++----------
+ 1 file changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/src/backend/storage/ipc/dsm.c b/src/backend/storage/ipc/dsm.c
+index cab7ae74cade..cfbebeb31d5e 100644
+--- a/src/backend/storage/ipc/dsm.c
++++ b/src/backend/storage/ipc/dsm.c
+@@ -569,22 +569,20 @@ dsm_attach(dsm_handle h)
+ 	nitems = dsm_control->nitems;
+ 	for (i = 0; i < nitems; ++i)
+ 	{
+-		/* If the reference count is 0, the slot is actually unused. */
+-		if (dsm_control->item[i].refcnt == 0)
++		/*
++		 * If the reference count is 0, the slot is actually unused.  If the
++		 * reference count is 1, the slot is still in use, but the segment is
++		 * in the process of going away; even if the handle matches, another
++		 * slot may already have started using the same handle value by
++		 * coincidence so we have to keep searching.
++		 */
++		if (dsm_control->item[i].refcnt <= 1)
+ 			continue;
+ 
+ 		/* If the handle doesn't match, it's not the slot we want. */
+ 		if (dsm_control->item[i].handle != seg->handle)
+ 			continue;
+ 
+-		/*
+-		 * If the reference count is 1, the slot is still in use, but the
+-		 * segment is in the process of going away.  Treat that as if we
+-		 * didn't find a match.
+-		 */
+-		if (dsm_control->item[i].refcnt == 1)
+-			break;
+-
+ 		/* Otherwise we've found a match. */
+ 		dsm_control->item[i].refcnt++;
+ 		seg->control_slot = i;

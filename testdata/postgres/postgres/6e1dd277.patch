@@ -1,0 +1,229 @@
+From 6e1dd2773eb60a6ab87b27b8d9391b756e904ac3 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Mon, 5 Jun 2017 18:53:41 -0700
+Subject: [PATCH] Unify SIGHUP handling between normal and walsender backends.
+
+Because walsender and normal backends share the same main loop it's
+problematic to have two different flag variables, set in signal
+handlers, indicating a pending configuration reload.  Only certain
+walsender commands reach code paths checking for the
+variable (START_[LOGICAL_]REPLICATION, CREATE_REPLICATION_SLOT
+... LOGICAL, notably not base backups).
+
+This is a bug present since the introduction of walsender, but has
+gotten worse in releases since then which allow walsender to do more.
+
+A later patch, not slated for v10, will similarly unify SIGHUP
+handling in other types of processes as well.
+
+Author: Petr Jelinek, Andres Freund
+Reviewed-By: Michael Paquier
+Discussion: https://postgr.es/m/20170423235941.qosiuoyqprq4nu7v@alap3.anarazel.de
+Backpatch: 9.2-, bug is present since 9.0
+---
+ src/backend/replication/walsender.c | 29 +++++++---------------------
+ src/backend/tcop/postgres.c         | 30 ++++++++++++++---------------
+ src/backend/utils/init/globals.c    |  1 +
+ src/include/miscadmin.h             |  5 +++++
+ 4 files changed, 27 insertions(+), 38 deletions(-)
+
+diff --git a/src/backend/replication/walsender.c b/src/backend/replication/walsender.c
+index c9a6f7019d80..61d0a199d69c 100644
+--- a/src/backend/replication/walsender.c
++++ b/src/backend/replication/walsender.c
+@@ -182,7 +182,6 @@ static bool streamingDoneReceiving;
+ static bool WalSndCaughtUp = false;
+ 
+ /* Flags set by signal handlers for later service in main loop */
+-static volatile sig_atomic_t got_SIGHUP = false;
+ static volatile sig_atomic_t got_SIGUSR2 = false;
+ static volatile sig_atomic_t got_STOPPING = false;
+ 
+@@ -218,7 +217,6 @@ static struct
+ }	LagTracker;
+ 
+ /* Signal handlers */
+-static void WalSndSigHupHandler(SIGNAL_ARGS);
+ static void WalSndLastCycleHandler(SIGNAL_ARGS);
+ 
+ /* Prototypes for private functions */
+@@ -1201,9 +1199,9 @@ WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
+ 		CHECK_FOR_INTERRUPTS();
+ 
+ 		/* Process any requests or signals received recently */
+-		if (got_SIGHUP)
++		if (ConfigReloadPending)
+ 		{
+-			got_SIGHUP = false;
++			ConfigReloadPending = false;
+ 			ProcessConfigFile(PGC_SIGHUP);
+ 			SyncRepInitConfig();
+ 		}
+@@ -1309,9 +1307,9 @@ WalSndWaitForWal(XLogRecPtr loc)
+ 		CHECK_FOR_INTERRUPTS();
+ 
+ 		/* Process any requests or signals received recently */
+-		if (got_SIGHUP)
++		if (ConfigReloadPending)
+ 		{
+-			got_SIGHUP = false;
++			ConfigReloadPending = false;
+ 			ProcessConfigFile(PGC_SIGHUP);
+ 			SyncRepInitConfig();
+ 		}
+@@ -2101,9 +2099,9 @@ WalSndLoop(WalSndSendDataCallback send_data)
+ 		CHECK_FOR_INTERRUPTS();
+ 
+ 		/* Process any requests or signals received recently */
+-		if (got_SIGHUP)
++		if (ConfigReloadPending)
+ 		{
+-			got_SIGHUP = false;
++			ConfigReloadPending = false;
+ 			ProcessConfigFile(PGC_SIGHUP);
+ 			SyncRepInitConfig();
+ 		}
+@@ -2908,19 +2906,6 @@ HandleWalSndInitStopping(void)
+ 		got_STOPPING = true;
+ }
+ 
+-/* SIGHUP: set flag to re-read config file at next convenient time */
+-static void
+-WalSndSigHupHandler(SIGNAL_ARGS)
+-{
+-	int			save_errno = errno;
+-
+-	got_SIGHUP = true;
+-
+-	SetLatch(MyLatch);
+-
+-	errno = save_errno;
+-}
+-
+ /*
+  * SIGUSR2: set flag to do a last cycle and shut down afterwards. The WAL
+  * sender should already have been switched to WALSNDSTATE_STOPPING at
+@@ -2942,7 +2927,7 @@ void
+ WalSndSignals(void)
+ {
+ 	/* Set up signal handlers */
+-	pqsignal(SIGHUP, WalSndSigHupHandler);		/* set flag to read config
++	pqsignal(SIGHUP, PostgresSigHupHandler);	/* set flag to read config
+ 												 * file */
+ 	pqsignal(SIGINT, SIG_IGN);	/* not used */
+ 	pqsignal(SIGTERM, die);		/* request shutdown */
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index 13577691505b..1c60b4316310 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -122,13 +122,6 @@ char	   *stack_base_ptr = NULL;
+ char	   *register_stack_base_ptr = NULL;
+ #endif
+ 
+-/*
+- * Flag to mark SIGHUP. Whenever the main loop comes around it
+- * will reread the configuration file. (Better than doing the
+- * reading in the signal handler, ey?)
+- */
+-static volatile sig_atomic_t got_SIGHUP = false;
+-
+ /*
+  * Flag to keep track of whether we have started a transaction.
+  * For extended query protocol this has to be remembered across messages.
+@@ -187,7 +180,6 @@ static bool IsTransactionExitStmt(Node *parsetree);
+ static bool IsTransactionExitStmtList(List *pstmts);
+ static bool IsTransactionStmtList(List *pstmts);
+ static void drop_unnamed_stmt(void);
+-static void SigHupHandler(SIGNAL_ARGS);
+ static void log_disconnections(int code, Datum arg);
+ 
+ 
+@@ -2684,13 +2676,19 @@ FloatExceptionHandler(SIGNAL_ARGS)
+ 					   "invalid operation, such as division by zero.")));
+ }
+ 
+-/* SIGHUP: set flag to re-read config file at next convenient time */
+-static void
+-SigHupHandler(SIGNAL_ARGS)
++/*
++ * SIGHUP: set flag to re-read config file at next convenient time.
++ *
++ * Sets the ConfigReloadPending flag, which should be checked at convenient
++ * places inside main loops. (Better than doing the reading in the signal
++ * handler, ey?)
++ */
++void
++PostgresSigHupHandler(SIGNAL_ARGS)
+ {
+ 	int			save_errno = errno;
+ 
+-	got_SIGHUP = true;
++	ConfigReloadPending = true;
+ 	SetLatch(MyLatch);
+ 
+ 	errno = save_errno;
+@@ -3632,8 +3630,8 @@ PostgresMain(int argc, char *argv[],
+ 		WalSndSignals();
+ 	else
+ 	{
+-		pqsignal(SIGHUP, SigHupHandler);		/* set flag to read config
+-												 * file */
++		pqsignal(SIGHUP, PostgresSigHupHandler);		/* set flag to read config
++														 * file */
+ 		pqsignal(SIGINT, StatementCancelHandler);		/* cancel current query */
+ 		pqsignal(SIGTERM, die); /* cancel current query and exit */
+ 
+@@ -4046,9 +4044,9 @@ PostgresMain(int argc, char *argv[],
+ 		 * (6) check for any other interesting events that happened while we
+ 		 * slept.
+ 		 */
+-		if (got_SIGHUP)
++		if (ConfigReloadPending)
+ 		{
+-			got_SIGHUP = false;
++			ConfigReloadPending = false;
+ 			ProcessConfigFile(PGC_SIGHUP);
+ 		}
+ 
+diff --git a/src/backend/utils/init/globals.c b/src/backend/utils/init/globals.c
+index 08b6030a6496..8000b79e5aa4 100644
+--- a/src/backend/utils/init/globals.c
++++ b/src/backend/utils/init/globals.c
+@@ -31,6 +31,7 @@ volatile bool QueryCancelPending = false;
+ volatile bool ProcDiePending = false;
+ volatile bool ClientConnectionLost = false;
+ volatile bool IdleInTransactionSessionTimeoutPending = false;
++volatile sig_atomic_t ConfigReloadPending = false;
+ volatile uint32 InterruptHoldoffCount = 0;
+ volatile uint32 QueryCancelHoldoffCount = 0;
+ volatile uint32 CritSectionCount = 0;
+diff --git a/src/include/miscadmin.h b/src/include/miscadmin.h
+index 4c607b299c2d..35ac4f619482 100644
+--- a/src/include/miscadmin.h
++++ b/src/include/miscadmin.h
+@@ -23,6 +23,8 @@
+ #ifndef MISCADMIN_H
+ #define MISCADMIN_H
+ 
++#include <signal.h>
++
+ #include "pgtime.h"				/* for pg_time_t */
+ 
+ 
+@@ -81,6 +83,7 @@ extern PGDLLIMPORT volatile bool InterruptPending;
+ extern PGDLLIMPORT volatile bool QueryCancelPending;
+ extern PGDLLIMPORT volatile bool ProcDiePending;
+ extern PGDLLIMPORT volatile bool IdleInTransactionSessionTimeoutPending;
++extern PGDLLIMPORT volatile sig_atomic_t ConfigReloadPending;
+ 
+ extern volatile bool ClientConnectionLost;
+ 
+@@ -273,6 +276,8 @@ extern void restore_stack_base(pg_stack_base_t base);
+ extern void check_stack_depth(void);
+ extern bool stack_is_too_deep(void);
+ 
++extern void PostgresSigHupHandler(SIGNAL_ARGS);
++
+ /* in tcop/utility.c */
+ extern void PreventCommandIfReadOnly(const char *cmdname);
+ extern void PreventCommandIfParallelMode(const char *cmdname);

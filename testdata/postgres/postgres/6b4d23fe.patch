@@ -1,0 +1,367 @@
+From 6b4d23feef6e334fb85af077f2857f62ab781848 Mon Sep 17 00:00:00 2001
+From: Magnus Hagander <magnus@hagander.net>
+Date: Thu, 8 Apr 2021 10:23:10 +0200
+Subject: [PATCH] Track identical top vs nested queries independently in
+ pg_stat_statements
+
+Changing pg_stat_statements.track between 'all' and 'top' would control
+if pg_stat_statements tracked just top level statements or also
+statements inside functions, but when tracking all it would not
+differentiate between the two. Being table to differentiate this is
+useful both to track where the actual query is coming from, and to see
+if there are differences in executions between the two.
+
+To do this, add a boolean to the hash key indicating if the statement
+was top level or not.
+
+Experience from the pg_stat_kcache module shows that in at least some
+"reasonable worloads" only <5% of the queries show up both top level and
+nested. Based on this, admittedly small, dataset, this patch does not
+try to de-duplicate those query *texts*, and will just store one copy
+for the top level and one for the nested.
+
+Author: Julien Rohaud
+Reviewed-By: Magnus Hagander, Masahiro Ikeda
+Discussion: https://postgr.es/m/20201202040516.GA43757@nol
+---
+ contrib/pg_stat_statements/Makefile           |  3 +-
+ .../expected/pg_stat_statements.out           | 40 +++++++++++++
+ .../pg_stat_statements--1.9--1.10.sql         | 57 +++++++++++++++++++
+ .../pg_stat_statements/pg_stat_statements.c   | 50 +++++++++++++---
+ .../pg_stat_statements.control                |  2 +-
+ .../sql/pg_stat_statements.sql                | 21 +++++++
+ doc/src/sgml/pgstatstatements.sgml            |  9 +++
+ 7 files changed, 173 insertions(+), 9 deletions(-)
+ create mode 100644 contrib/pg_stat_statements/pg_stat_statements--1.9--1.10.sql
+
+diff --git a/contrib/pg_stat_statements/Makefile b/contrib/pg_stat_statements/Makefile
+index 3ec627b95618..cab4f626ad17 100644
+--- a/contrib/pg_stat_statements/Makefile
++++ b/contrib/pg_stat_statements/Makefile
+@@ -6,7 +6,8 @@ OBJS = \
+ 	pg_stat_statements.o
+ 
+ EXTENSION = pg_stat_statements
+-DATA = pg_stat_statements--1.4.sql pg_stat_statements--1.8--1.9.sql \
++DATA = pg_stat_statements--1.4.sql \
++        pg_stat_statements--1.9--1.10.sql pg_stat_statements--1.8--1.9.sql \
+ 	pg_stat_statements--1.7--1.8.sql pg_stat_statements--1.6--1.7.sql \
+ 	pg_stat_statements--1.5--1.6.sql pg_stat_statements--1.4--1.5.sql \
+ 	pg_stat_statements--1.3--1.4.sql pg_stat_statements--1.2--1.3.sql \
+diff --git a/contrib/pg_stat_statements/expected/pg_stat_statements.out b/contrib/pg_stat_statements/expected/pg_stat_statements.out
+index 4ffb7e0076a1..674ed270a8f8 100644
+--- a/contrib/pg_stat_statements/expected/pg_stat_statements.out
++++ b/contrib/pg_stat_statements/expected/pg_stat_statements.out
+@@ -901,4 +901,44 @@ SELECT dealloc FROM pg_stat_statements_info;
+        0
+ (1 row)
+ 
++--
++-- top level handling
++--
++SET pg_stat_statements.track = 'top';
++DELETE FROM test;
++DO $$
++BEGIN
++    DELETE FROM test;
++END;
++$$ LANGUAGE plpgsql;
++SELECT query, toplevel, plans, calls FROM pg_stat_statements WHERE query LIKE '%DELETE%' ORDER BY query COLLATE "C", toplevel;
++         query         | toplevel | plans | calls 
++-----------------------+----------+-------+-------
++ DELETE FROM test      | t        |     1 |     1
++ DO $$                +| t        |     0 |     1
++ BEGIN                +|          |       | 
++     DELETE FROM test;+|          |       | 
++ END;                 +|          |       | 
++ $$ LANGUAGE plpgsql   |          |       | 
++(2 rows)
++
++SET pg_stat_statements.track = 'all';
++DELETE FROM test;
++DO $$
++BEGIN
++    DELETE FROM test;
++END;
++$$ LANGUAGE plpgsql;
++SELECT query, toplevel, plans, calls FROM pg_stat_statements WHERE query LIKE '%DELETE%' ORDER BY query COLLATE "C", toplevel;
++         query         | toplevel | plans | calls 
++-----------------------+----------+-------+-------
++ DELETE FROM test      | f        |     1 |     1
++ DELETE FROM test      | t        |     2 |     2
++ DO $$                +| t        |     0 |     2
++ BEGIN                +|          |       | 
++     DELETE FROM test;+|          |       | 
++ END;                 +|          |       | 
++ $$ LANGUAGE plpgsql   |          |       | 
++(3 rows)
++
+ DROP EXTENSION pg_stat_statements;
+diff --git a/contrib/pg_stat_statements/pg_stat_statements--1.9--1.10.sql b/contrib/pg_stat_statements/pg_stat_statements--1.9--1.10.sql
+new file mode 100644
+index 000000000000..f97d16497d4a
+--- /dev/null
++++ b/contrib/pg_stat_statements/pg_stat_statements--1.9--1.10.sql
+@@ -0,0 +1,57 @@
++/* contrib/pg_stat_statements/pg_stat_statements--1.9--1.10.sql */
++
++-- complain if script is sourced in psql, rather than via ALTER EXTENSION
++\echo Use "ALTER EXTENSION pg_stat_statements UPDATE TO '1.10'" to load this file. \quit
++
++/* First we have to remove them from the extension */
++ALTER EXTENSION pg_stat_statements DROP VIEW pg_stat_statements;
++ALTER EXTENSION pg_stat_statements DROP FUNCTION pg_stat_statements(boolean);
++
++/* Then we can drop them */
++DROP VIEW pg_stat_statements;
++DROP FUNCTION pg_stat_statements(boolean);
++
++/* Now redefine */
++CREATE FUNCTION pg_stat_statements(IN showtext boolean,
++    OUT userid oid,
++    OUT dbid oid,
++    OUT toplevel bool,
++    OUT queryid bigint,
++    OUT query text,
++    OUT plans int8,
++    OUT total_plan_time float8,
++    OUT min_plan_time float8,
++    OUT max_plan_time float8,
++    OUT mean_plan_time float8,
++    OUT stddev_plan_time float8,
++    OUT calls int8,
++    OUT total_exec_time float8,
++    OUT min_exec_time float8,
++    OUT max_exec_time float8,
++    OUT mean_exec_time float8,
++    OUT stddev_exec_time float8,
++    OUT rows int8,
++    OUT shared_blks_hit int8,
++    OUT shared_blks_read int8,
++    OUT shared_blks_dirtied int8,
++    OUT shared_blks_written int8,
++    OUT local_blks_hit int8,
++    OUT local_blks_read int8,
++    OUT local_blks_dirtied int8,
++    OUT local_blks_written int8,
++    OUT temp_blks_read int8,
++    OUT temp_blks_written int8,
++    OUT blk_read_time float8,
++    OUT blk_write_time float8,
++    OUT wal_records int8,
++    OUT wal_fpi int8,
++    OUT wal_bytes numeric
++)
++RETURNS SETOF record
++AS 'MODULE_PATHNAME', 'pg_stat_statements_1_10'
++LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
++
++CREATE VIEW pg_stat_statements AS
++  SELECT * FROM pg_stat_statements(true);
++
++GRANT SELECT ON pg_stat_statements TO PUBLIC;
+diff --git a/contrib/pg_stat_statements/pg_stat_statements.c b/contrib/pg_stat_statements/pg_stat_statements.c
+index 52cba8619697..fc2677643b92 100644
+--- a/contrib/pg_stat_statements/pg_stat_statements.c
++++ b/contrib/pg_stat_statements/pg_stat_statements.c
+@@ -87,7 +87,7 @@ PG_MODULE_MAGIC;
+ #define PGSS_TEXT_FILE	PG_STAT_TMP_DIR "/pgss_query_texts.stat"
+ 
+ /* Magic number identifying the stats file format */
+-static const uint32 PGSS_FILE_HEADER = 0x20201218;
++static const uint32 PGSS_FILE_HEADER = 0x20201227;
+ 
+ /* PostgreSQL major version number, changes in which invalidate all entries */
+ static const uint32 PGSS_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
+@@ -119,7 +119,8 @@ typedef enum pgssVersion
+ 	PGSS_V1_1,
+ 	PGSS_V1_2,
+ 	PGSS_V1_3,
+-	PGSS_V1_8
++	PGSS_V1_8,
++	PGSS_V1_10
+ } pgssVersion;
+ 
+ typedef enum pgssStoreKind
+@@ -141,16 +142,17 @@ typedef enum pgssStoreKind
+  * Hashtable key that defines the identity of a hashtable entry.  We separate
+  * queries by user and by database even if they are otherwise identical.
+  *
+- * Right now, this structure contains no padding.  If you add any, make sure
+- * to teach pgss_store() to zero the padding bytes.  Otherwise, things will
+- * break, because pgss_hash is created using HASH_BLOBS, and thus tag_hash
+- * is used to hash this.
++ * If you add a new key to this struct, make sure to teach pgss_store() to
++ * zero the padding bytes.  Otherwise, things will break, because pgss_hash is
++ * created using HASH_BLOBS, and thus tag_hash is used to hash this.
++
+  */
+ typedef struct pgssHashKey
+ {
+ 	Oid			userid;			/* user OID */
+ 	Oid			dbid;			/* database OID */
+ 	uint64		queryid;		/* query identifier */
++	bool		toplevel;		/* query executed at top level */
+ } pgssHashKey;
+ 
+ /*
+@@ -297,6 +299,7 @@ PG_FUNCTION_INFO_V1(pg_stat_statements_reset_1_7);
+ PG_FUNCTION_INFO_V1(pg_stat_statements_1_2);
+ PG_FUNCTION_INFO_V1(pg_stat_statements_1_3);
+ PG_FUNCTION_INFO_V1(pg_stat_statements_1_8);
++PG_FUNCTION_INFO_V1(pg_stat_statements_1_10);
+ PG_FUNCTION_INFO_V1(pg_stat_statements);
+ PG_FUNCTION_INFO_V1(pg_stat_statements_info);
+ 
+@@ -1224,9 +1227,14 @@ pgss_store(const char *query, uint64 queryId,
+ 	query = CleanQuerytext(query, &query_location, &query_len);
+ 
+ 	/* Set up key for hashtable search */
++
++	/* memset() is required when pgssHashKey is without padding only */
++	memset(&key, 0, sizeof(pgssHashKey));
++
+ 	key.userid = GetUserId();
+ 	key.dbid = MyDatabaseId;
+ 	key.queryid = queryId;
++	key.toplevel = (exec_nested_level == 0);
+ 
+ 	/* Lookup the hash table entry with shared lock. */
+ 	LWLockAcquire(pgss->lock, LW_SHARED);
+@@ -1406,7 +1414,8 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
+ #define PG_STAT_STATEMENTS_COLS_V1_2	19
+ #define PG_STAT_STATEMENTS_COLS_V1_3	23
+ #define PG_STAT_STATEMENTS_COLS_V1_8	32
+-#define PG_STAT_STATEMENTS_COLS			32	/* maximum of above */
++#define PG_STAT_STATEMENTS_COLS_V1_10	33
++#define PG_STAT_STATEMENTS_COLS			33	/* maximum of above */
+ 
+ /*
+  * Retrieve statement statistics.
+@@ -1418,6 +1427,16 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
+  * expected API version is identified by embedding it in the C name of the
+  * function.  Unfortunately we weren't bright enough to do that for 1.1.
+  */
++Datum
++pg_stat_statements_1_10(PG_FUNCTION_ARGS)
++{
++	bool		showtext = PG_GETARG_BOOL(0);
++
++	pg_stat_statements_internal(fcinfo, PGSS_V1_10, showtext);
++
++	return (Datum) 0;
++}
++
+ Datum
+ pg_stat_statements_1_8(PG_FUNCTION_ARGS)
+ {
+@@ -1537,6 +1556,10 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
+ 			if (api_version != PGSS_V1_8)
+ 				elog(ERROR, "incorrect number of output arguments");
+ 			break;
++		case PG_STAT_STATEMENTS_COLS_V1_10:
++			if (api_version != PGSS_V1_10)
++				elog(ERROR, "incorrect number of output arguments");
++			break;
+ 		default:
+ 			elog(ERROR, "incorrect number of output arguments");
+ 	}
+@@ -1628,6 +1651,8 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
+ 
+ 		values[i++] = ObjectIdGetDatum(entry->key.userid);
+ 		values[i++] = ObjectIdGetDatum(entry->key.dbid);
++		if (api_version >= PGSS_V1_10)
++			values[i++] = BoolGetDatum(entry->key.toplevel);
+ 
+ 		if (is_allowed_role || entry->key.userid == userid)
+ 		{
+@@ -1765,6 +1790,7 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
+ 					 api_version == PGSS_V1_2 ? PG_STAT_STATEMENTS_COLS_V1_2 :
+ 					 api_version == PGSS_V1_3 ? PG_STAT_STATEMENTS_COLS_V1_3 :
+ 					 api_version == PGSS_V1_8 ? PG_STAT_STATEMENTS_COLS_V1_8 :
++					 api_version == PGSS_V1_10 ? PG_STAT_STATEMENTS_COLS_V1_10 :
+ 					 -1 /* fail if you forget to update this assert */ ));
+ 
+ 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+@@ -2437,10 +2463,20 @@ entry_reset(Oid userid, Oid dbid, uint64 queryid)
+ 	if (userid != 0 && dbid != 0 && queryid != UINT64CONST(0))
+ 	{
+ 		/* If all the parameters are available, use the fast path. */
++		memset(&key, 0, sizeof(pgssHashKey));
+ 		key.userid = userid;
+ 		key.dbid = dbid;
+ 		key.queryid = queryid;
+ 
++		/* Remove the key if it exists, starting with the top-level entry  */
++		key.toplevel = false;
++		entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_REMOVE, NULL);
++		if (entry)				/* found */
++			num_remove++;
++
++		/* Also remove entries for top level statements */
++		key.toplevel = true;
++
+ 		/* Remove the key if exists */
+ 		entry = (pgssEntry *) hash_search(pgss_hash, &key, HASH_REMOVE, NULL);
+ 		if (entry)				/* found */
+diff --git a/contrib/pg_stat_statements/pg_stat_statements.control b/contrib/pg_stat_statements/pg_stat_statements.control
+index 2f1ce6ed5070..0747e4813837 100644
+--- a/contrib/pg_stat_statements/pg_stat_statements.control
++++ b/contrib/pg_stat_statements/pg_stat_statements.control
+@@ -1,5 +1,5 @@
+ # pg_stat_statements extension
+ comment = 'track planning and execution statistics of all SQL statements executed'
+-default_version = '1.9'
++default_version = '1.10'
+ module_pathname = '$libdir/pg_stat_statements'
+ relocatable = true
+diff --git a/contrib/pg_stat_statements/sql/pg_stat_statements.sql b/contrib/pg_stat_statements/sql/pg_stat_statements.sql
+index 6f58d9d0f669..56d8526ccfa4 100644
+--- a/contrib/pg_stat_statements/sql/pg_stat_statements.sql
++++ b/contrib/pg_stat_statements/sql/pg_stat_statements.sql
+@@ -364,4 +364,25 @@ SELECT query, plans, calls, rows FROM pg_stat_statements ORDER BY query COLLATE
+ SELECT pg_stat_statements_reset();
+ SELECT dealloc FROM pg_stat_statements_info;
+ 
++--
++-- top level handling
++--
++SET pg_stat_statements.track = 'top';
++DELETE FROM test;
++DO $$
++BEGIN
++    DELETE FROM test;
++END;
++$$ LANGUAGE plpgsql;
++SELECT query, toplevel, plans, calls FROM pg_stat_statements WHERE query LIKE '%DELETE%' ORDER BY query COLLATE "C", toplevel;
++
++SET pg_stat_statements.track = 'all';
++DELETE FROM test;
++DO $$
++BEGIN
++    DELETE FROM test;
++END;
++$$ LANGUAGE plpgsql;
++SELECT query, toplevel, plans, calls FROM pg_stat_statements WHERE query LIKE '%DELETE%' ORDER BY query COLLATE "C", toplevel;
++
+ DROP EXTENSION pg_stat_statements;
+diff --git a/doc/src/sgml/pgstatstatements.sgml b/doc/src/sgml/pgstatstatements.sgml
+index 3ca292d71fbb..5ad4f0aed2ab 100644
+--- a/doc/src/sgml/pgstatstatements.sgml
++++ b/doc/src/sgml/pgstatstatements.sgml
+@@ -87,6 +87,15 @@
+       </para></entry>
+      </row>
+ 
++     <row>
++      <entry role="catalog_table_entry"><para role="column_definition">
++       <structfield>toplevel</structfield> <type>bool</type>
++      </para>
++      <para>
++       True if the query was executed as a top level statement
++      </para></entry>
++     </row>
++
+      <row>
+       <entry role="catalog_table_entry"><para role="column_definition">
+        <structfield>queryid</structfield> <type>bigint</type>

@@ -1,0 +1,253 @@
+From 06dbd619bfbfe03fefa7223838690d4012f874ad Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Sat, 8 Oct 2022 09:33:23 -0700
+Subject: [PATCH] pgstat: Prevent stats reset from corrupting slotname by
+ removing slotname
+
+Previously PgStat_StatReplSlotEntry contained the slotname, which was mainly
+used when writing out the stats during shutdown, to identify the slot in the
+serialized data (at runtime the index in ReplicationSlotCtl->replication_slots
+is used, but that can change during a restart). Unfortunately the slotname was
+overwritten when the slot's stats were reset.
+
+That turned out to only cause "real" problems if the slot was active during
+the reset, triggering an assertion failure at the next
+pgstat_report_replslot(). In other paths the stats were re-initialized during
+pgstat_acquire_replslot().
+
+Fix this by removing slotname from PgStat_StatReplSlotEntry. Instead we can
+get the slot's name from the slot itself. Besides fixing a bug, this also is
+architecturally cleaner (a name is not really statistics). This is safe
+because stats, for a slot removed while shut down, will not be restored at
+startup.
+
+In 15 the slotname is not removed, but renamed, to avoid changing the stats
+format. In master, bump PGSTAT_FILE_FORMAT_ID.
+
+This commit does not contain a test for the fix. I think this can only be
+tested by a tap test starting pg_recvlogical in the background and checking
+pg_recvlogical's output. That type of test is notoriously hard to be reliable,
+so committing it shortly before the release is wrapped seems like a bad idea.
+
+Reported-by: Jaime Casanova <jcasanov@systemguards.com.ec>
+Author: Andres Freund <andres@anarazel.de>
+Reviewed-by: Masahiko Sawada <sawada.mshk@gmail.com>
+Reviewed-by: Kyotaro Horiguchi <horikyota.ntt@gmail.com>
+Discussion: https://postgr.es/m/YxfagaTXUNa9ggLb@ahch-to
+Backpatch: 15-, where the bug was introduced in 5891c7a8ed8f
+---
+ src/backend/replication/slot.c               | 28 ++++++++++
+ src/backend/utils/activity/pgstat.c          |  2 +-
+ src/backend/utils/activity/pgstat_replslot.c | 56 +++++++++-----------
+ src/include/pgstat.h                         |  3 +-
+ src/include/replication/slot.h               |  1 +
+ src/include/utils/pgstat_internal.h          |  5 +-
+ 6 files changed, 60 insertions(+), 35 deletions(-)
+
+diff --git a/src/backend/replication/slot.c b/src/backend/replication/slot.c
+index e9328961dd3e..d58d16e992a3 100644
+--- a/src/backend/replication/slot.c
++++ b/src/backend/replication/slot.c
+@@ -412,6 +412,34 @@ ReplicationSlotIndex(ReplicationSlot *slot)
+ 	return slot - ReplicationSlotCtl->replication_slots;
+ }
+ 
++/*
++ * If the slot at 'index' is unused, return false. Otherwise 'name' is set to
++ * the slot's name and true is returned.
++ *
++ * This likely is only useful for pgstat_replslot.c during shutdown, in other
++ * cases there are obvious TOCTOU issues.
++ */
++bool
++ReplicationSlotName(int index, Name name)
++{
++	ReplicationSlot *slot;
++	bool		found;
++
++	slot = &ReplicationSlotCtl->replication_slots[index];
++
++	/*
++	 * Ensure that the slot cannot be dropped while we copy the name. Don't
++	 * need the spinlock as the name of an existing slot cannot change.
++	 */
++	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
++	found = slot->in_use;
++	if (slot->in_use)
++		namestrcpy(name, NameStr(slot->data.name));
++	LWLockRelease(ReplicationSlotControlLock);
++
++	return found;
++}
++
+ /*
+  * Find a previously created slot and mark it as used by this process.
+  *
+diff --git a/src/backend/utils/activity/pgstat.c b/src/backend/utils/activity/pgstat.c
+index 609f0b1ad86b..1b97597f17ce 100644
+--- a/src/backend/utils/activity/pgstat.c
++++ b/src/backend/utils/activity/pgstat.c
+@@ -1367,7 +1367,7 @@ pgstat_write_statsfile(void)
+ 			/* stats entry identified by name on disk (e.g. slots) */
+ 			NameData	name;
+ 
+-			kind_info->to_serialized_name(shstats, &name);
++			kind_info->to_serialized_name(&ps->key, shstats, &name);
+ 
+ 			fputc('N', fpout);
+ 			write_chunk_s(fpout, &ps->key.kind);
+diff --git a/src/backend/utils/activity/pgstat_replslot.c b/src/backend/utils/activity/pgstat_replslot.c
+index 2039ac3147fc..252d2e4e078d 100644
+--- a/src/backend/utils/activity/pgstat_replslot.c
++++ b/src/backend/utils/activity/pgstat_replslot.c
+@@ -69,6 +69,10 @@ pgstat_reset_replslot(const char *name)
+ 
+ /*
+  * Report replication slot statistics.
++ *
++ * We can rely on the stats for the slot to exist and to belong to this
++ * slot. We can only get here if pgstat_create_replslot() or
++ * pgstat_acquire_replslot() have already been called.
+  */
+ void
+ pgstat_report_replslot(ReplicationSlot *slot, const PgStat_StatReplSlotEntry *repSlotStat)
+@@ -82,12 +86,6 @@ pgstat_report_replslot(ReplicationSlot *slot, const PgStat_StatReplSlotEntry *re
+ 	shstatent = (PgStatShared_ReplSlot *) entry_ref->shared_stats;
+ 	statent = &shstatent->stats;
+ 
+-	/*
+-	 * Any mismatch should have been fixed in pgstat_create_replslot() or
+-	 * pgstat_acquire_replslot().
+-	 */
+-	Assert(namestrcmp(&statent->slotname, NameStr(slot->data.name)) == 0);
+-
+ 	/* Update the replication slot statistics */
+ #define REPLSLOT_ACC(fld) statent->fld += repSlotStat->fld
+ 	REPLSLOT_ACC(spill_txns);
+@@ -124,38 +122,29 @@ pgstat_create_replslot(ReplicationSlot *slot)
+ 	 * if we previously crashed after dropping a slot.
+ 	 */
+ 	memset(&shstatent->stats, 0, sizeof(shstatent->stats));
+-	namestrcpy(&shstatent->stats.slotname, NameStr(slot->data.name));
+ 
+ 	pgstat_unlock_entry(entry_ref);
+ }
+ 
+ /*
+  * Report replication slot has been acquired.
++ *
++ * This guarantees that a stats entry exists during later
++ * pgstat_report_replslot() calls.
++ *
++ * If we previously crashed, no stats data exists. But if we did not crash,
++ * the stats do belong to this slot:
++ * - the stats cannot belong to a dropped slot, pgstat_drop_replslot() would
++ *   have been called
++ * - if the slot was removed while shut down,
++ *   pgstat_replslot_from_serialized_name_cb() returning false would have
++ *   caused the stats to be dropped
+  */
+ void
+ pgstat_acquire_replslot(ReplicationSlot *slot)
+ {
+-	PgStat_EntryRef *entry_ref;
+-	PgStatShared_ReplSlot *shstatent;
+-	PgStat_StatReplSlotEntry *statent;
+-
+-	entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_REPLSLOT, InvalidOid,
+-											ReplicationSlotIndex(slot), false);
+-	shstatent = (PgStatShared_ReplSlot *) entry_ref->shared_stats;
+-	statent = &shstatent->stats;
+-
+-	/*
+-	 * NB: need to accept that there might be stats from an older slot, e.g.
+-	 * if we previously crashed after dropping a slot.
+-	 */
+-	if (NameStr(statent->slotname)[0] == 0 ||
+-		namestrcmp(&statent->slotname, NameStr(slot->data.name)) != 0)
+-	{
+-		memset(statent, 0, sizeof(*statent));
+-		namestrcpy(&statent->slotname, NameStr(slot->data.name));
+-	}
+-
+-	pgstat_unlock_entry(entry_ref);
++	pgstat_get_entry_ref(PGSTAT_KIND_REPLSLOT, InvalidOid,
++						 ReplicationSlotIndex(slot), true, NULL);
+ }
+ 
+ /*
+@@ -185,9 +174,16 @@ pgstat_fetch_replslot(NameData slotname)
+ }
+ 
+ void
+-pgstat_replslot_to_serialized_name_cb(const PgStatShared_Common *header, NameData *name)
++pgstat_replslot_to_serialized_name_cb(const PgStat_HashKey *key, const PgStatShared_Common *header, NameData *name)
+ {
+-	namestrcpy(name, NameStr(((PgStatShared_ReplSlot *) header)->stats.slotname));
++	/*
++	 * This is only called late during shutdown. The set of existing slots
++	 * isn't allowed to change at this point, we can assume that a slot exists
++	 * at the offset.
++	 */
++	if (!ReplicationSlotName(key->objoid, name))
++		elog(ERROR, "could not find name for replication slot index %u",
++			 key->objoid);
+ }
+ 
+ bool
+diff --git a/src/include/pgstat.h b/src/include/pgstat.h
+index ad7334a0d218..cc1d1dcb7d20 100644
+--- a/src/include/pgstat.h
++++ b/src/include/pgstat.h
+@@ -242,7 +242,7 @@ typedef struct PgStat_TableXactStatus
+  * ------------------------------------------------------------
+  */
+ 
+-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCA7
++#define PGSTAT_FILE_FORMAT_ID	0x01A5BCA8
+ 
+ typedef struct PgStat_ArchiverStats
+ {
+@@ -321,7 +321,6 @@ typedef struct PgStat_StatFuncEntry
+ 
+ typedef struct PgStat_StatReplSlotEntry
+ {
+-	NameData	slotname;
+ 	PgStat_Counter spill_txns;
+ 	PgStat_Counter spill_count;
+ 	PgStat_Counter spill_bytes;
+diff --git a/src/include/replication/slot.h b/src/include/replication/slot.h
+index 8d5e764aef57..65f2c74239d0 100644
+--- a/src/include/replication/slot.h
++++ b/src/include/replication/slot.h
+@@ -218,6 +218,7 @@ extern void ReplicationSlotsDropDBSlots(Oid dboid);
+ extern bool InvalidateObsoleteReplicationSlots(XLogSegNo oldestSegno);
+ extern ReplicationSlot *SearchNamedReplicationSlot(const char *name, bool need_lock);
+ extern int	ReplicationSlotIndex(ReplicationSlot *slot);
++extern bool ReplicationSlotName(int index, Name name);
+ extern void ReplicationSlotNameForTablesync(Oid suboid, Oid relid, char *syncslotname, Size szslot);
+ extern void ReplicationSlotDropAtPubNode(WalReceiverConn *wrconn, char *slotname, bool missing_ok);
+ 
+diff --git a/src/include/utils/pgstat_internal.h b/src/include/utils/pgstat_internal.h
+index 40a36028554a..627c1389e4c7 100644
+--- a/src/include/utils/pgstat_internal.h
++++ b/src/include/utils/pgstat_internal.h
+@@ -242,7 +242,8 @@ typedef struct PgStat_KindInfo
+ 	/*
+ 	 * For variable-numbered stats with named_on_disk. Optional.
+ 	 */
+-	void		(*to_serialized_name) (const PgStatShared_Common *header, NameData *name);
++	void		(*to_serialized_name) (const PgStat_HashKey *key,
++									   const PgStatShared_Common *header, NameData *name);
+ 	bool		(*from_serialized_name) (const NameData *name, PgStat_HashKey *key);
+ 
+ 	/*
+@@ -567,7 +568,7 @@ extern void pgstat_relation_delete_pending_cb(PgStat_EntryRef *entry_ref);
+  */
+ 
+ extern void pgstat_replslot_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts);
+-extern void pgstat_replslot_to_serialized_name_cb(const PgStatShared_Common *header, NameData *name);
++extern void pgstat_replslot_to_serialized_name_cb(const PgStat_HashKey *key, const PgStatShared_Common *header, NameData *name);
+ extern bool pgstat_replslot_from_serialized_name_cb(const NameData *name, PgStat_HashKey *key);
+ 
+ 
