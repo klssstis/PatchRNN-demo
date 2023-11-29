@@ -1,0 +1,2480 @@
+From 1aba8e651ac3e37e1d2d875842de1e0ed22a651e Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Thu, 9 Nov 2017 18:07:25 -0500
+Subject: [PATCH] Add hash partitioning.
+
+Hash partitioning is useful when you want to partition a growing data
+set evenly.  This can be useful to keep table sizes reasonable, which
+makes maintenance operations such as VACUUM faster, or to enable
+partition-wise join.
+
+At present, we still depend on constraint exclusion for partitioning
+pruning, and the shape of the partition constraints for hash
+partitioning is such that that doesn't work.  Work is underway to fix
+that, which should both improve performance and make partitioning
+pruning work with hash partitioning.
+
+Amul Sul, reviewed and tested by Dilip Kumar, Ashutosh Bapat, Yugo
+Nagata, Rajkumar Raghuwanshi, Jesper Pedersen, and by me.  A few
+final tweaks also by me.
+
+Discussion: http://postgr.es/m/CAAJ_b96fhpJAP=ALbETmeLk1Uni_GFZD938zgenhF49qgDTjaQ@mail.gmail.com
+---
+ doc/src/sgml/ddl.sgml                        |  28 +-
+ doc/src/sgml/ref/alter_table.sgml            |   7 +
+ doc/src/sgml/ref/create_table.sgml           |  85 ++-
+ src/backend/catalog/partition.c              | 682 +++++++++++++++++--
+ src/backend/commands/tablecmds.c             |  48 +-
+ src/backend/nodes/copyfuncs.c                |   2 +
+ src/backend/nodes/equalfuncs.c               |   2 +
+ src/backend/nodes/outfuncs.c                 |   2 +
+ src/backend/nodes/readfuncs.c                |   2 +
+ src/backend/optimizer/path/joinrels.c        |  12 +-
+ src/backend/parser/gram.y                    |  76 ++-
+ src/backend/parser/parse_utilcmd.c           |  29 +-
+ src/backend/utils/adt/ruleutils.c            |  15 +-
+ src/backend/utils/cache/relcache.c           |  26 +-
+ src/bin/psql/tab-complete.c                  |   2 +-
+ src/include/catalog/catversion.h             |   2 +-
+ src/include/catalog/partition.h              |   3 +
+ src/include/catalog/pg_proc.h                |   4 +
+ src/include/nodes/parsenodes.h               |   8 +-
+ src/test/regress/expected/alter_table.out    |  62 ++
+ src/test/regress/expected/create_table.out   |  78 ++-
+ src/test/regress/expected/insert.out         |  46 ++
+ src/test/regress/expected/partition_join.out |  81 +++
+ src/test/regress/expected/update.out         |  29 +
+ src/test/regress/sql/alter_table.sql         |  64 ++
+ src/test/regress/sql/create_table.sql        |  51 +-
+ src/test/regress/sql/insert.sql              |  33 +
+ src/test/regress/sql/partition_join.sql      |  32 +
+ src/test/regress/sql/update.sql              |  28 +
+ src/tools/pgindent/typedefs.list             |   1 +
+ 30 files changed, 1420 insertions(+), 120 deletions(-)
+
+diff --git a/doc/src/sgml/ddl.sgml b/doc/src/sgml/ddl.sgml
+index 3f41939bea6b..daba66c187df 100644
+--- a/doc/src/sgml/ddl.sgml
++++ b/doc/src/sgml/ddl.sgml
+@@ -2875,6 +2875,19 @@ VALUES ('Albany', NULL, NULL, 'NY');
+         </para>
+        </listitem>
+       </varlistentry>
++
++      <varlistentry>
++       <term>Hash Partitioning</term>
++
++       <listitem>
++        <para>
++         The table is partitioned by specifying a modulus and a remainder for
++         each partition. Each partition will hold the rows for which the hash
++         value of the partition key divided by the specified modulus will
++         produce the specified remainder.
++        </para>
++       </listitem>
++      </varlistentry>
+      </variablelist>
+ 
+      If your application needs to use other forms of partitioning not listed
+@@ -2901,9 +2914,8 @@ VALUES ('Albany', NULL, NULL, 'NY');
+     All rows inserted into a partitioned table will be routed to one of the
+     <firstterm>partitions</firstterm> based on the value of the partition
+     key.  Each partition has a subset of the data defined by its
+-    <firstterm>partition bounds</firstterm>.  Currently supported
+-    partitioning methods include range and list, where each partition is
+-    assigned a range of keys and a list of keys, respectively.
++    <firstterm>partition bounds</firstterm>.  The currently supported
++    partitioning methods are range, list, and hash.
+    </para>
+ 
+    <para>
+@@ -3328,11 +3340,11 @@ ALTER TABLE measurement ATTACH PARTITION measurement_y2008m02
+ 
+       <listitem>
+        <para>
+-        Declarative partitioning only supports list and range partitioning,
+-        whereas table inheritance allows data to be divided in a manner of
+-        the user's choosing.  (Note, however, that if constraint exclusion is
+-        unable to prune partitions effectively, query performance will be very
+-        poor.)
++        Declarative partitioning only supports range, list and hash
++        partitioning, whereas table inheritance allows data to be divided in a
++        manner of the user's choosing.  (Note, however, that if constraint
++        exclusion is unable to prune partitions effectively, query performance
++        will be very poor.)
+        </para>
+       </listitem>
+ 
+diff --git a/doc/src/sgml/ref/alter_table.sgml b/doc/src/sgml/ref/alter_table.sgml
+index 41acda003f9f..3b19ea71315d 100644
+--- a/doc/src/sgml/ref/alter_table.sgml
++++ b/doc/src/sgml/ref/alter_table.sgml
+@@ -1431,6 +1431,13 @@ ALTER TABLE cities
+     ATTACH PARTITION cities_partdef DEFAULT;
+ </programlisting></para>
+ 
++  <para>
++   Attach a partition to hash partitioned table:
++<programlisting>
++ALTER TABLE orders
++    ATTACH PARTITION orders_p4 FOR VALUES WITH (MODULUS 4, REMAINDER 3);
++</programlisting></para>
++
+   <para>
+    Detach a partition from partitioned table:
+ <programlisting>
+diff --git a/doc/src/sgml/ref/create_table.sgml b/doc/src/sgml/ref/create_table.sgml
+index 4f7b741526f6..bbb3a51deff2 100644
+--- a/doc/src/sgml/ref/create_table.sgml
++++ b/doc/src/sgml/ref/create_table.sgml
+@@ -28,7 +28,7 @@ CREATE [ [ GLOBAL | LOCAL ] { TEMPORARY | TEMP } | UNLOGGED ] TABLE [ IF NOT EXI
+     [, ... ]
+ ] )
+ [ INHERITS ( <replaceable>parent_table</replaceable> [, ... ] ) ]
+-[ PARTITION BY { RANGE | LIST } ( { <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">opclass</replaceable> ] [, ... ] ) ]
++[ PARTITION BY { RANGE | LIST | HASH } ( { <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">opclass</replaceable> ] [, ... ] ) ]
+ [ WITH ( <replaceable class="parameter">storage_parameter</replaceable> [= <replaceable class="parameter">value</replaceable>] [, ... ] ) | WITH OIDS | WITHOUT OIDS ]
+ [ ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } ]
+ [ TABLESPACE <replaceable class="parameter">tablespace_name</replaceable> ]
+@@ -39,7 +39,7 @@ CREATE [ [ GLOBAL | LOCAL ] { TEMPORARY | TEMP } | UNLOGGED ] TABLE [ IF NOT EXI
+     | <replaceable>table_constraint</replaceable> }
+     [, ... ]
+ ) ]
+-[ PARTITION BY { RANGE | LIST } ( { <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">opclass</replaceable> ] [, ... ] ) ]
++[ PARTITION BY { RANGE | LIST | HASH } ( { <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">opclass</replaceable> ] [, ... ] ) ]
+ [ WITH ( <replaceable class="parameter">storage_parameter</replaceable> [= <replaceable class="parameter">value</replaceable>] [, ... ] ) | WITH OIDS | WITHOUT OIDS ]
+ [ ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } ]
+ [ TABLESPACE <replaceable class="parameter">tablespace_name</replaceable> ]
+@@ -50,7 +50,7 @@ CREATE [ [ GLOBAL | LOCAL ] { TEMPORARY | TEMP } | UNLOGGED ] TABLE [ IF NOT EXI
+     | <replaceable>table_constraint</replaceable> }
+     [, ... ]
+ ) ] { FOR VALUES <replaceable class="parameter">partition_bound_spec</replaceable> | DEFAULT }
+-[ PARTITION BY { RANGE | LIST } ( { <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">opclass</replaceable> ] [, ... ] ) ]
++[ PARTITION BY { RANGE | LIST | HASH } ( { <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">opclass</replaceable> ] [, ... ] ) ]
+ [ WITH ( <replaceable class="parameter">storage_parameter</replaceable> [= <replaceable class="parameter">value</replaceable>] [, ... ] ) | WITH OIDS | WITHOUT OIDS ]
+ [ ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } ]
+ [ TABLESPACE <replaceable class="parameter">tablespace_name</replaceable> ]
+@@ -88,7 +88,8 @@ CREATE [ [ GLOBAL | LOCAL ] { TEMPORARY | TEMP } | UNLOGGED ] TABLE [ IF NOT EXI
+ 
+ IN ( { <replaceable class="parameter">numeric_literal</replaceable> | <replaceable class="parameter">string_literal</replaceable> | NULL } [, ...] ) |
+ FROM ( { <replaceable class="parameter">numeric_literal</replaceable> | <replaceable class="parameter">string_literal</replaceable> | MINVALUE | MAXVALUE } [, ...] )
+-  TO ( { <replaceable class="parameter">numeric_literal</replaceable> | <replaceable class="parameter">string_literal</replaceable> | MINVALUE | MAXVALUE } [, ...] )
++  TO ( { <replaceable class="parameter">numeric_literal</replaceable> | <replaceable class="parameter">string_literal</replaceable> | MINVALUE | MAXVALUE } [, ...] ) |
++WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REMAINDER <replaceable class="parameter">numeric_literal</replaceable> )
+ 
+ <phrase><replaceable class="parameter">index_parameters</replaceable> in <literal>UNIQUE</literal>, <literal>PRIMARY KEY</literal>, and <literal>EXCLUDE</literal> constraints are:</phrase>
+ 
+@@ -256,7 +257,8 @@ FROM ( { <replaceable class="parameter">numeric_literal</replaceable> | <replace
+       Creates the table as a <firstterm>partition</firstterm> of the specified
+       parent table. The table can be created either as a partition for specific
+       values using <literal>FOR VALUES</literal> or as a default partition
+-      using <literal>DEFAULT</literal>.
++      using <literal>DEFAULT</literal>.  This option is not available for
++      hash-partitioned tables.
+      </para>
+ 
+      <para>
+@@ -264,8 +266,9 @@ FROM ( { <replaceable class="parameter">numeric_literal</replaceable> | <replace
+       must correspond to the partitioning method and partition key of the
+       parent table, and must not overlap with any existing partition of that
+       parent.  The form with <literal>IN</literal> is used for list partitioning,
+-      while the form with <literal>FROM</literal> and <literal>TO</literal> is used for
+-      range partitioning.
++      the form with <literal>FROM</literal> and <literal>TO</literal> is used
++      for range partitioning, and the form with <literal>WITH</literal> is used
++      for hash partitioning.
+      </para>
+ 
+      <para>
+@@ -363,6 +366,29 @@ FROM ( { <replaceable class="parameter">numeric_literal</replaceable> | <replace
+       partition.
+      </para>
+ 
++     <para>
++      When creating a hash partition, a modulus and remainder must be specified.
++      The modulus must be a positive integer, and the remainder must be a
++      non-negative integer less than the modulus.  Typically, when initially
++      setting up a hash-partitioned table, you should choose a modulus equal to
++      the number of partitions and assign every table the same modulus and a
++      different remainder (see examples, below).   However, it is not required
++      that every partition have the same modulus, only that every modulus which
++      occurs among the partitions of a hash-partitioned table is a factor of the
++      next larger modulus.  This allows the number of partitions to be increased
++      incrementally without needing to move all the data at once.  For example,
++      suppose you have a hash-partitioned table with 8 partitions, each of which
++      has modulus 8, but find it necessary to increase the number of partitions
++      to 16.  You can detach one of the modulus-8 partitions, create two new
++      modulus-16 partitions covering the same portion of the key space (one with
++      a remainder equal to the remainder of the detached partition, and the
++      other with a remainder equal to that value plus 8), and repopulate them
++      with data.  You can then repeat this -- perhaps at a later time -- for
++      each modulus-8 partition until none remain.  While this may still involve
++      a large amount of data movement at each step, it is still better than
++      having to create a whole new table and move all the data at once.
++     </para>
++
+      <para>
+       A partition must have the same column names and types as the partitioned
+       table to which it belongs.  If the parent is specified <literal>WITH
+@@ -486,20 +512,28 @@ FROM ( { <replaceable class="parameter">numeric_literal</replaceable> | <replace
+    </varlistentry>
+ 
+    <varlistentry>
+-    <term><literal>PARTITION BY { RANGE | LIST } ( { <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ <replaceable class="parameter">opclass</replaceable> ] [, ...] ) </literal></term>
++    <term><literal>PARTITION BY { RANGE | LIST | HASH } ( { <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ <replaceable class="parameter">opclass</replaceable> ] [, ...] ) </literal></term>
+     <listitem>
+      <para>
+       The optional <literal>PARTITION BY</literal> clause specifies a strategy
+       of partitioning the table.  The table thus created is called a
+       <firstterm>partitioned</firstterm> table.  The parenthesized list of
+       columns or expressions forms the <firstterm>partition key</firstterm>
+-      for the table.  When using range partitioning, the partition key can
+-      include multiple columns or expressions (up to 32, but this limit can be
+-      altered when building <productname>PostgreSQL</productname>), but for
++      for the table.  When using range or hash partitioning, the partition key
++      can include multiple columns or expressions (up to 32, but this limit can
++      be altered when building <productname>PostgreSQL</productname>), but for
+       list partitioning, the partition key must consist of a single column or
+-      expression.  If no B-tree operator class is specified when creating a
+-      partitioned table, the default B-tree operator class for the datatype will
+-      be used.  If there is none, an error will be reported.
++      expression.
++     </para>
++
++     <para>
++      Range and list partitioning require a btree operator class, while hash
++      partitioning requires a hash operator class.  If no operator class is
++      specified explicitly, the default operator class of the appropriate
++      type will be used; if no default operator class exists, an error will
++      be raised.  When hash partitioning is used, the operator class used
++      must implement support function 2 (see <xref linkend="xindex-support">
++      for details).
+      </para>
+ 
+      <para>
+@@ -1647,6 +1681,16 @@ CREATE TABLE cities (
+     name         text not null,
+     population   bigint
+ ) PARTITION BY LIST (left(lower(name), 1));
++</programlisting></para>
++
++  <para>
++   Create a hash partitioned table:
++<programlisting>
++CREATE TABLE orders (
++    order_id     bigint not null,
++    cust_id      bigint not null,
++    status       text
++) PARTITION BY HASH (order_id);
+ </programlisting></para>
+ 
+   <para>
+@@ -1701,6 +1745,19 @@ CREATE TABLE cities_ab_10000_to_100000
+     PARTITION OF cities_ab FOR VALUES FROM (10000) TO (100000);
+ </programlisting></para>
+ 
++  <para>
++   Create partitions of a hash partitioned table:
++<programlisting>
++CREATE TABLE orders_p1 PARTITION OF orders
++    FOR VALUES WITH (MODULUS 4, REMAINDER 0);
++CREATE TABLE orders_p2 PARTITION OF orders
++    FOR VALUES WITH (MODULUS 4, REMAINDER 1);
++CREATE TABLE orders_p3 PARTITION OF orders
++    FOR VALUES WITH (MODULUS 4, REMAINDER 2);
++CREATE TABLE orders_p4 PARTITION OF orders
++    FOR VALUES WITH (MODULUS 4, REMAINDER 3);
++</programlisting></para>
++
+   <para>
+    Create a default partition:
+ <programlisting>
+diff --git a/src/backend/catalog/partition.c b/src/backend/catalog/partition.c
+index 5daa8a1c19d2..cff59ed0551a 100644
+--- a/src/backend/catalog/partition.c
++++ b/src/backend/catalog/partition.c
+@@ -15,6 +15,7 @@
+ 
+ #include "postgres.h"
+ 
++#include "access/hash.h"
+ #include "access/heapam.h"
+ #include "access/htup_details.h"
+ #include "access/nbtree.h"
+@@ -46,6 +47,7 @@
+ #include "utils/datum.h"
+ #include "utils/memutils.h"
+ #include "utils/fmgroids.h"
++#include "utils/hashutils.h"
+ #include "utils/inval.h"
+ #include "utils/lsyscache.h"
+ #include "utils/rel.h"
+@@ -61,26 +63,35 @@
+  * In the case of range partitioning, ndatums will typically be far less than
+  * 2 * nparts, because a partition's upper bound and the next partition's lower
+  * bound are the same in most common cases, and we only store one of them (the
+- * upper bound).
++ * upper bound).  In case of hash partitioning, ndatums will be same as the
++ * number of partitions.
++ *
++ * For range and list partitioned tables, datums is an array of datum-tuples
++ * with key->partnatts datums each.  For hash partitioned tables, it is an array
++ * of datum-tuples with 2 datums, modulus and remainder, corresponding to a
++ * given partition.
+  *
+  * In the case of list partitioning, the indexes array stores one entry for
+  * every datum, which is the index of the partition that accepts a given datum.
+  * In case of range partitioning, it stores one entry per distinct range
+  * datum, which is the index of the partition for which a given datum
+- * is an upper bound.
++ * is an upper bound.  In the case of hash partitioning, the number of the
++ * entries in the indexes array is same as the greatest modulus amongst all
++ * partitions.  For a given partition key datum-tuple, the index of the
++ * partition which would accept that datum-tuple would be given by the entry
++ * pointed by remainder produced when hash value of the datum-tuple is divided
++ * by the greatest modulus.
+  */
+ 
+ typedef struct PartitionBoundInfoData
+ {
+-	char		strategy;		/* list or range bounds? */
++	char		strategy;		/* hash, list or range? */
+ 	int			ndatums;		/* Length of the datums following array */
+-	Datum	  **datums;			/* Array of datum-tuples with key->partnatts
+-								 * datums each */
++	Datum	  **datums;
+ 	PartitionRangeDatumKind **kind; /* The kind of each range bound datum;
+-									 * NULL for list partitioned tables */
+-	int		   *indexes;		/* Partition indexes; one entry per member of
+-								 * the datums array (plus one if range
+-								 * partitioned table) */
++									 * NULL for hash and list partitioned
++									 * tables */
++	int		   *indexes;		/* Partition indexes */
+ 	int			null_index;		/* Index of the null-accepting partition; -1
+ 								 * if there isn't one */
+ 	int			default_index;	/* Index of the default partition; -1 if there
+@@ -95,6 +106,14 @@ typedef struct PartitionBoundInfoData
+  * is represented with one of the following structs.
+  */
+ 
++/* One bound of a hash partition */
++typedef struct PartitionHashBound
++{
++	int			modulus;
++	int			remainder;
++	int			index;
++} PartitionHashBound;
++
+ /* One value coming from some (index'th) list partition */
+ typedef struct PartitionListValue
+ {
+@@ -111,6 +130,7 @@ typedef struct PartitionRangeBound
+ 	bool		lower;			/* this is the lower (vs upper) bound */
+ } PartitionRangeBound;
+ 
++static int32 qsort_partition_hbound_cmp(const void *a, const void *b);
+ static int32 qsort_partition_list_value_cmp(const void *a, const void *b,
+ 							   void *arg);
+ static int32 qsort_partition_rbound_cmp(const void *a, const void *b,
+@@ -126,6 +146,7 @@ static void get_range_key_properties(PartitionKey key, int keynum,
+ 						 ListCell **partexprs_item,
+ 						 Expr **keyCol,
+ 						 Const **lower_val, Const **upper_val);
++static List *get_qual_for_hash(Relation parent, PartitionBoundSpec *spec);
+ static List *get_qual_for_list(Relation parent, PartitionBoundSpec *spec);
+ static List *get_qual_for_range(Relation parent, PartitionBoundSpec *spec,
+ 				   bool for_default);
+@@ -134,6 +155,8 @@ static List *generate_partition_qual(Relation rel);
+ 
+ static PartitionRangeBound *make_one_range_bound(PartitionKey key, int index,
+ 					 List *datums, bool lower);
++static int32 partition_hbound_cmp(int modulus1, int remainder1, int modulus2,
++					 int remainder2);
+ static int32 partition_rbound_cmp(PartitionKey key,
+ 					 Datum *datums1, PartitionRangeDatumKind *kind1,
+ 					 bool lower1, PartitionRangeBound *b2);
+@@ -149,6 +172,12 @@ static int partition_bound_bsearch(PartitionKey key,
+ 						void *probe, bool probe_is_bound, bool *is_equal);
+ static void get_partition_dispatch_recurse(Relation rel, Relation parent,
+ 							   List **pds, List **leaf_part_oids);
++static int	get_partition_bound_num_indexes(PartitionBoundInfo b);
++static int	get_greatest_modulus(PartitionBoundInfo b);
++static uint64 compute_hash_value(PartitionKey key, Datum *values, bool *isnull);
++
++/* SQL-callable function for use in hash partition CHECK constraints */
++PG_FUNCTION_INFO_V1(satisfies_hash_partition);
+ 
+ /*
+  * RelationBuildPartitionDesc
+@@ -174,6 +203,9 @@ RelationBuildPartitionDesc(Relation rel)
+ 	int			ndatums = 0;
+ 	int			default_index = -1;
+ 
++	/* Hash partitioning specific */
++	PartitionHashBound **hbounds = NULL;
++
+ 	/* List partitioning specific */
+ 	PartitionListValue **all_values = NULL;
+ 	int			null_index = -1;
+@@ -255,7 +287,35 @@ RelationBuildPartitionDesc(Relation rel)
+ 			oids[i++] = lfirst_oid(cell);
+ 
+ 		/* Convert from node to the internal representation */
+-		if (key->strategy == PARTITION_STRATEGY_LIST)
++		if (key->strategy == PARTITION_STRATEGY_HASH)
++		{
++			ndatums = nparts;
++			hbounds = (PartitionHashBound **)
++				palloc(nparts * sizeof(PartitionHashBound *));
++
++			i = 0;
++			foreach(cell, boundspecs)
++			{
++				PartitionBoundSpec *spec = castNode(PartitionBoundSpec,
++													lfirst(cell));
++
++				if (spec->strategy != PARTITION_STRATEGY_HASH)
++					elog(ERROR, "invalid strategy in partition bound spec");
++
++				hbounds[i] = (PartitionHashBound *)
++					palloc(sizeof(PartitionHashBound));
++
++				hbounds[i]->modulus = spec->modulus;
++				hbounds[i]->remainder = spec->remainder;
++				hbounds[i]->index = i;
++				i++;
++			}
++
++			/* Sort all the bounds in ascending order */
++			qsort(hbounds, nparts, sizeof(PartitionHashBound *),
++				  qsort_partition_hbound_cmp);
++		}
++		else if (key->strategy == PARTITION_STRATEGY_LIST)
+ 		{
+ 			List	   *non_null_values = NIL;
+ 
+@@ -484,6 +544,42 @@ RelationBuildPartitionDesc(Relation rel)
+ 
+ 		switch (key->strategy)
+ 		{
++			case PARTITION_STRATEGY_HASH:
++				{
++					/* Modulus are stored in ascending order */
++					int			greatest_modulus = hbounds[ndatums - 1]->modulus;
++
++					boundinfo->indexes = (int *) palloc(greatest_modulus *
++														sizeof(int));
++
++					for (i = 0; i < greatest_modulus; i++)
++						boundinfo->indexes[i] = -1;
++
++					for (i = 0; i < nparts; i++)
++					{
++						int			modulus = hbounds[i]->modulus;
++						int			remainder = hbounds[i]->remainder;
++
++						boundinfo->datums[i] = (Datum *) palloc(2 *
++																sizeof(Datum));
++						boundinfo->datums[i][0] = Int32GetDatum(modulus);
++						boundinfo->datums[i][1] = Int32GetDatum(remainder);
++
++						while (remainder < greatest_modulus)
++						{
++							/* overlap? */
++							Assert(boundinfo->indexes[remainder] == -1);
++							boundinfo->indexes[remainder] = i;
++							remainder += modulus;
++						}
++
++						mapping[hbounds[i]->index] = i;
++						pfree(hbounds[i]);
++					}
++					pfree(hbounds);
++					break;
++				}
++
+ 			case PARTITION_STRATEGY_LIST:
+ 				{
+ 					boundinfo->indexes = (int *) palloc(ndatums * sizeof(int));
+@@ -617,8 +713,7 @@ RelationBuildPartitionDesc(Relation rel)
+ 		 * Now assign OIDs from the original array into mapped indexes of the
+ 		 * result array.  Order of OIDs in the former is defined by the
+ 		 * catalog scan that retrieved them, whereas that in the latter is
+-		 * defined by canonicalized representation of the list values or the
+-		 * range bounds.
++		 * defined by canonicalized representation of the partition bounds.
+ 		 */
+ 		for (i = 0; i < nparts; i++)
+ 			result->oids[mapping[i]] = oids[i];
+@@ -655,49 +750,97 @@ partition_bounds_equal(int partnatts, int16 *parttyplen, bool *parttypbyval,
+ 	if (b1->default_index != b2->default_index)
+ 		return false;
+ 
+-	for (i = 0; i < b1->ndatums; i++)
++	if (b1->strategy == PARTITION_STRATEGY_HASH)
+ 	{
+-		int			j;
++		int			greatest_modulus;
++
++		/*
++		 * If two hash partitioned tables have different greatest moduli,
++		 * their partition schemes don't match.  For hash partitioned table,
++		 * the greatest modulus is given by the last datum and number of
++		 * partitions is given by ndatums.
++		 */
++		if (b1->datums[b1->ndatums - 1][0] != b2->datums[b2->ndatums - 1][0])
++			return false;
++
++		/*
++		 * We arrange the partitions in the ascending order of their modulus
++		 * and remainders.  Also every modulus is factor of next larger
++		 * modulus.  Therefore we can safely store index of a given partition
++		 * in indexes array at remainder of that partition.  Also entries at
++		 * (remainder + N * modulus) positions in indexes array are all same
++		 * for (modulus, remainder) specification for any partition.  Thus
++		 * datums array from both the given bounds are same, if and only if
++		 * their indexes array will be same.  So, it suffices to compare
++		 * indexes array.
++		 */
++		greatest_modulus = get_greatest_modulus(b1);
++		for (i = 0; i < greatest_modulus; i++)
++			if (b1->indexes[i] != b2->indexes[i])
++				return false;
++
++#ifdef USE_ASSERT_CHECKING
+ 
+-		for (j = 0; j < partnatts; j++)
++		/*
++		 * Nonetheless make sure that the bounds are indeed same when the
++		 * indexes match.  Hash partition bound stores modulus and remainder
++		 * at b1->datums[i][0] and b1->datums[i][1] position respectively.
++		 */
++		for (i = 0; i < b1->ndatums; i++)
++			Assert((b1->datums[i][0] == b2->datums[i][0] &&
++					b1->datums[i][1] == b2->datums[i][1]));
++#endif
++	}
++	else
++	{
++		for (i = 0; i < b1->ndatums; i++)
+ 		{
+-			/* For range partitions, the bounds might not be finite. */
+-			if (b1->kind != NULL)
++			int			j;
++
++			for (j = 0; j < partnatts; j++)
+ 			{
+-				/* The different kinds of bound all differ from each other */
+-				if (b1->kind[i][j] != b2->kind[i][j])
+-					return false;
++				/* For range partitions, the bounds might not be finite. */
++				if (b1->kind != NULL)
++				{
++					/* The different kinds of bound all differ from each other */
++					if (b1->kind[i][j] != b2->kind[i][j])
++						return false;
+ 
+-				/* Non-finite bounds are equal without further examination. */
+-				if (b1->kind[i][j] != PARTITION_RANGE_DATUM_VALUE)
+-					continue;
++					/*
++					 * Non-finite bounds are equal without further
++					 * examination.
++					 */
++					if (b1->kind[i][j] != PARTITION_RANGE_DATUM_VALUE)
++						continue;
++				}
++
++				/*
++				 * Compare the actual values. Note that it would be both
++				 * incorrect and unsafe to invoke the comparison operator
++				 * derived from the partitioning specification here.  It would
++				 * be incorrect because we want the relcache entry to be
++				 * updated for ANY change to the partition bounds, not just
++				 * those that the partitioning operator thinks are
++				 * significant.  It would be unsafe because we might reach
++				 * this code in the context of an aborted transaction, and an
++				 * arbitrary partitioning operator might not be safe in that
++				 * context.  datumIsEqual() should be simple enough to be
++				 * safe.
++				 */
++				if (!datumIsEqual(b1->datums[i][j], b2->datums[i][j],
++								  parttypbyval[j], parttyplen[j]))
++					return false;
+ 			}
+ 
+-			/*
+-			 * Compare the actual values. Note that it would be both incorrect
+-			 * and unsafe to invoke the comparison operator derived from the
+-			 * partitioning specification here.  It would be incorrect because
+-			 * we want the relcache entry to be updated for ANY change to the
+-			 * partition bounds, not just those that the partitioning operator
+-			 * thinks are significant.  It would be unsafe because we might
+-			 * reach this code in the context of an aborted transaction, and
+-			 * an arbitrary partitioning operator might not be safe in that
+-			 * context.  datumIsEqual() should be simple enough to be safe.
+-			 */
+-			if (!datumIsEqual(b1->datums[i][j], b2->datums[i][j],
+-							  parttypbyval[j], parttyplen[j]))
++			if (b1->indexes[i] != b2->indexes[i])
+ 				return false;
+ 		}
+ 
+-		if (b1->indexes[i] != b2->indexes[i])
++		/* There are ndatums+1 indexes in case of range partitions */
++		if (b1->strategy == PARTITION_STRATEGY_RANGE &&
++			b1->indexes[i] != b2->indexes[i])
+ 			return false;
+ 	}
+-
+-	/* There are ndatums+1 indexes in case of range partitions */
+-	if (b1->strategy == PARTITION_STRATEGY_RANGE &&
+-		b1->indexes[i] != b2->indexes[i])
+-		return false;
+-
+ 	return true;
+ }
+ 
+@@ -709,11 +852,11 @@ extern PartitionBoundInfo
+ partition_bounds_copy(PartitionBoundInfo src,
+ 					  PartitionKey key)
+ {
+-	PartitionBoundInfo	dest;
+-	int		i;
+-	int		ndatums;
+-	int		partnatts;
+-	int		num_indexes;
++	PartitionBoundInfo dest;
++	int			i;
++	int			ndatums;
++	int			partnatts;
++	int			num_indexes;
+ 
+ 	dest = (PartitionBoundInfo) palloc(sizeof(PartitionBoundInfoData));
+ 
+@@ -721,8 +864,7 @@ partition_bounds_copy(PartitionBoundInfo src,
+ 	ndatums = dest->ndatums = src->ndatums;
+ 	partnatts = key->partnatts;
+ 
+-	/* Range partitioned table has an extra index. */
+-	num_indexes = key->strategy == PARTITION_STRATEGY_RANGE ? ndatums + 1 : ndatums;
++	num_indexes = get_partition_bound_num_indexes(src);
+ 
+ 	/* List partitioned tables have only a single partition key. */
+ 	Assert(key->strategy != PARTITION_STRATEGY_LIST || partnatts == 1);
+@@ -732,11 +874,11 @@ partition_bounds_copy(PartitionBoundInfo src,
+ 	if (src->kind != NULL)
+ 	{
+ 		dest->kind = (PartitionRangeDatumKind **) palloc(ndatums *
+-												sizeof(PartitionRangeDatumKind *));
++														 sizeof(PartitionRangeDatumKind *));
+ 		for (i = 0; i < ndatums; i++)
+ 		{
+ 			dest->kind[i] = (PartitionRangeDatumKind *) palloc(partnatts *
+-												sizeof(PartitionRangeDatumKind));
++															   sizeof(PartitionRangeDatumKind));
+ 
+ 			memcpy(dest->kind[i], src->kind[i],
+ 				   sizeof(PartitionRangeDatumKind) * key->partnatts);
+@@ -747,16 +889,37 @@ partition_bounds_copy(PartitionBoundInfo src,
+ 
+ 	for (i = 0; i < ndatums; i++)
+ 	{
+-		int		j;
+-		dest->datums[i] = (Datum *) palloc(sizeof(Datum) * partnatts);
++		int			j;
++
++		/*
++		 * For a corresponding to hash partition, datums array will have two
++		 * elements - modulus and remainder.
++		 */
++		bool		hash_part = (key->strategy == PARTITION_STRATEGY_HASH);
++		int			natts = hash_part ? 2 : partnatts;
+ 
+-		for (j = 0; j < partnatts; j++)
++		dest->datums[i] = (Datum *) palloc(sizeof(Datum) * natts);
++
++		for (j = 0; j < natts; j++)
+ 		{
++			bool		byval;
++			int			typlen;
++
++			if (hash_part)
++			{
++				typlen = sizeof(int32); /* Always int4 */
++				byval = true;	/* int4 is pass-by-value */
++			}
++			else
++			{
++				byval = key->parttypbyval[j];
++				typlen = key->parttyplen[j];
++			}
++
+ 			if (dest->kind == NULL ||
+ 				dest->kind[i][j] == PARTITION_RANGE_DATUM_VALUE)
+ 				dest->datums[i][j] = datumCopy(src->datums[i][j],
+-											   key->parttypbyval[j],
+-											   key->parttyplen[j]);
++											   byval, typlen);
+ 		}
+ 	}
+ 
+@@ -801,6 +964,89 @@ check_new_partition_bound(char *relname, Relation parent,
+ 
+ 	switch (key->strategy)
+ 	{
++		case PARTITION_STRATEGY_HASH:
++			{
++				Assert(spec->strategy == PARTITION_STRATEGY_HASH);
++				Assert(spec->remainder >= 0 && spec->remainder < spec->modulus);
++
++				if (partdesc->nparts > 0)
++				{
++					PartitionBoundInfo boundinfo = partdesc->boundinfo;
++					Datum	  **datums = boundinfo->datums;
++					int			ndatums = boundinfo->ndatums;
++					int			greatest_modulus;
++					int			remainder;
++					int			offset;
++					bool		equal,
++								valid_modulus = true;
++					int			prev_modulus,	/* Previous largest modulus */
++								next_modulus;	/* Next largest modulus */
++
++					/*
++					 * Check rule that every modulus must be a factor of the
++					 * next larger modulus.  For example, if you have a bunch
++					 * of partitions that all have modulus 5, you can add a
++					 * new partition with modulus 10 or a new partition with
++					 * modulus 15, but you cannot add both a partition with
++					 * modulus 10 and a partition with modulus 15, because 10
++					 * is not a factor of 15.
++					 *
++					 * Get greatest bound in array boundinfo->datums which is
++					 * less than or equal to spec->modulus and
++					 * spec->remainder.
++					 */
++					offset = partition_bound_bsearch(key, boundinfo, spec,
++													 true, &equal);
++					if (offset < 0)
++					{
++						next_modulus = DatumGetInt32(datums[0][0]);
++						valid_modulus = (next_modulus % spec->modulus) == 0;
++					}
++					else
++					{
++						prev_modulus = DatumGetInt32(datums[offset][0]);
++						valid_modulus = (spec->modulus % prev_modulus) == 0;
++
++						if (valid_modulus && (offset + 1) < ndatums)
++						{
++							next_modulus = DatumGetInt32(datums[offset + 1][0]);
++							valid_modulus = (next_modulus % spec->modulus) == 0;
++						}
++					}
++
++					if (!valid_modulus)
++						ereport(ERROR,
++								(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
++								 errmsg("every hash partition modulus must be a factor of the next larger modulus")));
++
++					greatest_modulus = get_greatest_modulus(boundinfo);
++					remainder = spec->remainder;
++
++					/*
++					 * Normally, the lowest remainder that could conflict with
++					 * the new partition is equal to the remainder specified
++					 * for the new partition, but when the new partition has a
++					 * modulus higher than any used so far, we need to adjust.
++					 */
++					if (remainder >= greatest_modulus)
++						remainder = remainder % greatest_modulus;
++
++					/* Check every potentially-conflicting remainder. */
++					do
++					{
++						if (boundinfo->indexes[remainder] != -1)
++						{
++							overlap = true;
++							with = boundinfo->indexes[remainder];
++							break;
++						}
++						remainder += spec->modulus;
++					} while (remainder < greatest_modulus);
++				}
++
++				break;
++			}
++
+ 		case PARTITION_STRATEGY_LIST:
+ 			{
+ 				Assert(spec->strategy == PARTITION_STRATEGY_LIST);
+@@ -1171,6 +1417,11 @@ get_qual_from_partbound(Relation rel, Relation parent,
+ 
+ 	switch (key->strategy)
+ 	{
++		case PARTITION_STRATEGY_HASH:
++			Assert(spec->strategy == PARTITION_STRATEGY_HASH);
++			my_qual = get_qual_for_hash(parent, spec);
++			break;
++
+ 		case PARTITION_STRATEGY_LIST:
+ 			Assert(spec->strategy == PARTITION_STRATEGY_LIST);
+ 			my_qual = get_qual_for_list(parent, spec);
+@@ -1541,6 +1792,92 @@ make_partition_op_expr(PartitionKey key, int keynum,
+ 	return result;
+ }
+ 
++/*
++ * get_qual_for_hash
++ *
++ * Given a list of partition columns, modulus and remainder corresponding to a
++ * partition, this function returns CHECK constraint expression Node for that
++ * partition.
++ *
++ * The partition constraint for a hash partition is always a call to the
++ * built-in function satisfies_hash_partition().  The first two arguments are
++ * the modulus and remainder for the partition; the remaining arguments are the
++ * values to be hashed.
++ */
++static List *
++get_qual_for_hash(Relation parent, PartitionBoundSpec *spec)
++{
++	PartitionKey key = RelationGetPartitionKey(parent);
++	FuncExpr   *fexpr;
++	Node	   *relidConst;
++	Node	   *modulusConst;
++	Node	   *remainderConst;
++	List	   *args;
++	ListCell   *partexprs_item;
++	int			i;
++
++	/* Fixed arguments. */
++	relidConst = (Node *) makeConst(OIDOID,
++									-1,
++									InvalidOid,
++									sizeof(Oid),
++									ObjectIdGetDatum(RelationGetRelid(parent)),
++									false,
++									true);
++
++	modulusConst = (Node *) makeConst(INT4OID,
++									  -1,
++									  InvalidOid,
++									  sizeof(int32),
++									  Int32GetDatum(spec->modulus),
++									  false,
++									  true);
++
++	remainderConst = (Node *) makeConst(INT4OID,
++										-1,
++										InvalidOid,
++										sizeof(int32),
++										Int32GetDatum(spec->remainder),
++										false,
++										true);
++
++	args = list_make3(relidConst, modulusConst, remainderConst);
++	partexprs_item = list_head(key->partexprs);
++
++	/* Add an argument for each key column. */
++	for (i = 0; i < key->partnatts; i++)
++	{
++		Node	   *keyCol;
++
++		/* Left operand */
++		if (key->partattrs[i] != 0)
++		{
++			keyCol = (Node *) makeVar(1,
++									  key->partattrs[i],
++									  key->parttypid[i],
++									  key->parttypmod[i],
++									  key->parttypcoll[i],
++									  0);
++		}
++		else
++		{
++			keyCol = (Node *) copyObject(lfirst(partexprs_item));
++			partexprs_item = lnext(partexprs_item);
++		}
++
++		args = lappend(args, keyCol);
++	}
++
++	fexpr = makeFuncExpr(F_SATISFIES_HASH_PARTITION,
++						 BOOLOID,
++						 args,
++						 InvalidOid,
++						 InvalidOid,
++						 COERCE_EXPLICIT_CALL);
++
++	return list_make1(fexpr);
++}
++
+ /*
+  * get_qual_for_list
+  *
+@@ -2412,6 +2749,17 @@ get_partition_for_tuple(PartitionDispatch *pd,
+ 		/* Route as appropriate based on partitioning strategy. */
+ 		switch (key->strategy)
+ 		{
++			case PARTITION_STRATEGY_HASH:
++				{
++					PartitionBoundInfo boundinfo = partdesc->boundinfo;
++					int			greatest_modulus = get_greatest_modulus(boundinfo);
++					uint64		rowHash = compute_hash_value(key, values,
++															 isnull);
++
++					cur_index = boundinfo->indexes[rowHash % greatest_modulus];
++				}
++				break;
++
+ 			case PARTITION_STRATEGY_LIST:
+ 
+ 				if (isnull[0])
+@@ -2524,6 +2872,38 @@ get_partition_for_tuple(PartitionDispatch *pd,
+ 	return result;
+ }
+ 
++/*
++ * qsort_partition_hbound_cmp
++ *
++ * We sort hash bounds by modulus, then by remainder.
++ */
++static int32
++qsort_partition_hbound_cmp(const void *a, const void *b)
++{
++	PartitionHashBound *h1 = (*(PartitionHashBound *const *) a);
++	PartitionHashBound *h2 = (*(PartitionHashBound *const *) b);
++
++	return partition_hbound_cmp(h1->modulus, h1->remainder,
++								h2->modulus, h2->remainder);
++}
++
++/*
++ * partition_hbound_cmp
++ *
++ * Compares modulus first, then remainder if modulus are equal.
++ */
++static int32
++partition_hbound_cmp(int modulus1, int remainder1, int modulus2, int remainder2)
++{
++	if (modulus1 < modulus2)
++		return -1;
++	if (modulus1 > modulus2)
++		return 1;
++	if (modulus1 == modulus2 && remainder1 != remainder2)
++		return (remainder1 > remainder2) ? 1 : -1;
++	return 0;
++}
++
+ /*
+  * qsort_partition_list_value_cmp
+  *
+@@ -2710,6 +3090,15 @@ partition_bound_cmp(PartitionKey key, PartitionBoundInfo boundinfo,
+ 
+ 	switch (key->strategy)
+ 	{
++		case PARTITION_STRATEGY_HASH:
++			{
++				PartitionBoundSpec *spec = (PartitionBoundSpec *) probe;
++
++				cmpval = partition_hbound_cmp(DatumGetInt32(bound_datums[0]),
++											  DatumGetInt32(bound_datums[1]),
++											  spec->modulus, spec->remainder);
++				break;
++			}
+ 		case PARTITION_STRATEGY_LIST:
+ 			cmpval = DatumGetInt32(FunctionCall2Coll(&key->partsupfunc[0],
+ 													 key->partcollation[0],
+@@ -2894,3 +3283,182 @@ get_proposed_default_constraint(List *new_part_constraints)
+ 
+ 	return list_make1(defPartConstraint);
+ }
++
++/*
++ * get_partition_bound_num_indexes
++ *
++ * Returns the number of the entries in the partition bound indexes array.
++ */
++static int
++get_partition_bound_num_indexes(PartitionBoundInfo bound)
++{
++	int			num_indexes;
++
++	Assert(bound);
++
++	switch (bound->strategy)
++	{
++		case PARTITION_STRATEGY_HASH:
++
++			/*
++			 * The number of the entries in the indexes array is same as the
++			 * greatest modulus.
++			 */
++			num_indexes = get_greatest_modulus(bound);
++			break;
++
++		case PARTITION_STRATEGY_LIST:
++			num_indexes = bound->ndatums;
++			break;
++
++		case PARTITION_STRATEGY_RANGE:
++			/* Range partitioned table has an extra index. */
++			num_indexes = bound->ndatums + 1;
++			break;
++
++		default:
++			elog(ERROR, "unexpected partition strategy: %d",
++				 (int) bound->strategy);
++	}
++
++	return num_indexes;
++}
++
++/*
++ * get_greatest_modulus
++ *
++ * Returns the greatest modulus of the hash partition bound. The greatest
++ * modulus will be at the end of the datums array because hash partitions are
++ * arranged in the ascending order of their modulus and remainders.
++ */
++static int
++get_greatest_modulus(PartitionBoundInfo bound)
++{
++	Assert(bound && bound->strategy == PARTITION_STRATEGY_HASH);
++	Assert(bound->datums && bound->ndatums > 0);
++	Assert(DatumGetInt32(bound->datums[bound->ndatums - 1][0]) > 0);
++
++	return DatumGetInt32(bound->datums[bound->ndatums - 1][0]);
++}
++
++/*
++ * compute_hash_value
++ *
++ * Compute the hash value for given not null partition key values.
++ */
++static uint64
++compute_hash_value(PartitionKey key, Datum *values, bool *isnull)
++{
++	int			i;
++	int			nkeys = key->partnatts;
++	uint64		rowHash = 0;
++	Datum		seed = UInt64GetDatum(HASH_PARTITION_SEED);
++
++	for (i = 0; i < nkeys; i++)
++	{
++		if (!isnull[i])
++		{
++			Datum		hash;
++
++			Assert(OidIsValid(key->partsupfunc[i].fn_oid));
++
++			/*
++			 * Compute hash for each datum value by calling respective
++			 * datatype-specific hash functions of each partition key
++			 * attribute.
++			 */
++			hash = FunctionCall2(&key->partsupfunc[i], values[i], seed);
++
++			/* Form a single 64-bit hash value */
++			rowHash = hash_combine64(rowHash, DatumGetUInt64(hash));
++		}
++	}
++
++	return rowHash;
++}
++
++/*
++ * satisfies_hash_partition
++ *
++ * This is a SQL-callable function for use in hash partition constraints takes
++ * an already computed hash values of each partition key attribute, and combine
++ * them into a single hash value by calling hash_combine64.
++ *
++ * Returns true if remainder produced when this computed single hash value is
++ * divided by the given modulus is equal to given remainder, otherwise false.
++ *
++ * See get_qual_for_hash() for usage.
++ */
++Datum
++satisfies_hash_partition(PG_FUNCTION_ARGS)
++{
++	typedef struct ColumnsHashData
++	{
++		Oid			relid;
++		int16		nkeys;
++		FmgrInfo	partsupfunc[PARTITION_MAX_KEYS];
++	}			ColumnsHashData;
++	Oid			parentId = PG_GETARG_OID(0);
++	int			modulus = PG_GETARG_INT32(1);
++	int			remainder = PG_GETARG_INT32(2);
++	short		nkeys = PG_NARGS() - 3;
++	int			i;
++	Datum		seed = UInt64GetDatum(HASH_PARTITION_SEED);
++	ColumnsHashData *my_extra;
++	uint64		rowHash = 0;
++
++	/*
++	 * Cache hash function information.
++	 */
++	my_extra = (ColumnsHashData *) fcinfo->flinfo->fn_extra;
++	if (my_extra == NULL || my_extra->nkeys != nkeys ||
++		my_extra->relid != parentId)
++	{
++		Relation	parent;
++		PartitionKey key;
++		int j;
++
++		fcinfo->flinfo->fn_extra =
++			MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt,
++								   offsetof(ColumnsHashData, partsupfunc) +
++								   sizeof(FmgrInfo) * nkeys);
++		my_extra = (ColumnsHashData *) fcinfo->flinfo->fn_extra;
++		my_extra->nkeys = nkeys;
++		my_extra->relid = parentId;
++
++		/* Open parent relation and fetch partition keyinfo */
++		parent = heap_open(parentId, AccessShareLock);
++		key = RelationGetPartitionKey(parent);
++
++		Assert(key->partnatts == nkeys);
++		for (j = 0; j < nkeys; ++j)
++			fmgr_info_copy(&my_extra->partsupfunc[j],
++						   key->partsupfunc,
++						   fcinfo->flinfo->fn_mcxt);
++
++		/* Hold lock until commit */
++		heap_close(parent, NoLock);
++	}
++
++	for (i = 0; i < nkeys; i++)
++	{
++		/* keys start from fourth argument of function. */
++		int			argno = i + 3;
++
++		if (!PG_ARGISNULL(argno))
++		{
++			Datum		hash;
++
++			Assert(OidIsValid(my_extra->partsupfunc[i].fn_oid));
++
++			hash = FunctionCall2(&my_extra->partsupfunc[i],
++								 PG_GETARG_DATUM(argno),
++								 seed);
++
++			/* Form a single 64-bit hash value */
++			rowHash = hash_combine64(rowHash, DatumGetUInt64(hash));
++		}
++	}
++
++	PG_RETURN_BOOL(rowHash % modulus == remainder);
++}
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index b7ddb335d2d0..165b165d5582 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -471,7 +471,7 @@ static void RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid,
+ static bool is_partition_attr(Relation rel, AttrNumber attnum, bool *used_in_expr);
+ static PartitionSpec *transformPartitionSpec(Relation rel, PartitionSpec *partspec, char *strategy);
+ static void ComputePartitionAttrs(Relation rel, List *partParams, AttrNumber *partattrs,
+-					  List **partexprs, Oid *partopclass, Oid *partcollation);
++					  List **partexprs, Oid *partopclass, Oid *partcollation, char strategy);
+ static void CreateInheritance(Relation child_rel, Relation parent_rel);
+ static void RemoveInheritance(Relation child_rel, Relation parent_rel);
+ static ObjectAddress ATExecAttachPartition(List **wqueue, Relation rel,
+@@ -894,7 +894,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+ 
+ 		ComputePartitionAttrs(rel, stmt->partspec->partParams,
+ 							  partattrs, &partexprs, partopclass,
+-							  partcollation);
++							  partcollation, strategy);
+ 
+ 		StorePartitionKey(rel, strategy, partnatts, partattrs, partexprs,
+ 						  partopclass, partcollation);
+@@ -13337,7 +13337,9 @@ transformPartitionSpec(Relation rel, PartitionSpec *partspec, char *strategy)
+ 	newspec->location = partspec->location;
+ 
+ 	/* Parse partitioning strategy name */
+-	if (pg_strcasecmp(partspec->strategy, "list") == 0)
++	if (pg_strcasecmp(partspec->strategy, "hash") == 0)
++		*strategy = PARTITION_STRATEGY_HASH;
++	else if (pg_strcasecmp(partspec->strategy, "list") == 0)
+ 		*strategy = PARTITION_STRATEGY_LIST;
+ 	else if (pg_strcasecmp(partspec->strategy, "range") == 0)
+ 		*strategy = PARTITION_STRATEGY_RANGE;
+@@ -13407,10 +13409,12 @@ transformPartitionSpec(Relation rel, PartitionSpec *partspec, char *strategy)
+  */
+ static void
+ ComputePartitionAttrs(Relation rel, List *partParams, AttrNumber *partattrs,
+-					  List **partexprs, Oid *partopclass, Oid *partcollation)
++					  List **partexprs, Oid *partopclass, Oid *partcollation,
++					  char strategy)
+ {
+ 	int			attn;
+ 	ListCell   *lc;
++	Oid			am_oid;
+ 
+ 	attn = 0;
+ 	foreach(lc, partParams)
+@@ -13570,25 +13574,41 @@ ComputePartitionAttrs(Relation rel, List *partParams, AttrNumber *partattrs,
+ 		partcollation[attn] = attcollation;
+ 
+ 		/*
+-		 * Identify a btree opclass to use. Currently, we use only btree
+-		 * operators, which seems enough for list and range partitioning.
++		 * Identify the appropriate operator class.  For list and range
++		 * partitioning, we use a btree operator class; hash partitioning uses
++		 * a hash operator class.
+ 		 */
++		if (strategy == PARTITION_STRATEGY_HASH)
++			am_oid = HASH_AM_OID;
++		else
++			am_oid = BTREE_AM_OID;
++
+ 		if (!pelem->opclass)
+ 		{
+-			partopclass[attn] = GetDefaultOpClass(atttype, BTREE_AM_OID);
++			partopclass[attn] = GetDefaultOpClass(atttype, am_oid);
+ 
+ 			if (!OidIsValid(partopclass[attn]))
+-				ereport(ERROR,
+-						(errcode(ERRCODE_UNDEFINED_OBJECT),
+-						 errmsg("data type %s has no default btree operator class",
+-								format_type_be(atttype)),
+-						 errhint("You must specify a btree operator class or define a default btree operator class for the data type.")));
++			{
++				if (strategy == PARTITION_STRATEGY_HASH)
++					ereport(ERROR,
++							(errcode(ERRCODE_UNDEFINED_OBJECT),
++							 errmsg("data type %s has no default hash operator class",
++									format_type_be(atttype)),
++							 errhint("You must specify a hash operator class or define a default hash operator class for the data type.")));
++				else
++					ereport(ERROR,
++							(errcode(ERRCODE_UNDEFINED_OBJECT),
++							 errmsg("data type %s has no default btree operator class",
++									format_type_be(atttype)),
++							 errhint("You must specify a btree operator class or define a default btree operator class for the data type.")));
++
++			}
+ 		}
+ 		else
+ 			partopclass[attn] = ResolveOpClass(pelem->opclass,
+ 											   atttype,
+-											   "btree",
+-											   BTREE_AM_OID);
++											   am_oid == HASH_AM_OID ? "hash" : "btree",
++											   am_oid);
+ 
+ 		attn++;
+ 	}
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index c1a83ca9098f..cadd253ef17e 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -4461,6 +4461,8 @@ _copyPartitionBoundSpec(const PartitionBoundSpec *from)
+ 
+ 	COPY_SCALAR_FIELD(strategy);
+ 	COPY_SCALAR_FIELD(is_default);
++	COPY_SCALAR_FIELD(modulus);
++	COPY_SCALAR_FIELD(remainder);
+ 	COPY_NODE_FIELD(listdatums);
+ 	COPY_NODE_FIELD(lowerdatums);
+ 	COPY_NODE_FIELD(upperdatums);
+diff --git a/src/backend/nodes/equalfuncs.c b/src/backend/nodes/equalfuncs.c
+index 7a700018e72a..2866fd7b4afd 100644
+--- a/src/backend/nodes/equalfuncs.c
++++ b/src/backend/nodes/equalfuncs.c
+@@ -2848,6 +2848,8 @@ _equalPartitionBoundSpec(const PartitionBoundSpec *a, const PartitionBoundSpec *
+ {
+ 	COMPARE_SCALAR_FIELD(strategy);
+ 	COMPARE_SCALAR_FIELD(is_default);
++	COMPARE_SCALAR_FIELD(modulus);
++	COMPARE_SCALAR_FIELD(remainder);
+ 	COMPARE_NODE_FIELD(listdatums);
+ 	COMPARE_NODE_FIELD(lowerdatums);
+ 	COMPARE_NODE_FIELD(upperdatums);
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index 43d62062bc03..291d1eeb46f0 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -3578,6 +3578,8 @@ _outPartitionBoundSpec(StringInfo str, const PartitionBoundSpec *node)
+ 
+ 	WRITE_CHAR_FIELD(strategy);
+ 	WRITE_BOOL_FIELD(is_default);
++	WRITE_INT_FIELD(modulus);
++	WRITE_INT_FIELD(remainder);
+ 	WRITE_NODE_FIELD(listdatums);
+ 	WRITE_NODE_FIELD(lowerdatums);
+ 	WRITE_NODE_FIELD(upperdatums);
+diff --git a/src/backend/nodes/readfuncs.c b/src/backend/nodes/readfuncs.c
+index ccb6a1f4acbb..42c595dc039d 100644
+--- a/src/backend/nodes/readfuncs.c
++++ b/src/backend/nodes/readfuncs.c
+@@ -2397,6 +2397,8 @@ _readPartitionBoundSpec(void)
+ 
+ 	READ_CHAR_FIELD(strategy);
+ 	READ_BOOL_FIELD(is_default);
++	READ_INT_FIELD(modulus);
++	READ_INT_FIELD(remainder);
+ 	READ_NODE_FIELD(listdatums);
+ 	READ_NODE_FIELD(lowerdatums);
+ 	READ_NODE_FIELD(upperdatums);
+diff --git a/src/backend/optimizer/path/joinrels.c b/src/backend/optimizer/path/joinrels.c
+index 244708ad5ac5..453f25964ac6 100644
+--- a/src/backend/optimizer/path/joinrels.c
++++ b/src/backend/optimizer/path/joinrels.c
+@@ -1463,7 +1463,7 @@ have_partkey_equi_join(RelOptInfo *rel1, RelOptInfo *rel2, JoinType jointype,
+ 			continue;
+ 
+ 		/* Skip clauses which are not equality conditions. */
+-		if (!rinfo->mergeopfamilies)
++		if (!rinfo->mergeopfamilies && !OidIsValid(rinfo->hashjoinoperator))
+ 			continue;
+ 
+ 		opexpr = (OpExpr *) rinfo->clause;
+@@ -1515,8 +1515,14 @@ have_partkey_equi_join(RelOptInfo *rel1, RelOptInfo *rel2, JoinType jointype,
+ 		 * The clause allows partition-wise join if only it uses the same
+ 		 * operator family as that specified by the partition key.
+ 		 */
+-		if (!list_member_oid(rinfo->mergeopfamilies,
+-							 part_scheme->partopfamily[ipk1]))
++		if (rel1->part_scheme->strategy == PARTITION_STRATEGY_HASH)
++		{
++			if (!op_in_opfamily(rinfo->hashjoinoperator,
++								part_scheme->partopfamily[ipk1]))
++				continue;
++		}
++		else if (!list_member_oid(rinfo->mergeopfamilies,
++								  part_scheme->partopfamily[ipk1]))
+ 			continue;
+ 
+ 		/* Mark the partition key as having an equi-join clause. */
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 09b9a899e495..c301ca465d47 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -579,7 +579,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ %type <list>		part_params
+ %type <partboundspec> PartitionBoundSpec
+ %type <node>		partbound_datum PartitionRangeDatum
+-%type <list>		partbound_datum_list range_datum_list
++%type <list>		hash_partbound partbound_datum_list range_datum_list
++%type <defelt>		hash_partbound_elem
+ 
+ /*
+  * Non-keyword token types.  These are hard-wired into the "flex" lexer.
+@@ -2638,8 +2639,61 @@ alter_identity_column_option:
+ 		;
+ 
+ PartitionBoundSpec:
++			/* a HASH partition*/
++			FOR VALUES WITH '(' hash_partbound ')'
++				{
++					ListCell   *lc;
++					PartitionBoundSpec *n = makeNode(PartitionBoundSpec);
++
++					n->strategy = PARTITION_STRATEGY_HASH;
++					n->modulus = n->remainder = -1;
++
++					foreach (lc, $5)
++					{
++						DefElem    *opt = lfirst_node(DefElem, lc);
++
++						if (strcmp(opt->defname, "modulus") == 0)
++						{
++							if (n->modulus != -1)
++								ereport(ERROR,
++										(errcode(ERRCODE_DUPLICATE_OBJECT),
++										 errmsg("modulus for hash partition provided more than once"),
++										 parser_errposition(opt->location)));
++							n->modulus = defGetInt32(opt);
++						}
++						else if (strcmp(opt->defname, "remainder") == 0)
++						{
++							if (n->remainder != -1)
++								ereport(ERROR,
++										(errcode(ERRCODE_DUPLICATE_OBJECT),
++										 errmsg("remainder for hash partition provided more than once"),
++										 parser_errposition(opt->location)));
++							n->remainder = defGetInt32(opt);
++						}
++						else
++							ereport(ERROR,
++									(errcode(ERRCODE_SYNTAX_ERROR),
++									 errmsg("unrecognized hash partition bound specification \"%s\"",
++											opt->defname),
++									 parser_errposition(opt->location)));
++					}
++
++					if (n->modulus == -1)
++						ereport(ERROR,
++								(errcode(ERRCODE_SYNTAX_ERROR),
++								 errmsg("modulus for hash partition must be specified")));
++					if (n->remainder == -1)
++						ereport(ERROR,
++								(errcode(ERRCODE_SYNTAX_ERROR),
++								 errmsg("remainder for hash partition must be specified")));
++
++					n->location = @3;
++
++					$$ = n;
++				}
++
+ 			/* a LIST partition */
+-			FOR VALUES IN_P '(' partbound_datum_list ')'
++			| FOR VALUES IN_P '(' partbound_datum_list ')'
+ 				{
+ 					PartitionBoundSpec *n = makeNode(PartitionBoundSpec);
+ 
+@@ -2677,6 +2731,24 @@ PartitionBoundSpec:
+ 				}
+ 		;
+ 
++hash_partbound_elem:
++		NonReservedWord Iconst
++			{
++				$$ = makeDefElem($1, (Node *)makeInteger($2), @1);
++			}
++		;
++
++hash_partbound:
++		hash_partbound_elem
++			{
++				$$ = list_make1($1);
++			}
++		| hash_partbound ',' hash_partbound_elem
++			{
++				$$ = lappend($1, $3);
++			}
++		;
++
+ partbound_datum:
+ 			Sconst			{ $$ = makeStringConst($1, @1); }
+ 			| NumericOnly	{ $$ = makeAConst($1, @1); }
+diff --git a/src/backend/parser/parse_utilcmd.c b/src/backend/parser/parse_utilcmd.c
+index 30fc2d9ff842..8461da490aca 100644
+--- a/src/backend/parser/parse_utilcmd.c
++++ b/src/backend/parser/parse_utilcmd.c
+@@ -3310,6 +3310,11 @@ transformPartitionBound(ParseState *pstate, Relation parent,
+ 
+ 	if (spec->is_default)
+ 	{
++		if (strategy == PARTITION_STRATEGY_HASH)
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
++					 errmsg("a hash-partitioned table may not have a default partition")));
++
+ 		/*
+ 		 * In case of the default partition, parser had no way to identify the
+ 		 * partition strategy. Assign the parent's strategy to the default
+@@ -3320,7 +3325,27 @@ transformPartitionBound(ParseState *pstate, Relation parent,
+ 		return result_spec;
+ 	}
+ 
+-	if (strategy == PARTITION_STRATEGY_LIST)
++	if (strategy == PARTITION_STRATEGY_HASH)
++	{
++		if (spec->strategy != PARTITION_STRATEGY_HASH)
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
++					 errmsg("invalid bound specification for a hash partition"),
++					 parser_errposition(pstate, exprLocation((Node *) spec))));
++
++		if (spec->modulus <= 0)
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
++					 errmsg("modulus for hash partition must be a positive integer")));
++
++		Assert(spec->remainder >= 0);
++
++		if (spec->remainder >= spec->modulus)
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
++					 errmsg("remainder for hash partition must be less than modulus")));
++	}
++	else if (strategy == PARTITION_STRATEGY_LIST)
+ 	{
+ 		ListCell   *cell;
+ 		char	   *colname;
+@@ -3485,7 +3510,7 @@ transformPartitionBound(ParseState *pstate, Relation parent,
+ static void
+ validateInfiniteBounds(ParseState *pstate, List *blist)
+ {
+-	ListCell *lc;
++	ListCell   *lc;
+ 	PartitionRangeDatumKind kind = PARTITION_RANGE_DATUM_VALUE;
+ 
+ 	foreach(lc, blist)
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index 752cef09e66c..b543b7046cd0 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -1551,7 +1551,7 @@ pg_get_statisticsobj_worker(Oid statextid, bool missing_ok)
+  *
+  * Returns the partition key specification, ie, the following:
+  *
+- * PARTITION BY { RANGE | LIST } (column opt_collation opt_opclass [, ...])
++ * PARTITION BY { RANGE | LIST | HASH } (column opt_collation opt_opclass [, ...])
+  */
+ Datum
+ pg_get_partkeydef(PG_FUNCTION_ARGS)
+@@ -1655,6 +1655,10 @@ pg_get_partkeydef_worker(Oid relid, int prettyFlags,
+ 
+ 	switch (form->partstrat)
+ 	{
++		case PARTITION_STRATEGY_HASH:
++			if (!attrsOnly)
++				appendStringInfo(&buf, "HASH");
++			break;
+ 		case PARTITION_STRATEGY_LIST:
+ 			if (!attrsOnly)
+ 				appendStringInfoString(&buf, "LIST");
+@@ -8711,6 +8715,15 @@ get_rule_expr(Node *node, deparse_context *context,
+ 
+ 				switch (spec->strategy)
+ 				{
++					case PARTITION_STRATEGY_HASH:
++						Assert(spec->modulus > 0 && spec->remainder >= 0);
++						Assert(spec->modulus > spec->remainder);
++
++						appendStringInfoString(buf, "FOR VALUES");
++						appendStringInfo(buf, " WITH (modulus %d, remainder %d)",
++										 spec->modulus, spec->remainder);
++						break;
++
+ 					case PARTITION_STRATEGY_LIST:
+ 						Assert(spec->listdatums != NIL);
+ 
+diff --git a/src/backend/utils/cache/relcache.c b/src/backend/utils/cache/relcache.c
+index a31b68a8d5e2..1908420d8274 100644
+--- a/src/backend/utils/cache/relcache.c
++++ b/src/backend/utils/cache/relcache.c
+@@ -30,6 +30,7 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ 
++#include "access/hash.h"
+ #include "access/htup_details.h"
+ #include "access/multixact.h"
+ #include "access/nbtree.h"
+@@ -833,6 +834,7 @@ RelationBuildPartitionKey(Relation relation)
+ 	Datum		datum;
+ 	MemoryContext partkeycxt,
+ 				oldcxt;
++	int16		procnum;
+ 
+ 	tuple = SearchSysCache1(PARTRELID,
+ 							ObjectIdGetDatum(RelationGetRelid(relation)));
+@@ -912,6 +914,10 @@ RelationBuildPartitionKey(Relation relation)
+ 	key->parttypalign = (char *) palloc0(key->partnatts * sizeof(char));
+ 	key->parttypcoll = (Oid *) palloc0(key->partnatts * sizeof(Oid));
+ 
++	/* For the hash partitioning, an extended hash function will be used. */
++	procnum = (key->strategy == PARTITION_STRATEGY_HASH) ?
++		HASHEXTENDED_PROC : BTORDER_PROC;
++
+ 	/* Copy partattrs and fill other per-attribute info */
+ 	memcpy(key->partattrs, attrs, key->partnatts * sizeof(int16));
+ 	partexprs_item = list_head(key->partexprs);
+@@ -932,18 +938,20 @@ RelationBuildPartitionKey(Relation relation)
+ 		key->partopfamily[i] = opclassform->opcfamily;
+ 		key->partopcintype[i] = opclassform->opcintype;
+ 
+-		/*
+-		 * A btree support function covers the cases of list and range methods
+-		 * currently supported.
+-		 */
++		/* Get a support function for the specified opfamily and datatypes */
+ 		funcid = get_opfamily_proc(opclassform->opcfamily,
+ 								   opclassform->opcintype,
+ 								   opclassform->opcintype,
+-								   BTORDER_PROC);
+-		if (!OidIsValid(funcid))	/* should not happen */
+-			elog(ERROR, "missing support function %d(%u,%u) in opfamily %u",
+-				 BTORDER_PROC, opclassform->opcintype, opclassform->opcintype,
+-				 opclassform->opcfamily);
++								   procnum);
++		if (!OidIsValid(funcid))
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
++					 errmsg("operator class \"%s\" of access method %s is missing support function %d for data type \"%s\"",
++							NameStr(opclassform->opcname),
++							(key->strategy == PARTITION_STRATEGY_HASH) ?
++							"hash" : "btree",
++							procnum,
++							format_type_be(opclassform->opcintype))));
+ 
+ 		fmgr_info(funcid, &key->partsupfunc[i]);
+ 
+diff --git a/src/bin/psql/tab-complete.c b/src/bin/psql/tab-complete.c
+index a09c49d6cf94..b3e3799c1320 100644
+--- a/src/bin/psql/tab-complete.c
++++ b/src/bin/psql/tab-complete.c
+@@ -2055,7 +2055,7 @@ psql_completion(const char *text, int start, int end)
+ 	else if (TailMatches3("ATTACH", "PARTITION", MatchAny))
+ 		COMPLETE_WITH_LIST2("FOR VALUES", "DEFAULT");
+ 	else if (TailMatches2("FOR", "VALUES"))
+-		COMPLETE_WITH_LIST2("FROM (", "IN (");
++		COMPLETE_WITH_LIST3("FROM (", "IN (", "WITH (");
+ 
+ 	/*
+ 	 * If we have ALTER TABLE <foo> DETACH PARTITION, provide a list of
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 39c70b415aed..bd4014a69d0b 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	201711091
++#define CATALOG_VERSION_NO	201711092
+ 
+ #endif
+diff --git a/src/include/catalog/partition.h b/src/include/catalog/partition.h
+index 945ac0239d25..8acc01a87684 100644
+--- a/src/include/catalog/partition.h
++++ b/src/include/catalog/partition.h
+@@ -19,6 +19,9 @@
+ #include "parser/parse_node.h"
+ #include "utils/rel.h"
+ 
++/* Seed for the extended hash function */
++#define HASH_PARTITION_SEED UINT64CONST(0x7A5B22367996DCFD)
++
+ /*
+  * PartitionBoundInfo encapsulates a set of partition bounds.  It is usually
+  * associated with partitioned tables as part of its partition descriptor.
+diff --git a/src/include/catalog/pg_proc.h b/src/include/catalog/pg_proc.h
+index 5e3e7228d625..0330c04f169b 100644
+--- a/src/include/catalog/pg_proc.h
++++ b/src/include/catalog/pg_proc.h
+@@ -5522,6 +5522,10 @@ DESCR("list files in the log directory");
+ DATA(insert OID = 3354 (  pg_ls_waldir				 PGNSP PGUID 12 10 20 0 0 f f f f t t v s 0 0 2249 "" "{25,20,1184}" "{o,o,o}" "{name,size,modification}" _null_ _null_ pg_ls_waldir _null_ _null_ _null_ ));
+ DESCR("list of files in the WAL directory");
+ 
++/* hash partitioning constraint function */
++DATA(insert OID = 5028 ( satisfies_hash_partition PGNSP PGUID 12 1 0 2276 0 f f f f f f i s 4 0 16 "26 23 23 2276" _null_ _null_ _null_ _null_ _null_ satisfies_hash_partition _null_ _null_ _null_ ));
++DESCR("hash partition CHECK constraint");
++
+ /*
+  * Symbolic values for provolatile column: these indicate whether the result
+  * of a function is dependent *only* on the values of its explicit arguments,
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index a240c271db75..34d6afc80f46 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -777,12 +777,14 @@ typedef struct PartitionElem
+ typedef struct PartitionSpec
+ {
+ 	NodeTag		type;
+-	char	   *strategy;		/* partitioning strategy ('list' or 'range') */
++	char	   *strategy;		/* partitioning strategy ('hash', 'list' or
++								 * 'range') */
+ 	List	   *partParams;		/* List of PartitionElems */
+ 	int			location;		/* token location, or -1 if unknown */
+ } PartitionSpec;
+ 
+ /* Internal codes for partitioning strategies */
++#define PARTITION_STRATEGY_HASH		'h'
+ #define PARTITION_STRATEGY_LIST		'l'
+ #define PARTITION_STRATEGY_RANGE	'r'
+ 
+@@ -799,6 +801,10 @@ typedef struct PartitionBoundSpec
+ 	char		strategy;		/* see PARTITION_STRATEGY codes above */
+ 	bool		is_default;		/* is it a default partition bound? */
+ 
++	/* Partitioning info for HASH strategy: */
++	int			modulus;
++	int			remainder;
++
+ 	/* Partitioning info for LIST strategy: */
+ 	List	   *listdatums;		/* List of Consts (or A_Consts in raw tree) */
+ 
+diff --git a/src/test/regress/expected/alter_table.out b/src/test/regress/expected/alter_table.out
+index ee1f10c8e0a3..11f0baa11b0e 100644
+--- a/src/test/regress/expected/alter_table.out
++++ b/src/test/regress/expected/alter_table.out
+@@ -3399,6 +3399,7 @@ SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_1'::reg
+ CREATE TABLE fail_part (LIKE part_1 INCLUDING CONSTRAINTS);
+ ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES IN (1);
+ ERROR:  partition "fail_part" would overlap partition "part_1"
++DROP TABLE fail_part;
+ -- check that an existing table can be attached as a default partition
+ CREATE TABLE def_part (LIKE list_parted INCLUDING CONSTRAINTS);
+ ALTER TABLE list_parted ATTACH PARTITION def_part DEFAULT;
+@@ -3596,6 +3597,59 @@ CREATE TABLE quuux1 PARTITION OF quuux FOR VALUES IN (1);
+ CREATE TABLE quuux2 PARTITION OF quuux FOR VALUES IN (2);
+ INFO:  updated partition constraint for default partition "quuux_default1" is implied by existing constraints
+ DROP TABLE quuux;
++-- check validation when attaching hash partitions
++-- The default hash functions as they exist today aren't portable; they can
++-- return different results on different machines.  Depending upon how the
++-- values are hashed, the row may map to different partitions, which result in
++-- regression failure.  To avoid this, let's create a non-default hash function
++-- that just returns the input value unchanged.
++CREATE OR REPLACE FUNCTION dummy_hashint4(a int4, seed int8) RETURNS int8 AS
++$$ BEGIN RETURN (a + 1 + seed); END; $$ LANGUAGE 'plpgsql' IMMUTABLE;
++CREATE OPERATOR CLASS custom_opclass FOR TYPE int4 USING HASH AS
++OPERATOR 1 = , FUNCTION 2 dummy_hashint4(int4, int8);
++-- check that the new partition won't overlap with an existing partition
++CREATE TABLE hash_parted (
++	a int,
++	b int
++) PARTITION BY HASH (a custom_opclass);
++CREATE TABLE hpart_1 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 4, REMAINDER 0);
++CREATE TABLE fail_part (LIKE hpart_1);
++ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 8, REMAINDER 4);
++ERROR:  partition "fail_part" would overlap partition "hpart_1"
++ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 8, REMAINDER 0);
++ERROR:  partition "fail_part" would overlap partition "hpart_1"
++DROP TABLE fail_part;
++-- check validation when attaching hash partitions
++-- check that violating rows are correctly reported
++CREATE TABLE hpart_2 (LIKE hash_parted);
++INSERT INTO hpart_2 VALUES (3, 0);
++ALTER TABLE hash_parted ATTACH PARTITION hpart_2 FOR VALUES WITH (MODULUS 4, REMAINDER 1);
++ERROR:  partition constraint is violated by some row
++-- should be ok after deleting the bad row
++DELETE FROM hpart_2;
++ALTER TABLE hash_parted ATTACH PARTITION hpart_2 FOR VALUES WITH (MODULUS 4, REMAINDER 1);
++-- check that leaf partitions are scanned when attaching a partitioned
++-- table
++CREATE TABLE hpart_5 (
++	LIKE hash_parted
++) PARTITION BY LIST (b);
++-- check that violating rows are correctly reported
++CREATE TABLE hpart_5_a PARTITION OF hpart_5 FOR VALUES IN ('1', '2', '3');
++INSERT INTO hpart_5_a (a, b) VALUES (7, 1);
++ALTER TABLE hash_parted ATTACH PARTITION hpart_5 FOR VALUES WITH (MODULUS 4, REMAINDER 2);
++ERROR:  partition constraint is violated by some row
++-- should be ok after deleting the bad row
++DELETE FROM hpart_5_a;
++ALTER TABLE hash_parted ATTACH PARTITION hpart_5 FOR VALUES WITH (MODULUS 4, REMAINDER 2);
++-- check that the table being attach is with valid modulus and remainder value
++CREATE TABLE fail_part(LIKE hash_parted);
++ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 0, REMAINDER 1);
++ERROR:  modulus for hash partition must be a positive integer
++ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 8, REMAINDER 8);
++ERROR:  remainder for hash partition must be less than modulus
++ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 3, REMAINDER 2);
++ERROR:  every hash partition modulus must be a factor of the next larger modulus
++DROP TABLE fail_part;
+ --
+ -- DETACH PARTITION
+ --
+@@ -3607,12 +3661,17 @@ DROP TABLE regular_table;
+ -- check that the partition being detached exists at all
+ ALTER TABLE list_parted2 DETACH PARTITION part_4;
+ ERROR:  relation "part_4" does not exist
++ALTER TABLE hash_parted DETACH PARTITION hpart_4;
++ERROR:  relation "hpart_4" does not exist
+ -- check that the partition being detached is actually a partition of the parent
+ CREATE TABLE not_a_part (a int);
+ ALTER TABLE list_parted2 DETACH PARTITION not_a_part;
+ ERROR:  relation "not_a_part" is not a partition of relation "list_parted2"
+ ALTER TABLE list_parted2 DETACH PARTITION part_1;
+ ERROR:  relation "part_1" is not a partition of relation "list_parted2"
++ALTER TABLE hash_parted DETACH PARTITION not_a_part;
++ERROR:  relation "not_a_part" is not a partition of relation "hash_parted"
++DROP TABLE not_a_part;
+ -- check that, after being detached, attinhcount/coninhcount is dropped to 0 and
+ -- attislocal/conislocal is set to true
+ ALTER TABLE list_parted2 DETACH PARTITION part_3_4;
+@@ -3716,6 +3775,9 @@ SELECT * FROM list_parted;
+ -- cleanup
+ DROP TABLE list_parted, list_parted2, range_parted;
+ DROP TABLE fail_def_part;
++DROP TABLE hash_parted;
++DROP OPERATOR CLASS custom_opclass USING HASH;
++DROP FUNCTION dummy_hashint4(a int4, seed int8);
+ -- more tests for certain multi-level partitioning scenarios
+ create table p (a int, b int) partition by range (a, b);
+ create table p1 (b int, a int not null) partition by range (b);
+diff --git a/src/test/regress/expected/create_table.out b/src/test/regress/expected/create_table.out
+index 60ab28a96ad4..335cd37e1846 100644
+--- a/src/test/regress/expected/create_table.out
++++ b/src/test/regress/expected/create_table.out
+@@ -340,11 +340,11 @@ CREATE TABLE partitioned (
+ ) PARTITION BY RANGE (const_func());
+ ERROR:  cannot use constant expression as partition key
+ DROP FUNCTION const_func();
+--- only accept "list" and "range" as partitioning strategy
++-- only accept valid partitioning strategy
+ CREATE TABLE partitioned (
+-	a int
+-) PARTITION BY HASH (a);
+-ERROR:  unrecognized partitioning strategy "hash"
++    a int
++) PARTITION BY MAGIC (a);
++ERROR:  unrecognized partitioning strategy "magic"
+ -- specified column must be present in the table
+ CREATE TABLE partitioned (
+ 	a int
+@@ -467,6 +467,11 @@ CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES FROM (1) TO (2);
+ ERROR:  invalid bound specification for a list partition
+ LINE 1: ...BLE fail_part PARTITION OF list_parted FOR VALUES FROM (1) T...
+                                                              ^
++-- trying to specify modulus and remainder for list partitioned table
++CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES WITH (MODULUS 10, REMAINDER 1);
++ERROR:  invalid bound specification for a list partition
++LINE 1: ...BLE fail_part PARTITION OF list_parted FOR VALUES WITH (MODU...
++                                                             ^
+ -- check default partition cannot be created more than once
+ CREATE TABLE part_default PARTITION OF list_parted DEFAULT;
+ CREATE TABLE fail_default_part PARTITION OF list_parted DEFAULT;
+@@ -509,6 +514,11 @@ CREATE TABLE fail_part PARTITION OF range_parted FOR VALUES IN ('a');
+ ERROR:  invalid bound specification for a range partition
+ LINE 1: ...BLE fail_part PARTITION OF range_parted FOR VALUES IN ('a');
+                                                               ^
++-- trying to specify modulus and remainder for range partitioned table
++CREATE TABLE fail_part PARTITION OF range_parted FOR VALUES WITH (MODULUS 10, REMAINDER 1);
++ERROR:  invalid bound specification for a range partition
++LINE 1: ...LE fail_part PARTITION OF range_parted FOR VALUES WITH (MODU...
++                                                             ^
+ -- each of start and end bounds must have same number of values as the
+ -- length of the partition key
+ CREATE TABLE fail_part PARTITION OF range_parted FOR VALUES FROM ('a', 1) TO ('z');
+@@ -518,6 +528,37 @@ ERROR:  TO must specify exactly one value per partitioning column
+ -- cannot specify null values in range bounds
+ CREATE TABLE fail_part PARTITION OF range_parted FOR VALUES FROM (null) TO (maxvalue);
+ ERROR:  cannot specify NULL in range bound
++-- trying to specify modulus and remainder for range partitioned table
++CREATE TABLE fail_part PARTITION OF range_parted FOR VALUES WITH (MODULUS 10, REMAINDER 1);
++ERROR:  invalid bound specification for a range partition
++LINE 1: ...LE fail_part PARTITION OF range_parted FOR VALUES WITH (MODU...
++                                                             ^
++-- check partition bound syntax for the hash partition
++CREATE TABLE hash_parted (
++	a int
++) PARTITION BY HASH (a);
++CREATE TABLE hpart_1 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 10, REMAINDER 0);
++CREATE TABLE hpart_2 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 50, REMAINDER 1);
++CREATE TABLE hpart_3 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 200, REMAINDER 2);
++-- modulus 25 is factor of modulus of 50 but 10 is not factor of 25.
++CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES WITH (MODULUS 25, REMAINDER 3);
++ERROR:  every hash partition modulus must be a factor of the next larger modulus
++-- previous modulus 50 is factor of 150 but this modulus is not factor of next modulus 200.
++CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES WITH (MODULUS 150, REMAINDER 3);
++ERROR:  every hash partition modulus must be a factor of the next larger modulus
++-- trying to specify range for the hash partitioned table
++CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES FROM ('a', 1) TO ('z');
++ERROR:  invalid bound specification for a hash partition
++LINE 1: ...BLE fail_part PARTITION OF hash_parted FOR VALUES FROM ('a',...
++                                                             ^
++-- trying to specify list value for the hash partitioned table
++CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES IN (1000);
++ERROR:  invalid bound specification for a hash partition
++LINE 1: ...BLE fail_part PARTITION OF hash_parted FOR VALUES IN (1000);
++                                                             ^
++-- trying to create default partition for the hash partitioned table
++CREATE TABLE fail_default_part PARTITION OF hash_parted DEFAULT;
++ERROR:  a hash-partitioned table may not have a default partition
+ -- check if compatible with the specified parent
+ -- cannot create as partition of a non-partitioned table
+ CREATE TABLE unparted (
+@@ -525,6 +566,8 @@ CREATE TABLE unparted (
+ );
+ CREATE TABLE fail_part PARTITION OF unparted FOR VALUES IN ('a');
+ ERROR:  "unparted" is not partitioned
++CREATE TABLE fail_part PARTITION OF unparted FOR VALUES WITH (MODULUS 2, REMAINDER 1);
++ERROR:  "unparted" is not partitioned
+ DROP TABLE unparted;
+ -- cannot create a permanent rel as partition of a temp rel
+ CREATE TEMP TABLE temp_parted (
+@@ -623,6 +666,23 @@ CREATE TABLE range3_default PARTITION OF range_parted3 DEFAULT;
+ -- more specific ranges
+ CREATE TABLE fail_part PARTITION OF range_parted3 FOR VALUES FROM (1, minvalue) TO (1, maxvalue);
+ ERROR:  partition "fail_part" would overlap partition "part10"
++-- check for partition bound overlap and other invalid specifications for the hash partition
++CREATE TABLE hash_parted2 (
++	a varchar
++) PARTITION BY HASH (a);
++CREATE TABLE h2part_1 PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 4, REMAINDER 2);
++CREATE TABLE h2part_2 PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 8, REMAINDER 0);
++CREATE TABLE h2part_3 PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 8, REMAINDER 4);
++CREATE TABLE h2part_4 PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 8, REMAINDER 5);
++-- overlap with part_4
++CREATE TABLE fail_part PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 2, REMAINDER 1);
++ERROR:  partition "fail_part" would overlap partition "h2part_4"
++-- modulus must be greater than zero
++CREATE TABLE fail_part PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 0, REMAINDER 1);
++ERROR:  modulus for hash partition must be a positive integer
++-- remainder must be greater than or equal to zero and less than modulus
++CREATE TABLE fail_part PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 8, REMAINDER 8);
++ERROR:  remainder for hash partition must be less than modulus
+ -- check schema propagation from parent
+ CREATE TABLE parted (
+ 	a text,
+@@ -721,6 +781,14 @@ Check constraints:
+     "check_a" CHECK (length(a) > 0)
+ Number of partitions: 3 (Use \d+ to list them.)
+ 
++\d hash_parted
++            Table "public.hash_parted"
++ Column |  Type   | Collation | Nullable | Default 
++--------+---------+-----------+----------+---------
++ a      | integer |           |          | 
++Partition key: HASH (a)
++Number of partitions: 3 (Use \d+ to list them.)
++
+ -- check that we get the expected partition constraints
+ CREATE TABLE range_parted4 (a int, b int, c int) PARTITION BY RANGE (abs(a), abs(b), c);
+ CREATE TABLE unbounded_range_part PARTITION OF range_parted4 FOR VALUES FROM (MINVALUE, MINVALUE, MINVALUE) TO (MAXVALUE, MAXVALUE, MAXVALUE);
+@@ -771,6 +839,8 @@ Partition constraint: ((abs(a) IS NOT NULL) AND (abs(b) IS NOT NULL) AND (c IS N
+ DROP TABLE range_parted4;
+ -- cleanup
+ DROP TABLE parted, list_parted, range_parted, list_parted2, range_parted2, range_parted3;
++DROP TABLE hash_parted;
++DROP TABLE hash_parted2;
+ -- comments on partitioned tables columns
+ CREATE TABLE parted_col_comment (a int, b text) PARTITION BY LIST (a);
+ COMMENT ON TABLE parted_col_comment IS 'Am partitioned table';
+diff --git a/src/test/regress/expected/insert.out b/src/test/regress/expected/insert.out
+index b715619313a0..9d84ba46583a 100644
+--- a/src/test/regress/expected/insert.out
++++ b/src/test/regress/expected/insert.out
+@@ -382,8 +382,54 @@ select tableoid::regclass::text, a, min(b) as min_b, max(b) as max_b from list_p
+  part_null     |    |     1 |     1
+ (9 rows)
+ 
++-- direct partition inserts should check hash partition bound constraint
++-- create custom operator class and hash function, for the same reason
++-- explained in alter_table.sql
++create or replace function dummy_hashint4(a int4, seed int8) returns int8 as
++$$ begin return (a + seed); end; $$ language 'plpgsql' immutable;
++create operator class custom_opclass for type int4 using hash as
++operator 1 = , function 2 dummy_hashint4(int4, int8);
++create table hash_parted (
++	a int
++) partition by hash (a custom_opclass);
++create table hpart0 partition of hash_parted for values with (modulus 4, remainder 0);
++create table hpart1 partition of hash_parted for values with (modulus 4, remainder 1);
++create table hpart2 partition of hash_parted for values with (modulus 4, remainder 2);
++create table hpart3 partition of hash_parted for values with (modulus 4, remainder 3);
++insert into hash_parted values(generate_series(1,10));
++-- direct insert of values divisible by 4 - ok;
++insert into hpart0 values(12),(16);
++-- fail;
++insert into hpart0 values(11);
++ERROR:  new row for relation "hpart0" violates partition constraint
++DETAIL:  Failing row contains (11).
++-- 11 % 4 -> 3 remainder i.e. valid data for hpart3 partition
++insert into hpart3 values(11);
++-- view data
++select tableoid::regclass as part, a, a%4 as "remainder = a % 4"
++from hash_parted order by part;
++  part  | a  | remainder = a % 4 
++--------+----+-------------------
++ hpart0 |  4 |                 0
++ hpart0 |  8 |                 0
++ hpart0 | 12 |                 0
++ hpart0 | 16 |                 0
++ hpart1 |  1 |                 1
++ hpart1 |  5 |                 1
++ hpart1 |  9 |                 1
++ hpart2 |  2 |                 2
++ hpart2 |  6 |                 2
++ hpart2 | 10 |                 2
++ hpart3 |  3 |                 3
++ hpart3 |  7 |                 3
++ hpart3 | 11 |                 3
++(13 rows)
++
+ -- cleanup
+ drop table range_parted, list_parted;
++drop table hash_parted;
++drop operator class custom_opclass using hash;
++drop function dummy_hashint4(a int4, seed int8);
+ -- test that a default partition added as the first partition accepts any value
+ -- including null
+ create table list_parted (a int) partition by list (a);
+diff --git a/src/test/regress/expected/partition_join.out b/src/test/regress/expected/partition_join.out
+index adf6aedfa66c..27ab8521f845 100644
+--- a/src/test/regress/expected/partition_join.out
++++ b/src/test/regress/expected/partition_join.out
+@@ -1256,6 +1256,87 @@ SELECT t1.a, t1.c, t2.b, t2.c FROM (SELECT * FROM prt1 WHERE a = 1 AND a = 2) t1
+                      One-Time Filter: false
+ (14 rows)
+ 
++--
++-- tests for hash partitioned tables.
++--
++CREATE TABLE pht1 (a int, b int, c text) PARTITION BY HASH(c);
++CREATE TABLE pht1_p1 PARTITION OF pht1 FOR VALUES WITH (MODULUS 3, REMAINDER 0);
++CREATE TABLE pht1_p2 PARTITION OF pht1 FOR VALUES WITH (MODULUS 3, REMAINDER 1);
++CREATE TABLE pht1_p3 PARTITION OF pht1 FOR VALUES WITH (MODULUS 3, REMAINDER 2);
++INSERT INTO pht1 SELECT i, i, to_char(i/50, 'FM0000') FROM generate_series(0, 599, 2) i;
++ANALYZE pht1;
++CREATE TABLE pht2 (a int, b int, c text) PARTITION BY HASH(c);
++CREATE TABLE pht2_p1 PARTITION OF pht2 FOR VALUES WITH (MODULUS 3, REMAINDER 0);
++CREATE TABLE pht2_p2 PARTITION OF pht2 FOR VALUES WITH (MODULUS 3, REMAINDER 1);
++CREATE TABLE pht2_p3 PARTITION OF pht2 FOR VALUES WITH (MODULUS 3, REMAINDER 2);
++INSERT INTO pht2 SELECT i, i, to_char(i/50, 'FM0000') FROM generate_series(0, 599, 3) i;
++ANALYZE pht2;
++--
++-- hash partitioned by expression
++--
++CREATE TABLE pht1_e (a int, b int, c text) PARTITION BY HASH(ltrim(c, 'A'));
++CREATE TABLE pht1_e_p1 PARTITION OF pht1_e FOR VALUES WITH (MODULUS 3, REMAINDER 0);
++CREATE TABLE pht1_e_p2 PARTITION OF pht1_e FOR VALUES WITH (MODULUS 3, REMAINDER 1);
++CREATE TABLE pht1_e_p3 PARTITION OF pht1_e FOR VALUES WITH (MODULUS 3, REMAINDER 2);
++INSERT INTO pht1_e SELECT i, i, 'A' || to_char(i/50, 'FM0000') FROM generate_series(0, 599, 2) i;
++ANALYZE pht1_e;
++-- test partition matching with N-way join
++EXPLAIN (COSTS OFF)
++SELECT avg(t1.a), avg(t2.b), avg(t3.a + t3.b), t1.c, t2.c, t3.c FROM pht1 t1, pht2 t2, pht1_e t3 WHERE t1.c = t2.c AND ltrim(t3.c, 'A') = t1.c GROUP BY t1.c, t2.c, t3.c ORDER BY t1.c, t2.c, t3.c;
++                                      QUERY PLAN                                      
++--------------------------------------------------------------------------------------
++ Sort
++   Sort Key: t1.c, t3.c
++   ->  HashAggregate
++         Group Key: t1.c, t2.c, t3.c
++         ->  Result
++               ->  Append
++                     ->  Hash Join
++                           Hash Cond: (t1.c = t2.c)
++                           ->  Seq Scan on pht1_p1 t1
++                           ->  Hash
++                                 ->  Hash Join
++                                       Hash Cond: (t2.c = ltrim(t3.c, 'A'::text))
++                                       ->  Seq Scan on pht2_p1 t2
++                                       ->  Hash
++                                             ->  Seq Scan on pht1_e_p1 t3
++                     ->  Hash Join
++                           Hash Cond: (t1_1.c = t2_1.c)
++                           ->  Seq Scan on pht1_p2 t1_1
++                           ->  Hash
++                                 ->  Hash Join
++                                       Hash Cond: (t2_1.c = ltrim(t3_1.c, 'A'::text))
++                                       ->  Seq Scan on pht2_p2 t2_1
++                                       ->  Hash
++                                             ->  Seq Scan on pht1_e_p2 t3_1
++                     ->  Hash Join
++                           Hash Cond: (t1_2.c = t2_2.c)
++                           ->  Seq Scan on pht1_p3 t1_2
++                           ->  Hash
++                                 ->  Hash Join
++                                       Hash Cond: (t2_2.c = ltrim(t3_2.c, 'A'::text))
++                                       ->  Seq Scan on pht2_p3 t2_2
++                                       ->  Hash
++                                             ->  Seq Scan on pht1_e_p3 t3_2
++(33 rows)
++
++SELECT avg(t1.a), avg(t2.b), avg(t3.a + t3.b), t1.c, t2.c, t3.c FROM pht1 t1, pht2 t2, pht1_e t3 WHERE t1.c = t2.c AND ltrim(t3.c, 'A') = t1.c GROUP BY t1.c, t2.c, t3.c ORDER BY t1.c, t2.c, t3.c;
++         avg          |         avg          |          avg          |  c   |  c   |   c   
++----------------------+----------------------+-----------------------+------+------+-------
++  24.0000000000000000 |  24.0000000000000000 |   48.0000000000000000 | 0000 | 0000 | A0000
++  74.0000000000000000 |  75.0000000000000000 |  148.0000000000000000 | 0001 | 0001 | A0001
++ 124.0000000000000000 | 124.5000000000000000 |  248.0000000000000000 | 0002 | 0002 | A0002
++ 174.0000000000000000 | 174.0000000000000000 |  348.0000000000000000 | 0003 | 0003 | A0003
++ 224.0000000000000000 | 225.0000000000000000 |  448.0000000000000000 | 0004 | 0004 | A0004
++ 274.0000000000000000 | 274.5000000000000000 |  548.0000000000000000 | 0005 | 0005 | A0005
++ 324.0000000000000000 | 324.0000000000000000 |  648.0000000000000000 | 0006 | 0006 | A0006
++ 374.0000000000000000 | 375.0000000000000000 |  748.0000000000000000 | 0007 | 0007 | A0007
++ 424.0000000000000000 | 424.5000000000000000 |  848.0000000000000000 | 0008 | 0008 | A0008
++ 474.0000000000000000 | 474.0000000000000000 |  948.0000000000000000 | 0009 | 0009 | A0009
++ 524.0000000000000000 | 525.0000000000000000 | 1048.0000000000000000 | 0010 | 0010 | A0010
++ 574.0000000000000000 | 574.5000000000000000 | 1148.0000000000000000 | 0011 | 0011 | A0011
++(12 rows)
++
+ --
+ -- multiple levels of partitioning
+ --
+diff --git a/src/test/regress/expected/update.out b/src/test/regress/expected/update.out
+index cef70b1a1e1f..a4fe96112ed2 100644
+--- a/src/test/regress/expected/update.out
++++ b/src/test/regress/expected/update.out
+@@ -250,6 +250,35 @@ ERROR:  new row for relation "list_default" violates partition constraint
+ DETAIL:  Failing row contains (a, 10).
+ -- ok
+ update list_default set a = 'x' where a = 'd';
++-- create custom operator class and hash function, for the same reason
++-- explained in alter_table.sql
++create or replace function dummy_hashint4(a int4, seed int8) returns int8 as
++$$ begin return (a + seed); end; $$ language 'plpgsql' immutable;
++create operator class custom_opclass for type int4 using hash as
++operator 1 = , function 2 dummy_hashint4(int4, int8);
++create table hash_parted (
++	a int,
++	b int
++) partition by hash (a custom_opclass, b custom_opclass);
++create table hpart1 partition of hash_parted for values with (modulus 2, remainder 1);
++create table hpart2 partition of hash_parted for values with (modulus 4, remainder 2);
++create table hpart3 partition of hash_parted for values with (modulus 8, remainder 0);
++create table hpart4 partition of hash_parted for values with (modulus 8, remainder 4);
++insert into hpart1 values (1, 1);
++insert into hpart2 values (2, 5);
++insert into hpart4 values (3, 4);
++-- fail
++update hpart1 set a = 3, b=4 where a = 1;
++ERROR:  new row for relation "hpart1" violates partition constraint
++DETAIL:  Failing row contains (3, 4).
++update hash_parted set b = b - 1 where b = 1;
++ERROR:  new row for relation "hpart1" violates partition constraint
++DETAIL:  Failing row contains (1, 0).
++-- ok
++update hash_parted set b = b + 8 where b = 1;
+ -- cleanup
+ drop table range_parted;
+ drop table list_parted;
++drop table hash_parted;
++drop operator class custom_opclass using hash;
++drop function dummy_hashint4(a int4, seed int8);
+diff --git a/src/test/regress/sql/alter_table.sql b/src/test/regress/sql/alter_table.sql
+index 4ae4c2eceea3..02a33ca7c400 100644
+--- a/src/test/regress/sql/alter_table.sql
++++ b/src/test/regress/sql/alter_table.sql
+@@ -2139,6 +2139,7 @@ SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_1'::reg
+ -- check that the new partition won't overlap with an existing partition
+ CREATE TABLE fail_part (LIKE part_1 INCLUDING CONSTRAINTS);
+ ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES IN (1);
++DROP TABLE fail_part;
+ -- check that an existing table can be attached as a default partition
+ CREATE TABLE def_part (LIKE list_parted INCLUDING CONSTRAINTS);
+ ALTER TABLE list_parted ATTACH PARTITION def_part DEFAULT;
+@@ -2332,6 +2333,62 @@ CREATE TABLE quuux1 PARTITION OF quuux FOR VALUES IN (1);
+ CREATE TABLE quuux2 PARTITION OF quuux FOR VALUES IN (2);
+ DROP TABLE quuux;
+ 
++-- check validation when attaching hash partitions
++
++-- The default hash functions as they exist today aren't portable; they can
++-- return different results on different machines.  Depending upon how the
++-- values are hashed, the row may map to different partitions, which result in
++-- regression failure.  To avoid this, let's create a non-default hash function
++-- that just returns the input value unchanged.
++CREATE OR REPLACE FUNCTION dummy_hashint4(a int4, seed int8) RETURNS int8 AS
++$$ BEGIN RETURN (a + 1 + seed); END; $$ LANGUAGE 'plpgsql' IMMUTABLE;
++CREATE OPERATOR CLASS custom_opclass FOR TYPE int4 USING HASH AS
++OPERATOR 1 = , FUNCTION 2 dummy_hashint4(int4, int8);
++
++-- check that the new partition won't overlap with an existing partition
++CREATE TABLE hash_parted (
++	a int,
++	b int
++) PARTITION BY HASH (a custom_opclass);
++CREATE TABLE hpart_1 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 4, REMAINDER 0);
++CREATE TABLE fail_part (LIKE hpart_1);
++ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 8, REMAINDER 4);
++ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 8, REMAINDER 0);
++DROP TABLE fail_part;
++
++-- check validation when attaching hash partitions
++
++-- check that violating rows are correctly reported
++CREATE TABLE hpart_2 (LIKE hash_parted);
++INSERT INTO hpart_2 VALUES (3, 0);
++ALTER TABLE hash_parted ATTACH PARTITION hpart_2 FOR VALUES WITH (MODULUS 4, REMAINDER 1);
++
++-- should be ok after deleting the bad row
++DELETE FROM hpart_2;
++ALTER TABLE hash_parted ATTACH PARTITION hpart_2 FOR VALUES WITH (MODULUS 4, REMAINDER 1);
++
++-- check that leaf partitions are scanned when attaching a partitioned
++-- table
++CREATE TABLE hpart_5 (
++	LIKE hash_parted
++) PARTITION BY LIST (b);
++
++-- check that violating rows are correctly reported
++CREATE TABLE hpart_5_a PARTITION OF hpart_5 FOR VALUES IN ('1', '2', '3');
++INSERT INTO hpart_5_a (a, b) VALUES (7, 1);
++ALTER TABLE hash_parted ATTACH PARTITION hpart_5 FOR VALUES WITH (MODULUS 4, REMAINDER 2);
++
++-- should be ok after deleting the bad row
++DELETE FROM hpart_5_a;
++ALTER TABLE hash_parted ATTACH PARTITION hpart_5 FOR VALUES WITH (MODULUS 4, REMAINDER 2);
++
++-- check that the table being attach is with valid modulus and remainder value
++CREATE TABLE fail_part(LIKE hash_parted);
++ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 0, REMAINDER 1);
++ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 8, REMAINDER 8);
++ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 3, REMAINDER 2);
++DROP TABLE fail_part;
++
+ --
+ -- DETACH PARTITION
+ --
+@@ -2343,12 +2400,16 @@ DROP TABLE regular_table;
+ 
+ -- check that the partition being detached exists at all
+ ALTER TABLE list_parted2 DETACH PARTITION part_4;
++ALTER TABLE hash_parted DETACH PARTITION hpart_4;
+ 
+ -- check that the partition being detached is actually a partition of the parent
+ CREATE TABLE not_a_part (a int);
+ ALTER TABLE list_parted2 DETACH PARTITION not_a_part;
+ ALTER TABLE list_parted2 DETACH PARTITION part_1;
+ 
++ALTER TABLE hash_parted DETACH PARTITION not_a_part;
++DROP TABLE not_a_part;
++
+ -- check that, after being detached, attinhcount/coninhcount is dropped to 0 and
+ -- attislocal/conislocal is set to true
+ ALTER TABLE list_parted2 DETACH PARTITION part_3_4;
+@@ -2425,6 +2486,9 @@ SELECT * FROM list_parted;
+ -- cleanup
+ DROP TABLE list_parted, list_parted2, range_parted;
+ DROP TABLE fail_def_part;
++DROP TABLE hash_parted;
++DROP OPERATOR CLASS custom_opclass USING HASH;
++DROP FUNCTION dummy_hashint4(a int4, seed int8);
+ 
+ -- more tests for certain multi-level partitioning scenarios
+ create table p (a int, b int) partition by range (a, b);
+diff --git a/src/test/regress/sql/create_table.sql b/src/test/regress/sql/create_table.sql
+index df6a6d732678..b77b4764365b 100644
+--- a/src/test/regress/sql/create_table.sql
++++ b/src/test/regress/sql/create_table.sql
+@@ -350,10 +350,10 @@ CREATE TABLE partitioned (
+ ) PARTITION BY RANGE (const_func());
+ DROP FUNCTION const_func();
+ 
+--- only accept "list" and "range" as partitioning strategy
++-- only accept valid partitioning strategy
+ CREATE TABLE partitioned (
+-	a int
+-) PARTITION BY HASH (a);
++    a int
++) PARTITION BY MAGIC (a);
+ 
+ -- specified column must be present in the table
+ CREATE TABLE partitioned (
+@@ -446,6 +446,8 @@ CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES IN ('1'::int);
+ CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES IN ();
+ -- trying to specify range for list partitioned table
+ CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES FROM (1) TO (2);
++-- trying to specify modulus and remainder for list partitioned table
++CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES WITH (MODULUS 10, REMAINDER 1);
+ 
+ -- check default partition cannot be created more than once
+ CREATE TABLE part_default PARTITION OF list_parted DEFAULT;
+@@ -481,6 +483,8 @@ CREATE TABLE range_parted (
+ 
+ -- trying to specify list for range partitioned table
+ CREATE TABLE fail_part PARTITION OF range_parted FOR VALUES IN ('a');
++-- trying to specify modulus and remainder for range partitioned table
++CREATE TABLE fail_part PARTITION OF range_parted FOR VALUES WITH (MODULUS 10, REMAINDER 1);
+ -- each of start and end bounds must have same number of values as the
+ -- length of the partition key
+ CREATE TABLE fail_part PARTITION OF range_parted FOR VALUES FROM ('a', 1) TO ('z');
+@@ -489,6 +493,28 @@ CREATE TABLE fail_part PARTITION OF range_parted FOR VALUES FROM ('a') TO ('z',
+ -- cannot specify null values in range bounds
+ CREATE TABLE fail_part PARTITION OF range_parted FOR VALUES FROM (null) TO (maxvalue);
+ 
++-- trying to specify modulus and remainder for range partitioned table
++CREATE TABLE fail_part PARTITION OF range_parted FOR VALUES WITH (MODULUS 10, REMAINDER 1);
++
++-- check partition bound syntax for the hash partition
++CREATE TABLE hash_parted (
++	a int
++) PARTITION BY HASH (a);
++CREATE TABLE hpart_1 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 10, REMAINDER 0);
++CREATE TABLE hpart_2 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 50, REMAINDER 1);
++CREATE TABLE hpart_3 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 200, REMAINDER 2);
++-- modulus 25 is factor of modulus of 50 but 10 is not factor of 25.
++CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES WITH (MODULUS 25, REMAINDER 3);
++-- previous modulus 50 is factor of 150 but this modulus is not factor of next modulus 200.
++CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES WITH (MODULUS 150, REMAINDER 3);
++-- trying to specify range for the hash partitioned table
++CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES FROM ('a', 1) TO ('z');
++-- trying to specify list value for the hash partitioned table
++CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES IN (1000);
++
++-- trying to create default partition for the hash partitioned table
++CREATE TABLE fail_default_part PARTITION OF hash_parted DEFAULT;
++
+ -- check if compatible with the specified parent
+ 
+ -- cannot create as partition of a non-partitioned table
+@@ -496,6 +522,7 @@ CREATE TABLE unparted (
+ 	a int
+ );
+ CREATE TABLE fail_part PARTITION OF unparted FOR VALUES IN ('a');
++CREATE TABLE fail_part PARTITION OF unparted FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+ DROP TABLE unparted;
+ 
+ -- cannot create a permanent rel as partition of a temp rel
+@@ -585,6 +612,21 @@ CREATE TABLE range3_default PARTITION OF range_parted3 DEFAULT;
+ -- more specific ranges
+ CREATE TABLE fail_part PARTITION OF range_parted3 FOR VALUES FROM (1, minvalue) TO (1, maxvalue);
+ 
++-- check for partition bound overlap and other invalid specifications for the hash partition
++CREATE TABLE hash_parted2 (
++	a varchar
++) PARTITION BY HASH (a);
++CREATE TABLE h2part_1 PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 4, REMAINDER 2);
++CREATE TABLE h2part_2 PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 8, REMAINDER 0);
++CREATE TABLE h2part_3 PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 8, REMAINDER 4);
++CREATE TABLE h2part_4 PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 8, REMAINDER 5);
++-- overlap with part_4
++CREATE TABLE fail_part PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 2, REMAINDER 1);
++-- modulus must be greater than zero
++CREATE TABLE fail_part PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 0, REMAINDER 1);
++-- remainder must be greater than or equal to zero and less than modulus
++CREATE TABLE fail_part PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 8, REMAINDER 8);
++
+ -- check schema propagation from parent
+ 
+ CREATE TABLE parted (
+@@ -638,6 +680,7 @@ CREATE TABLE part_c_1_10 PARTITION OF part_c FOR VALUES FROM (1) TO (10);
+ -- output could vary depending on the order in which partition oids are
+ -- returned.
+ \d parted
++\d hash_parted
+ 
+ -- check that we get the expected partition constraints
+ CREATE TABLE range_parted4 (a int, b int, c int) PARTITION BY RANGE (abs(a), abs(b), c);
+@@ -654,6 +697,8 @@ DROP TABLE range_parted4;
+ 
+ -- cleanup
+ DROP TABLE parted, list_parted, range_parted, list_parted2, range_parted2, range_parted3;
++DROP TABLE hash_parted;
++DROP TABLE hash_parted2;
+ 
+ -- comments on partitioned tables columns
+ CREATE TABLE parted_col_comment (a int, b text) PARTITION BY LIST (a);
+diff --git a/src/test/regress/sql/insert.sql b/src/test/regress/sql/insert.sql
+index d74151441413..791817ba5073 100644
+--- a/src/test/regress/sql/insert.sql
++++ b/src/test/regress/sql/insert.sql
+@@ -222,8 +222,41 @@ insert into list_parted select 'gg', s.a from generate_series(1, 9) s(a);
+ insert into list_parted (b) values (1);
+ select tableoid::regclass::text, a, min(b) as min_b, max(b) as max_b from list_parted group by 1, 2 order by 1;
+ 
++-- direct partition inserts should check hash partition bound constraint
++
++-- create custom operator class and hash function, for the same reason
++-- explained in alter_table.sql
++create or replace function dummy_hashint4(a int4, seed int8) returns int8 as
++$$ begin return (a + seed); end; $$ language 'plpgsql' immutable;
++create operator class custom_opclass for type int4 using hash as
++operator 1 = , function 2 dummy_hashint4(int4, int8);
++
++create table hash_parted (
++	a int
++) partition by hash (a custom_opclass);
++create table hpart0 partition of hash_parted for values with (modulus 4, remainder 0);
++create table hpart1 partition of hash_parted for values with (modulus 4, remainder 1);
++create table hpart2 partition of hash_parted for values with (modulus 4, remainder 2);
++create table hpart3 partition of hash_parted for values with (modulus 4, remainder 3);
++
++insert into hash_parted values(generate_series(1,10));
++
++-- direct insert of values divisible by 4 - ok;
++insert into hpart0 values(12),(16);
++-- fail;
++insert into hpart0 values(11);
++-- 11 % 4 -> 3 remainder i.e. valid data for hpart3 partition
++insert into hpart3 values(11);
++
++-- view data
++select tableoid::regclass as part, a, a%4 as "remainder = a % 4"
++from hash_parted order by part;
++
+ -- cleanup
+ drop table range_parted, list_parted;
++drop table hash_parted;
++drop operator class custom_opclass using hash;
++drop function dummy_hashint4(a int4, seed int8);
+ 
+ -- test that a default partition added as the first partition accepts any value
+ -- including null
+diff --git a/src/test/regress/sql/partition_join.sql b/src/test/regress/sql/partition_join.sql
+index 25abf2dc136c..6efdf3c51751 100644
+--- a/src/test/regress/sql/partition_join.sql
++++ b/src/test/regress/sql/partition_join.sql
+@@ -229,6 +229,38 @@ SELECT t1.a, t1.c, t2.b, t2.c FROM (SELECT * FROM prt1 WHERE a = 1 AND a = 2) t1
+ EXPLAIN (COSTS OFF)
+ SELECT t1.a, t1.c, t2.b, t2.c FROM (SELECT * FROM prt1 WHERE a = 1 AND a = 2) t1 FULL JOIN prt2 t2 ON t1.a = t2.b WHERE t2.a = 0 ORDER BY t1.a, t2.b;
+ 
++--
++-- tests for hash partitioned tables.
++--
++CREATE TABLE pht1 (a int, b int, c text) PARTITION BY HASH(c);
++CREATE TABLE pht1_p1 PARTITION OF pht1 FOR VALUES WITH (MODULUS 3, REMAINDER 0);
++CREATE TABLE pht1_p2 PARTITION OF pht1 FOR VALUES WITH (MODULUS 3, REMAINDER 1);
++CREATE TABLE pht1_p3 PARTITION OF pht1 FOR VALUES WITH (MODULUS 3, REMAINDER 2);
++INSERT INTO pht1 SELECT i, i, to_char(i/50, 'FM0000') FROM generate_series(0, 599, 2) i;
++ANALYZE pht1;
++
++CREATE TABLE pht2 (a int, b int, c text) PARTITION BY HASH(c);
++CREATE TABLE pht2_p1 PARTITION OF pht2 FOR VALUES WITH (MODULUS 3, REMAINDER 0);
++CREATE TABLE pht2_p2 PARTITION OF pht2 FOR VALUES WITH (MODULUS 3, REMAINDER 1);
++CREATE TABLE pht2_p3 PARTITION OF pht2 FOR VALUES WITH (MODULUS 3, REMAINDER 2);
++INSERT INTO pht2 SELECT i, i, to_char(i/50, 'FM0000') FROM generate_series(0, 599, 3) i;
++ANALYZE pht2;
++
++--
++-- hash partitioned by expression
++--
++CREATE TABLE pht1_e (a int, b int, c text) PARTITION BY HASH(ltrim(c, 'A'));
++CREATE TABLE pht1_e_p1 PARTITION OF pht1_e FOR VALUES WITH (MODULUS 3, REMAINDER 0);
++CREATE TABLE pht1_e_p2 PARTITION OF pht1_e FOR VALUES WITH (MODULUS 3, REMAINDER 1);
++CREATE TABLE pht1_e_p3 PARTITION OF pht1_e FOR VALUES WITH (MODULUS 3, REMAINDER 2);
++INSERT INTO pht1_e SELECT i, i, 'A' || to_char(i/50, 'FM0000') FROM generate_series(0, 599, 2) i;
++ANALYZE pht1_e;
++
++-- test partition matching with N-way join
++EXPLAIN (COSTS OFF)
++SELECT avg(t1.a), avg(t2.b), avg(t3.a + t3.b), t1.c, t2.c, t3.c FROM pht1 t1, pht2 t2, pht1_e t3 WHERE t1.c = t2.c AND ltrim(t3.c, 'A') = t1.c GROUP BY t1.c, t2.c, t3.c ORDER BY t1.c, t2.c, t3.c;
++SELECT avg(t1.a), avg(t2.b), avg(t3.a + t3.b), t1.c, t2.c, t3.c FROM pht1 t1, pht2 t2, pht1_e t3 WHERE t1.c = t2.c AND ltrim(t3.c, 'A') = t1.c GROUP BY t1.c, t2.c, t3.c ORDER BY t1.c, t2.c, t3.c;
++
+ --
+ -- multiple levels of partitioning
+ --
+diff --git a/src/test/regress/sql/update.sql b/src/test/regress/sql/update.sql
+index 66d1feca10de..0c70d64a89ac 100644
+--- a/src/test/regress/sql/update.sql
++++ b/src/test/regress/sql/update.sql
+@@ -148,6 +148,34 @@ update list_default set a = 'a' where a = 'd';
+ -- ok
+ update list_default set a = 'x' where a = 'd';
+ 
++-- create custom operator class and hash function, for the same reason
++-- explained in alter_table.sql
++create or replace function dummy_hashint4(a int4, seed int8) returns int8 as
++$$ begin return (a + seed); end; $$ language 'plpgsql' immutable;
++create operator class custom_opclass for type int4 using hash as
++operator 1 = , function 2 dummy_hashint4(int4, int8);
++
++create table hash_parted (
++	a int,
++	b int
++) partition by hash (a custom_opclass, b custom_opclass);
++create table hpart1 partition of hash_parted for values with (modulus 2, remainder 1);
++create table hpart2 partition of hash_parted for values with (modulus 4, remainder 2);
++create table hpart3 partition of hash_parted for values with (modulus 8, remainder 0);
++create table hpart4 partition of hash_parted for values with (modulus 8, remainder 4);
++insert into hpart1 values (1, 1);
++insert into hpart2 values (2, 5);
++insert into hpart4 values (3, 4);
++
++-- fail
++update hpart1 set a = 3, b=4 where a = 1;
++update hash_parted set b = b - 1 where b = 1;
++-- ok
++update hash_parted set b = b + 8 where b = 1;
++
+ -- cleanup
+ drop table range_parted;
+ drop table list_parted;
++drop table hash_parted;
++drop operator class custom_opclass using hash;
++drop function dummy_hashint4(a int4, seed int8);
+diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list
+index 7f0ae978c197..61aeb51c29d8 100644
+--- a/src/tools/pgindent/typedefs.list
++++ b/src/tools/pgindent/typedefs.list
+@@ -1565,6 +1565,7 @@ PartitionDispatch
+ PartitionDispatchData
+ PartitionElem
+ PartitionKey
++PartitionHashBound
+ PartitionListValue
+ PartitionRangeBound
+ PartitionRangeDatum

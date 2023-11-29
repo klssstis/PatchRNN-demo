@@ -1,0 +1,347 @@
+From 1d65416661bbb0b165865a521ce038ffb61b12ad Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Wed, 2 Sep 2020 09:08:12 +0900
+Subject: [PATCH] Improve handling of dropped relations for REINDEX
+ DATABASE/SCHEMA/SYSTEM
+
+When multiple relations are reindexed, a scan of pg_class is done first
+to build the list of relations to work on.  However the REINDEX logic
+has never checked if a relation listed still exists when beginning the
+work on it, causing for example sudden cache lookup failures.
+
+This commit adds safeguards against dropped relations for REINDEX,
+similarly to VACUUM or CLUSTER where we try to open the relation,
+ignoring it if it is missing.  A new option is added to the REINDEX
+routines to control if a missed relation is OK to ignore or not.
+
+An isolation test, based on REINDEX SCHEMA, is added for the concurrent
+and non-concurrent cases.
+
+Author: Michael Paquier
+Reviewed-by: Anastasia Lubennikova
+Discussion: https://postgr.es/m/20200813043805.GE11663@paquier.xyz
+---
+ src/backend/access/table/table.c              | 34 ++++++++++
+ src/backend/catalog/index.c                   | 34 ++++++++--
+ src/backend/commands/indexcmds.c              | 63 +++++++++++++++++--
+ src/include/access/table.h                    |  1 +
+ src/include/nodes/parsenodes.h                |  1 +
+ .../isolation/expected/reindex-schema.out     | 17 +++++
+ src/test/isolation/isolation_schedule         |  1 +
+ src/test/isolation/specs/reindex-schema.spec  | 32 ++++++++++
+ 8 files changed, 174 insertions(+), 9 deletions(-)
+ create mode 100644 src/test/isolation/expected/reindex-schema.out
+ create mode 100644 src/test/isolation/specs/reindex-schema.spec
+
+diff --git a/src/backend/access/table/table.c b/src/backend/access/table/table.c
+index 1aa01a54b341..7c29091e6c19 100644
+--- a/src/backend/access/table/table.c
++++ b/src/backend/access/table/table.c
+@@ -57,6 +57,40 @@ table_open(Oid relationId, LOCKMODE lockmode)
+ 	return r;
+ }
+ 
++
++/* ----------------
++ *		try_table_open - open a table relation by relation OID
++ *
++ *		Same as table_open, except return NULL instead of failing
++ *		if the relation does not exist.
++ * ----------------
++ */
++Relation
++try_table_open(Oid relationId, LOCKMODE lockmode)
++{
++	Relation	r;
++
++	r = try_relation_open(relationId, lockmode);
++
++	/* leave if table does not exist */
++	if (!r)
++		return NULL;
++
++	if (r->rd_rel->relkind == RELKIND_INDEX ||
++		r->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
++		ereport(ERROR,
++				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++				 errmsg("\"%s\" is an index",
++						RelationGetRelationName(r))));
++	else if (r->rd_rel->relkind == RELKIND_COMPOSITE_TYPE)
++		ereport(ERROR,
++				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++				 errmsg("\"%s\" is a composite type",
++						RelationGetRelationName(r))));
++
++	return r;
++}
++
+ /* ----------------
+  *		table_openrv - open a table relation specified
+  *		by a RangeVar node
+diff --git a/src/backend/catalog/index.c b/src/backend/catalog/index.c
+index d0ec9a4b9c80..1d662e9af433 100644
+--- a/src/backend/catalog/index.c
++++ b/src/backend/catalog/index.c
+@@ -3437,8 +3437,20 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
+ 	 * Open and lock the parent heap relation.  ShareLock is sufficient since
+ 	 * we only need to be sure no schema or data changes are going on.
+ 	 */
+-	heapId = IndexGetRelation(indexId, false);
+-	heapRelation = table_open(heapId, ShareLock);
++	heapId = IndexGetRelation(indexId,
++							  (options & REINDEXOPT_MISSING_OK) != 0);
++	/* if relation is missing, leave */
++	if (!OidIsValid(heapId))
++		return;
++
++	if ((options & REINDEXOPT_MISSING_OK) != 0)
++		heapRelation = try_table_open(heapId, ShareLock);
++	else
++		heapRelation = table_open(heapId, ShareLock);
++
++	/* if relation is gone, leave */
++	if (!heapRelation)
++		return;
+ 
+ 	if (progress)
+ 	{
+@@ -3672,7 +3684,14 @@ reindex_relation(Oid relid, int flags, int options)
+ 	 * to prevent schema and data changes in it.  The lock level used here
+ 	 * should match ReindexTable().
+ 	 */
+-	rel = table_open(relid, ShareLock);
++	if ((options & REINDEXOPT_MISSING_OK) != 0)
++		rel = try_table_open(relid, ShareLock);
++	else
++		rel = table_open(relid, ShareLock);
++
++	/* if relation is gone, leave */
++	if (!rel)
++		return false;
+ 
+ 	/*
+ 	 * This may be useful when implemented someday; but that day is not today.
+@@ -3771,7 +3790,14 @@ reindex_relation(Oid relid, int flags, int options)
+ 	 * still hold the lock on the main table.
+ 	 */
+ 	if ((flags & REINDEX_REL_PROCESS_TOAST) && OidIsValid(toast_relid))
+-		result |= reindex_relation(toast_relid, flags, options);
++	{
++		/*
++		 * Note that this should fail if the toast relation is missing, so
++		 * reset REINDEXOPT_MISSING_OK.
++		 */
++		result |= reindex_relation(toast_relid, flags,
++								   options & ~(REINDEXOPT_MISSING_OK));
++	}
+ 
+ 	return result;
+ }
+diff --git a/src/backend/commands/indexcmds.c b/src/backend/commands/indexcmds.c
+index 254dbcdce52b..b3a92381f95f 100644
+--- a/src/backend/commands/indexcmds.c
++++ b/src/backend/commands/indexcmds.c
+@@ -2766,9 +2766,19 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
+ 		/* functions in indexes may want a snapshot set */
+ 		PushActiveSnapshot(GetTransactionSnapshot());
+ 
++		/* check if the relation still exists */
++		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
++		{
++			PopActiveSnapshot();
++			CommitTransactionCommand();
++			continue;
++		}
++
+ 		if (concurrent && get_rel_persistence(relid) != RELPERSISTENCE_TEMP)
+ 		{
+-			(void) ReindexRelationConcurrently(relid, options);
++			(void) ReindexRelationConcurrently(relid,
++											   options |
++											   REINDEXOPT_MISSING_OK);
+ 			/* ReindexRelationConcurrently() does the verbose output */
+ 		}
+ 		else
+@@ -2778,7 +2788,9 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
+ 			result = reindex_relation(relid,
+ 									  REINDEX_REL_PROCESS_TOAST |
+ 									  REINDEX_REL_CHECK_CONSTRAINTS,
+-									  options | REINDEXOPT_REPORT_PROGRESS);
++									  options |
++									  REINDEXOPT_REPORT_PROGRESS |
++									  REINDEXOPT_MISSING_OK);
+ 
+ 			if (result && (options & REINDEXOPT_VERBOSE))
+ 				ereport(INFO,
+@@ -2893,7 +2905,17 @@ ReindexRelationConcurrently(Oid relationOid, int options)
+ 							 errmsg("cannot reindex system catalogs concurrently")));
+ 
+ 				/* Open relation to get its indexes */
+-				heapRelation = table_open(relationOid, ShareUpdateExclusiveLock);
++				if ((options & REINDEXOPT_MISSING_OK) != 0)
++				{
++					heapRelation = try_table_open(relationOid,
++												  ShareUpdateExclusiveLock);
++					/* leave if relation does not exist */
++					if (!heapRelation)
++						break;
++				}
++				else
++					heapRelation = table_open(relationOid,
++											  ShareUpdateExclusiveLock);
+ 
+ 				/* Add all the valid indexes of relation to list */
+ 				foreach(lc, RelationGetIndexList(heapRelation))
+@@ -2978,7 +3000,13 @@ ReindexRelationConcurrently(Oid relationOid, int options)
+ 			}
+ 		case RELKIND_INDEX:
+ 			{
+-				Oid			heapId = IndexGetRelation(relationOid, false);
++				Oid			heapId = IndexGetRelation(relationOid,
++													  (options & REINDEXOPT_MISSING_OK) != 0);
++				Relation	heapRelation;
++
++				/* if relation is missing, leave */
++				if (!OidIsValid(heapId))
++					break;
+ 
+ 				if (IsCatalogRelationOid(heapId))
+ 					ereport(ERROR,
+@@ -2995,6 +3023,25 @@ ReindexRelationConcurrently(Oid relationOid, int options)
+ 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+ 							 errmsg("cannot reindex invalid index on TOAST table concurrently")));
+ 
++				/*
++				 * Check if parent relation can be locked and if it exists,
++				 * this needs to be done at this stage as the list of indexes
++				 * to rebuild is not complete yet, and REINDEXOPT_MISSING_OK
++				 * should not be used once all the session locks are taken.
++				 */
++				if ((options & REINDEXOPT_MISSING_OK) != 0)
++				{
++					heapRelation = try_table_open(heapId,
++												  ShareUpdateExclusiveLock);
++					/* leave if relation does not exist */
++					if (!heapRelation)
++						break;
++				}
++				else
++					heapRelation = table_open(heapId,
++											  ShareUpdateExclusiveLock);
++				table_close(heapRelation, NoLock);
++
+ 				/* Save the list of relation OIDs in private context */
+ 				oldcontext = MemoryContextSwitchTo(private_context);
+ 
+@@ -3025,7 +3072,13 @@ ReindexRelationConcurrently(Oid relationOid, int options)
+ 			break;
+ 	}
+ 
+-	/* Definitely no indexes, so leave */
++	/*
++	 * Definitely no indexes, so leave.  Any checks based on
++	 * REINDEXOPT_MISSING_OK should be done only while the list of indexes to
++	 * work on is built as the session locks taken before this transaction
++	 * commits will make sure that they cannot be dropped by a concurrent
++	 * session until this operation completes.
++	 */
+ 	if (indexIds == NIL)
+ 	{
+ 		PopActiveSnapshot();
+diff --git a/src/include/access/table.h b/src/include/access/table.h
+index cf0ef7b337ba..68dc4d62c03f 100644
+--- a/src/include/access/table.h
++++ b/src/include/access/table.h
+@@ -22,6 +22,7 @@ extern Relation table_open(Oid relationId, LOCKMODE lockmode);
+ extern Relation table_openrv(const RangeVar *relation, LOCKMODE lockmode);
+ extern Relation table_openrv_extended(const RangeVar *relation,
+ 									  LOCKMODE lockmode, bool missing_ok);
++extern Relation try_table_open(Oid relationId, LOCKMODE lockmode);
+ extern void table_close(Relation relation, LOCKMODE lockmode);
+ 
+ #endif							/* TABLE_H */
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index 47d4c07306d0..23840bb8e64e 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -3352,6 +3352,7 @@ typedef struct ConstraintsSetStmt
+ /* Reindex options */
+ #define REINDEXOPT_VERBOSE (1 << 0) /* print progress info */
+ #define REINDEXOPT_REPORT_PROGRESS (1 << 1) /* report pgstat progress */
++#define REINDEXOPT_MISSING_OK (2 << 1)	/* skip missing relations */
+ 
+ typedef enum ReindexObjectType
+ {
+diff --git a/src/test/isolation/expected/reindex-schema.out b/src/test/isolation/expected/reindex-schema.out
+new file mode 100644
+index 000000000000..0884e7541236
+--- /dev/null
++++ b/src/test/isolation/expected/reindex-schema.out
+@@ -0,0 +1,17 @@
++Parsed test spec with 3 sessions
++
++starting permutation: begin1 lock1 reindex2 drop3 end1
++step begin1: BEGIN;
++step lock1: LOCK reindex_schema.tab_locked IN SHARE UPDATE EXCLUSIVE MODE;
++step reindex2: REINDEX SCHEMA reindex_schema; <waiting ...>
++step drop3: DROP TABLE reindex_schema.tab_dropped;
++step end1: COMMIT;
++step reindex2: <... completed>
++
++starting permutation: begin1 lock1 reindex_conc2 drop3 end1
++step begin1: BEGIN;
++step lock1: LOCK reindex_schema.tab_locked IN SHARE UPDATE EXCLUSIVE MODE;
++step reindex_conc2: REINDEX SCHEMA CONCURRENTLY reindex_schema; <waiting ...>
++step drop3: DROP TABLE reindex_schema.tab_dropped;
++step end1: COMMIT;
++step reindex_conc2: <... completed>
+diff --git a/src/test/isolation/isolation_schedule b/src/test/isolation/isolation_schedule
+index 218c87b24bf4..6acbb695ecea 100644
+--- a/src/test/isolation/isolation_schedule
++++ b/src/test/isolation/isolation_schedule
+@@ -49,6 +49,7 @@ test: lock-committed-update
+ test: lock-committed-keyupdate
+ test: update-locked-tuple
+ test: reindex-concurrently
++test: reindex-schema
+ test: propagate-lock-delete
+ test: tuplelock-conflict
+ test: tuplelock-update
+diff --git a/src/test/isolation/specs/reindex-schema.spec b/src/test/isolation/specs/reindex-schema.spec
+new file mode 100644
+index 000000000000..feff8a5ec05d
+--- /dev/null
++++ b/src/test/isolation/specs/reindex-schema.spec
+@@ -0,0 +1,32 @@
++# REINDEX with schemas
++#
++# Check that concurrent drop of relations while doing a REINDEX
++# SCHEMA allows the command to work.
++
++setup
++{
++    CREATE SCHEMA reindex_schema;
++    CREATE TABLE reindex_schema.tab_locked (a int PRIMARY KEY);
++    CREATE TABLE reindex_schema.tab_dropped (a int PRIMARY KEY);
++}
++
++teardown
++{
++    DROP SCHEMA reindex_schema CASCADE;
++}
++
++session "s1"
++step "begin1"        { BEGIN; }
++step "lock1"         { LOCK reindex_schema.tab_locked IN SHARE UPDATE EXCLUSIVE MODE; }
++step "end1"          { COMMIT; }
++
++session "s2"
++step "reindex2"      { REINDEX SCHEMA reindex_schema; }
++step "reindex_conc2" { REINDEX SCHEMA CONCURRENTLY reindex_schema; }
++
++session "s3"
++step "drop3"         { DROP TABLE reindex_schema.tab_dropped; }
++
++# The table can be dropped while reindex is waiting.
++permutation "begin1" "lock1" "reindex2" "drop3" "end1"
++permutation "begin1" "lock1" "reindex_conc2" "drop3" "end1"

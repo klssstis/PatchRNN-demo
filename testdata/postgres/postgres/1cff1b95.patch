@@ -1,0 +1,5714 @@
+From 1cff1b95ab6ddae32faa3efe0d95a820dbfdc164 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 15 Jul 2019 13:41:58 -0400
+Subject: [PATCH] Represent Lists as expansible arrays, not chains of
+ cons-cells.
+
+Originally, Postgres Lists were a more or less exact reimplementation of
+Lisp lists, which consist of chains of separately-allocated cons cells,
+each having a value and a next-cell link.  We'd hacked that once before
+(commit d0b4399d8) to add a separate List header, but the data was still
+in cons cells.  That makes some operations -- notably list_nth() -- O(N),
+and it's bulky because of the next-cell pointers and per-cell palloc
+overhead, and it's very cache-unfriendly if the cons cells end up
+scattered around rather than being adjacent.
+
+In this rewrite, we still have List headers, but the data is in a
+resizable array of values, with no next-cell links.  Now we need at
+most two palloc's per List, and often only one, since we can allocate
+some values in the same palloc call as the List header.  (Of course,
+extending an existing List may require repalloc's to enlarge the array.
+But this involves just O(log N) allocations not O(N).)
+
+Of course this is not without downsides.  The key difficulty is that
+addition or deletion of a list entry may now cause other entries to
+move, which it did not before.
+
+For example, that breaks foreach() and sister macros, which historically
+used a pointer to the current cons-cell as loop state.  We can repair
+those macros transparently by making their actual loop state be an
+integer list index; the exposed "ListCell *" pointer is no longer state
+carried across loop iterations, but is just a derived value.  (In
+practice, modern compilers can optimize things back to having just one
+loop state value, at least for simple cases with inline loop bodies.)
+In principle, this is a semantics change for cases where the loop body
+inserts or deletes list entries ahead of the current loop index; but
+I found no such cases in the Postgres code.
+
+The change is not at all transparent for code that doesn't use foreach()
+but chases lists "by hand" using lnext().  The largest share of such
+code in the backend is in loops that were maintaining "prev" and "next"
+variables in addition to the current-cell pointer, in order to delete
+list cells efficiently using list_delete_cell().  However, we no longer
+need a previous-cell pointer to delete a list cell efficiently.  Keeping
+a next-cell pointer doesn't work, as explained above, but we can improve
+matters by changing such code to use a regular foreach() loop and then
+using the new macro foreach_delete_current() to delete the current cell.
+(This macro knows how to update the associated foreach loop's state so
+that no cells will be missed in the traversal.)
+
+There remains a nontrivial risk of code assuming that a ListCell *
+pointer will remain good over an operation that could now move the list
+contents.  To help catch such errors, list.c can be compiled with a new
+define symbol DEBUG_LIST_MEMORY_USAGE that forcibly moves list contents
+whenever that could possibly happen.  This makes list operations
+significantly more expensive so it's not normally turned on (though it
+is on by default if USE_VALGRIND is on).
+
+There are two notable API differences from the previous code:
+
+* lnext() now requires the List's header pointer in addition to the
+current cell's address.
+
+* list_delete_cell() no longer requires a previous-cell argument.
+
+These changes are somewhat unfortunate, but on the other hand code using
+either function needs inspection to see if it is assuming anything
+it shouldn't, so it's not all bad.
+
+Programmers should be aware of these significant performance changes:
+
+* list_nth() and related functions are now O(1); so there's no
+major access-speed difference between a list and an array.
+
+* Inserting or deleting a list element now takes time proportional to
+the distance to the end of the list, due to moving the array elements.
+(However, it typically *doesn't* require palloc or pfree, so except in
+long lists it's probably still faster than before.)  Notably, lcons()
+used to be about the same cost as lappend(), but that's no longer true
+if the list is long.  Code that uses lcons() and list_delete_first()
+to maintain a stack might usefully be rewritten to push and pop at the
+end of the list rather than the beginning.
+
+* There are now list_insert_nth...() and list_delete_nth...() functions
+that add or remove a list cell identified by index.  These have the
+data-movement penalty explained above, but there's no search penalty.
+
+* list_concat() and variants now copy the second list's data into
+storage belonging to the first list, so there is no longer any
+sharing of cells between the input lists.  The second argument is
+now declared "const List *" to reflect that it isn't changed.
+
+This patch just does the minimum needed to get the new implementation
+in place and fix bugs exposed by the regression tests.  As suggested
+by the foregoing, there's a fair amount of followup work remaining to
+do.
+
+Also, the ENABLE_LIST_COMPAT macros are finally removed in this
+commit.  Code using those should have been gone a dozen years ago.
+
+Patch by me; thanks to David Rowley, Jesper Pedersen, and others
+for review.
+
+Discussion: https://postgr.es/m/11587.1550975080@sss.pgh.pa.us
+---
+ contrib/file_fdw/file_fdw.c               |   9 +-
+ contrib/pg_trgm/trgm_regexp.c             |  18 +-
+ contrib/postgres_fdw/deparse.c            |   6 +-
+ contrib/sepgsql/label.c                   |  11 +-
+ contrib/sepgsql/uavc.c                    |   9 +-
+ src/backend/access/common/printtup.c      |   4 +-
+ src/backend/catalog/heap.c                |   2 +-
+ src/backend/catalog/index.c               |   6 +-
+ src/backend/catalog/namespace.c           |   6 +-
+ src/backend/catalog/partition.c           |   2 +-
+ src/backend/catalog/pg_inherits.c         |  14 +-
+ src/backend/catalog/pg_proc.c             |  10 +-
+ src/backend/catalog/pg_publication.c      |  12 +-
+ src/backend/commands/analyze.c            |   3 +-
+ src/backend/commands/async.c              |  26 +-
+ src/backend/commands/createas.c           |   4 +-
+ src/backend/commands/explain.c            |   2 +-
+ src/backend/commands/foreigncmds.c        |   7 +-
+ src/backend/commands/indexcmds.c          |   2 +-
+ src/backend/commands/prepare.c            |   2 +-
+ src/backend/commands/seclabel.c           |   2 +-
+ src/backend/commands/tablecmds.c          |  65 +-
+ src/backend/commands/tsearchcmds.c        |  12 +-
+ src/backend/commands/view.c               |   2 +-
+ src/backend/executor/execJunk.c           |   2 +-
+ src/backend/executor/execPartition.c      |   2 +-
+ src/backend/executor/execUtils.c          |   2 +-
+ src/backend/executor/functions.c          |   2 +-
+ src/backend/executor/nodeTableFuncscan.c  |   2 +-
+ src/backend/libpq/auth.c                  |   6 +-
+ src/backend/libpq/hba.c                   |  16 +-
+ src/backend/nodes/copyfuncs.c             |  44 +-
+ src/backend/nodes/list.c                  | 816 +++++++++++++---------
+ src/backend/nodes/nodeFuncs.c             |   4 +-
+ src/backend/nodes/outfuncs.c              |   2 +-
+ src/backend/nodes/print.c                 |   4 +-
+ src/backend/optimizer/geqo/geqo_eval.c    |   7 +-
+ src/backend/optimizer/path/allpaths.c     |   4 +-
+ src/backend/optimizer/path/costsize.c     |  12 +-
+ src/backend/optimizer/path/equivclass.c   |  38 +-
+ src/backend/optimizer/path/indxpath.c     |  53 +-
+ src/backend/optimizer/path/joinrels.c     |  46 +-
+ src/backend/optimizer/path/pathkeys.c     |   6 +-
+ src/backend/optimizer/plan/analyzejoins.c |  29 +-
+ src/backend/optimizer/plan/createplan.c   |   9 +-
+ src/backend/optimizer/plan/planner.c      |  16 +-
+ src/backend/optimizer/plan/subselect.c    |   2 +-
+ src/backend/optimizer/prep/prepjointree.c |  22 +-
+ src/backend/optimizer/prep/preptlist.c    |   4 +-
+ src/backend/optimizer/prep/prepunion.c    |   4 +-
+ src/backend/optimizer/util/clauses.c      |   2 +-
+ src/backend/optimizer/util/paramassign.c  |  17 +-
+ src/backend/optimizer/util/pathnode.c     |  51 +-
+ src/backend/optimizer/util/plancat.c      |   4 +-
+ src/backend/optimizer/util/predtest.c     |  12 +-
+ src/backend/optimizer/util/tlist.c        |  12 +-
+ src/backend/parser/analyze.c              |   2 +-
+ src/backend/parser/gram.y                 |  13 +-
+ src/backend/parser/parse_agg.c            |   4 +-
+ src/backend/parser/parse_coerce.c         |   8 +-
+ src/backend/parser/parse_collate.c        |   6 +-
+ src/backend/parser/parse_cte.c            |   8 +-
+ src/backend/parser/parse_expr.c           |   6 +-
+ src/backend/parser/parse_func.c           |  16 +-
+ src/backend/parser/parse_relation.c       |  31 +-
+ src/backend/parser/parse_target.c         |  24 +-
+ src/backend/parser/parse_utilcmd.c        |   2 +-
+ src/backend/partitioning/partbounds.c     |  17 +-
+ src/backend/partitioning/partprune.c      |  17 +-
+ src/backend/replication/basebackup.c      |   2 +-
+ src/backend/replication/syncrep.c         |  12 +-
+ src/backend/storage/sync/sync.c           |  12 +-
+ src/backend/tcop/postgres.c               |   4 +-
+ src/backend/tcop/pquery.c                 |   2 +-
+ src/backend/tcop/utility.c                |   4 +-
+ src/backend/utils/adt/jsonpath_exec.c     |  10 +-
+ src/backend/utils/adt/jsonpath_gram.y     |   8 +-
+ src/backend/utils/adt/partitionfuncs.c    |  34 +-
+ src/backend/utils/adt/ruleutils.c         |  32 +-
+ src/backend/utils/adt/selfuncs.c          |  13 +-
+ src/backend/utils/cache/partcache.c       |   2 +-
+ src/backend/utils/cache/relcache.c        |   2 +-
+ src/backend/utils/init/postinit.c         |   4 +-
+ src/backend/utils/mb/mbutils.c            |  12 +-
+ src/include/nodes/pg_list.h               | 566 ++++++++++-----
+ src/pl/plpgsql/src/pl_exec.c              |   2 +-
+ 86 files changed, 1248 insertions(+), 1115 deletions(-)
+
+diff --git a/contrib/file_fdw/file_fdw.c b/contrib/file_fdw/file_fdw.c
+index 412dcabe55e2..549821ca84cd 100644
+--- a/contrib/file_fdw/file_fdw.c
++++ b/contrib/file_fdw/file_fdw.c
+@@ -360,8 +360,7 @@ fileGetOptions(Oid foreigntableid,
+ 	ForeignServer *server;
+ 	ForeignDataWrapper *wrapper;
+ 	List	   *options;
+-	ListCell   *lc,
+-			   *prev;
++	ListCell   *lc;
+ 
+ 	/*
+ 	 * Extract options from FDW objects.  We ignore user mappings because
+@@ -387,7 +386,6 @@ fileGetOptions(Oid foreigntableid,
+ 	 */
+ 	*filename = NULL;
+ 	*is_program = false;
+-	prev = NULL;
+ 	foreach(lc, options)
+ 	{
+ 		DefElem    *def = (DefElem *) lfirst(lc);
+@@ -395,17 +393,16 @@ fileGetOptions(Oid foreigntableid,
+ 		if (strcmp(def->defname, "filename") == 0)
+ 		{
+ 			*filename = defGetString(def);
+-			options = list_delete_cell(options, lc, prev);
++			options = foreach_delete_current(options, lc);
+ 			break;
+ 		}
+ 		else if (strcmp(def->defname, "program") == 0)
+ 		{
+ 			*filename = defGetString(def);
+ 			*is_program = true;
+-			options = list_delete_cell(options, lc, prev);
++			options = foreach_delete_current(options, lc);
+ 			break;
+ 		}
+-		prev = lc;
+ 	}
+ 
+ 	/*
+diff --git a/contrib/pg_trgm/trgm_regexp.c b/contrib/pg_trgm/trgm_regexp.c
+index c239d8cea6e9..3ad5731ae801 100644
+--- a/contrib/pg_trgm/trgm_regexp.c
++++ b/contrib/pg_trgm/trgm_regexp.c
+@@ -1013,9 +1013,7 @@ addKey(TrgmNFA *trgmNFA, TrgmState *state, TrgmStateKey *key)
+ {
+ 	regex_arc_t *arcs;
+ 	TrgmStateKey destKey;
+-	ListCell   *cell,
+-			   *prev,
+-			   *next;
++	ListCell   *cell;
+ 	int			i,
+ 				arcsCount;
+ 
+@@ -1030,13 +1028,10 @@ addKey(TrgmNFA *trgmNFA, TrgmState *state, TrgmStateKey *key)
+ 	 * redundancy.  We can drop either old key(s) or the new key if we find
+ 	 * redundancy.
+ 	 */
+-	prev = NULL;
+-	cell = list_head(state->enterKeys);
+-	while (cell)
++	foreach(cell, state->enterKeys)
+ 	{
+ 		TrgmStateKey *existingKey = (TrgmStateKey *) lfirst(cell);
+ 
+-		next = lnext(cell);
+ 		if (existingKey->nstate == key->nstate)
+ 		{
+ 			if (prefixContains(&existingKey->prefix, &key->prefix))
+@@ -1050,15 +1045,10 @@ addKey(TrgmNFA *trgmNFA, TrgmState *state, TrgmStateKey *key)
+ 				 * The new key covers this old key. Remove the old key, it's
+ 				 * no longer needed once we add this key to the list.
+ 				 */
+-				state->enterKeys = list_delete_cell(state->enterKeys,
+-													cell, prev);
++				state->enterKeys = foreach_delete_current(state->enterKeys,
++														  cell);
+ 			}
+-			else
+-				prev = cell;
+ 		}
+-		else
+-			prev = cell;
+-		cell = next;
+ 	}
+ 
+ 	/* No redundancy, so add this key to the state's list */
+diff --git a/contrib/postgres_fdw/deparse.c b/contrib/postgres_fdw/deparse.c
+index b951b11592e1..548ae66119b0 100644
+--- a/contrib/postgres_fdw/deparse.c
++++ b/contrib/postgres_fdw/deparse.c
+@@ -2610,7 +2610,7 @@ deparseSubscriptingRef(SubscriptingRef *node, deparse_expr_cxt *context)
+ 		{
+ 			deparseExpr(lfirst(lowlist_item), context);
+ 			appendStringInfoChar(buf, ':');
+-			lowlist_item = lnext(lowlist_item);
++			lowlist_item = lnext(node->reflowerindexpr, lowlist_item);
+ 		}
+ 		deparseExpr(lfirst(uplist_item), context);
+ 		appendStringInfoChar(buf, ']');
+@@ -2673,7 +2673,7 @@ deparseFuncExpr(FuncExpr *node, deparse_expr_cxt *context)
+ 	{
+ 		if (!first)
+ 			appendStringInfoString(buf, ", ");
+-		if (use_variadic && lnext(arg) == NULL)
++		if (use_variadic && lnext(node->args, arg) == NULL)
+ 			appendStringInfoString(buf, "VARIADIC ");
+ 		deparseExpr((Expr *) lfirst(arg), context);
+ 		first = false;
+@@ -3001,7 +3001,7 @@ deparseAggref(Aggref *node, deparse_expr_cxt *context)
+ 				first = false;
+ 
+ 				/* Add VARIADIC */
+-				if (use_variadic && lnext(arg) == NULL)
++				if (use_variadic && lnext(node->args, arg) == NULL)
+ 					appendStringInfoString(buf, "VARIADIC ");
+ 
+ 				deparseExpr((Expr *) n, context);
+diff --git a/contrib/sepgsql/label.c b/contrib/sepgsql/label.c
+index 1d17d5a0c04d..2b6a41509316 100644
+--- a/contrib/sepgsql/label.c
++++ b/contrib/sepgsql/label.c
+@@ -207,23 +207,16 @@ sepgsql_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+ 						 SubTransactionId parentSubid, void *arg)
+ {
+ 	ListCell   *cell;
+-	ListCell   *prev;
+-	ListCell   *next;
+ 
+ 	if (event == SUBXACT_EVENT_ABORT_SUB)
+ 	{
+-		prev = NULL;
+-		for (cell = list_head(client_label_pending); cell; cell = next)
++		foreach(cell, client_label_pending)
+ 		{
+ 			pending_label *plabel = lfirst(cell);
+ 
+-			next = lnext(cell);
+-
+ 			if (plabel->subid == mySubid)
+ 				client_label_pending
+-					= list_delete_cell(client_label_pending, cell, prev);
+-			else
+-				prev = cell;
++					= foreach_delete_current(client_label_pending, cell);
+ 		}
+ 	}
+ }
+diff --git a/contrib/sepgsql/uavc.c b/contrib/sepgsql/uavc.c
+index 7d94c31e56ea..60fcf996539b 100644
+--- a/contrib/sepgsql/uavc.c
++++ b/contrib/sepgsql/uavc.c
+@@ -93,24 +93,20 @@ static void
+ sepgsql_avc_reclaim(void)
+ {
+ 	ListCell   *cell;
+-	ListCell   *next;
+-	ListCell   *prev;
+ 	int			index;
+ 
+ 	while (avc_num_caches >= avc_threshold - AVC_NUM_RECLAIM)
+ 	{
+ 		index = avc_lru_hint;
+ 
+-		prev = NULL;
+-		for (cell = list_head(avc_slots[index]); cell; cell = next)
++		foreach(cell, avc_slots[index])
+ 		{
+ 			avc_cache  *cache = lfirst(cell);
+ 
+-			next = lnext(cell);
+ 			if (!cache->hot_cache)
+ 			{
+ 				avc_slots[index]
+-					= list_delete_cell(avc_slots[index], cell, prev);
++					= foreach_delete_current(avc_slots[index], cell);
+ 
+ 				pfree(cache->scontext);
+ 				pfree(cache->tcontext);
+@@ -123,7 +119,6 @@ sepgsql_avc_reclaim(void)
+ 			else
+ 			{
+ 				cache->hot_cache = false;
+-				prev = cell;
+ 			}
+ 		}
+ 		avc_lru_hint = (avc_lru_hint + 1) % AVC_NUM_SLOTS;
+diff --git a/src/backend/access/common/printtup.c b/src/backend/access/common/printtup.c
+index 24d6cd024923..e330f496892d 100644
+--- a/src/backend/access/common/printtup.c
++++ b/src/backend/access/common/printtup.c
+@@ -262,14 +262,14 @@ SendRowDescriptionCols_3(StringInfo buf, TupleDesc typeinfo, List *targetlist, i
+ 		/* Do we have a non-resjunk tlist item? */
+ 		while (tlist_item &&
+ 			   ((TargetEntry *) lfirst(tlist_item))->resjunk)
+-			tlist_item = lnext(tlist_item);
++			tlist_item = lnext(targetlist, tlist_item);
+ 		if (tlist_item)
+ 		{
+ 			TargetEntry *tle = (TargetEntry *) lfirst(tlist_item);
+ 
+ 			resorigtbl = tle->resorigtbl;
+ 			resorigcol = tle->resorigcol;
+-			tlist_item = lnext(tlist_item);
++			tlist_item = lnext(targetlist, tlist_item);
+ 		}
+ 		else
+ 		{
+diff --git a/src/backend/catalog/heap.c b/src/backend/catalog/heap.c
+index 3b8c8b193a7f..ab8a475923f2 100644
+--- a/src/backend/catalog/heap.c
++++ b/src/backend/catalog/heap.c
+@@ -3420,7 +3420,7 @@ insert_ordered_unique_oid(List *list, Oid datum)
+ 	prev = list_head(list);
+ 	for (;;)
+ 	{
+-		ListCell   *curr = lnext(prev);
++		ListCell   *curr = lnext(list, prev);
+ 
+ 		if (curr == NULL || datum < lfirst_oid(curr))
+ 			break;				/* it belongs after 'prev', before 'curr' */
+diff --git a/src/backend/catalog/index.c b/src/backend/catalog/index.c
+index bb60b23093e3..9234e93261c5 100644
+--- a/src/backend/catalog/index.c
++++ b/src/backend/catalog/index.c
+@@ -347,7 +347,7 @@ ConstructTupleDescriptor(Relation heapRelation,
+ 			if (indexpr_item == NULL)	/* shouldn't happen */
+ 				elog(ERROR, "too few entries in indexprs list");
+ 			indexkey = (Node *) lfirst(indexpr_item);
+-			indexpr_item = lnext(indexpr_item);
++			indexpr_item = lnext(indexInfo->ii_Expressions, indexpr_item);
+ 
+ 			/*
+ 			 * Lookup the expression type in pg_type for the type length etc.
+@@ -397,7 +397,7 @@ ConstructTupleDescriptor(Relation heapRelation,
+ 		if (colnames_item == NULL)	/* shouldn't happen */
+ 			elog(ERROR, "too few entries in colnames list");
+ 		namestrcpy(&to->attname, (const char *) lfirst(colnames_item));
+-		colnames_item = lnext(colnames_item);
++		colnames_item = lnext(indexColNames, colnames_item);
+ 
+ 		/*
+ 		 * Check the opclass and index AM to see if either provides a keytype
+@@ -2465,7 +2465,7 @@ FormIndexDatum(IndexInfo *indexInfo,
+ 			iDatum = ExecEvalExprSwitchContext((ExprState *) lfirst(indexpr_item),
+ 											   GetPerTupleExprContext(estate),
+ 											   &isNull);
+-			indexpr_item = lnext(indexpr_item);
++			indexpr_item = lnext(indexInfo->ii_ExpressionsState, indexpr_item);
+ 		}
+ 		values[i] = iDatum;
+ 		isnull[i] = isNull;
+diff --git a/src/backend/catalog/namespace.c b/src/backend/catalog/namespace.c
+index 05c6ca81b98a..5fd9eba57ff1 100644
+--- a/src/backend/catalog/namespace.c
++++ b/src/backend/catalog/namespace.c
+@@ -3402,7 +3402,7 @@ OverrideSearchPathMatchesCurrent(OverrideSearchPath *path)
+ 	if (path->addTemp)
+ 	{
+ 		if (lc && lfirst_oid(lc) == myTempNamespace)
+-			lc = lnext(lc);
++			lc = lnext(activeSearchPath, lc);
+ 		else
+ 			return false;
+ 	}
+@@ -3410,7 +3410,7 @@ OverrideSearchPathMatchesCurrent(OverrideSearchPath *path)
+ 	if (path->addCatalog)
+ 	{
+ 		if (lc && lfirst_oid(lc) == PG_CATALOG_NAMESPACE)
+-			lc = lnext(lc);
++			lc = lnext(activeSearchPath, lc);
+ 		else
+ 			return false;
+ 	}
+@@ -3421,7 +3421,7 @@ OverrideSearchPathMatchesCurrent(OverrideSearchPath *path)
+ 	foreach(lcp, path->schemas)
+ 	{
+ 		if (lc && lfirst_oid(lc) == lfirst_oid(lcp))
+-			lc = lnext(lc);
++			lc = lnext(activeSearchPath, lc);
+ 		else
+ 			return false;
+ 	}
+diff --git a/src/backend/catalog/partition.c b/src/backend/catalog/partition.c
+index e96620e4018f..07b82233486e 100644
+--- a/src/backend/catalog/partition.c
++++ b/src/backend/catalog/partition.c
+@@ -275,7 +275,7 @@ has_partition_attrs(Relation rel, Bitmapset *attnums, bool *used_in_expr)
+ 
+ 			/* Find all attributes referenced */
+ 			pull_varattnos(expr, 1, &expr_attrs);
+-			partexprs_item = lnext(partexprs_item);
++			partexprs_item = lnext(partexprs, partexprs_item);
+ 
+ 			if (bms_overlap(attnums, expr_attrs))
+ 			{
+diff --git a/src/backend/catalog/pg_inherits.c b/src/backend/catalog/pg_inherits.c
+index 00f7957b3da2..59af16221eac 100644
+--- a/src/backend/catalog/pg_inherits.c
++++ b/src/backend/catalog/pg_inherits.c
+@@ -37,7 +37,7 @@
+ typedef struct SeenRelsEntry
+ {
+ 	Oid			rel_id;			/* relation oid */
+-	ListCell   *numparents_cell;	/* corresponding list cell */
++	int			list_index;		/* its position in output list(s) */
+ } SeenRelsEntry;
+ 
+ /*
+@@ -186,7 +186,9 @@ find_all_inheritors(Oid parentrelId, LOCKMODE lockmode, List **numparents)
+ 	 * indirect children.  We can use a single list as both the record of
+ 	 * already-found rels and the agenda of rels yet to be scanned for more
+ 	 * children.  This is a bit tricky but works because the foreach() macro
+-	 * doesn't fetch the next list element until the bottom of the loop.
++	 * doesn't fetch the next list element until the bottom of the loop.  Note
++	 * that we can't keep pointers into the output lists; but an index is
++	 * sufficient.
+ 	 */
+ 	rels_list = list_make1_oid(parentrelId);
+ 	rel_numparents = list_make1_int(0);
+@@ -217,14 +219,18 @@ find_all_inheritors(Oid parentrelId, LOCKMODE lockmode, List **numparents)
+ 			if (found)
+ 			{
+ 				/* if the rel is already there, bump number-of-parents counter */
+-				lfirst_int(hash_entry->numparents_cell)++;
++				ListCell   *numparents_cell;
++
++				numparents_cell = list_nth_cell(rel_numparents,
++												hash_entry->list_index);
++				lfirst_int(numparents_cell)++;
+ 			}
+ 			else
+ 			{
+ 				/* if it's not there, add it. expect 1 parent, initially. */
++				hash_entry->list_index = list_length(rels_list);
+ 				rels_list = lappend_oid(rels_list, child_oid);
+ 				rel_numparents = lappend_int(rel_numparents, 1);
+-				hash_entry->numparents_cell = rel_numparents->tail;
+ 			}
+ 		}
+ 	}
+diff --git a/src/backend/catalog/pg_proc.c b/src/backend/catalog/pg_proc.c
+index 02b7fdd49435..ef009ad2bc6d 100644
+--- a/src/backend/catalog/pg_proc.c
++++ b/src/backend/catalog/pg_proc.c
+@@ -538,11 +538,9 @@ ProcedureCreate(const char *procedureName,
+ 			Assert(list_length(oldDefaults) == oldproc->pronargdefaults);
+ 
+ 			/* new list can have more defaults than old, advance over 'em */
+-			newlc = list_head(parameterDefaults);
+-			for (i = list_length(parameterDefaults) - oldproc->pronargdefaults;
+-				 i > 0;
+-				 i--)
+-				newlc = lnext(newlc);
++			newlc = list_nth_cell(parameterDefaults,
++								  list_length(parameterDefaults) -
++								  oldproc->pronargdefaults);
+ 
+ 			foreach(oldlc, oldDefaults)
+ 			{
+@@ -557,7 +555,7 @@ ProcedureCreate(const char *procedureName,
+ 							 errhint("Use %s %s first.",
+ 									 dropcmd,
+ 									 format_procedure(oldproc->oid))));
+-				newlc = lnext(newlc);
++				newlc = lnext(parameterDefaults, newlc);
+ 			}
+ 		}
+ 
+diff --git a/src/backend/catalog/pg_publication.c b/src/backend/catalog/pg_publication.c
+index b3bf81ae6332..fd5da7d5f7b4 100644
+--- a/src/backend/catalog/pg_publication.c
++++ b/src/backend/catalog/pg_publication.c
+@@ -481,7 +481,6 @@ pg_get_publication_tables(PG_FUNCTION_ARGS)
+ 	char	   *pubname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+ 	Publication *publication;
+ 	List	   *tables;
+-	ListCell  **lcp;
+ 
+ 	/* stuff done only on the first call of the function */
+ 	if (SRF_IS_FIRSTCALL())
+@@ -499,22 +498,19 @@ pg_get_publication_tables(PG_FUNCTION_ARGS)
+ 			tables = GetAllTablesPublicationRelations();
+ 		else
+ 			tables = GetPublicationRelations(publication->oid);
+-		lcp = (ListCell **) palloc(sizeof(ListCell *));
+-		*lcp = list_head(tables);
+-		funcctx->user_fctx = (void *) lcp;
++		funcctx->user_fctx = (void *) tables;
+ 
+ 		MemoryContextSwitchTo(oldcontext);
+ 	}
+ 
+ 	/* stuff done on every call of the function */
+ 	funcctx = SRF_PERCALL_SETUP();
+-	lcp = (ListCell **) funcctx->user_fctx;
++	tables = (List *) funcctx->user_fctx;
+ 
+-	while (*lcp != NULL)
++	if (funcctx->call_cntr < list_length(tables))
+ 	{
+-		Oid			relid = lfirst_oid(*lcp);
++		Oid			relid = list_nth_oid(tables, funcctx->call_cntr);
+ 
+-		*lcp = lnext(*lcp);
+ 		SRF_RETURN_NEXT(funcctx, ObjectIdGetDatum(relid));
+ 	}
+ 
+diff --git a/src/backend/commands/analyze.c b/src/backend/commands/analyze.c
+index d7004e53138d..8d633f258516 100644
+--- a/src/backend/commands/analyze.c
++++ b/src/backend/commands/analyze.c
+@@ -455,7 +455,8 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
+ 						if (indexpr_item == NULL)	/* shouldn't happen */
+ 							elog(ERROR, "too few entries in indexprs list");
+ 						indexkey = (Node *) lfirst(indexpr_item);
+-						indexpr_item = lnext(indexpr_item);
++						indexpr_item = lnext(indexInfo->ii_Expressions,
++											 indexpr_item);
+ 						thisdata->vacattrstats[tcnt] =
+ 							examine_attribute(Irel[ind], i + 1, indexkey);
+ 						if (thisdata->vacattrstats[tcnt] != NULL)
+diff --git a/src/backend/commands/async.c b/src/backend/commands/async.c
+index 738e6ec7e296..34e5ca9edb36 100644
+--- a/src/backend/commands/async.c
++++ b/src/backend/commands/async.c
+@@ -689,7 +689,6 @@ Datum
+ pg_listening_channels(PG_FUNCTION_ARGS)
+ {
+ 	FuncCallContext *funcctx;
+-	ListCell  **lcp;
+ 
+ 	/* stuff done only on the first call of the function */
+ 	if (SRF_IS_FIRSTCALL())
+@@ -702,23 +701,17 @@ pg_listening_channels(PG_FUNCTION_ARGS)
+ 		/* switch to memory context appropriate for multiple function calls */
+ 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+ 
+-		/* allocate memory for user context */
+-		lcp = (ListCell **) palloc(sizeof(ListCell *));
+-		*lcp = list_head(listenChannels);
+-		funcctx->user_fctx = (void *) lcp;
+-
+ 		MemoryContextSwitchTo(oldcontext);
+ 	}
+ 
+ 	/* stuff done on every call of the function */
+ 	funcctx = SRF_PERCALL_SETUP();
+-	lcp = (ListCell **) funcctx->user_fctx;
+ 
+-	while (*lcp != NULL)
++	if (funcctx->call_cntr < list_length(listenChannels))
+ 	{
+-		char	   *channel = (char *) lfirst(*lcp);
++		char	   *channel = (char *) list_nth(listenChannels,
++												funcctx->call_cntr);
+ 
+-		*lcp = lnext(*lcp);
+ 		SRF_RETURN_NEXT(funcctx, CStringGetTextDatum(channel));
+ 	}
+ 
+@@ -1035,23 +1028,20 @@ static void
+ Exec_UnlistenCommit(const char *channel)
+ {
+ 	ListCell   *q;
+-	ListCell   *prev;
+ 
+ 	if (Trace_notify)
+ 		elog(DEBUG1, "Exec_UnlistenCommit(%s,%d)", channel, MyProcPid);
+ 
+-	prev = NULL;
+ 	foreach(q, listenChannels)
+ 	{
+ 		char	   *lchan = (char *) lfirst(q);
+ 
+ 		if (strcmp(lchan, channel) == 0)
+ 		{
+-			listenChannels = list_delete_cell(listenChannels, q, prev);
++			listenChannels = foreach_delete_current(listenChannels, q);
+ 			pfree(lchan);
+ 			break;
+ 		}
+-		prev = q;
+ 	}
+ 
+ 	/*
+@@ -1311,9 +1301,9 @@ asyncQueueNotificationToEntry(Notification *n, AsyncQueueEntry *qe)
+  * database OID in order to fill the page. So every page is always used up to
+  * the last byte which simplifies reading the page later.
+  *
+- * We are passed the list cell containing the next notification to write
+- * and return the first still-unwritten cell back.  Eventually we will return
+- * NULL indicating all is done.
++ * We are passed the list cell (in pendingNotifies) containing the next
++ * notification to write and return the first still-unwritten cell back.
++ * Eventually we will return NULL indicating all is done.
+  *
+  * We are holding AsyncQueueLock already from the caller and grab AsyncCtlLock
+  * locally in this function.
+@@ -1362,7 +1352,7 @@ asyncQueueAddEntries(ListCell *nextNotify)
+ 		if (offset + qe.length <= QUEUE_PAGESIZE)
+ 		{
+ 			/* OK, so advance nextNotify past this item */
+-			nextNotify = lnext(nextNotify);
++			nextNotify = lnext(pendingNotifies, nextNotify);
+ 		}
+ 		else
+ 		{
+diff --git a/src/backend/commands/createas.c b/src/backend/commands/createas.c
+index 4c1d909d380c..b7d220699fb9 100644
+--- a/src/backend/commands/createas.c
++++ b/src/backend/commands/createas.c
+@@ -181,7 +181,7 @@ create_ctas_nodata(List *tlist, IntoClause *into)
+ 			if (lc)
+ 			{
+ 				colname = strVal(lfirst(lc));
+-				lc = lnext(lc);
++				lc = lnext(into->colNames, lc);
+ 			}
+ 			else
+ 				colname = tle->resname;
+@@ -465,7 +465,7 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
+ 		if (lc)
+ 		{
+ 			colname = strVal(lfirst(lc));
+-			lc = lnext(lc);
++			lc = lnext(into->colNames, lc);
+ 		}
+ 		else
+ 			colname = NameStr(attribute->attname);
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index dff2ed3f978a..62fb3434a32f 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -257,7 +257,7 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt, const char *queryString,
+ 							queryString, params, queryEnv);
+ 
+ 			/* Separate plans with an appropriate separator */
+-			if (lnext(l) != NULL)
++			if (lnext(rewritten, l) != NULL)
+ 				ExplainSeparatePlans(es);
+ 		}
+ 	}
+diff --git a/src/backend/commands/foreigncmds.c b/src/backend/commands/foreigncmds.c
+index d7bc6e35f029..f96c278a6a15 100644
+--- a/src/backend/commands/foreigncmds.c
++++ b/src/backend/commands/foreigncmds.c
+@@ -120,11 +120,10 @@ transformGenericOptions(Oid catalogId,
+ 	{
+ 		DefElem    *od = lfirst(optcell);
+ 		ListCell   *cell;
+-		ListCell   *prev = NULL;
+ 
+ 		/*
+ 		 * Find the element in resultOptions.  We need this for validation in
+-		 * all cases.  Also identify the previous element.
++		 * all cases.
+ 		 */
+ 		foreach(cell, resultOptions)
+ 		{
+@@ -132,8 +131,6 @@ transformGenericOptions(Oid catalogId,
+ 
+ 			if (strcmp(def->defname, od->defname) == 0)
+ 				break;
+-			else
+-				prev = cell;
+ 		}
+ 
+ 		/*
+@@ -150,7 +147,7 @@ transformGenericOptions(Oid catalogId,
+ 							(errcode(ERRCODE_UNDEFINED_OBJECT),
+ 							 errmsg("option \"%s\" not found",
+ 									od->defname)));
+-				resultOptions = list_delete_cell(resultOptions, cell, prev);
++				resultOptions = list_delete_cell(resultOptions, cell);
+ 				break;
+ 
+ 			case DEFELEM_SET:
+diff --git a/src/backend/commands/indexcmds.c b/src/backend/commands/indexcmds.c
+index 6fa5738bbfb5..fd299273c5a8 100644
+--- a/src/backend/commands/indexcmds.c
++++ b/src/backend/commands/indexcmds.c
+@@ -1793,7 +1793,7 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
+ 			indexInfo->ii_ExclusionOps[attn] = opid;
+ 			indexInfo->ii_ExclusionProcs[attn] = get_opcode(opid);
+ 			indexInfo->ii_ExclusionStrats[attn] = strat;
+-			nextExclOp = lnext(nextExclOp);
++			nextExclOp = lnext(exclusionOpNames, nextExclOp);
+ 		}
+ 
+ 		/*
+diff --git a/src/backend/commands/prepare.c b/src/backend/commands/prepare.c
+index c278ee7318bb..c12b61376339 100644
+--- a/src/backend/commands/prepare.c
++++ b/src/backend/commands/prepare.c
+@@ -682,7 +682,7 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
+ 		/* No need for CommandCounterIncrement, as ExplainOnePlan did it */
+ 
+ 		/* Separate plans with an appropriate separator */
+-		if (lnext(p) != NULL)
++		if (lnext(plan_list, p) != NULL)
+ 			ExplainSeparatePlans(es);
+ 	}
+ 
+diff --git a/src/backend/commands/seclabel.c b/src/backend/commands/seclabel.c
+index 9db82280287c..63219ad589f7 100644
+--- a/src/backend/commands/seclabel.c
++++ b/src/backend/commands/seclabel.c
+@@ -58,7 +58,7 @@ ExecSecLabelStmt(SecLabelStmt *stmt)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+ 					 errmsg("no security label providers have been loaded")));
+-		if (lnext(list_head(label_provider_list)) != NULL)
++		if (list_length(label_provider_list) != 1)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+ 					 errmsg("must specify provider when multiple security label providers have been loaded")));
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index 0f1a9f0e5486..2e792edbcfa2 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -2040,13 +2040,13 @@ static List *
+ MergeAttributes(List *schema, List *supers, char relpersistence,
+ 				bool is_partition, List **supconstr)
+ {
+-	ListCell   *entry;
+ 	List	   *inhSchema = NIL;
+ 	List	   *constraints = NIL;
+ 	bool		have_bogus_defaults = false;
+ 	int			child_attno;
+ 	static Node bogus_marker = {0}; /* marks conflicting defaults */
+ 	List	   *saved_schema = NIL;
++	ListCell   *entry;
+ 
+ 	/*
+ 	 * Check for and reject tables with too many columns. We perform this
+@@ -2071,12 +2071,17 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
+ 	 * Although we might consider merging such entries in the same way that we
+ 	 * handle name conflicts for inherited attributes, it seems to make more
+ 	 * sense to assume such conflicts are errors.
++	 *
++	 * We don't use foreach() here because we have two nested loops over the
++	 * schema list, with possible element deletions in the inner one.  If we
++	 * used foreach_delete_current() it could only fix up the state of one of
++	 * the loops, so it seems cleaner to use looping over list indexes for
++	 * both loops.  Note that any deletion will happen beyond where the outer
++	 * loop is, so its index never needs adjustment.
+ 	 */
+-	foreach(entry, schema)
++	for (int coldefpos = 0; coldefpos < list_length(schema); coldefpos++)
+ 	{
+-		ColumnDef  *coldef = lfirst(entry);
+-		ListCell   *rest = lnext(entry);
+-		ListCell   *prev = entry;
++		ColumnDef  *coldef = list_nth_node(ColumnDef, schema, coldefpos);
+ 
+ 		if (!is_partition && coldef->typeName == NULL)
+ 		{
+@@ -2092,11 +2097,10 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
+ 							coldef->colname)));
+ 		}
+ 
+-		while (rest != NULL)
++		/* restpos scans all entries beyond coldef; incr is in loop body */
++		for (int restpos = coldefpos + 1; restpos < list_length(schema);)
+ 		{
+-			ColumnDef  *restdef = lfirst(rest);
+-			ListCell   *next = lnext(rest); /* need to save it in case we
+-											 * delete it */
++			ColumnDef  *restdef = list_nth_node(ColumnDef, schema, restpos);
+ 
+ 			if (strcmp(coldef->colname, restdef->colname) == 0)
+ 			{
+@@ -2110,13 +2114,7 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
+ 					coldef->cooked_default = restdef->cooked_default;
+ 					coldef->constraints = restdef->constraints;
+ 					coldef->is_from_type = false;
+-					schema = list_delete_cell(schema, rest, prev);
+-
+-					/*
+-					 * As two elements are merged and one is removed, we
+-					 * should never finish with an empty list.
+-					 */
+-					Assert(schema != NIL);
++					schema = list_delete_nth_cell(schema, restpos);
+ 				}
+ 				else
+ 					ereport(ERROR,
+@@ -2124,8 +2122,8 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
+ 							 errmsg("column \"%s\" specified more than once",
+ 									coldef->colname)));
+ 			}
+-			prev = rest;
+-			rest = next;
++			else
++				restpos++;
+ 		}
+ 	}
+ 
+@@ -7866,7 +7864,8 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
+ 			 * assess ppeqop or ffeqop, which RI_Initial_Check() does not use.
+ 			 */
+ 			old_check_ok = (pfeqop == lfirst_oid(old_pfeqop_item));
+-			old_pfeqop_item = lnext(old_pfeqop_item);
++			old_pfeqop_item = lnext(fkconstraint->old_conpfeqop,
++									old_pfeqop_item);
+ 		}
+ 		if (old_check_ok)
+ 		{
+@@ -14619,12 +14618,8 @@ void
+ AtEOXact_on_commit_actions(bool isCommit)
+ {
+ 	ListCell   *cur_item;
+-	ListCell   *prev_item;
+-
+-	prev_item = NULL;
+-	cur_item = list_head(on_commits);
+ 
+-	while (cur_item != NULL)
++	foreach(cur_item, on_commits)
+ 	{
+ 		OnCommitItem *oc = (OnCommitItem *) lfirst(cur_item);
+ 
+@@ -14632,20 +14627,14 @@ AtEOXact_on_commit_actions(bool isCommit)
+ 			oc->creating_subid != InvalidSubTransactionId)
+ 		{
+ 			/* cur_item must be removed */
+-			on_commits = list_delete_cell(on_commits, cur_item, prev_item);
++			on_commits = foreach_delete_current(on_commits, cur_item);
+ 			pfree(oc);
+-			if (prev_item)
+-				cur_item = lnext(prev_item);
+-			else
+-				cur_item = list_head(on_commits);
+ 		}
+ 		else
+ 		{
+ 			/* cur_item must be preserved */
+ 			oc->creating_subid = InvalidSubTransactionId;
+ 			oc->deleting_subid = InvalidSubTransactionId;
+-			prev_item = cur_item;
+-			cur_item = lnext(prev_item);
+ 		}
+ 	}
+ }
+@@ -14662,24 +14651,16 @@ AtEOSubXact_on_commit_actions(bool isCommit, SubTransactionId mySubid,
+ 							  SubTransactionId parentSubid)
+ {
+ 	ListCell   *cur_item;
+-	ListCell   *prev_item;
+ 
+-	prev_item = NULL;
+-	cur_item = list_head(on_commits);
+-
+-	while (cur_item != NULL)
++	foreach(cur_item, on_commits)
+ 	{
+ 		OnCommitItem *oc = (OnCommitItem *) lfirst(cur_item);
+ 
+ 		if (!isCommit && oc->creating_subid == mySubid)
+ 		{
+ 			/* cur_item must be removed */
+-			on_commits = list_delete_cell(on_commits, cur_item, prev_item);
++			on_commits = foreach_delete_current(on_commits, cur_item);
+ 			pfree(oc);
+-			if (prev_item)
+-				cur_item = lnext(prev_item);
+-			else
+-				cur_item = list_head(on_commits);
+ 		}
+ 		else
+ 		{
+@@ -14688,8 +14669,6 @@ AtEOSubXact_on_commit_actions(bool isCommit, SubTransactionId mySubid,
+ 				oc->creating_subid = parentSubid;
+ 			if (oc->deleting_subid == mySubid)
+ 				oc->deleting_subid = isCommit ? parentSubid : InvalidSubTransactionId;
+-			prev_item = cur_item;
+-			cur_item = lnext(prev_item);
+ 		}
+ 	}
+ }
+diff --git a/src/backend/commands/tsearchcmds.c b/src/backend/commands/tsearchcmds.c
+index 11a7f29eafa7..5d6528f9cf87 100644
+--- a/src/backend/commands/tsearchcmds.c
++++ b/src/backend/commands/tsearchcmds.c
+@@ -575,22 +575,16 @@ AlterTSDictionary(AlterTSDictionaryStmt *stmt)
+ 	{
+ 		DefElem    *defel = (DefElem *) lfirst(pl);
+ 		ListCell   *cell;
+-		ListCell   *prev;
+-		ListCell   *next;
+ 
+ 		/*
+ 		 * Remove any matches ...
+ 		 */
+-		prev = NULL;
+-		for (cell = list_head(dictoptions); cell; cell = next)
++		foreach(cell, dictoptions)
+ 		{
+ 			DefElem    *oldel = (DefElem *) lfirst(cell);
+ 
+-			next = lnext(cell);
+ 			if (strcmp(oldel->defname, defel->defname) == 0)
+-				dictoptions = list_delete_cell(dictoptions, cell, prev);
+-			else
+-				prev = cell;
++				dictoptions = foreach_delete_current(dictoptions, cell);
+ 		}
+ 
+ 		/*
+@@ -1558,7 +1552,7 @@ serialize_deflist(List *deflist)
+ 			appendStringInfoChar(&buf, ch);
+ 		}
+ 		appendStringInfoChar(&buf, '\'');
+-		if (lnext(l) != NULL)
++		if (lnext(deflist, l) != NULL)
+ 			appendStringInfoString(&buf, ", ");
+ 	}
+ 
+diff --git a/src/backend/commands/view.c b/src/backend/commands/view.c
+index 87ed453649b9..9773bdc1c3d3 100644
+--- a/src/backend/commands/view.c
++++ b/src/backend/commands/view.c
+@@ -522,7 +522,7 @@ DefineView(ViewStmt *stmt, const char *queryString,
+ 			if (te->resjunk)
+ 				continue;
+ 			te->resname = pstrdup(strVal(lfirst(alist_item)));
+-			alist_item = lnext(alist_item);
++			alist_item = lnext(stmt->aliases, alist_item);
+ 			if (alist_item == NULL)
+ 				break;			/* done assigning aliases */
+ 		}
+diff --git a/src/backend/executor/execJunk.c b/src/backend/executor/execJunk.c
+index 79fcc8dee2b1..897ff52e0341 100644
+--- a/src/backend/executor/execJunk.c
++++ b/src/backend/executor/execJunk.c
+@@ -173,7 +173,7 @@ ExecInitJunkFilterConversion(List *targetList,
+ 			{
+ 				TargetEntry *tle = lfirst(t);
+ 
+-				t = lnext(t);
++				t = lnext(targetList, t);
+ 				if (!tle->resjunk)
+ 				{
+ 					cleanMap[i] = tle->resno;
+diff --git a/src/backend/executor/execPartition.c b/src/backend/executor/execPartition.c
+index 6f2b4d62b415..f49a48adb68e 100644
+--- a/src/backend/executor/execPartition.c
++++ b/src/backend/executor/execPartition.c
+@@ -1214,7 +1214,7 @@ FormPartitionKeyDatum(PartitionDispatch pd,
+ 			datum = ExecEvalExprSwitchContext((ExprState *) lfirst(partexpr_item),
+ 											  GetPerTupleExprContext(estate),
+ 											  &isNull);
+-			partexpr_item = lnext(partexpr_item);
++			partexpr_item = lnext(pd->keystate, partexpr_item);
+ 		}
+ 		values[i] = datum;
+ 		isnull[i] = isNull;
+diff --git a/src/backend/executor/execUtils.c b/src/backend/executor/execUtils.c
+index 9b866a5dd663..c1fc0d54e956 100644
+--- a/src/backend/executor/execUtils.c
++++ b/src/backend/executor/execUtils.c
+@@ -588,7 +588,7 @@ tlist_matches_tupdesc(PlanState *ps, List *tlist, Index varno, TupleDesc tupdesc
+ 			 var->vartypmod != -1))
+ 			return false;		/* type mismatch */
+ 
+-		tlist_item = lnext(tlist_item);
++		tlist_item = lnext(tlist, tlist_item);
+ 	}
+ 
+ 	if (tlist_item)
+diff --git a/src/backend/executor/functions.c b/src/backend/executor/functions.c
+index 29a8a16f5f9d..64a9e584627f 100644
+--- a/src/backend/executor/functions.c
++++ b/src/backend/executor/functions.c
+@@ -1181,7 +1181,7 @@ fmgr_sql(PG_FUNCTION_ARGS)
+ 		es = es->next;
+ 		while (!es)
+ 		{
+-			eslc = lnext(eslc);
++			eslc = lnext(eslist, eslc);
+ 			if (!eslc)
+ 				break;			/* end of function */
+ 
+diff --git a/src/backend/executor/nodeTableFuncscan.c b/src/backend/executor/nodeTableFuncscan.c
+index 45d5f3c4244b..d264337899a4 100644
+--- a/src/backend/executor/nodeTableFuncscan.c
++++ b/src/backend/executor/nodeTableFuncscan.c
+@@ -514,7 +514,7 @@ tfuncLoadRows(TableFuncScanState *tstate, ExprContext *econtext)
+ 
+ 			/* advance list of default expressions */
+ 			if (cell != NULL)
+-				cell = lnext(cell);
++				cell = lnext(tstate->coldefexprs, cell);
+ 		}
+ 
+ 		tuplestore_putvalues(tstate->tupstore, tupdesc, values, nulls);
+diff --git a/src/backend/libpq/auth.c b/src/backend/libpq/auth.c
+index 931058695ac0..9358219aa60a 100644
+--- a/src/backend/libpq/auth.c
++++ b/src/backend/libpq/auth.c
+@@ -3031,11 +3031,11 @@ CheckRADIUSAuth(Port *port)
+ 		 * don't and will then reuse the correct value.
+ 		 */
+ 		if (list_length(port->hba->radiussecrets) > 1)
+-			secrets = lnext(secrets);
++			secrets = lnext(port->hba->radiussecrets, secrets);
+ 		if (list_length(port->hba->radiusports) > 1)
+-			radiusports = lnext(radiusports);
++			radiusports = lnext(port->hba->radiusports, radiusports);
+ 		if (list_length(port->hba->radiusidentifiers) > 1)
+-			identifiers = lnext(identifiers);
++			identifiers = lnext(port->hba->radiusidentifiers, identifiers);
+ 	}
+ 
+ 	/* No servers left to try, so give up */
+diff --git a/src/backend/libpq/hba.c b/src/backend/libpq/hba.c
+index 563d2510198b..2221c04fef6a 100644
+--- a/src/backend/libpq/hba.c
++++ b/src/backend/libpq/hba.c
+@@ -1060,7 +1060,7 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
+ 	}
+ 
+ 	/* Get the databases. */
+-	field = lnext(field);
++	field = lnext(tok_line->fields, field);
+ 	if (!field)
+ 	{
+ 		ereport(elevel,
+@@ -1080,7 +1080,7 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
+ 	}
+ 
+ 	/* Get the roles. */
+-	field = lnext(field);
++	field = lnext(tok_line->fields, field);
+ 	if (!field)
+ 	{
+ 		ereport(elevel,
+@@ -1102,7 +1102,7 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
+ 	if (parsedline->conntype != ctLocal)
+ 	{
+ 		/* Read the IP address field. (with or without CIDR netmask) */
+-		field = lnext(field);
++		field = lnext(tok_line->fields, field);
+ 		if (!field)
+ 		{
+ 			ereport(elevel,
+@@ -1222,7 +1222,7 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
+ 			{
+ 				/* Read the mask field. */
+ 				pfree(str);
+-				field = lnext(field);
++				field = lnext(tok_line->fields, field);
+ 				if (!field)
+ 				{
+ 					ereport(elevel,
+@@ -1283,7 +1283,7 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
+ 	}							/* != ctLocal */
+ 
+ 	/* Get the authentication method */
+-	field = lnext(field);
++	field = lnext(tok_line->fields, field);
+ 	if (!field)
+ 	{
+ 		ereport(elevel,
+@@ -1488,7 +1488,7 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
+ 	}
+ 
+ 	/* Parse remaining arguments */
+-	while ((field = lnext(field)) != NULL)
++	while ((field = lnext(tok_line->fields, field)) != NULL)
+ 	{
+ 		tokens = lfirst(field);
+ 		foreach(tokencell, tokens)
+@@ -2729,7 +2729,7 @@ parse_ident_line(TokenizedLine *tok_line)
+ 	parsedline->usermap = pstrdup(token->string);
+ 
+ 	/* Get the ident user token */
+-	field = lnext(field);
++	field = lnext(tok_line->fields, field);
+ 	IDENT_FIELD_ABSENT(field);
+ 	tokens = lfirst(field);
+ 	IDENT_MULTI_VALUE(tokens);
+@@ -2737,7 +2737,7 @@ parse_ident_line(TokenizedLine *tok_line)
+ 	parsedline->ident_user = pstrdup(token->string);
+ 
+ 	/* Get the PG rolename token */
+-	field = lnext(field);
++	field = lnext(tok_line->fields, field);
+ 	IDENT_FIELD_ABSENT(field);
+ 	tokens = lfirst(field);
+ 	IDENT_MULTI_VALUE(tokens);
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index 78deade89b4d..6414aded0efe 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -4658,48 +4658,6 @@ _copyDropSubscriptionStmt(const DropSubscriptionStmt *from)
+ 	return newnode;
+ }
+ 
+-/* ****************************************************************
+- *					pg_list.h copy functions
+- * ****************************************************************
+- */
+-
+-/*
+- * Perform a deep copy of the specified list, using copyObject(). The
+- * list MUST be of type T_List; T_IntList and T_OidList nodes don't
+- * need deep copies, so they should be copied via list_copy()
+- */
+-#define COPY_NODE_CELL(new, old)					\
+-	(new) = (ListCell *) palloc(sizeof(ListCell));	\
+-	lfirst(new) = copyObjectImpl(lfirst(old));
+-
+-static List *
+-_copyList(const List *from)
+-{
+-	List	   *new;
+-	ListCell   *curr_old;
+-	ListCell   *prev_new;
+-
+-	Assert(list_length(from) >= 1);
+-
+-	new = makeNode(List);
+-	new->length = from->length;
+-
+-	COPY_NODE_CELL(new->head, from->head);
+-	prev_new = new->head;
+-	curr_old = lnext(from->head);
+-
+-	while (curr_old)
+-	{
+-		COPY_NODE_CELL(prev_new->next, curr_old);
+-		prev_new = prev_new->next;
+-		curr_old = curr_old->next;
+-	}
+-	prev_new->next = NULL;
+-	new->tail = prev_new;
+-
+-	return new;
+-}
+-
+ /* ****************************************************************
+  *					extensible.h copy functions
+  * ****************************************************************
+@@ -5140,7 +5098,7 @@ copyObjectImpl(const void *from)
+ 			 * LIST NODES
+ 			 */
+ 		case T_List:
+-			retval = _copyList(from);
++			retval = list_copy_deep(from);
+ 			break;
+ 
+ 			/*
+diff --git a/src/backend/nodes/list.c b/src/backend/nodes/list.c
+index 9897ab127d08..ecc2911496f9 100644
+--- a/src/backend/nodes/list.c
++++ b/src/backend/nodes/list.c
+@@ -1,7 +1,9 @@
+ /*-------------------------------------------------------------------------
+  *
+  * list.c
+- *	  implementation for PostgreSQL generic linked list package
++ *	  implementation for PostgreSQL generic list package
++ *
++ * See comments in pg_list.h.
+  *
+  *
+  * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+@@ -16,10 +18,35 @@
+ #include "postgres.h"
+ 
+ #include "nodes/pg_list.h"
++#include "utils/memutils.h"
++
++
++/*
++ * The previous List implementation, since it used a separate palloc chunk
++ * for each cons cell, had the property that adding or deleting list cells
++ * did not move the storage of other existing cells in the list.  Quite a
++ * bit of existing code depended on that, by retaining ListCell pointers
++ * across such operations on a list.  There is no such guarantee in this
++ * implementation, so instead we have debugging support that is meant to
++ * help flush out now-broken assumptions.  Defining DEBUG_LIST_MEMORY_USAGE
++ * while building this file causes the List operations to forcibly move
++ * all cells in a list whenever a cell is added or deleted.  In combination
++ * with MEMORY_CONTEXT_CHECKING and/or Valgrind, this can usually expose
++ * broken code.  It's a bit expensive though, as there's many more palloc
++ * cycles and a lot more data-copying than in a default build.
++ *
++ * By default, we enable this when building for Valgrind.
++ */
++#ifdef USE_VALGRIND
++#define DEBUG_LIST_MEMORY_USAGE
++#endif
+ 
++/* Overhead for the fixed part of a List header, measured in ListCells */
++#define LIST_HEADER_OVERHEAD  \
++	((int) ((offsetof(List, initial_elements) - 1) / sizeof(ListCell) + 1))
+ 
+ /*
+- * Routines to simplify writing assertions about the type of a list; a
++ * Macros to simplify writing assertions about the type of a list; a
+  * NIL list is considered to be an empty list of any type.
+  */
+ #define IsPointerList(l)		((l) == NIL || IsA((l), List))
+@@ -37,50 +64,221 @@ check_list_invariants(const List *list)
+ 		return;
+ 
+ 	Assert(list->length > 0);
+-	Assert(list->head != NULL);
+-	Assert(list->tail != NULL);
++	Assert(list->length <= list->max_length);
++	Assert(list->elements != NULL);
+ 
+ 	Assert(list->type == T_List ||
+ 		   list->type == T_IntList ||
+ 		   list->type == T_OidList);
+-
+-	if (list->length == 1)
+-		Assert(list->head == list->tail);
+-	if (list->length == 2)
+-		Assert(list->head->next == list->tail);
+-	Assert(list->tail->next == NULL);
+ }
+ #else
+-#define check_list_invariants(l)
++#define check_list_invariants(l)  ((void) 0)
+ #endif							/* USE_ASSERT_CHECKING */
+ 
+ /*
+- * Return a freshly allocated List. Since empty non-NIL lists are
+- * invalid, new_list() also allocates the head cell of the new list:
+- * the caller should be sure to fill in that cell's data.
++ * Return a freshly allocated List with room for at least min_size cells.
++ *
++ * Since empty non-NIL lists are invalid, new_list() sets the initial length
++ * to min_size, effectively marking that number of cells as valid; the caller
++ * is responsible for filling in their data.
+  */
+ static List *
+-new_list(NodeTag type)
++new_list(NodeTag type, int min_size)
+ {
+-	List	   *new_list;
+-	ListCell   *new_head;
++	List	   *newlist;
++	int			max_size;
+ 
+-	new_head = (ListCell *) palloc(sizeof(*new_head));
+-	new_head->next = NULL;
+-	/* new_head->data is left undefined! */
++	Assert(min_size > 0);
++
++	/*
++	 * We allocate all the requested cells, and possibly some more, as part of
++	 * the same palloc request as the List header.  This is a big win for the
++	 * typical case of short fixed-length lists.  It can lose if we allocate a
++	 * moderately long list and then it gets extended; we'll be wasting more
++	 * initial_elements[] space than if we'd made the header small.  However,
++	 * rounding up the request as we do in the normal code path provides some
++	 * defense against small extensions.
++	 */
+ 
+-	new_list = (List *) palloc(sizeof(*new_list));
+-	new_list->type = type;
+-	new_list->length = 1;
+-	new_list->head = new_head;
+-	new_list->tail = new_head;
++#ifndef DEBUG_LIST_MEMORY_USAGE
+ 
+-	return new_list;
++	/*
++	 * Normally, we set up a list with some extra cells, to allow it to grow
++	 * without a repalloc.  Prefer cell counts chosen to make the total
++	 * allocation a power-of-2, since palloc would round it up to that anyway.
++	 * (That stops being true for very large allocations, but very long lists
++	 * are infrequent, so it doesn't seem worth special logic for such cases.)
++	 *
++	 * The minimum allocation is 8 ListCell units, providing either 4 or 5
++	 * available ListCells depending on the machine's word width.  Counting
++	 * palloc's overhead, this uses the same amount of space as a one-cell
++	 * list did in the old implementation, and less space for any longer list.
++	 *
++	 * We needn't worry about integer overflow; no caller passes min_size
++	 * that's more than twice the size of an existing list, so the size limits
++	 * within palloc will ensure that we don't overflow here.
++	 */
++	max_size = 8;				/* semi-arbitrary small power of 2 */
++	while (max_size < min_size + LIST_HEADER_OVERHEAD)
++		max_size *= 2;
++	max_size -= LIST_HEADER_OVERHEAD;
++#else
++
++	/*
++	 * For debugging, don't allow any extra space.  This forces any cell
++	 * addition to go through enlarge_list() and thus move the existing data.
++	 */
++	max_size = min_size;
++#endif
++
++	newlist = (List *) palloc(offsetof(List, initial_elements) +
++							  max_size * sizeof(ListCell));
++	newlist->type = type;
++	newlist->length = min_size;
++	newlist->max_length = max_size;
++	newlist->elements = newlist->initial_elements;
++
++	return newlist;
+ }
+ 
+ /*
+- * Allocate a new cell and make it the head of the specified
+- * list. Assumes the list it is passed is non-NIL.
++ * Enlarge an existing non-NIL List to have room for at least min_size cells.
++ *
++ * This does *not* update list->length, as some callers would find that
++ * inconvenient.  (list->length had better be the correct number of existing
++ * valid cells, though.)
++ */
++static void
++enlarge_list(List *list, int min_size)
++{
++	int			new_max_len;
++
++	Assert(min_size > list->max_length);	/* else we shouldn't be here */
++
++#ifndef DEBUG_LIST_MEMORY_USAGE
++
++	/*
++	 * As above, we prefer power-of-two total allocations; but here we need
++	 * not account for list header overhead.  The existing max length might
++	 * not be a power of 2, so don't rely on that.
++	 */
++	new_max_len = 16;			/* semi-arbitrary small power of 2 */
++	while (new_max_len < min_size)
++		new_max_len *= 2;
++#else
++	/* As above, don't allocate anything extra */
++	new_max_len = min_size;
++#endif
++
++	if (list->elements == list->initial_elements)
++	{
++		List	   *newlist PG_USED_FOR_ASSERTS_ONLY;
++
++		/*
++		 * Replace original in-line allocation with a separate palloc block.
++		 * Ensure it is in the same memory context as the List header.  (The
++		 * previous List implementation did not offer any guarantees about
++		 * keeping all list cells in the same context, but it seems reasonable
++		 * to create such a guarantee now.)
++		 */
++		list->elements = (ListCell *)
++			MemoryContextAlloc(GetMemoryChunkContext(list),
++							   new_max_len * sizeof(ListCell));
++		memcpy(list->elements, list->initial_elements,
++			   list->length * sizeof(ListCell));
++
++		/*
++		 * Currently, asking aset.c to reduce the allocated size of the List
++		 * header is pointless in terms of reclaiming space, unless the list
++		 * is very long.  However, it seems worth doing anyway to cause the
++		 * no-longer-needed initial_elements[] space to be cleared in
++		 * debugging builds.
++		 */
++		newlist = (List *) repalloc(list, offsetof(List, initial_elements));
++
++		/* That better not have failed, nor moved the list header */
++		Assert(newlist == list);
++	}
++	else
++	{
++#ifndef DEBUG_LIST_MEMORY_USAGE
++		/* Normally, let repalloc deal with enlargement */
++		list->elements = (ListCell *) repalloc(list->elements,
++											   new_max_len * sizeof(ListCell));
++#else
++		/*
++		 * repalloc() might enlarge the space in-place, which we don't want
++		 * for debugging purposes, so forcibly move the data somewhere else.
++		 */
++		ListCell   *newelements;
++
++		newelements = (ListCell *)
++			MemoryContextAlloc(GetMemoryChunkContext(list),
++							   new_max_len * sizeof(ListCell));
++		memcpy(newelements, list->elements,
++			   list->length * sizeof(ListCell));
++		pfree(list->elements);
++		list->elements = newelements;
++#endif
++	}
++
++	list->max_length = new_max_len;
++}
++
++/*
++ * Convenience functions to construct short Lists from given values.
++ * (These are normally invoked via the list_makeN macros.)
++ */
++List *
++list_make1_impl(NodeTag t, ListCell datum1)
++{
++	List	   *list = new_list(t, 1);
++
++	list->elements[0] = datum1;
++	check_list_invariants(list);
++	return list;
++}
++
++List *
++list_make2_impl(NodeTag t, ListCell datum1, ListCell datum2)
++{
++	List	   *list = new_list(t, 2);
++
++	list->elements[0] = datum1;
++	list->elements[1] = datum2;
++	check_list_invariants(list);
++	return list;
++}
++
++List *
++list_make3_impl(NodeTag t, ListCell datum1, ListCell datum2,
++				ListCell datum3)
++{
++	List	   *list = new_list(t, 3);
++
++	list->elements[0] = datum1;
++	list->elements[1] = datum2;
++	list->elements[2] = datum3;
++	check_list_invariants(list);
++	return list;
++}
++
++List *
++list_make4_impl(NodeTag t, ListCell datum1, ListCell datum2,
++				ListCell datum3, ListCell datum4)
++{
++	List	   *list = new_list(t, 4);
++
++	list->elements[0] = datum1;
++	list->elements[1] = datum2;
++	list->elements[2] = datum3;
++	list->elements[3] = datum4;
++	check_list_invariants(list);
++	return list;
++}
++
++/*
++ * Make room for a new head cell in the given (non-NIL) list.
+  *
+  * The data in the new head cell is undefined; the caller should be
+  * sure to fill it in
+@@ -88,18 +286,17 @@ new_list(NodeTag type)
+ static void
+ new_head_cell(List *list)
+ {
+-	ListCell   *new_head;
+-
+-	new_head = (ListCell *) palloc(sizeof(*new_head));
+-	new_head->next = list->head;
+-
+-	list->head = new_head;
++	/* Enlarge array if necessary */
++	if (list->length >= list->max_length)
++		enlarge_list(list, list->length + 1);
++	/* Now shove the existing data over */
++	memmove(&list->elements[1], &list->elements[0],
++			list->length * sizeof(ListCell));
+ 	list->length++;
+ }
+ 
+ /*
+- * Allocate a new cell and make it the tail of the specified
+- * list. Assumes the list it is passed is non-NIL.
++ * Make room for a new tail cell in the given (non-NIL) list.
+  *
+  * The data in the new tail cell is undefined; the caller should be
+  * sure to fill it in
+@@ -107,13 +304,9 @@ new_head_cell(List *list)
+ static void
+ new_tail_cell(List *list)
+ {
+-	ListCell   *new_tail;
+-
+-	new_tail = (ListCell *) palloc(sizeof(*new_tail));
+-	new_tail->next = NULL;
+-
+-	list->tail->next = new_tail;
+-	list->tail = new_tail;
++	/* Enlarge array if necessary */
++	if (list->length >= list->max_length)
++		enlarge_list(list, list->length + 1);
+ 	list->length++;
+ }
+ 
+@@ -130,11 +323,11 @@ lappend(List *list, void *datum)
+ 	Assert(IsPointerList(list));
+ 
+ 	if (list == NIL)
+-		list = new_list(T_List);
++		list = new_list(T_List, 1);
+ 	else
+ 		new_tail_cell(list);
+ 
+-	lfirst(list->tail) = datum;
++	lfirst(list_tail(list)) = datum;
+ 	check_list_invariants(list);
+ 	return list;
+ }
+@@ -148,11 +341,11 @@ lappend_int(List *list, int datum)
+ 	Assert(IsIntegerList(list));
+ 
+ 	if (list == NIL)
+-		list = new_list(T_IntList);
++		list = new_list(T_IntList, 1);
+ 	else
+ 		new_tail_cell(list);
+ 
+-	lfirst_int(list->tail) = datum;
++	lfirst_int(list_tail(list)) = datum;
+ 	check_list_invariants(list);
+ 	return list;
+ }
+@@ -166,82 +359,130 @@ lappend_oid(List *list, Oid datum)
+ 	Assert(IsOidList(list));
+ 
+ 	if (list == NIL)
+-		list = new_list(T_OidList);
++		list = new_list(T_OidList, 1);
+ 	else
+ 		new_tail_cell(list);
+ 
+-	lfirst_oid(list->tail) = datum;
++	lfirst_oid(list_tail(list)) = datum;
+ 	check_list_invariants(list);
+ 	return list;
+ }
+ 
+ /*
+- * Add a new cell to the list, in the position after 'prev_cell'. The
+- * data in the cell is left undefined, and must be filled in by the
+- * caller. 'list' is assumed to be non-NIL, and 'prev_cell' is assumed
+- * to be non-NULL and a member of 'list'.
++ * Make room for a new cell at position 'pos' (measured from 0).
++ * The data in the cell is left undefined, and must be filled in by the
++ * caller. 'list' is assumed to be non-NIL, and 'pos' must be a valid
++ * list position, ie, 0 <= pos <= list's length.
++ * Returns address of the new cell.
+  */
+ static ListCell *
+-add_new_cell(List *list, ListCell *prev_cell)
++insert_new_cell(List *list, int pos)
+ {
+-	ListCell   *new_cell;
++	Assert(pos >= 0 && pos <= list->length);
++
++	/* Enlarge array if necessary */
++	if (list->length >= list->max_length)
++		enlarge_list(list, list->length + 1);
++	/* Now shove the existing data over */
++	if (pos < list->length)
++		memmove(&list->elements[pos + 1], &list->elements[pos],
++				(list->length - pos) * sizeof(ListCell));
++	list->length++;
+ 
+-	new_cell = (ListCell *) palloc(sizeof(*new_cell));
+-	/* new_cell->data is left undefined! */
+-	new_cell->next = prev_cell->next;
+-	prev_cell->next = new_cell;
++	return &list->elements[pos];
++}
+ 
+-	if (list->tail == prev_cell)
+-		list->tail = new_cell;
++/*
++ * Insert the given datum at position 'pos' (measured from 0) in the list.
++ * 'pos' must be valid, ie, 0 <= pos <= list's length.
++ */
++List *
++list_insert_nth(List *list, int pos, void *datum)
++{
++	if (list == NIL)
++	{
++		Assert(pos == 0);
++		return list_make1(datum);
++	}
++	Assert(IsPointerList(list));
++	lfirst(insert_new_cell(list, pos)) = datum;
++	check_list_invariants(list);
++	return list;
++}
+ 
+-	list->length++;
++List *
++list_insert_nth_int(List *list, int pos, int datum)
++{
++	if (list == NIL)
++	{
++		Assert(pos == 0);
++		return list_make1_int(datum);
++	}
++	Assert(IsIntegerList(list));
++	lfirst_int(insert_new_cell(list, pos)) = datum;
++	check_list_invariants(list);
++	return list;
++}
+ 
+-	return new_cell;
++List *
++list_insert_nth_oid(List *list, int pos, Oid datum)
++{
++	if (list == NIL)
++	{
++		Assert(pos == 0);
++		return list_make1_oid(datum);
++	}
++	Assert(IsOidList(list));
++	lfirst_oid(insert_new_cell(list, pos)) = datum;
++	check_list_invariants(list);
++	return list;
++}
++
++/*
++ * Add a new cell to the list, in the position after 'prev_cell'. The
++ * data in the cell is left undefined, and must be filled in by the
++ * caller. 'list' is assumed to be non-NIL, and 'prev_cell' is assumed
++ * to be non-NULL and a member of 'list'. Returns address of new cell.
++ *
++ * Caution: prev_cell might no longer point into the list after this!
++ */
++static ListCell *
++add_new_cell_after(List *list, ListCell *prev_cell)
++{
++	/* insert_new_cell will assert that this is in-range: */
++	int			pos = prev_cell - list->elements;
++
++	return insert_new_cell(list, pos + 1);
+ }
+ 
+ /*
+  * Add a new cell to the specified list (which must be non-NIL);
+  * it will be placed after the list cell 'prev' (which must be
+  * non-NULL and a member of 'list'). The data placed in the new cell
+- * is 'datum'. The newly-constructed cell is returned.
++ * is 'datum'.
+  */
+-ListCell *
++void
+ lappend_cell(List *list, ListCell *prev, void *datum)
+ {
+-	ListCell   *new_cell;
+-
+ 	Assert(IsPointerList(list));
+-
+-	new_cell = add_new_cell(list, prev);
+-	lfirst(new_cell) = datum;
++	lfirst(add_new_cell_after(list, prev)) = datum;
+ 	check_list_invariants(list);
+-	return new_cell;
+ }
+ 
+-ListCell *
++void
+ lappend_cell_int(List *list, ListCell *prev, int datum)
+ {
+-	ListCell   *new_cell;
+-
+ 	Assert(IsIntegerList(list));
+-
+-	new_cell = add_new_cell(list, prev);
+-	lfirst_int(new_cell) = datum;
++	lfirst_int(add_new_cell_after(list, prev)) = datum;
+ 	check_list_invariants(list);
+-	return new_cell;
+ }
+ 
+-ListCell *
++void
+ lappend_cell_oid(List *list, ListCell *prev, Oid datum)
+ {
+-	ListCell   *new_cell;
+-
+ 	Assert(IsOidList(list));
+-
+-	new_cell = add_new_cell(list, prev);
+-	lfirst_oid(new_cell) = datum;
++	lfirst_oid(add_new_cell_after(list, prev)) = datum;
+ 	check_list_invariants(list);
+-	return new_cell;
+ }
+ 
+ /*
+@@ -261,11 +502,11 @@ lcons(void *datum, List *list)
+ 	Assert(IsPointerList(list));
+ 
+ 	if (list == NIL)
+-		list = new_list(T_List);
++		list = new_list(T_List, 1);
+ 	else
+ 		new_head_cell(list);
+ 
+-	lfirst(list->head) = datum;
++	lfirst(list_head(list)) = datum;
+ 	check_list_invariants(list);
+ 	return list;
+ }
+@@ -279,11 +520,11 @@ lcons_int(int datum, List *list)
+ 	Assert(IsIntegerList(list));
+ 
+ 	if (list == NIL)
+-		list = new_list(T_IntList);
++		list = new_list(T_IntList, 1);
+ 	else
+ 		new_head_cell(list);
+ 
+-	lfirst_int(list->head) = datum;
++	lfirst_int(list_head(list)) = datum;
+ 	check_list_invariants(list);
+ 	return list;
+ }
+@@ -297,41 +538,44 @@ lcons_oid(Oid datum, List *list)
+ 	Assert(IsOidList(list));
+ 
+ 	if (list == NIL)
+-		list = new_list(T_OidList);
++		list = new_list(T_OidList, 1);
+ 	else
+ 		new_head_cell(list);
+ 
+-	lfirst_oid(list->head) = datum;
++	lfirst_oid(list_head(list)) = datum;
+ 	check_list_invariants(list);
+ 	return list;
+ }
+ 
+ /*
+  * Concatenate list2 to the end of list1, and return list1. list1 is
+- * destructively changed. Callers should be sure to use the return
+- * value as the new pointer to the concatenated list: the 'list1'
+- * input pointer may or may not be the same as the returned pointer.
+- *
+- * The nodes in list2 are merely appended to the end of list1 in-place
+- * (i.e. they aren't copied; the two lists will share some of the same
+- * storage). Therefore, invoking list_free() on list2 will also
+- * invalidate a portion of list1.
++ * destructively changed, list2 is not. (However, in the case of pointer
++ * lists, list1 and list2 will point to the same structures.) Callers
++ * should be sure to use the return value as the new pointer to the
++ * concatenated list: the 'list1' input pointer may or may not be the
++ * same as the returned pointer.
+  */
+ List *
+-list_concat(List *list1, List *list2)
++list_concat(List *list1, const List *list2)
+ {
++	int			new_len;
++
+ 	if (list1 == NIL)
+-		return list2;
++		return list_copy(list2);
+ 	if (list2 == NIL)
+ 		return list1;
+-	if (list1 == list2)
+-		elog(ERROR, "cannot list_concat() a list to itself");
+ 
+ 	Assert(list1->type == list2->type);
+ 
+-	list1->length += list2->length;
+-	list1->tail->next = list2->head;
+-	list1->tail = list2->tail;
++	new_len = list1->length + list2->length;
++	/* Enlarge array if necessary */
++	if (new_len > list1->max_length)
++		enlarge_list(list1, new_len);
++
++	/* Even if list1 == list2, using memcpy should be safe here */
++	memcpy(&list1->elements[list1->length], &list2->elements[0],
++		   list2->length * sizeof(ListCell));
++	list1->length = new_len;
+ 
+ 	check_list_invariants(list1);
+ 	return list1;
+@@ -349,92 +593,26 @@ list_concat(List *list1, List *list2)
+ List *
+ list_truncate(List *list, int new_size)
+ {
+-	ListCell   *cell;
+-	int			n;
+-
+ 	if (new_size <= 0)
+ 		return NIL;				/* truncate to zero length */
+ 
+ 	/* If asked to effectively extend the list, do nothing */
+-	if (new_size >= list_length(list))
+-		return list;
++	if (new_size < list_length(list))
++		list->length = new_size;
+ 
+-	n = 1;
+-	foreach(cell, list)
+-	{
+-		if (n == new_size)
+-		{
+-			cell->next = NULL;
+-			list->tail = cell;
+-			list->length = new_size;
+-			check_list_invariants(list);
+-			return list;
+-		}
+-		n++;
+-	}
++	/*
++	 * Note: unlike the individual-list-cell deletion functions, we don't move
++	 * the list cells to new storage, even in DEBUG_LIST_MEMORY_USAGE mode.
++	 * This is because none of them can move in this operation, so just like
++	 * in the old cons-cell-based implementation, this function doesn't
++	 * invalidate any pointers to cells of the list.  This is also the reason
++	 * for not wiping the memory of the deleted cells: the old code didn't
++	 * free them either.  Perhaps later we'll tighten this up.
++	 */
+ 
+-	/* keep the compiler quiet; never reached */
+-	Assert(false);
+ 	return list;
+ }
+ 
+-/*
+- * Locate the n'th cell (counting from 0) of the list.  It is an assertion
+- * failure if there is no such cell.
+- */
+-ListCell *
+-list_nth_cell(const List *list, int n)
+-{
+-	ListCell   *match;
+-
+-	Assert(list != NIL);
+-	Assert(n >= 0);
+-	Assert(n < list->length);
+-	check_list_invariants(list);
+-
+-	/* Does the caller actually mean to fetch the tail? */
+-	if (n == list->length - 1)
+-		return list->tail;
+-
+-	for (match = list->head; n-- > 0; match = match->next)
+-		;
+-
+-	return match;
+-}
+-
+-/*
+- * Return the data value contained in the n'th element of the
+- * specified list. (List elements begin at 0.)
+- */
+-void *
+-list_nth(const List *list, int n)
+-{
+-	Assert(IsPointerList(list));
+-	return lfirst(list_nth_cell(list, n));
+-}
+-
+-/*
+- * Return the integer value contained in the n'th element of the
+- * specified list.
+- */
+-int
+-list_nth_int(const List *list, int n)
+-{
+-	Assert(IsIntegerList(list));
+-	return lfirst_int(list_nth_cell(list, n));
+-}
+-
+-/*
+- * Return the OID value contained in the n'th element of the specified
+- * list.
+- */
+-Oid
+-list_nth_oid(const List *list, int n)
+-{
+-	Assert(IsOidList(list));
+-	return lfirst_oid(list_nth_cell(list, n));
+-}
+-
+ /*
+  * Return true iff 'datum' is a member of the list. Equality is
+  * determined via equal(), so callers should ensure that they pass a
+@@ -519,16 +697,16 @@ list_member_oid(const List *list, Oid datum)
+ }
+ 
+ /*
+- * Delete 'cell' from 'list'; 'prev' is the previous element to 'cell'
+- * in 'list', if any (i.e. prev == NULL iff list->head == cell)
++ * Delete the n'th cell (counting from 0) in list.
+  *
+- * The cell is pfree'd, as is the List header if this was the last member.
++ * The List is pfree'd if this was the last member.
+  */
+ List *
+-list_delete_cell(List *list, ListCell *cell, ListCell *prev)
++list_delete_nth_cell(List *list, int n)
+ {
+ 	check_list_invariants(list);
+-	Assert(prev != NULL ? lnext(prev) == cell : list_head(list) == cell);
++
++	Assert(n >= 0 && n < list->length);
+ 
+ 	/*
+ 	 * If we're about to delete the last node from the list, free the whole
+@@ -542,23 +720,61 @@ list_delete_cell(List *list, ListCell *cell, ListCell *prev)
+ 	}
+ 
+ 	/*
+-	 * Otherwise, adjust the necessary list links, deallocate the particular
+-	 * node we have just removed, and return the list we were given.
++	 * Otherwise, we normally just collapse out the removed element.  But for
++	 * debugging purposes, move the whole list contents someplace else.
++	 *
++	 * (Note that we *must* keep the contents in the same memory context.)
+ 	 */
++#ifndef DEBUG_LIST_MEMORY_USAGE
++	memmove(&list->elements[n], &list->elements[n + 1],
++			(list->length - 1 - n) * sizeof(ListCell));
+ 	list->length--;
++#else
++	{
++		ListCell   *newelems;
++		int			newmaxlen = list->length - 1;
++
++		newelems = (ListCell *)
++			MemoryContextAlloc(GetMemoryChunkContext(list),
++							   newmaxlen * sizeof(ListCell));
++		memcpy(newelems, list->elements, n * sizeof(ListCell));
++		memcpy(&newelems[n], &list->elements[n + 1],
++			   (list->length - 1 - n) * sizeof(ListCell));
++		if (list->elements != list->initial_elements)
++			pfree(list->elements);
++		else
++		{
++			/*
++			 * As in enlarge_list(), tell palloc code we're not using the
++			 * initial_elements space anymore.
++			 */
++			List	   *newlist PG_USED_FOR_ASSERTS_ONLY;
++
++			newlist = (List *) repalloc(list, offsetof(List, initial_elements));
++			Assert(newlist == list);
++		}
++		list->elements = newelems;
++		list->max_length = newmaxlen;
++		list->length--;
++		check_list_invariants(list);
++	}
++#endif
+ 
+-	if (prev)
+-		prev->next = cell->next;
+-	else
+-		list->head = cell->next;
+-
+-	if (list->tail == cell)
+-		list->tail = prev;
+-
+-	pfree(cell);
+ 	return list;
+ }
+ 
++/*
++ * Delete 'cell' from 'list'.
++ *
++ * The List is pfree'd if this was the last member.  However, we do not
++ * touch any data the cell might've been pointing to.
++ */
++List *
++list_delete_cell(List *list, ListCell *cell)
++{
++	return list_delete_nth_cell(list, cell - list->elements);
++}
++
+ /*
+  * Delete the first cell in list that matches datum, if any.
+  * Equality is determined via equal().
+@@ -567,18 +783,14 @@ List *
+ list_delete(List *list, void *datum)
+ {
+ 	ListCell   *cell;
+-	ListCell   *prev;
+ 
+ 	Assert(IsPointerList(list));
+ 	check_list_invariants(list);
+ 
+-	prev = NULL;
+ 	foreach(cell, list)
+ 	{
+ 		if (equal(lfirst(cell), datum))
+-			return list_delete_cell(list, cell, prev);
+-
+-		prev = cell;
++			return list_delete_cell(list, cell);
+ 	}
+ 
+ 	/* Didn't find a match: return the list unmodified */
+@@ -590,18 +802,14 @@ List *
+ list_delete_ptr(List *list, void *datum)
+ {
+ 	ListCell   *cell;
+-	ListCell   *prev;
+ 
+ 	Assert(IsPointerList(list));
+ 	check_list_invariants(list);
+ 
+-	prev = NULL;
+ 	foreach(cell, list)
+ 	{
+ 		if (lfirst(cell) == datum)
+-			return list_delete_cell(list, cell, prev);
+-
+-		prev = cell;
++			return list_delete_cell(list, cell);
+ 	}
+ 
+ 	/* Didn't find a match: return the list unmodified */
+@@ -613,18 +821,14 @@ List *
+ list_delete_int(List *list, int datum)
+ {
+ 	ListCell   *cell;
+-	ListCell   *prev;
+ 
+ 	Assert(IsIntegerList(list));
+ 	check_list_invariants(list);
+ 
+-	prev = NULL;
+ 	foreach(cell, list)
+ 	{
+ 		if (lfirst_int(cell) == datum)
+-			return list_delete_cell(list, cell, prev);
+-
+-		prev = cell;
++			return list_delete_cell(list, cell);
+ 	}
+ 
+ 	/* Didn't find a match: return the list unmodified */
+@@ -636,18 +840,14 @@ List *
+ list_delete_oid(List *list, Oid datum)
+ {
+ 	ListCell   *cell;
+-	ListCell   *prev;
+ 
+ 	Assert(IsOidList(list));
+ 	check_list_invariants(list);
+ 
+-	prev = NULL;
+ 	foreach(cell, list)
+ 	{
+ 		if (lfirst_oid(cell) == datum)
+-			return list_delete_cell(list, cell, prev);
+-
+-		prev = cell;
++			return list_delete_cell(list, cell);
+ 	}
+ 
+ 	/* Didn't find a match: return the list unmodified */
+@@ -659,8 +859,8 @@ list_delete_oid(List *list, Oid datum)
+  *
+  * This is useful to replace the Lisp-y code "list = lnext(list);" in cases
+  * where the intent is to alter the list rather than just traverse it.
+- * Beware that the removed cell is freed, whereas the lnext() coding leaves
+- * the original list head intact if there's another pointer to it.
++ * Beware that the list is modified, whereas the Lisp-y coding leaves
++ * the original list head intact in case there's another pointer to it.
+  */
+ List *
+ list_delete_first(List *list)
+@@ -670,7 +870,7 @@ list_delete_first(List *list)
+ 	if (list == NIL)
+ 		return NIL;				/* would an error be better? */
+ 
+-	return list_delete_cell(list, list_head(list), NULL);
++	return list_delete_nth_cell(list, 0);
+ }
+ 
+ /*
+@@ -688,7 +888,7 @@ list_delete_first(List *list)
+  * in list1 (so it only performs a "union" if list1 is known unique to
+  * start with).  Also, if you are about to write "x = list_union(x, y)"
+  * you probably want to use list_concat_unique() instead to avoid wasting
+- * the list cells of the old x list.
++ * the storage of the old x list.
+  *
+  * This function could probably be implemented a lot faster if it is a
+  * performance bottleneck.
+@@ -1013,12 +1213,10 @@ list_append_unique_oid(List *list, Oid datum)
+  * This is almost the same functionality as list_union(), but list1 is
+  * modified in-place rather than being copied. However, callers of this
+  * function may have strict ordering expectations -- i.e. that the relative
+- * order of those list2 elements that are not duplicates is preserved. Note
+- * also that list2's cells are not inserted in list1, so the analogy to
+- * list_concat() isn't perfect.
++ * order of those list2 elements that are not duplicates is preserved.
+  */
+ List *
+-list_concat_unique(List *list1, List *list2)
++list_concat_unique(List *list1, const List *list2)
+ {
+ 	ListCell   *cell;
+ 
+@@ -1040,7 +1238,7 @@ list_concat_unique(List *list1, List *list2)
+  * simple pointer equality.
+  */
+ List *
+-list_concat_unique_ptr(List *list1, List *list2)
++list_concat_unique_ptr(List *list1, const List *list2)
+ {
+ 	ListCell   *cell;
+ 
+@@ -1061,7 +1259,7 @@ list_concat_unique_ptr(List *list1, List *list2)
+  * This variant of list_concat_unique() operates upon lists of integers.
+  */
+ List *
+-list_concat_unique_int(List *list1, List *list2)
++list_concat_unique_int(List *list1, const List *list2)
+ {
+ 	ListCell   *cell;
+ 
+@@ -1082,7 +1280,7 @@ list_concat_unique_int(List *list1, List *list2)
+  * This variant of list_concat_unique() operates upon lists of OIDs.
+  */
+ List *
+-list_concat_unique_oid(List *list1, List *list2)
++list_concat_unique_oid(List *list1, const List *list2)
+ {
+ 	ListCell   *cell;
+ 
+@@ -1105,23 +1303,19 @@ list_concat_unique_oid(List *list1, List *list2)
+ static void
+ list_free_private(List *list, bool deep)
+ {
+-	ListCell   *cell;
++	if (list == NIL)
++		return;					/* nothing to do */
+ 
+ 	check_list_invariants(list);
+ 
+-	cell = list_head(list);
+-	while (cell != NULL)
++	if (deep)
+ 	{
+-		ListCell   *tmp = cell;
+-
+-		cell = lnext(cell);
+-		if (deep)
+-			pfree(lfirst(tmp));
+-		pfree(tmp);
++		for (int i = 0; i < list->length; i++)
++			pfree(lfirst(&list->elements[i]));
+ 	}
+-
+-	if (list)
+-		pfree(list);
++	if (list->elements != list->initial_elements)
++		pfree(list->elements);
++	pfree(list);
+ }
+ 
+ /*
+@@ -1163,37 +1357,13 @@ List *
+ list_copy(const List *oldlist)
+ {
+ 	List	   *newlist;
+-	ListCell   *newlist_prev;
+-	ListCell   *oldlist_cur;
+ 
+ 	if (oldlist == NIL)
+ 		return NIL;
+ 
+-	newlist = new_list(oldlist->type);
+-	newlist->length = oldlist->length;
+-
+-	/*
+-	 * Copy over the data in the first cell; new_list() has already allocated
+-	 * the head cell itself
+-	 */
+-	newlist->head->data = oldlist->head->data;
+-
+-	newlist_prev = newlist->head;
+-	oldlist_cur = oldlist->head->next;
+-	while (oldlist_cur)
+-	{
+-		ListCell   *newlist_cur;
+-
+-		newlist_cur = (ListCell *) palloc(sizeof(*newlist_cur));
+-		newlist_cur->data = oldlist_cur->data;
+-		newlist_prev->next = newlist_cur;
+-
+-		newlist_prev = newlist_cur;
+-		oldlist_cur = oldlist_cur->next;
+-	}
+-
+-	newlist_prev->next = NULL;
+-	newlist->tail = newlist_prev;
++	newlist = new_list(oldlist->type, oldlist->length);
++	memcpy(newlist->elements, oldlist->elements,
++		   newlist->length * sizeof(ListCell));
+ 
+ 	check_list_invariants(newlist);
+ 	return newlist;
+@@ -1206,8 +1376,6 @@ List *
+ list_copy_tail(const List *oldlist, int nskip)
+ {
+ 	List	   *newlist;
+-	ListCell   *newlist_prev;
+-	ListCell   *oldlist_cur;
+ 
+ 	if (nskip < 0)
+ 		nskip = 0;				/* would it be better to elog? */
+@@ -1215,38 +1383,36 @@ list_copy_tail(const List *oldlist, int nskip)
+ 	if (oldlist == NIL || nskip >= oldlist->length)
+ 		return NIL;
+ 
+-	newlist = new_list(oldlist->type);
+-	newlist->length = oldlist->length - nskip;
+-
+-	/*
+-	 * Skip over the unwanted elements.
+-	 */
+-	oldlist_cur = oldlist->head;
+-	while (nskip-- > 0)
+-		oldlist_cur = oldlist_cur->next;
++	newlist = new_list(oldlist->type, oldlist->length - nskip);
++	memcpy(newlist->elements, &oldlist->elements[nskip],
++		   newlist->length * sizeof(ListCell));
+ 
+-	/*
+-	 * Copy over the data in the first remaining cell; new_list() has already
+-	 * allocated the head cell itself
+-	 */
+-	newlist->head->data = oldlist_cur->data;
++	check_list_invariants(newlist);
++	return newlist;
++}
+ 
+-	newlist_prev = newlist->head;
+-	oldlist_cur = oldlist_cur->next;
+-	while (oldlist_cur)
+-	{
+-		ListCell   *newlist_cur;
++/*
++ * Return a deep copy of the specified list.
++ *
++ * The list elements are copied via copyObject(), so that this function's
++ * idea of a "deep" copy is considerably deeper than what list_free_deep()
++ * means by the same word.
++ */
++List *
++list_copy_deep(const List *oldlist)
++{
++	List	   *newlist;
+ 
+-		newlist_cur = (ListCell *) palloc(sizeof(*newlist_cur));
+-		newlist_cur->data = oldlist_cur->data;
+-		newlist_prev->next = newlist_cur;
++	if (oldlist == NIL)
++		return NIL;
+ 
+-		newlist_prev = newlist_cur;
+-		oldlist_cur = oldlist_cur->next;
+-	}
++	/* This is only sensible for pointer Lists */
++	Assert(IsA(oldlist, List));
+ 
+-	newlist_prev->next = NULL;
+-	newlist->tail = newlist_prev;
++	newlist = new_list(oldlist->type, oldlist->length);
++	for (int i = 0; i < newlist->length; i++)
++		lfirst(&newlist->elements[i]) =
++			copyObjectImpl(lfirst(&oldlist->elements[i]));
+ 
+ 	check_list_invariants(newlist);
+ 	return newlist;
+@@ -1259,6 +1425,8 @@ list_copy_tail(const List *oldlist, int nskip)
+  * fresh copies of any pointed-to data.
+  *
+  * The comparator function receives arguments of type ListCell **.
++ * (XXX that's really inefficient now, but changing it seems like
++ * material for a standalone patch.)
+  */
+ List *
+ list_qsort(const List *list, list_qsort_comparator cmp)
+@@ -1266,7 +1434,6 @@ list_qsort(const List *list, list_qsort_comparator cmp)
+ 	int			len = list_length(list);
+ 	ListCell  **list_arr;
+ 	List	   *newlist;
+-	ListCell   *newlist_prev;
+ 	ListCell   *cell;
+ 	int			i;
+ 
+@@ -1274,7 +1441,7 @@ list_qsort(const List *list, list_qsort_comparator cmp)
+ 	if (len == 0)
+ 		return NIL;
+ 
+-	/* Flatten list cells into an array, so we can use qsort */
++	/* We have to make an array of pointers to satisfy the API */
+ 	list_arr = (ListCell **) palloc(sizeof(ListCell *) * len);
+ 	i = 0;
+ 	foreach(cell, list)
+@@ -1283,29 +1450,10 @@ list_qsort(const List *list, list_qsort_comparator cmp)
+ 	qsort(list_arr, len, sizeof(ListCell *), cmp);
+ 
+ 	/* Construct new list (this code is much like list_copy) */
+-	newlist = new_list(list->type);
+-	newlist->length = len;
+-
+-	/*
+-	 * Copy over the data in the first cell; new_list() has already allocated
+-	 * the head cell itself
+-	 */
+-	newlist->head->data = list_arr[0]->data;
++	newlist = new_list(list->type, len);
+ 
+-	newlist_prev = newlist->head;
+-	for (i = 1; i < len; i++)
+-	{
+-		ListCell   *newlist_cur;
+-
+-		newlist_cur = (ListCell *) palloc(sizeof(*newlist_cur));
+-		newlist_cur->data = list_arr[i]->data;
+-		newlist_prev->next = newlist_cur;
+-
+-		newlist_prev = newlist_cur;
+-	}
+-
+-	newlist_prev->next = NULL;
+-	newlist->tail = newlist_prev;
++	for (i = 0; i < len; i++)
++		newlist->elements[i] = *list_arr[i];
+ 
+ 	/* Might as well free the workspace array */
+ 	pfree(list_arr);
+@@ -1313,27 +1461,3 @@ list_qsort(const List *list, list_qsort_comparator cmp)
+ 	check_list_invariants(newlist);
+ 	return newlist;
+ }
+-
+-/*
+- * Temporary compatibility functions
+- *
+- * In order to avoid warnings for these function definitions, we need
+- * to include a prototype here as well as in pg_list.h. That's because
+- * we don't enable list API compatibility in list.c, so we
+- * don't see the prototypes for these functions.
+- */
+-
+-/*
+- * Given a list, return its length. This is merely defined for the
+- * sake of backward compatibility: we can't afford to define a macro
+- * called "length", so it must be a function. New code should use the
+- * list_length() macro in order to avoid the overhead of a function
+- * call.
+- */
+-int			length(const List *list);
+-
+-int
+-length(const List *list)
+-{
+-	return list_length(list);
+-}
+diff --git a/src/backend/nodes/nodeFuncs.c b/src/backend/nodes/nodeFuncs.c
+index 05ae73f7db8f..18bd5ac903ee 100644
+--- a/src/backend/nodes/nodeFuncs.c
++++ b/src/backend/nodes/nodeFuncs.c
+@@ -442,7 +442,7 @@ exprTypmod(const Node *expr)
+ 				typmod = exprTypmod((Node *) linitial(cexpr->args));
+ 				if (typmod < 0)
+ 					return -1;	/* no point in trying harder */
+-				for_each_cell(arg, lnext(list_head(cexpr->args)))
++				for_each_cell(arg, cexpr->args, list_second_cell(cexpr->args))
+ 				{
+ 					Node	   *e = (Node *) lfirst(arg);
+ 
+@@ -470,7 +470,7 @@ exprTypmod(const Node *expr)
+ 				typmod = exprTypmod((Node *) linitial(mexpr->args));
+ 				if (typmod < 0)
+ 					return -1;	/* no point in trying harder */
+-				for_each_cell(arg, lnext(list_head(mexpr->args)))
++				for_each_cell(arg, mexpr->args, list_second_cell(mexpr->args))
+ 				{
+ 					Node	   *e = (Node *) lfirst(arg);
+ 
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index 8400dd319e23..8e31fae47fc9 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -218,7 +218,7 @@ _outList(StringInfo str, const List *node)
+ 		if (IsA(node, List))
+ 		{
+ 			outNode(str, lfirst(lc));
+-			if (lnext(lc))
++			if (lnext(node, lc))
+ 				appendStringInfoChar(str, ' ');
+ 		}
+ 		else if (IsA(node, IntList))
+diff --git a/src/backend/nodes/print.c b/src/backend/nodes/print.c
+index 4b9e141404c0..4ecde6b4211e 100644
+--- a/src/backend/nodes/print.c
++++ b/src/backend/nodes/print.c
+@@ -410,7 +410,7 @@ print_expr(const Node *expr, const List *rtable)
+ 		foreach(l, e->args)
+ 		{
+ 			print_expr(lfirst(l), rtable);
+-			if (lnext(l))
++			if (lnext(e->args, l))
+ 				printf(",");
+ 		}
+ 		printf(")");
+@@ -453,7 +453,7 @@ print_pathkeys(const List *pathkeys, const List *rtable)
+ 			print_expr((Node *) mem->em_expr, rtable);
+ 		}
+ 		printf(")");
+-		if (lnext(i))
++		if (lnext(pathkeys, i))
+ 			printf(", ");
+ 	}
+ 	printf(")\n");
+diff --git a/src/backend/optimizer/geqo/geqo_eval.c b/src/backend/optimizer/geqo/geqo_eval.c
+index 6c69c1c14789..8a44ac8530d7 100644
+--- a/src/backend/optimizer/geqo/geqo_eval.c
++++ b/src/backend/optimizer/geqo/geqo_eval.c
+@@ -238,11 +238,9 @@ static List *
+ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
+ 			bool force)
+ {
+-	ListCell   *prev;
+ 	ListCell   *lc;
+ 
+ 	/* Look for a clump that new_clump can join to */
+-	prev = NULL;
+ 	foreach(lc, clumps)
+ 	{
+ 		Clump	   *old_clump = (Clump *) lfirst(lc);
+@@ -286,7 +284,7 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
+ 				pfree(new_clump);
+ 
+ 				/* Remove old_clump from list */
+-				clumps = list_delete_cell(clumps, lc, prev);
++				clumps = foreach_delete_current(clumps, lc);
+ 
+ 				/*
+ 				 * Recursively try to merge the enlarged old_clump with
+@@ -296,7 +294,6 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
+ 				return merge_clump(root, clumps, old_clump, num_gene, force);
+ 			}
+ 		}
+-		prev = lc;
+ 	}
+ 
+ 	/*
+@@ -315,7 +312,7 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
+ 	/* Else search for the place to insert it */
+ 	for (;;)
+ 	{
+-		ListCell   *nxt = lnext(lc);
++		ListCell   *nxt = lnext(clumps, lc);
+ 
+ 		if (nxt == NULL || new_clump->size > ((Clump *) lfirst(nxt))->size)
+ 			break;				/* it belongs after 'lc', before 'nxt' */
+diff --git a/src/backend/optimizer/path/allpaths.c b/src/backend/optimizer/path/allpaths.c
+index b7723481b0e7..e9ee32b7f439 100644
+--- a/src/backend/optimizer/path/allpaths.c
++++ b/src/backend/optimizer/path/allpaths.c
+@@ -3204,7 +3204,7 @@ compare_tlist_datatypes(List *tlist, List *colTypes,
+ 			elog(ERROR, "wrong number of tlist entries");
+ 		if (exprType((Node *) tle->expr) != lfirst_oid(colType))
+ 			safetyInfo->unsafeColumns[tle->resno] = true;
+-		colType = lnext(colType);
++		colType = lnext(colTypes, colType);
+ 	}
+ 	if (colType != NULL)
+ 		elog(ERROR, "wrong number of tlist entries");
+@@ -3761,7 +3761,7 @@ print_restrictclauses(PlannerInfo *root, List *clauses)
+ 		RestrictInfo *c = lfirst(l);
+ 
+ 		print_expr((Node *) c->clause, root->parse->rtable);
+-		if (lnext(l))
++		if (lnext(clauses, l))
+ 			printf(", ");
+ 	}
+ }
+diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
+index a2a9b1f7be61..3a9a994733b4 100644
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -1838,7 +1838,7 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
+ 	 * For each of the remaining subpaths, add its cost to the array element
+ 	 * with minimum cost.
+ 	 */
+-	for_each_cell(l, cell)
++	for_each_cell(l, subpaths, cell)
+ 	{
+ 		Path	   *subpath = (Path *) lfirst(l);
+ 		int			i;
+@@ -4724,8 +4724,6 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
+ 		bool		ref_is_outer;
+ 		List	   *removedlist;
+ 		ListCell   *cell;
+-		ListCell   *prev;
+-		ListCell   *next;
+ 
+ 		/*
+ 		 * This FK is not relevant unless it connects a baserel on one side of
+@@ -4766,14 +4764,12 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
+ 			worklist = list_copy(worklist);
+ 
+ 		removedlist = NIL;
+-		prev = NULL;
+-		for (cell = list_head(worklist); cell; cell = next)
++		foreach(cell, worklist)
+ 		{
+ 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(cell);
+ 			bool		remove_it = false;
+ 			int			i;
+ 
+-			next = lnext(cell);
+ 			/* Drop this clause if it matches any column of the FK */
+ 			for (i = 0; i < fkinfo->nkeys; i++)
+ 			{
+@@ -4813,11 +4809,9 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
+ 			}
+ 			if (remove_it)
+ 			{
+-				worklist = list_delete_cell(worklist, cell, prev);
++				worklist = foreach_delete_current(worklist, cell);
+ 				removedlist = lappend(removedlist, rinfo);
+ 			}
+-			else
+-				prev = cell;
+ 		}
+ 
+ 		/*
+diff --git a/src/backend/optimizer/path/equivclass.c b/src/backend/optimizer/path/equivclass.c
+index 688d9b070752..78d076b13cde 100644
+--- a/src/backend/optimizer/path/equivclass.c
++++ b/src/backend/optimizer/path/equivclass.c
+@@ -1573,8 +1573,6 @@ reconsider_outer_join_clauses(PlannerInfo *root)
+ {
+ 	bool		found;
+ 	ListCell   *cell;
+-	ListCell   *prev;
+-	ListCell   *next;
+ 
+ 	/* Outer loop repeats until we find no more deductions */
+ 	do
+@@ -1582,72 +1580,60 @@ reconsider_outer_join_clauses(PlannerInfo *root)
+ 		found = false;
+ 
+ 		/* Process the LEFT JOIN clauses */
+-		prev = NULL;
+-		for (cell = list_head(root->left_join_clauses); cell; cell = next)
++		foreach(cell, root->left_join_clauses)
+ 		{
+ 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(cell);
+ 
+-			next = lnext(cell);
+ 			if (reconsider_outer_join_clause(root, rinfo, true))
+ 			{
+ 				found = true;
+ 				/* remove it from the list */
+ 				root->left_join_clauses =
+-					list_delete_cell(root->left_join_clauses, cell, prev);
++					foreach_delete_current(root->left_join_clauses, cell);
+ 				/* we throw it back anyway (see notes above) */
+ 				/* but the thrown-back clause has no extra selectivity */
+ 				rinfo->norm_selec = 2.0;
+ 				rinfo->outer_selec = 1.0;
+ 				distribute_restrictinfo_to_rels(root, rinfo);
+ 			}
+-			else
+-				prev = cell;
+ 		}
+ 
+ 		/* Process the RIGHT JOIN clauses */
+-		prev = NULL;
+-		for (cell = list_head(root->right_join_clauses); cell; cell = next)
++		foreach(cell, root->right_join_clauses)
+ 		{
+ 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(cell);
+ 
+-			next = lnext(cell);
+ 			if (reconsider_outer_join_clause(root, rinfo, false))
+ 			{
+ 				found = true;
+ 				/* remove it from the list */
+ 				root->right_join_clauses =
+-					list_delete_cell(root->right_join_clauses, cell, prev);
++					foreach_delete_current(root->right_join_clauses, cell);
+ 				/* we throw it back anyway (see notes above) */
+ 				/* but the thrown-back clause has no extra selectivity */
+ 				rinfo->norm_selec = 2.0;
+ 				rinfo->outer_selec = 1.0;
+ 				distribute_restrictinfo_to_rels(root, rinfo);
+ 			}
+-			else
+-				prev = cell;
+ 		}
+ 
+ 		/* Process the FULL JOIN clauses */
+-		prev = NULL;
+-		for (cell = list_head(root->full_join_clauses); cell; cell = next)
++		foreach(cell, root->full_join_clauses)
+ 		{
+ 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(cell);
+ 
+-			next = lnext(cell);
+ 			if (reconsider_full_join_clause(root, rinfo))
+ 			{
+ 				found = true;
+ 				/* remove it from the list */
+ 				root->full_join_clauses =
+-					list_delete_cell(root->full_join_clauses, cell, prev);
++					foreach_delete_current(root->full_join_clauses, cell);
+ 				/* we throw it back anyway (see notes above) */
+ 				/* but the thrown-back clause has no extra selectivity */
+ 				rinfo->norm_selec = 2.0;
+ 				rinfo->outer_selec = 1.0;
+ 				distribute_restrictinfo_to_rels(root, rinfo);
+ 			}
+-			else
+-				prev = cell;
+ 		}
+ 	} while (found);
+ 
+@@ -2123,7 +2109,7 @@ add_child_rel_equivalences(PlannerInfo *root,
+ 	foreach(lc1, root->eq_classes)
+ 	{
+ 		EquivalenceClass *cur_ec = (EquivalenceClass *) lfirst(lc1);
+-		ListCell   *lc2;
++		int			num_members;
+ 
+ 		/*
+ 		 * If this EC contains a volatile expression, then generating child
+@@ -2140,9 +2126,15 @@ add_child_rel_equivalences(PlannerInfo *root,
+ 		if (!bms_is_subset(child_rel->top_parent_relids, cur_ec->ec_relids))
+ 			continue;
+ 
+-		foreach(lc2, cur_ec->ec_members)
++		/*
++		 * We don't use foreach() here because there's no point in scanning
++		 * newly-added child members, so we can stop after the last
++		 * pre-existing EC member.
++		 */
++		num_members = list_length(cur_ec->ec_members);
++		for (int pos = 0; pos < num_members; pos++)
+ 		{
+-			EquivalenceMember *cur_em = (EquivalenceMember *) lfirst(lc2);
++			EquivalenceMember *cur_em = (EquivalenceMember *) list_nth(cur_ec->ec_members, pos);
+ 
+ 			if (cur_em->em_is_const)
+ 				continue;		/* ignore consts here */
+diff --git a/src/backend/optimizer/path/indxpath.c b/src/backend/optimizer/path/indxpath.c
+index c208e9bfb0b6..5f339fdfde77 100644
+--- a/src/backend/optimizer/path/indxpath.c
++++ b/src/backend/optimizer/path/indxpath.c
+@@ -520,7 +520,7 @@ consider_index_join_outer_rels(PlannerInfo *root, RelOptInfo *rel,
+ 		IndexClause *iclause = (IndexClause *) lfirst(lc);
+ 		Relids		clause_relids = iclause->rinfo->clause_relids;
+ 		EquivalenceClass *parent_ec = iclause->rinfo->parent_ec;
+-		ListCell   *lc2;
++		int			num_considered_relids;
+ 
+ 		/* If we already tried its relids set, no need to do so again */
+ 		if (bms_equal_any(clause_relids, *considered_relids))
+@@ -533,15 +533,16 @@ consider_index_join_outer_rels(PlannerInfo *root, RelOptInfo *rel,
+ 		 * exponential growth of planning time when there are many clauses,
+ 		 * limit the number of relid sets accepted to 10 * considered_clauses.
+ 		 *
+-		 * Note: get_join_index_paths adds entries to *considered_relids, but
+-		 * it prepends them to the list, so that we won't visit new entries
+-		 * during the inner foreach loop.  No real harm would be done if we
+-		 * did, since the subset check would reject them; but it would waste
+-		 * some cycles.
++		 * Note: get_join_index_paths appends entries to *considered_relids,
++		 * but we do not need to visit such newly-added entries within this
++		 * loop, so we don't use foreach() here.  No real harm would be done
++		 * if we did visit them, since the subset check would reject them; but
++		 * it would waste some cycles.
+ 		 */
+-		foreach(lc2, *considered_relids)
++		num_considered_relids = list_length(*considered_relids);
++		for (int pos = 0; pos < num_considered_relids; pos++)
+ 		{
+-			Relids		oldrelids = (Relids) lfirst(lc2);
++			Relids		oldrelids = (Relids) list_nth(*considered_relids, pos);
+ 
+ 			/*
+ 			 * If either is a subset of the other, no new set is possible.
+@@ -671,10 +672,9 @@ get_join_index_paths(PlannerInfo *root, RelOptInfo *rel,
+ 	get_index_paths(root, rel, index, &clauseset, bitindexpaths);
+ 
+ 	/*
+-	 * Remember we considered paths for this set of relids.  We use lcons not
+-	 * lappend to avoid confusing the loop in consider_index_join_outer_rels.
++	 * Remember we considered paths for this set of relids.
+ 	 */
+-	*considered_relids = lcons(relids, *considered_relids);
++	*considered_relids = lappend(*considered_relids, relids);
+ }
+ 
+ /*
+@@ -1502,7 +1502,6 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
+ 		Cost		costsofar;
+ 		List	   *qualsofar;
+ 		Bitmapset  *clauseidsofar;
+-		ListCell   *lastcell;
+ 
+ 		pathinfo = pathinfoarray[i];
+ 		paths = list_make1(pathinfo->path);
+@@ -1510,7 +1509,6 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
+ 		qualsofar = list_concat(list_copy(pathinfo->quals),
+ 								list_copy(pathinfo->preds));
+ 		clauseidsofar = bms_copy(pathinfo->clauseids);
+-		lastcell = list_head(paths);	/* for quick deletions */
+ 
+ 		for (j = i + 1; j < npaths; j++)
+ 		{
+@@ -1551,14 +1549,12 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
+ 										list_copy(pathinfo->preds));
+ 				clauseidsofar = bms_add_members(clauseidsofar,
+ 												pathinfo->clauseids);
+-				lastcell = lnext(lastcell);
+ 			}
+ 			else
+ 			{
+ 				/* reject new path, remove it from paths list */
+-				paths = list_delete_cell(paths, lnext(lastcell), lastcell);
++				paths = list_truncate(paths, list_length(paths) - 1);
+ 			}
+-			Assert(lnext(lastcell) == NULL);
+ 		}
+ 
+ 		/* Keep the cheapest AND-group (or singleton) */
+@@ -2970,10 +2966,6 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
+ 	List	   *new_ops;
+ 	List	   *var_args;
+ 	List	   *non_var_args;
+-	ListCell   *vargs_cell;
+-	ListCell   *nargs_cell;
+-	ListCell   *opnos_cell;
+-	ListCell   *collids_cell;
+ 
+ 	iclause->rinfo = rinfo;
+ 	iclause->indexcol = indexcol;
+@@ -3010,18 +3002,14 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
+ 	 * indexed relation.
+ 	 */
+ 	matching_cols = 1;
+-	vargs_cell = lnext(list_head(var_args));
+-	nargs_cell = lnext(list_head(non_var_args));
+-	opnos_cell = lnext(list_head(clause->opnos));
+-	collids_cell = lnext(list_head(clause->inputcollids));
+ 
+-	while (vargs_cell != NULL)
++	while (matching_cols < list_length(var_args))
+ 	{
+-		Node	   *varop = (Node *) lfirst(vargs_cell);
+-		Node	   *constop = (Node *) lfirst(nargs_cell);
++		Node	   *varop = (Node *) list_nth(var_args, matching_cols);
++		Node	   *constop = (Node *) list_nth(non_var_args, matching_cols);
+ 		int			i;
+ 
+-		expr_op = lfirst_oid(opnos_cell);
++		expr_op = list_nth_oid(clause->opnos, matching_cols);
+ 		if (!var_on_left)
+ 		{
+ 			/* indexkey is on right, so commute the operator */
+@@ -3043,7 +3031,8 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
+ 				get_op_opfamily_strategy(expr_op,
+ 										 index->opfamily[i]) == op_strategy &&
+ 				IndexCollMatchesExprColl(index->indexcollations[i],
+-										 lfirst_oid(collids_cell)))
++										 list_nth_oid(clause->inputcollids,
++													  matching_cols)))
+ 				break;
+ 		}
+ 		if (i >= index->nkeycolumns)
+@@ -3064,10 +3053,6 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
+ 
+ 		/* This column matches, keep scanning */
+ 		matching_cols++;
+-		vargs_cell = lnext(vargs_cell);
+-		nargs_cell = lnext(nargs_cell);
+-		opnos_cell = lnext(opnos_cell);
+-		collids_cell = lnext(collids_cell);
+ 	}
+ 
+ 	/* Result is non-lossy if all columns are usable as index quals */
+@@ -3866,7 +3851,7 @@ match_index_to_operand(Node *operand,
+ 			{
+ 				if (indexpr_item == NULL)
+ 					elog(ERROR, "wrong number of index expressions");
+-				indexpr_item = lnext(indexpr_item);
++				indexpr_item = lnext(index->indexprs, indexpr_item);
+ 			}
+ 		}
+ 		if (indexpr_item == NULL)
+diff --git a/src/backend/optimizer/path/joinrels.c b/src/backend/optimizer/path/joinrels.c
+index 43c3b7ea489b..6a480ab76443 100644
+--- a/src/backend/optimizer/path/joinrels.c
++++ b/src/backend/optimizer/path/joinrels.c
+@@ -26,10 +26,11 @@
+ 
+ static void make_rels_by_clause_joins(PlannerInfo *root,
+ 									  RelOptInfo *old_rel,
++									  List *other_rels_list,
+ 									  ListCell *other_rels);
+ static void make_rels_by_clauseless_joins(PlannerInfo *root,
+ 										  RelOptInfo *old_rel,
+-										  ListCell *other_rels);
++										  List *other_rels);
+ static bool has_join_restriction(PlannerInfo *root, RelOptInfo *rel);
+ static bool has_legal_joinclause(PlannerInfo *root, RelOptInfo *rel);
+ static bool restriction_is_constant_false(List *restrictlist,
+@@ -101,15 +102,23 @@ join_search_one_level(PlannerInfo *root, int level)
+ 			 * to each initial rel they don't already include but have a join
+ 			 * clause or restriction with.
+ 			 */
++			List	   *other_rels_list;
+ 			ListCell   *other_rels;
+ 
+ 			if (level == 2)		/* consider remaining initial rels */
+-				other_rels = lnext(r);
++			{
++				other_rels_list = joinrels[level - 1];
++				other_rels = lnext(other_rels_list, r);
++			}
+ 			else				/* consider all initial rels */
+-				other_rels = list_head(joinrels[1]);
++			{
++				other_rels_list = joinrels[1];
++				other_rels = list_head(other_rels_list);
++			}
+ 
+ 			make_rels_by_clause_joins(root,
+ 									  old_rel,
++									  other_rels_list,
+ 									  other_rels);
+ 		}
+ 		else
+@@ -128,7 +137,7 @@ join_search_one_level(PlannerInfo *root, int level)
+ 			 */
+ 			make_rels_by_clauseless_joins(root,
+ 										  old_rel,
+-										  list_head(joinrels[1]));
++										  joinrels[1]);
+ 		}
+ 	}
+ 
+@@ -154,6 +163,7 @@ join_search_one_level(PlannerInfo *root, int level)
+ 		foreach(r, joinrels[k])
+ 		{
+ 			RelOptInfo *old_rel = (RelOptInfo *) lfirst(r);
++			List	   *other_rels_list;
+ 			ListCell   *other_rels;
+ 			ListCell   *r2;
+ 
+@@ -167,11 +177,18 @@ join_search_one_level(PlannerInfo *root, int level)
+ 				continue;
+ 
+ 			if (k == other_level)
+-				other_rels = lnext(r);	/* only consider remaining rels */
++			{
++				/* only consider remaining rels */
++				other_rels_list = joinrels[k];
++				other_rels = lnext(other_rels_list, r);
++			}
+ 			else
+-				other_rels = list_head(joinrels[other_level]);
++			{
++				other_rels_list = joinrels[other_level];
++				other_rels = list_head(other_rels_list);
++			}
+ 
+-			for_each_cell(r2, other_rels)
++			for_each_cell(r2, other_rels_list, other_rels)
+ 			{
+ 				RelOptInfo *new_rel = (RelOptInfo *) lfirst(r2);
+ 
+@@ -223,7 +240,7 @@ join_search_one_level(PlannerInfo *root, int level)
+ 
+ 			make_rels_by_clauseless_joins(root,
+ 										  old_rel,
+-										  list_head(joinrels[1]));
++										  joinrels[1]);
+ 		}
+ 
+ 		/*----------
+@@ -265,8 +282,9 @@ join_search_one_level(PlannerInfo *root, int level)
+  * automatically ensures that each new joinrel is only added to the list once.
+  *
+  * 'old_rel' is the relation entry for the relation to be joined
+- * 'other_rels': the first cell in a linked list containing the other
++ * 'other_rels_list': a list containing the other
+  * rels to be considered for joining
++ * 'other_rels': the first cell to be considered
+  *
+  * Currently, this is only used with initial rels in other_rels, but it
+  * will work for joining to joinrels too.
+@@ -274,11 +292,12 @@ join_search_one_level(PlannerInfo *root, int level)
+ static void
+ make_rels_by_clause_joins(PlannerInfo *root,
+ 						  RelOptInfo *old_rel,
++						  List *other_rels_list,
+ 						  ListCell *other_rels)
+ {
+ 	ListCell   *l;
+ 
+-	for_each_cell(l, other_rels)
++	for_each_cell(l, other_rels_list, other_rels)
+ 	{
+ 		RelOptInfo *other_rel = (RelOptInfo *) lfirst(l);
+ 
+@@ -299,8 +318,7 @@ make_rels_by_clause_joins(PlannerInfo *root,
+  *	  The join rels are returned in root->join_rel_level[join_cur_level].
+  *
+  * 'old_rel' is the relation entry for the relation to be joined
+- * 'other_rels': the first cell of a linked list containing the
+- * other rels to be considered for joining
++ * 'other_rels': a list containing the other rels to be considered for joining
+  *
+  * Currently, this is only used with initial rels in other_rels, but it would
+  * work for joining to joinrels too.
+@@ -308,11 +326,11 @@ make_rels_by_clause_joins(PlannerInfo *root,
+ static void
+ make_rels_by_clauseless_joins(PlannerInfo *root,
+ 							  RelOptInfo *old_rel,
+-							  ListCell *other_rels)
++							  List *other_rels)
+ {
+ 	ListCell   *l;
+ 
+-	for_each_cell(l, other_rels)
++	foreach(l, other_rels)
+ 	{
+ 		RelOptInfo *other_rel = (RelOptInfo *) lfirst(l);
+ 
+diff --git a/src/backend/optimizer/path/pathkeys.c b/src/backend/optimizer/path/pathkeys.c
+index 08b506161282..202a4b9db821 100644
+--- a/src/backend/optimizer/path/pathkeys.c
++++ b/src/backend/optimizer/path/pathkeys.c
+@@ -1529,7 +1529,7 @@ make_inner_pathkeys_for_merge(PlannerInfo *root,
+ 			if (!lop)
+ 				elog(ERROR, "too few pathkeys for mergeclauses");
+ 			opathkey = (PathKey *) lfirst(lop);
+-			lop = lnext(lop);
++			lop = lnext(outer_pathkeys, lop);
+ 			lastoeclass = opathkey->pk_eclass;
+ 			if (oeclass != lastoeclass)
+ 				elog(ERROR, "outer pathkeys do not match mergeclause");
+@@ -1609,7 +1609,7 @@ trim_mergeclauses_for_inner_pathkeys(PlannerInfo *root,
+ 	lip = list_head(pathkeys);
+ 	pathkey = (PathKey *) lfirst(lip);
+ 	pathkey_ec = pathkey->pk_eclass;
+-	lip = lnext(lip);
++	lip = lnext(pathkeys, lip);
+ 	matched_pathkey = false;
+ 
+ 	/* Scan mergeclauses to see how many we can use */
+@@ -1636,7 +1636,7 @@ trim_mergeclauses_for_inner_pathkeys(PlannerInfo *root,
+ 				break;
+ 			pathkey = (PathKey *) lfirst(lip);
+ 			pathkey_ec = pathkey->pk_eclass;
+-			lip = lnext(lip);
++			lip = lnext(pathkeys, lip);
+ 			matched_pathkey = false;
+ 		}
+ 
+diff --git a/src/backend/optimizer/plan/analyzejoins.c b/src/backend/optimizer/plan/analyzejoins.c
+index 32695db367b9..d19ff4138e53 100644
+--- a/src/backend/optimizer/plan/analyzejoins.c
++++ b/src/backend/optimizer/plan/analyzejoins.c
+@@ -96,17 +96,16 @@ remove_useless_joins(PlannerInfo *root, List *joinlist)
+ 
+ 		/*
+ 		 * We can delete this SpecialJoinInfo from the list too, since it's no
+-		 * longer of interest.
++		 * longer of interest.  (Since we'll restart the foreach loop
++		 * immediately, we don't bother with foreach_delete_current.)
+ 		 */
+-		root->join_info_list = list_delete_ptr(root->join_info_list, sjinfo);
++		root->join_info_list = list_delete_cell(root->join_info_list, lc);
+ 
+ 		/*
+ 		 * Restart the scan.  This is necessary to ensure we find all
+ 		 * removable joins independently of ordering of the join_info_list
+ 		 * (note that removal of attr_needed bits may make a join appear
+-		 * removable that did not before).  Also, since we just deleted the
+-		 * current list cell, we'd have to have some kluge to continue the
+-		 * list scan anyway.
++		 * removable that did not before).
+ 		 */
+ 		goto restart;
+ 	}
+@@ -316,7 +315,6 @@ remove_rel_from_query(PlannerInfo *root, int relid, Relids joinrelids)
+ 	List	   *joininfos;
+ 	Index		rti;
+ 	ListCell   *l;
+-	ListCell   *nextl;
+ 
+ 	/*
+ 	 * Mark the rel as "dead" to show it is no longer part of the join tree.
+@@ -383,16 +381,15 @@ remove_rel_from_query(PlannerInfo *root, int relid, Relids joinrelids)
+ 	 * remove or just update the PHV.  There is no corresponding test in
+ 	 * join_is_removable because it doesn't need to distinguish those cases.
+ 	 */
+-	for (l = list_head(root->placeholder_list); l != NULL; l = nextl)
++	foreach(l, root->placeholder_list)
+ 	{
+ 		PlaceHolderInfo *phinfo = (PlaceHolderInfo *) lfirst(l);
+ 
+-		nextl = lnext(l);
+ 		Assert(!bms_is_member(relid, phinfo->ph_lateral));
+ 		if (bms_is_subset(phinfo->ph_needed, joinrelids) &&
+ 			bms_is_member(relid, phinfo->ph_eval_at))
+-			root->placeholder_list = list_delete_ptr(root->placeholder_list,
+-													 phinfo);
++			root->placeholder_list = foreach_delete_current(root->placeholder_list,
++															l);
+ 		else
+ 		{
+ 			phinfo->ph_eval_at = bms_del_member(phinfo->ph_eval_at, relid);
+@@ -511,13 +508,11 @@ void
+ reduce_unique_semijoins(PlannerInfo *root)
+ {
+ 	ListCell   *lc;
+-	ListCell   *next;
+ 
+ 	/*
+-	 * Scan the join_info_list to find semijoins.  We can't use foreach
+-	 * because we may delete the current cell.
++	 * Scan the join_info_list to find semijoins.
+ 	 */
+-	for (lc = list_head(root->join_info_list); lc != NULL; lc = next)
++	foreach(lc, root->join_info_list)
+ 	{
+ 		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+ 		int			innerrelid;
+@@ -525,8 +520,6 @@ reduce_unique_semijoins(PlannerInfo *root)
+ 		Relids		joinrelids;
+ 		List	   *restrictlist;
+ 
+-		next = lnext(lc);
+-
+ 		/*
+ 		 * Must be a non-delaying semijoin to a single baserel, else we aren't
+ 		 * going to be able to do anything with it.  (It's probably not
+@@ -572,7 +565,7 @@ reduce_unique_semijoins(PlannerInfo *root)
+ 			continue;
+ 
+ 		/* OK, remove the SpecialJoinInfo from the list. */
+-		root->join_info_list = list_delete_ptr(root->join_info_list, sjinfo);
++		root->join_info_list = foreach_delete_current(root->join_info_list, lc);
+ 	}
+ }
+ 
+@@ -897,7 +890,7 @@ query_is_distinct_for(Query *query, List *colnos, List *opids)
+ 				/* non-resjunk columns should have grouping clauses */
+ 				Assert(lg != NULL);
+ 				sgc = (SortGroupClause *) lfirst(lg);
+-				lg = lnext(lg);
++				lg = lnext(topop->groupClauses, lg);
+ 
+ 				opid = distinct_col_search(tle->resno, colnos, opids);
+ 				if (!OidIsValid(opid) ||
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index 12fba56285d7..c6b8553a083f 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -2211,10 +2211,9 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
+ 	chain = NIL;
+ 	if (list_length(rollups) > 1)
+ 	{
+-		ListCell   *lc2 = lnext(list_head(rollups));
+ 		bool		is_first_sort = ((RollupData *) linitial(rollups))->is_hashed;
+ 
+-		for_each_cell(lc, lc2)
++		for_each_cell(lc, rollups, list_second_cell(rollups))
+ 		{
+ 			RollupData *rollup = lfirst(lc);
+ 			AttrNumber *new_grpColIdx;
+@@ -4261,7 +4260,7 @@ create_mergejoin_plan(PlannerInfo *root,
+ 				elog(ERROR, "outer pathkeys do not match mergeclauses");
+ 			opathkey = (PathKey *) lfirst(lop);
+ 			opeclass = opathkey->pk_eclass;
+-			lop = lnext(lop);
++			lop = lnext(outerpathkeys, lop);
+ 			if (oeclass != opeclass)
+ 				elog(ERROR, "outer pathkeys do not match mergeclauses");
+ 		}
+@@ -4288,7 +4287,7 @@ create_mergejoin_plan(PlannerInfo *root,
+ 			if (ieclass == ipeclass)
+ 			{
+ 				/* successful first match to this inner pathkey */
+-				lip = lnext(lip);
++				lip = lnext(innerpathkeys, lip);
+ 				first_inner_match = true;
+ 			}
+ 		}
+@@ -4820,7 +4819,7 @@ fix_indexqual_operand(Node *node, IndexOptInfo *index, int indexcol)
+ 				else
+ 					elog(ERROR, "index key does not match expected index column");
+ 			}
+-			indexpr_item = lnext(indexpr_item);
++			indexpr_item = lnext(index->indexprs, indexpr_item);
+ 		}
+ 	}
+ 
+diff --git a/src/backend/optimizer/plan/planner.c b/src/backend/optimizer/plan/planner.c
+index 401299e54204..ca3b7f29e18c 100644
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -3351,7 +3351,7 @@ extract_rollup_sets(List *groupingSets)
+ 	while (lc1 && lfirst(lc1) == NIL)
+ 	{
+ 		++num_empty;
+-		lc1 = lnext(lc1);
++		lc1 = lnext(groupingSets, lc1);
+ 	}
+ 
+ 	/* bail out now if it turns out that all we had were empty sets. */
+@@ -3385,7 +3385,7 @@ extract_rollup_sets(List *groupingSets)
+ 	j = 0;
+ 	i = 1;
+ 
+-	for_each_cell(lc, lc1)
++	for_each_cell(lc, groupingSets, lc1)
+ 	{
+ 		List	   *candidate = (List *) lfirst(lc);
+ 		Bitmapset  *candidate_set = NULL;
+@@ -4243,7 +4243,7 @@ consider_groupingsets_paths(PlannerInfo *root,
+ 		{
+ 			unhashed_rollup = lfirst_node(RollupData, l_start);
+ 			exclude_groups = unhashed_rollup->numGroups;
+-			l_start = lnext(l_start);
++			l_start = lnext(gd->rollups, l_start);
+ 		}
+ 
+ 		hashsize = estimate_hashagg_tablesize(path,
+@@ -4264,7 +4264,7 @@ consider_groupingsets_paths(PlannerInfo *root,
+ 		 */
+ 		sets_data = list_copy(gd->unsortable_sets);
+ 
+-		for_each_cell(lc, l_start)
++		for_each_cell(lc, gd->rollups, l_start)
+ 		{
+ 			RollupData *rollup = lfirst_node(RollupData, lc);
+ 
+@@ -4425,7 +4425,7 @@ consider_groupingsets_paths(PlannerInfo *root,
+ 			 * below, must use the same condition.
+ 			 */
+ 			i = 0;
+-			for_each_cell(lc, lnext(list_head(gd->rollups)))
++			for_each_cell(lc, gd->rollups, list_second_cell(gd->rollups))
+ 			{
+ 				RollupData *rollup = lfirst_node(RollupData, lc);
+ 
+@@ -4459,7 +4459,7 @@ consider_groupingsets_paths(PlannerInfo *root,
+ 				rollups = list_make1(linitial(gd->rollups));
+ 
+ 				i = 0;
+-				for_each_cell(lc, lnext(list_head(gd->rollups)))
++				for_each_cell(lc, gd->rollups, list_second_cell(gd->rollups))
+ 				{
+ 					RollupData *rollup = lfirst_node(RollupData, lc);
+ 
+@@ -4672,7 +4672,7 @@ create_one_window_path(PlannerInfo *root,
+ 											 -1.0);
+ 		}
+ 
+-		if (lnext(l))
++		if (lnext(activeWindows, l))
+ 		{
+ 			/*
+ 			 * Add the current WindowFuncs to the output target for this
+@@ -5333,7 +5333,7 @@ postprocess_setop_tlist(List *new_tlist, List *orig_tlist)
+ 
+ 		Assert(orig_tlist_item != NULL);
+ 		orig_tle = lfirst_node(TargetEntry, orig_tlist_item);
+-		orig_tlist_item = lnext(orig_tlist_item);
++		orig_tlist_item = lnext(orig_tlist, orig_tlist_item);
+ 		if (orig_tle->resjunk)	/* should not happen */
+ 			elog(ERROR, "resjunk output columns are not implemented");
+ 		Assert(new_tle->resno == orig_tle->resno);
+diff --git a/src/backend/optimizer/plan/subselect.c b/src/backend/optimizer/plan/subselect.c
+index efd0fbc21c58..48b62a55de87 100644
+--- a/src/backend/optimizer/plan/subselect.c
++++ b/src/backend/optimizer/plan/subselect.c
+@@ -567,7 +567,7 @@ build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
+ 		{
+ 			ptr += sprintf(ptr, "$%d%s",
+ 						   lfirst_int(lc),
+-						   lnext(lc) ? "," : ")");
++						   lnext(splan->setParam, lc) ? "," : ")");
+ 		}
+ 	}
+ 
+diff --git a/src/backend/optimizer/prep/prepjointree.c b/src/backend/optimizer/prep/prepjointree.c
+index 67eeba938dbe..e20bee0b330b 100644
+--- a/src/backend/optimizer/prep/prepjointree.c
++++ b/src/backend/optimizer/prep/prepjointree.c
+@@ -2791,8 +2791,6 @@ void
+ remove_useless_result_rtes(PlannerInfo *root)
+ {
+ 	ListCell   *cell;
+-	ListCell   *prev;
+-	ListCell   *next;
+ 
+ 	/* Top level of jointree must always be a FromExpr */
+ 	Assert(IsA(root->parse->jointree, FromExpr));
+@@ -2813,16 +2811,12 @@ remove_useless_result_rtes(PlannerInfo *root)
+ 	 * RTE_RESULT RTE; otherwise we'll generate a whole-row Var for the
+ 	 * RTE_RESULT, which the executor has no support for.
+ 	 */
+-	prev = NULL;
+-	for (cell = list_head(root->rowMarks); cell; cell = next)
++	foreach(cell, root->rowMarks)
+ 	{
+ 		PlanRowMark *rc = (PlanRowMark *) lfirst(cell);
+ 
+-		next = lnext(cell);
+ 		if (rt_fetch(rc->rti, root->parse->rtable)->rtekind == RTE_RESULT)
+-			root->rowMarks = list_delete_cell(root->rowMarks, cell, prev);
+-		else
+-			prev = cell;
++			root->rowMarks = foreach_delete_current(root->rowMarks, cell);
+ 	}
+ }
+ 
+@@ -2845,17 +2839,14 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode)
+ 		FromExpr   *f = (FromExpr *) jtnode;
+ 		Relids		result_relids = NULL;
+ 		ListCell   *cell;
+-		ListCell   *prev;
+-		ListCell   *next;
+ 
+ 		/*
+ 		 * We can drop RTE_RESULT rels from the fromlist so long as at least
+ 		 * one child remains, since joining to a one-row table changes
+ 		 * nothing.  The easiest way to mechanize this rule is to modify the
+-		 * list in-place, using list_delete_cell.
++		 * list in-place.
+ 		 */
+-		prev = NULL;
+-		for (cell = list_head(f->fromlist); cell; cell = next)
++		foreach(cell, f->fromlist)
+ 		{
+ 			Node	   *child = (Node *) lfirst(cell);
+ 			int			varno;
+@@ -2864,7 +2855,6 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode)
+ 			child = remove_useless_results_recurse(root, child);
+ 			/* ... and stick it back into the tree */
+ 			lfirst(cell) = child;
+-			next = lnext(cell);
+ 
+ 			/*
+ 			 * If it's an RTE_RESULT with at least one sibling, we can drop
+@@ -2874,11 +2864,9 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode)
+ 			if (list_length(f->fromlist) > 1 &&
+ 				(varno = get_result_relid(root, child)) != 0)
+ 			{
+-				f->fromlist = list_delete_cell(f->fromlist, cell, prev);
++				f->fromlist = foreach_delete_current(f->fromlist, cell);
+ 				result_relids = bms_add_member(result_relids, varno);
+ 			}
+-			else
+-				prev = cell;
+ 		}
+ 
+ 		/*
+diff --git a/src/backend/optimizer/prep/preptlist.c b/src/backend/optimizer/prep/preptlist.c
+index 05172ff0234a..792ae393d978 100644
+--- a/src/backend/optimizer/prep/preptlist.c
++++ b/src/backend/optimizer/prep/preptlist.c
+@@ -285,7 +285,7 @@ expand_targetlist(List *tlist, int command_type,
+ 			if (!old_tle->resjunk && old_tle->resno == attrno)
+ 			{
+ 				new_tle = old_tle;
+-				tlist_item = lnext(tlist_item);
++				tlist_item = lnext(tlist, tlist_item);
+ 			}
+ 		}
+ 
+@@ -410,7 +410,7 @@ expand_targetlist(List *tlist, int command_type,
+ 		}
+ 		new_tlist = lappend(new_tlist, old_tle);
+ 		attrno++;
+-		tlist_item = lnext(tlist_item);
++		tlist_item = lnext(tlist, tlist_item);
+ 	}
+ 
+ 	return new_tlist;
+diff --git a/src/backend/optimizer/prep/prepunion.c b/src/backend/optimizer/prep/prepunion.c
+index cd9d49c1f79b..611207785166 100644
+--- a/src/backend/optimizer/prep/prepunion.c
++++ b/src/backend/optimizer/prep/prepunion.c
+@@ -1310,7 +1310,7 @@ generate_append_tlist(List *colTypes, List *colCollations,
+ 				/* types disagree, so force typmod to -1 */
+ 				colTypmods[colindex] = -1;
+ 			}
+-			curColType = lnext(curColType);
++			curColType = lnext(colTypes, curColType);
+ 			colindex++;
+ 		}
+ 		Assert(curColType == NULL);
+@@ -1410,7 +1410,7 @@ generate_setop_grouplist(SetOperationStmt *op, List *targetlist)
+ 		/* non-resjunk columns should have grouping clauses */
+ 		Assert(lg != NULL);
+ 		sgc = (SortGroupClause *) lfirst(lg);
+-		lg = lnext(lg);
++		lg = lnext(grouplist, lg);
+ 		Assert(sgc->tleSortGroupRef == 0);
+ 
+ 		sgc->tleSortGroupRef = tle->ressortgroupref;
+diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
+index d78f4e64c1bb..f0e789f37e6a 100644
+--- a/src/backend/optimizer/util/clauses.c
++++ b/src/backend/optimizer/util/clauses.c
+@@ -5255,7 +5255,7 @@ tlist_matches_coltypelist(List *tlist, List *coltypelist)
+ 			return false;		/* too many tlist items */
+ 
+ 		coltype = lfirst_oid(clistitem);
+-		clistitem = lnext(clistitem);
++		clistitem = lnext(coltypelist, clistitem);
+ 
+ 		if (exprType((Node *) tle->expr) != coltype)
+ 			return false;		/* column type mismatch */
+diff --git a/src/backend/optimizer/util/paramassign.c b/src/backend/optimizer/util/paramassign.c
+index 838587c2b8dd..536d80a27567 100644
+--- a/src/backend/optimizer/util/paramassign.c
++++ b/src/backend/optimizer/util/paramassign.c
+@@ -510,17 +510,12 @@ identify_current_nestloop_params(PlannerInfo *root, Relids leftrelids)
+ {
+ 	List	   *result;
+ 	ListCell   *cell;
+-	ListCell   *prev;
+-	ListCell   *next;
+ 
+ 	result = NIL;
+-	prev = NULL;
+-	for (cell = list_head(root->curOuterParams); cell; cell = next)
++	foreach(cell, root->curOuterParams)
+ 	{
+ 		NestLoopParam *nlp = (NestLoopParam *) lfirst(cell);
+ 
+-		next = lnext(cell);
+-
+ 		/*
+ 		 * We are looking for Vars and PHVs that can be supplied by the
+ 		 * lefthand rels.  The "bms_overlap" test is just an optimization to
+@@ -529,8 +524,8 @@ identify_current_nestloop_params(PlannerInfo *root, Relids leftrelids)
+ 		if (IsA(nlp->paramval, Var) &&
+ 			bms_is_member(nlp->paramval->varno, leftrelids))
+ 		{
+-			root->curOuterParams = list_delete_cell(root->curOuterParams,
+-													cell, prev);
++			root->curOuterParams = foreach_delete_current(root->curOuterParams,
++														  cell);
+ 			result = lappend(result, nlp);
+ 		}
+ 		else if (IsA(nlp->paramval, PlaceHolderVar) &&
+@@ -541,12 +536,10 @@ identify_current_nestloop_params(PlannerInfo *root, Relids leftrelids)
+ 													 false)->ph_eval_at,
+ 							   leftrelids))
+ 		{
+-			root->curOuterParams = list_delete_cell(root->curOuterParams,
+-													cell, prev);
++			root->curOuterParams = foreach_delete_current(root->curOuterParams,
++														  cell);
+ 			result = lappend(result, nlp);
+ 		}
+-		else
+-			prev = cell;
+ 	}
+ 	return result;
+ }
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index d884d2bb000e..67254c2fd91c 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -423,11 +423,9 @@ void
+ add_path(RelOptInfo *parent_rel, Path *new_path)
+ {
+ 	bool		accept_new = true;	/* unless we find a superior old path */
+-	ListCell   *insert_after = NULL;	/* where to insert new item */
++	int			insert_at = 0;	/* where to insert new item */
+ 	List	   *new_path_pathkeys;
+ 	ListCell   *p1;
+-	ListCell   *p1_prev;
+-	ListCell   *p1_next;
+ 
+ 	/*
+ 	 * This is a convenient place to check for query cancel --- no part of the
+@@ -442,12 +440,8 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
+ 	 * Loop to check proposed new path against old paths.  Note it is possible
+ 	 * for more than one old path to be tossed out because new_path dominates
+ 	 * it.
+-	 *
+-	 * We can't use foreach here because the loop body may delete the current
+-	 * list cell.
+ 	 */
+-	p1_prev = NULL;
+-	for (p1 = list_head(parent_rel->pathlist); p1 != NULL; p1 = p1_next)
++	foreach(p1, parent_rel->pathlist)
+ 	{
+ 		Path	   *old_path = (Path *) lfirst(p1);
+ 		bool		remove_old = false; /* unless new proves superior */
+@@ -455,8 +449,6 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
+ 		PathKeysComparison keyscmp;
+ 		BMS_Comparison outercmp;
+ 
+-		p1_next = lnext(p1);
+-
+ 		/*
+ 		 * Do a fuzzy cost comparison with standard fuzziness limit.
+ 		 */
+@@ -593,23 +585,20 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
+ 		 */
+ 		if (remove_old)
+ 		{
+-			parent_rel->pathlist = list_delete_cell(parent_rel->pathlist,
+-													p1, p1_prev);
++			parent_rel->pathlist = foreach_delete_current(parent_rel->pathlist,
++														  p1);
+ 
+ 			/*
+ 			 * Delete the data pointed-to by the deleted cell, if possible
+ 			 */
+ 			if (!IsA(old_path, IndexPath))
+ 				pfree(old_path);
+-			/* p1_prev does not advance */
+ 		}
+ 		else
+ 		{
+ 			/* new belongs after this old path if it has cost >= old's */
+ 			if (new_path->total_cost >= old_path->total_cost)
+-				insert_after = p1;
+-			/* p1_prev advances */
+-			p1_prev = p1;
++				insert_at = foreach_current_index(p1) + 1;
+ 		}
+ 
+ 		/*
+@@ -624,10 +613,8 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
+ 	if (accept_new)
+ 	{
+ 		/* Accept the new path: insert it at proper place in pathlist */
+-		if (insert_after)
+-			lappend_cell(parent_rel->pathlist, insert_after, new_path);
+-		else
+-			parent_rel->pathlist = lcons(new_path, parent_rel->pathlist);
++		parent_rel->pathlist =
++			list_insert_nth(parent_rel->pathlist, insert_at, new_path);
+ 	}
+ 	else
+ 	{
+@@ -763,10 +750,8 @@ void
+ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+ {
+ 	bool		accept_new = true;	/* unless we find a superior old path */
+-	ListCell   *insert_after = NULL;	/* where to insert new item */
++	int			insert_at = 0;	/* where to insert new item */
+ 	ListCell   *p1;
+-	ListCell   *p1_prev;
+-	ListCell   *p1_next;
+ 
+ 	/* Check for query cancel. */
+ 	CHECK_FOR_INTERRUPTS();
+@@ -781,16 +766,12 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+ 	 * As in add_path, throw out any paths which are dominated by the new
+ 	 * path, but throw out the new path if some existing path dominates it.
+ 	 */
+-	p1_prev = NULL;
+-	for (p1 = list_head(parent_rel->partial_pathlist); p1 != NULL;
+-		 p1 = p1_next)
++	foreach(p1, parent_rel->partial_pathlist)
+ 	{
+ 		Path	   *old_path = (Path *) lfirst(p1);
+ 		bool		remove_old = false; /* unless new proves superior */
+ 		PathKeysComparison keyscmp;
+ 
+-		p1_next = lnext(p1);
+-
+ 		/* Compare pathkeys. */
+ 		keyscmp = compare_pathkeys(new_path->pathkeys, old_path->pathkeys);
+ 
+@@ -841,17 +822,14 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+ 		if (remove_old)
+ 		{
+ 			parent_rel->partial_pathlist =
+-				list_delete_cell(parent_rel->partial_pathlist, p1, p1_prev);
++				foreach_delete_current(parent_rel->partial_pathlist, p1);
+ 			pfree(old_path);
+-			/* p1_prev does not advance */
+ 		}
+ 		else
+ 		{
+ 			/* new belongs after this old path if it has cost >= old's */
+ 			if (new_path->total_cost >= old_path->total_cost)
+-				insert_after = p1;
+-			/* p1_prev advances */
+-			p1_prev = p1;
++				insert_at = foreach_current_index(p1) + 1;
+ 		}
+ 
+ 		/*
+@@ -866,11 +844,8 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+ 	if (accept_new)
+ 	{
+ 		/* Accept the new path: insert it at proper place */
+-		if (insert_after)
+-			lappend_cell(parent_rel->partial_pathlist, insert_after, new_path);
+-		else
+-			parent_rel->partial_pathlist =
+-				lcons(new_path, parent_rel->partial_pathlist);
++		parent_rel->partial_pathlist =
++			list_insert_nth(parent_rel->partial_pathlist, insert_at, new_path);
+ 	}
+ 	else
+ 	{
+diff --git a/src/backend/optimizer/util/plancat.c b/src/backend/optimizer/util/plancat.c
+index 40f497660d1e..6ea625a148cc 100644
+--- a/src/backend/optimizer/util/plancat.c
++++ b/src/backend/optimizer/util/plancat.c
+@@ -1742,7 +1742,7 @@ build_index_tlist(PlannerInfo *root, IndexOptInfo *index,
+ 			if (indexpr_item == NULL)
+ 				elog(ERROR, "wrong number of index expressions");
+ 			indexvar = (Expr *) lfirst(indexpr_item);
+-			indexpr_item = lnext(indexpr_item);
++			indexpr_item = lnext(index->indexprs, indexpr_item);
+ 		}
+ 
+ 		tlist = lappend(tlist,
+@@ -2301,7 +2301,7 @@ set_baserel_partition_key_exprs(Relation relation,
+ 			/* Re-stamp the expression with given varno. */
+ 			partexpr = (Expr *) copyObject(lfirst(lc));
+ 			ChangeVarNodes((Node *) partexpr, 1, varno, 0);
+-			lc = lnext(lc);
++			lc = lnext(partkey->partexprs, lc);
+ 		}
+ 
+ 		partexprs[cnt] = list_make1(partexpr);
+diff --git a/src/backend/optimizer/util/predtest.c b/src/backend/optimizer/util/predtest.c
+index b81eba721911..08a160fff60f 100644
+--- a/src/backend/optimizer/util/predtest.c
++++ b/src/backend/optimizer/util/predtest.c
+@@ -59,6 +59,7 @@ typedef struct PredIterInfoData
+ {
+ 	/* node-type-specific iteration state */
+ 	void	   *state;
++	List	   *state_list;
+ 	/* initialize to do the iteration */
+ 	void		(*startup_fn) (Node *clause, PredIterInfo info);
+ 	/* next-component iteration function */
+@@ -905,7 +906,8 @@ predicate_classify(Node *clause, PredIterInfo info)
+ static void
+ list_startup_fn(Node *clause, PredIterInfo info)
+ {
+-	info->state = (void *) list_head((List *) clause);
++	info->state_list = (List *) clause;
++	info->state = (void *) list_head(info->state_list);
+ }
+ 
+ static Node *
+@@ -917,7 +919,7 @@ list_next_fn(PredIterInfo info)
+ 	if (l == NULL)
+ 		return NULL;
+ 	n = lfirst(l);
+-	info->state = (void *) lnext(l);
++	info->state = (void *) lnext(info->state_list, l);
+ 	return n;
+ }
+ 
+@@ -934,7 +936,8 @@ list_cleanup_fn(PredIterInfo info)
+ static void
+ boolexpr_startup_fn(Node *clause, PredIterInfo info)
+ {
+-	info->state = (void *) list_head(((BoolExpr *) clause)->args);
++	info->state_list = ((BoolExpr *) clause)->args;
++	info->state = (void *) list_head(info->state_list);
+ }
+ 
+ /*
+@@ -1057,6 +1060,7 @@ arrayexpr_startup_fn(Node *clause, PredIterInfo info)
+ 
+ 	/* Initialize iteration variable to first member of ArrayExpr */
+ 	arrayexpr = (ArrayExpr *) lsecond(saop->args);
++	info->state_list = arrayexpr->elements;
+ 	state->next = list_head(arrayexpr->elements);
+ }
+ 
+@@ -1068,7 +1072,7 @@ arrayexpr_next_fn(PredIterInfo info)
+ 	if (state->next == NULL)
+ 		return NULL;
+ 	lsecond(state->opexpr.args) = lfirst(state->next);
+-	state->next = lnext(state->next);
++	state->next = lnext(info->state_list, state->next);
+ 	return (Node *) &(state->opexpr);
+ }
+ 
+diff --git a/src/backend/optimizer/util/tlist.c b/src/backend/optimizer/util/tlist.c
+index 41402821a159..7ccb10e4e1bc 100644
+--- a/src/backend/optimizer/util/tlist.c
++++ b/src/backend/optimizer/util/tlist.c
+@@ -287,7 +287,7 @@ tlist_same_datatypes(List *tlist, List *colTypes, bool junkOK)
+ 				return false;	/* tlist longer than colTypes */
+ 			if (exprType((Node *) tle->expr) != lfirst_oid(curColType))
+ 				return false;
+-			curColType = lnext(curColType);
++			curColType = lnext(colTypes, curColType);
+ 		}
+ 	}
+ 	if (curColType != NULL)
+@@ -321,7 +321,7 @@ tlist_same_collations(List *tlist, List *colCollations, bool junkOK)
+ 				return false;	/* tlist longer than colCollations */
+ 			if (exprCollation((Node *) tle->expr) != lfirst_oid(curColColl))
+ 				return false;
+-			curColColl = lnext(curColColl);
++			curColColl = lnext(colCollations, curColColl);
+ 		}
+ 	}
+ 	if (curColColl != NULL)
+@@ -1022,7 +1022,7 @@ split_pathtarget_at_srfs(PlannerInfo *root,
+ 		List	   *level_srfs = (List *) lfirst(lc1);
+ 		PathTarget *ntarget;
+ 
+-		if (lnext(lc1) == NULL)
++		if (lnext(context.level_srfs, lc1) == NULL)
+ 		{
+ 			ntarget = target;
+ 		}
+@@ -1037,13 +1037,15 @@ split_pathtarget_at_srfs(PlannerInfo *root,
+ 			 * later levels.
+ 			 */
+ 			add_sp_items_to_pathtarget(ntarget, level_srfs);
+-			for_each_cell(lc, lnext(lc2))
++			for_each_cell(lc, context.level_input_vars,
++						  lnext(context.level_input_vars, lc2))
+ 			{
+ 				List	   *input_vars = (List *) lfirst(lc);
+ 
+ 				add_sp_items_to_pathtarget(ntarget, input_vars);
+ 			}
+-			for_each_cell(lc, lnext(lc3))
++			for_each_cell(lc, context.level_input_srfs,
++						  lnext(context.level_input_srfs, lc3))
+ 			{
+ 				List	   *input_srfs = (List *) lfirst(lc);
+ 				ListCell   *lcx;
+diff --git a/src/backend/parser/analyze.c b/src/backend/parser/analyze.c
+index 345a8e619778..85d7a96406e1 100644
+--- a/src/backend/parser/analyze.c
++++ b/src/backend/parser/analyze.c
+@@ -2341,7 +2341,7 @@ transformUpdateTargetList(ParseState *pstate, List *origTlist)
+ 		target_rte->updatedCols = bms_add_member(target_rte->updatedCols,
+ 												 attrno - FirstLowInvalidHeapAttributeNumber);
+ 
+-		orig_tl = lnext(orig_tl);
++		orig_tl = lnext(origTlist, orig_tl);
+ 	}
+ 	if (orig_tl != NULL)
+ 		elog(ERROR, "UPDATE target count mismatch --- internal error");
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 208b4a1f28a7..c97bb367f8e5 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -15579,7 +15579,7 @@ makeColumnRef(char *colname, List *indirection,
+ 		else if (IsA(lfirst(l), A_Star))
+ 		{
+ 			/* We only allow '*' at the end of a ColumnRef */
+-			if (lnext(l) != NULL)
++			if (lnext(indirection, l) != NULL)
+ 				parser_yyerror("improper use of \"*\"");
+ 		}
+ 		nfields++;
+@@ -15768,7 +15768,7 @@ check_indirection(List *indirection, core_yyscan_t yyscanner)
+ 	{
+ 		if (IsA(lfirst(l), A_Star))
+ 		{
+-			if (lnext(l) != NULL)
++			if (lnext(indirection, l) != NULL)
+ 				parser_yyerror("improper use of \"*\"");
+ 		}
+ 	}
+@@ -16181,20 +16181,15 @@ SplitColQualList(List *qualList,
+ 				 core_yyscan_t yyscanner)
+ {
+ 	ListCell   *cell;
+-	ListCell   *prev;
+-	ListCell   *next;
+ 
+ 	*collClause = NULL;
+-	prev = NULL;
+-	for (cell = list_head(qualList); cell; cell = next)
++	foreach(cell, qualList)
+ 	{
+ 		Node   *n = (Node *) lfirst(cell);
+ 
+-		next = lnext(cell);
+ 		if (IsA(n, Constraint))
+ 		{
+ 			/* keep it in list */
+-			prev = cell;
+ 			continue;
+ 		}
+ 		if (IsA(n, CollateClause))
+@@ -16211,7 +16206,7 @@ SplitColQualList(List *qualList,
+ 		else
+ 			elog(ERROR, "unexpected node type %d", (int) n->type);
+ 		/* remove non-Constraint nodes from qualList */
+-		qualList = list_delete_cell(qualList, cell, prev);
++		qualList = foreach_delete_current(qualList, cell);
+ 	}
+ 	*constraintList = qualList;
+ }
+diff --git a/src/backend/parser/parse_agg.c b/src/backend/parser/parse_agg.c
+index d50410d23a62..8dc3793b5fc6 100644
+--- a/src/backend/parser/parse_agg.c
++++ b/src/backend/parser/parse_agg.c
+@@ -1083,7 +1083,7 @@ parseCheckAggregates(ParseState *pstate, Query *qry)
+ 
+ 		if (gset_common)
+ 		{
+-			for_each_cell(l, lnext(list_head(gsets)))
++			for_each_cell(l, gsets, list_second_cell(gsets))
+ 			{
+ 				gset_common = list_intersection_int(gset_common, lfirst(l));
+ 				if (!gset_common)
+@@ -1777,7 +1777,7 @@ expand_grouping_sets(List *groupingSets, int limit)
+ 		result = lappend(result, list_union_int(NIL, (List *) lfirst(lc)));
+ 	}
+ 
+-	for_each_cell(lc, lnext(list_head(expanded_groups)))
++	for_each_cell(lc, expanded_groups, list_second_cell(expanded_groups))
+ 	{
+ 		List	   *p = lfirst(lc);
+ 		List	   *new_result = NIL;
+diff --git a/src/backend/parser/parse_coerce.c b/src/backend/parser/parse_coerce.c
+index 903478d8ca73..a6c51a95daeb 100644
+--- a/src/backend/parser/parse_coerce.c
++++ b/src/backend/parser/parse_coerce.c
+@@ -1085,7 +1085,7 @@ coerce_record_to_complex(ParseState *pstate, Node *node,
+ 					 parser_coercion_errposition(pstate, location, expr)));
+ 		newargs = lappend(newargs, cexpr);
+ 		ucolno++;
+-		arg = lnext(arg);
++		arg = lnext(args, arg);
+ 	}
+ 	if (arg != NULL)
+ 		ereport(ERROR,
+@@ -1283,7 +1283,7 @@ select_common_type(ParseState *pstate, List *exprs, const char *context,
+ 
+ 	Assert(exprs != NIL);
+ 	pexpr = (Node *) linitial(exprs);
+-	lc = lnext(list_head(exprs));
++	lc = list_second_cell(exprs);
+ 	ptype = exprType(pexpr);
+ 
+ 	/*
+@@ -1293,7 +1293,7 @@ select_common_type(ParseState *pstate, List *exprs, const char *context,
+ 	 */
+ 	if (ptype != UNKNOWNOID)
+ 	{
+-		for_each_cell(lc, lc)
++		for_each_cell(lc, exprs, lc)
+ 		{
+ 			Node	   *nexpr = (Node *) lfirst(lc);
+ 			Oid			ntype = exprType(nexpr);
+@@ -1317,7 +1317,7 @@ select_common_type(ParseState *pstate, List *exprs, const char *context,
+ 	ptype = getBaseType(ptype);
+ 	get_type_category_preferred(ptype, &pcategory, &pispreferred);
+ 
+-	for_each_cell(lc, lc)
++	for_each_cell(lc, exprs, lc)
+ 	{
+ 		Node	   *nexpr = (Node *) lfirst(lc);
+ 		Oid			ntype = getBaseType(exprType(nexpr));
+diff --git a/src/backend/parser/parse_collate.c b/src/backend/parser/parse_collate.c
+index 4d2e586bd64f..31a5f702a9a8 100644
+--- a/src/backend/parser/parse_collate.c
++++ b/src/backend/parser/parse_collate.c
+@@ -946,7 +946,7 @@ assign_hypothetical_collations(Aggref *aggref,
+ 	while (extra_args-- > 0)
+ 	{
+ 		(void) assign_collations_walker((Node *) lfirst(h_cell), loccontext);
+-		h_cell = lnext(h_cell);
++		h_cell = lnext(aggref->aggdirectargs, h_cell);
+ 	}
+ 
+ 	/* Scan hypothetical args and aggregated args in parallel */
+@@ -1027,8 +1027,8 @@ assign_hypothetical_collations(Aggref *aggref,
+ 								  paircontext.location2,
+ 								  loccontext);
+ 
+-		h_cell = lnext(h_cell);
+-		s_cell = lnext(s_cell);
++		h_cell = lnext(aggref->aggdirectargs, h_cell);
++		s_cell = lnext(aggref->args, s_cell);
+ 	}
+ 	Assert(h_cell == NULL && s_cell == NULL);
+ }
+diff --git a/src/backend/parser/parse_cte.c b/src/backend/parser/parse_cte.c
+index 84af95ed866d..63eea2a431c6 100644
+--- a/src/backend/parser/parse_cte.c
++++ b/src/backend/parser/parse_cte.c
+@@ -122,7 +122,7 @@ transformWithClause(ParseState *pstate, WithClause *withClause)
+ 		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+ 		ListCell   *rest;
+ 
+-		for_each_cell(rest, lnext(lc))
++		for_each_cell(rest, withClause->ctes, lnext(withClause->ctes, lc))
+ 		{
+ 			CommonTableExpr *cte2 = (CommonTableExpr *) lfirst(rest);
+ 
+@@ -327,9 +327,9 @@ analyzeCTE(ParseState *pstate, CommonTableExpr *cte)
+ 								get_collation_name(exprCollation(texpr))),
+ 						 errhint("Use the COLLATE clause to set the collation of the non-recursive term."),
+ 						 parser_errposition(pstate, exprLocation(texpr))));
+-			lctyp = lnext(lctyp);
+-			lctypmod = lnext(lctypmod);
+-			lccoll = lnext(lccoll);
++			lctyp = lnext(cte->ctecoltypes, lctyp);
++			lctypmod = lnext(cte->ctecoltypmods, lctypmod);
++			lccoll = lnext(cte->ctecolcollations, lccoll);
+ 		}
+ 		if (lctyp != NULL || lctypmod != NULL || lccoll != NULL)	/* shouldn't happen */
+ 			elog(ERROR, "wrong number of output columns in WITH");
+diff --git a/src/backend/parser/parse_expr.c b/src/backend/parser/parse_expr.c
+index 97f535a2f00f..76f3dd7076f2 100644
+--- a/src/backend/parser/parse_expr.c
++++ b/src/backend/parser/parse_expr.c
+@@ -2259,7 +2259,6 @@ transformRowExpr(ParseState *pstate, RowExpr *r, bool allowDefault)
+ 	RowExpr    *newr;
+ 	char		fname[16];
+ 	int			fnum;
+-	ListCell   *lc;
+ 
+ 	newr = makeNode(RowExpr);
+ 
+@@ -2273,10 +2272,9 @@ transformRowExpr(ParseState *pstate, RowExpr *r, bool allowDefault)
+ 
+ 	/* ROW() has anonymous columns, so invent some field names */
+ 	newr->colnames = NIL;
+-	fnum = 1;
+-	foreach(lc, newr->args)
++	for (fnum = 1; fnum <= list_length(newr->args); fnum++)
+ 	{
+-		snprintf(fname, sizeof(fname), "f%d", fnum++);
++		snprintf(fname, sizeof(fname), "f%d", fnum);
+ 		newr->colnames = lappend(newr->colnames, makeString(pstrdup(fname)));
+ 	}
+ 
+diff --git a/src/backend/parser/parse_func.c b/src/backend/parser/parse_func.c
+index 2a44b434a595..0102c220a4be 100644
+--- a/src/backend/parser/parse_func.c
++++ b/src/backend/parser/parse_func.c
+@@ -100,7 +100,6 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
+ 	Oid			rettype;
+ 	Oid			funcid;
+ 	ListCell   *l;
+-	ListCell   *nextl;
+ 	Node	   *first_arg = NULL;
+ 	int			nargs;
+ 	int			nargsplusdefs;
+@@ -147,21 +146,18 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
+ 	 * to distinguish "input" and "output" parameter symbols while parsing
+ 	 * function-call constructs.  Don't do this if dealing with column syntax,
+ 	 * nor if we had WITHIN GROUP (because in that case it's critical to keep
+-	 * the argument count unchanged).  We can't use foreach() because we may
+-	 * modify the list ...
++	 * the argument count unchanged).
+ 	 */
+ 	nargs = 0;
+-	for (l = list_head(fargs); l != NULL; l = nextl)
++	foreach(l, fargs)
+ 	{
+ 		Node	   *arg = lfirst(l);
+ 		Oid			argtype = exprType(arg);
+ 
+-		nextl = lnext(l);
+-
+ 		if (argtype == VOIDOID && IsA(arg, Param) &&
+ 			!is_column && !agg_within_group)
+ 		{
+-			fargs = list_delete_ptr(fargs, arg);
++			fargs = foreach_delete_current(fargs, l);
+ 			continue;
+ 		}
+ 
+@@ -1683,8 +1679,8 @@ func_get_detail(List *funcname,
+ 				int			ndelete;
+ 
+ 				ndelete = list_length(defaults) - best_candidate->ndargs;
+-				while (ndelete-- > 0)
+-					defaults = list_delete_first(defaults);
++				if (ndelete > 0)
++					defaults = list_copy_tail(defaults, ndelete);
+ 				*argdefaults = defaults;
+ 			}
+ 		}
+@@ -2009,7 +2005,7 @@ funcname_signature_string(const char *funcname, int nargs,
+ 		if (i >= numposargs)
+ 		{
+ 			appendStringInfo(&argbuf, "%s => ", (char *) lfirst(lc));
+-			lc = lnext(lc);
++			lc = lnext(argnames, lc);
+ 		}
+ 		appendStringInfoString(&argbuf, format_type_be(argtypes[i]));
+ 	}
+diff --git a/src/backend/parser/parse_relation.c b/src/backend/parser/parse_relation.c
+index 77a48b039d99..4dd81507a78a 100644
+--- a/src/backend/parser/parse_relation.c
++++ b/src/backend/parser/parse_relation.c
+@@ -1044,6 +1044,7 @@ static void
+ buildRelationAliases(TupleDesc tupdesc, Alias *alias, Alias *eref)
+ {
+ 	int			maxattrs = tupdesc->natts;
++	List	   *aliaslist;
+ 	ListCell   *aliaslc;
+ 	int			numaliases;
+ 	int			varattno;
+@@ -1053,13 +1054,15 @@ buildRelationAliases(TupleDesc tupdesc, Alias *alias, Alias *eref)
+ 
+ 	if (alias)
+ 	{
+-		aliaslc = list_head(alias->colnames);
+-		numaliases = list_length(alias->colnames);
++		aliaslist = alias->colnames;
++		aliaslc = list_head(aliaslist);
++		numaliases = list_length(aliaslist);
+ 		/* We'll rebuild the alias colname list */
+ 		alias->colnames = NIL;
+ 	}
+ 	else
+ 	{
++		aliaslist = NIL;
+ 		aliaslc = NULL;
+ 		numaliases = 0;
+ 	}
+@@ -1081,7 +1084,7 @@ buildRelationAliases(TupleDesc tupdesc, Alias *alias, Alias *eref)
+ 		{
+ 			/* Use the next user-supplied alias */
+ 			attrname = (Value *) lfirst(aliaslc);
+-			aliaslc = lnext(aliaslc);
++			aliaslc = lnext(aliaslist, aliaslc);
+ 			alias->colnames = lappend(alias->colnames, attrname);
+ 		}
+ 		else
+@@ -2287,7 +2290,7 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
+ 						*colvars = lappend(*colvars, varnode);
+ 					}
+ 
+-					aliasp_item = lnext(aliasp_item);
++					aliasp_item = lnext(rte->eref->colnames, aliasp_item);
+ 				}
+ 			}
+ 			break;
+@@ -2514,7 +2517,7 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
+ 							*colnames = lappend(*colnames,
+ 												makeString(pstrdup("")));
+ 
+-						aliasp_item = lnext(aliasp_item);
++						aliasp_item = lnext(rte->eref->colnames, aliasp_item);
+ 					}
+ 
+ 					if (colvars)
+@@ -2586,19 +2589,11 @@ expandTupleDesc(TupleDesc tupdesc, Alias *eref, int count, int offset,
+ 				int location, bool include_dropped,
+ 				List **colnames, List **colvars)
+ {
+-	ListCell   *aliascell = list_head(eref->colnames);
++	ListCell   *aliascell;
+ 	int			varattno;
+ 
+-	if (colnames)
+-	{
+-		int			i;
+-
+-		for (i = 0; i < offset; i++)
+-		{
+-			if (aliascell)
+-				aliascell = lnext(aliascell);
+-		}
+-	}
++	aliascell = (offset < list_length(eref->colnames)) ?
++		list_nth_cell(eref->colnames, offset) : NULL;
+ 
+ 	Assert(count <= tupdesc->natts);
+ 	for (varattno = 0; varattno < count; varattno++)
+@@ -2622,7 +2617,7 @@ expandTupleDesc(TupleDesc tupdesc, Alias *eref, int count, int offset,
+ 				}
+ 			}
+ 			if (aliascell)
+-				aliascell = lnext(aliascell);
++				aliascell = lnext(eref->colnames, aliascell);
+ 			continue;
+ 		}
+ 
+@@ -2633,7 +2628,7 @@ expandTupleDesc(TupleDesc tupdesc, Alias *eref, int count, int offset,
+ 			if (aliascell)
+ 			{
+ 				label = strVal(lfirst(aliascell));
+-				aliascell = lnext(aliascell);
++				aliascell = lnext(eref->colnames, aliascell);
+ 			}
+ 			else
+ 			{
+diff --git a/src/backend/parser/parse_target.c b/src/backend/parser/parse_target.c
+index b70d92b95509..290102501510 100644
+--- a/src/backend/parser/parse_target.c
++++ b/src/backend/parser/parse_target.c
+@@ -42,7 +42,8 @@ static Node *transformAssignmentIndirection(ParseState *pstate,
+ 											Oid targetTypeId,
+ 											int32 targetTypMod,
+ 											Oid targetCollation,
+-											ListCell *indirection,
++											List *indirection,
++											ListCell *indirection_cell,
+ 											Node *rhs,
+ 											int location);
+ static Node *transformAssignmentSubscripts(ParseState *pstate,
+@@ -53,6 +54,7 @@ static Node *transformAssignmentSubscripts(ParseState *pstate,
+ 										   Oid targetCollation,
+ 										   List *subscripts,
+ 										   bool isSlice,
++										   List *indirection,
+ 										   ListCell *next_indirection,
+ 										   Node *rhs,
+ 										   int location);
+@@ -561,6 +563,7 @@ transformAssignedExpr(ParseState *pstate,
+ 										   attrtype,
+ 										   attrtypmod,
+ 										   attrcollation,
++										   indirection,
+ 										   list_head(indirection),
+ 										   (Node *) expr,
+ 										   location);
+@@ -662,8 +665,9 @@ updateTargetListEntry(ParseState *pstate,
+  * collation of the object to be assigned to (initially the target column,
+  * later some subobject).
+  *
+- * indirection is the sublist remaining to process.  When it's NULL, we're
+- * done recursing and can just coerce and return the RHS.
++ * indirection is the list of indirection nodes, and indirection_cell is the
++ * start of the sublist remaining to process.  When it's NULL, we're done
++ * recursing and can just coerce and return the RHS.
+  *
+  * rhs is the already-transformed value to be assigned; note it has not been
+  * coerced to any particular type.
+@@ -681,7 +685,8 @@ transformAssignmentIndirection(ParseState *pstate,
+ 							   Oid targetTypeId,
+ 							   int32 targetTypMod,
+ 							   Oid targetCollation,
+-							   ListCell *indirection,
++							   List *indirection,
++							   ListCell *indirection_cell,
+ 							   Node *rhs,
+ 							   int location)
+ {
+@@ -690,7 +695,7 @@ transformAssignmentIndirection(ParseState *pstate,
+ 	bool		isSlice = false;
+ 	ListCell   *i;
+ 
+-	if (indirection && !basenode)
++	if (indirection_cell && !basenode)
+ 	{
+ 		/*
+ 		 * Set up a substitution.  We abuse CaseTestExpr for this.  It's safe
+@@ -712,7 +717,7 @@ transformAssignmentIndirection(ParseState *pstate,
+ 	 * subscripting.  Adjacent A_Indices nodes have to be treated as a single
+ 	 * multidimensional subscript operation.
+ 	 */
+-	for_each_cell(i, indirection)
++	for_each_cell(i, indirection, indirection_cell)
+ 	{
+ 		Node	   *n = lfirst(i);
+ 
+@@ -754,6 +759,7 @@ transformAssignmentIndirection(ParseState *pstate,
+ 													 targetCollation,
+ 													 subscripts,
+ 													 isSlice,
++													 indirection,
+ 													 i,
+ 													 rhs,
+ 													 location);
+@@ -803,7 +809,8 @@ transformAssignmentIndirection(ParseState *pstate,
+ 												 fieldTypeId,
+ 												 fieldTypMod,
+ 												 fieldCollation,
+-												 lnext(i),
++												 indirection,
++												 lnext(indirection, i),
+ 												 rhs,
+ 												 location);
+ 
+@@ -840,6 +847,7 @@ transformAssignmentIndirection(ParseState *pstate,
+ 											 targetCollation,
+ 											 subscripts,
+ 											 isSlice,
++											 indirection,
+ 											 NULL,
+ 											 rhs,
+ 											 location);
+@@ -892,6 +900,7 @@ transformAssignmentSubscripts(ParseState *pstate,
+ 							  Oid targetCollation,
+ 							  List *subscripts,
+ 							  bool isSlice,
++							  List *indirection,
+ 							  ListCell *next_indirection,
+ 							  Node *rhs,
+ 							  int location)
+@@ -931,6 +940,7 @@ transformAssignmentSubscripts(ParseState *pstate,
+ 										 typeNeeded,
+ 										 containerTypMod,
+ 										 collationNeeded,
++										 indirection,
+ 										 next_indirection,
+ 										 rhs,
+ 										 location);
+diff --git a/src/backend/parser/parse_utilcmd.c b/src/backend/parser/parse_utilcmd.c
+index 7450d74b7acb..f0f6ee7db6ba 100644
+--- a/src/backend/parser/parse_utilcmd.c
++++ b/src/backend/parser/parse_utilcmd.c
+@@ -1547,7 +1547,7 @@ generateClonedIndexStmt(RangeVar *heapRel, Relation source_idx,
+ 			if (indexpr_item == NULL)
+ 				elog(ERROR, "too few entries in indexprs list");
+ 			indexkey = (Node *) lfirst(indexpr_item);
+-			indexpr_item = lnext(indexpr_item);
++			indexpr_item = lnext(indexprs, indexpr_item);
+ 
+ 			/* Adjust Vars to match new table's column numbering */
+ 			indexkey = map_variable_attnos(indexkey,
+diff --git a/src/backend/partitioning/partbounds.c b/src/backend/partitioning/partbounds.c
+index 13d576c37942..7d8907b2b423 100644
+--- a/src/backend/partitioning/partbounds.c
++++ b/src/backend/partitioning/partbounds.c
+@@ -2046,7 +2046,7 @@ get_qual_for_hash(Relation parent, PartitionBoundSpec *spec)
+ 		else
+ 		{
+ 			keyCol = (Node *) copyObject(lfirst(partexprs_item));
+-			partexprs_item = lnext(partexprs_item);
++			partexprs_item = lnext(key->partexprs, partexprs_item);
+ 		}
+ 
+ 		args = lappend(args, keyCol);
+@@ -2491,19 +2491,20 @@ get_qual_for_range(Relation parent, PartitionBoundSpec *spec,
+ 		j = i;
+ 		partexprs_item = partexprs_item_saved;
+ 
+-		for_both_cell(cell1, lower_or_start_datum, cell2, upper_or_start_datum)
++		for_both_cell(cell1, spec->lowerdatums, lower_or_start_datum,
++					  cell2, spec->upperdatums, upper_or_start_datum)
+ 		{
+ 			PartitionRangeDatum *ldatum_next = NULL,
+ 					   *udatum_next = NULL;
+ 
+ 			ldatum = castNode(PartitionRangeDatum, lfirst(cell1));
+-			if (lnext(cell1))
++			if (lnext(spec->lowerdatums, cell1))
+ 				ldatum_next = castNode(PartitionRangeDatum,
+-									   lfirst(lnext(cell1)));
++									   lfirst(lnext(spec->lowerdatums, cell1)));
+ 			udatum = castNode(PartitionRangeDatum, lfirst(cell2));
+-			if (lnext(cell2))
++			if (lnext(spec->upperdatums, cell2))
+ 				udatum_next = castNode(PartitionRangeDatum,
+-									   lfirst(lnext(cell2)));
++									   lfirst(lnext(spec->upperdatums, cell2)));
+ 			get_range_key_properties(key, j, ldatum, udatum,
+ 									 &partexprs_item,
+ 									 &keyCol,
+@@ -2668,7 +2669,7 @@ get_range_key_properties(PartitionKey key, int keynum,
+ 		if (*partexprs_item == NULL)
+ 			elog(ERROR, "wrong number of partition key expressions");
+ 		*keyCol = copyObject(lfirst(*partexprs_item));
+-		*partexprs_item = lnext(*partexprs_item);
++		*partexprs_item = lnext(key->partexprs, *partexprs_item);
+ 	}
+ 
+ 	/* Get appropriate Const nodes for the bounds */
+@@ -2716,7 +2717,7 @@ get_range_nulltest(PartitionKey key)
+ 			if (partexprs_item == NULL)
+ 				elog(ERROR, "wrong number of partition key expressions");
+ 			keyCol = copyObject(lfirst(partexprs_item));
+-			partexprs_item = lnext(partexprs_item);
++			partexprs_item = lnext(key->partexprs, partexprs_item);
+ 		}
+ 
+ 		nulltest = makeNode(NullTest);
+diff --git a/src/backend/partitioning/partprune.c b/src/backend/partitioning/partprune.c
+index e71a21c0a743..6d3751d44a6a 100644
+--- a/src/backend/partitioning/partprune.c
++++ b/src/backend/partitioning/partprune.c
+@@ -174,6 +174,7 @@ static List *get_steps_using_prefix_recurse(GeneratePruningStepsContext *context
+ 											Oid step_lastcmpfn,
+ 											int step_lastkeyno,
+ 											Bitmapset *step_nullkeys,
++											List *prefix,
+ 											ListCell *start,
+ 											List *step_exprs,
+ 											List *step_cmpfns);
+@@ -1521,7 +1522,7 @@ gen_prune_steps_from_opexps(GeneratePruningStepsContext *context,
+ 					 * of expressions of different keys, which
+ 					 * get_steps_using_prefix will take care of for us.
+ 					 */
+-					for_each_cell(lc1, lc)
++					for_each_cell(lc1, eq_clauses, lc)
+ 					{
+ 						pc = lfirst(lc1);
+ 
+@@ -2213,6 +2214,7 @@ get_steps_using_prefix(GeneratePruningStepsContext *context,
+ 										  step_lastcmpfn,
+ 										  step_lastkeyno,
+ 										  step_nullkeys,
++										  prefix,
+ 										  list_head(prefix),
+ 										  NIL, NIL);
+ }
+@@ -2224,6 +2226,7 @@ get_steps_using_prefix(GeneratePruningStepsContext *context,
+  *		column that is less than the one for which we're currently generating
+  *		steps (that is, step_lastkeyno)
+  *
++ * 'prefix' is the list of PartClauseInfos.
+  * 'start' is where we should start iterating for the current invocation.
+  * 'step_exprs' and 'step_cmpfns' each contains the expressions and cmpfns
+  * we've generated so far from the clauses for the previous part keys.
+@@ -2236,6 +2239,7 @@ get_steps_using_prefix_recurse(GeneratePruningStepsContext *context,
+ 							   Oid step_lastcmpfn,
+ 							   int step_lastkeyno,
+ 							   Bitmapset *step_nullkeys,
++							   List *prefix,
+ 							   ListCell *start,
+ 							   List *step_exprs,
+ 							   List *step_cmpfns)
+@@ -2261,7 +2265,7 @@ get_steps_using_prefix_recurse(GeneratePruningStepsContext *context,
+ 		 * next_start to the ListCell of the first clause for the next
+ 		 * partition key.
+ 		 */
+-		for_each_cell(lc, start)
++		for_each_cell(lc, prefix, start)
+ 		{
+ 			pc = lfirst(lc);
+ 
+@@ -2270,7 +2274,7 @@ get_steps_using_prefix_recurse(GeneratePruningStepsContext *context,
+ 		}
+ 		next_start = lc;
+ 
+-		for_each_cell(lc, start)
++		for_each_cell(lc, prefix, start)
+ 		{
+ 			List	   *moresteps;
+ 
+@@ -2304,6 +2308,7 @@ get_steps_using_prefix_recurse(GeneratePruningStepsContext *context,
+ 													   step_lastcmpfn,
+ 													   step_lastkeyno,
+ 													   step_nullkeys,
++													   prefix,
+ 													   next_start,
+ 													   step_exprs,
+ 													   step_cmpfns);
+@@ -2318,7 +2323,7 @@ get_steps_using_prefix_recurse(GeneratePruningStepsContext *context,
+ 		 * till the end of the list.
+ 		 */
+ 		Assert(list_length(step_exprs) == cur_keyno);
+-		for_each_cell(lc, start)
++		for_each_cell(lc, prefix, start)
+ 		{
+ 			PartClauseInfo *pc = lfirst(lc);
+ 			PartitionPruneStep *step;
+@@ -3263,8 +3268,8 @@ perform_pruning_base_step(PartitionPruneContext *context,
+ 			values[keyno] = datum;
+ 			nvalues++;
+ 
+-			lc1 = lnext(lc1);
+-			lc2 = lnext(lc2);
++			lc1 = lnext(opstep->exprs, lc1);
++			lc2 = lnext(opstep->cmpfns, lc2);
+ 		}
+ 	}
+ 
+diff --git a/src/backend/replication/basebackup.c b/src/backend/replication/basebackup.c
+index 57f17e14181a..d8c370efc723 100644
+--- a/src/backend/replication/basebackup.c
++++ b/src/backend/replication/basebackup.c
+@@ -355,7 +355,7 @@ perform_base_backup(basebackup_options *opt)
+ 			 */
+ 			if (opt->includewal && ti->path == NULL)
+ 			{
+-				Assert(lnext(lc) == NULL);
++				Assert(lnext(tablespaces, lc) == NULL);
+ 			}
+ 			else
+ 				pq_putemptymessage('c');	/* CopyDone */
+diff --git a/src/backend/replication/syncrep.c b/src/backend/replication/syncrep.c
+index 577791f3d5fd..79c7c13ada09 100644
+--- a/src/backend/replication/syncrep.c
++++ b/src/backend/replication/syncrep.c
+@@ -887,18 +887,14 @@ SyncRepGetSyncStandbysPriority(bool *am_sync)
+ 	while (priority <= lowest_priority)
+ 	{
+ 		ListCell   *cell;
+-		ListCell   *prev = NULL;
+-		ListCell   *next;
+ 
+ 		next_highest_priority = lowest_priority + 1;
+ 
+-		for (cell = list_head(pending); cell != NULL; cell = next)
++		foreach(cell, pending)
+ 		{
+ 			i = lfirst_int(cell);
+ 			walsnd = &WalSndCtl->walsnds[i];
+ 
+-			next = lnext(cell);
+-
+ 			this_priority = walsnd->sync_standby_priority;
+ 			if (this_priority == priority)
+ 			{
+@@ -921,15 +917,13 @@ SyncRepGetSyncStandbysPriority(bool *am_sync)
+ 				 * Remove the entry for this sync standby from the list to
+ 				 * prevent us from looking at the same entry again.
+ 				 */
+-				pending = list_delete_cell(pending, cell, prev);
++				pending = foreach_delete_current(pending, cell);
+ 
+-				continue;
++				continue;		/* don't adjust next_highest_priority */
+ 			}
+ 
+ 			if (this_priority < next_highest_priority)
+ 				next_highest_priority = this_priority;
+-
+-			prev = cell;
+ 		}
+ 
+ 		priority = next_highest_priority;
+diff --git a/src/backend/storage/sync/sync.c b/src/backend/storage/sync/sync.c
+index 705f229b27fd..f329c3fd667c 100644
+--- a/src/backend/storage/sync/sync.c
++++ b/src/backend/storage/sync/sync.c
+@@ -452,9 +452,7 @@ RememberSyncRequest(const FileTag *ftag, SyncRequestType type)
+ 	{
+ 		HASH_SEQ_STATUS hstat;
+ 		PendingFsyncEntry *entry;
+-		ListCell   *cell,
+-				   *prev,
+-				   *next;
++		ListCell   *cell;
+ 
+ 		/* Cancel matching fsync requests */
+ 		hash_seq_init(&hstat, pendingOps);
+@@ -466,20 +464,16 @@ RememberSyncRequest(const FileTag *ftag, SyncRequestType type)
+ 		}
+ 
+ 		/* Remove matching unlink requests */
+-		prev = NULL;
+-		for (cell = list_head(pendingUnlinks); cell; cell = next)
++		foreach(cell, pendingUnlinks)
+ 		{
+ 			PendingUnlinkEntry *entry = (PendingUnlinkEntry *) lfirst(cell);
+ 
+-			next = lnext(cell);
+ 			if (entry->tag.handler == ftag->handler &&
+ 				syncsw[ftag->handler].sync_filetagmatches(ftag, &entry->tag))
+ 			{
+-				pendingUnlinks = list_delete_cell(pendingUnlinks, cell, prev);
++				pendingUnlinks = foreach_delete_current(pendingUnlinks, cell);
+ 				pfree(entry);
+ 			}
+-			else
+-				prev = cell;
+ 		}
+ 	}
+ 	else if (type == SYNC_UNLINK_REQUEST)
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index ffd84d877c1c..a6505c7335b4 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -1142,7 +1142,7 @@ exec_simple_query(const char *query_string)
+ 		 * reset shortly after completion anyway.  In event of an error, the
+ 		 * per_parsetree_context will be deleted when MessageContext is reset.
+ 		 */
+-		if (lnext(parsetree_item) != NULL)
++		if (lnext(parsetree_list, parsetree_item) != NULL)
+ 		{
+ 			per_parsetree_context =
+ 				AllocSetContextCreate(MessageContext,
+@@ -1240,7 +1240,7 @@ exec_simple_query(const char *query_string)
+ 
+ 		PortalDrop(portal, false);
+ 
+-		if (lnext(parsetree_item) == NULL)
++		if (lnext(parsetree_list, parsetree_item) == NULL)
+ 		{
+ 			/*
+ 			 * If this is the last parsetree of the query string, close down
+diff --git a/src/backend/tcop/pquery.c b/src/backend/tcop/pquery.c
+index d5e71e8bd74b..1ed2838ad458 100644
+--- a/src/backend/tcop/pquery.c
++++ b/src/backend/tcop/pquery.c
+@@ -1334,7 +1334,7 @@ PortalRunMulti(Portal portal,
+ 		 * Increment command counter between queries, but not after the last
+ 		 * one.
+ 		 */
+-		if (lnext(stmtlist_item) != NULL)
++		if (lnext(portal->stmts, stmtlist_item) != NULL)
+ 			CommandCounterIncrement();
+ 
+ 		/*
+diff --git a/src/backend/tcop/utility.c b/src/backend/tcop/utility.c
+index 05ec7f3ac617..7f6f0b6498f2 100644
+--- a/src/backend/tcop/utility.c
++++ b/src/backend/tcop/utility.c
+@@ -1081,7 +1081,7 @@ ProcessUtilitySlow(ParseState *pstate,
+ 						}
+ 
+ 						/* Need CCI between commands */
+-						if (lnext(l) != NULL)
++						if (lnext(stmts, l) != NULL)
+ 							CommandCounterIncrement();
+ 					}
+ 
+@@ -1162,7 +1162,7 @@ ProcessUtilitySlow(ParseState *pstate,
+ 							}
+ 
+ 							/* Need CCI between commands */
+-							if (lnext(l) != NULL)
++							if (lnext(stmts, l) != NULL)
+ 								CommandCounterIncrement();
+ 						}
+ 
+diff --git a/src/backend/utils/adt/jsonpath_exec.c b/src/backend/utils/adt/jsonpath_exec.c
+index 6bf4dcaec333..d8647f71af3a 100644
+--- a/src/backend/utils/adt/jsonpath_exec.c
++++ b/src/backend/utils/adt/jsonpath_exec.c
+@@ -146,6 +146,7 @@ typedef struct JsonValueList
+ typedef struct JsonValueListIterator
+ {
+ 	JsonbValue *value;
++	List	   *list;
+ 	ListCell   *next;
+ } JsonValueListIterator;
+ 
+@@ -2182,16 +2183,19 @@ JsonValueListInitIterator(const JsonValueList *jvl, JsonValueListIterator *it)
+ 	if (jvl->singleton)
+ 	{
+ 		it->value = jvl->singleton;
++		it->list = NIL;
+ 		it->next = NULL;
+ 	}
+-	else if (list_head(jvl->list) != NULL)
++	else if (jvl->list != NIL)
+ 	{
+ 		it->value = (JsonbValue *) linitial(jvl->list);
+-		it->next = lnext(list_head(jvl->list));
++		it->list = jvl->list;
++		it->next = list_second_cell(jvl->list);
+ 	}
+ 	else
+ 	{
+ 		it->value = NULL;
++		it->list = NIL;
+ 		it->next = NULL;
+ 	}
+ }
+@@ -2207,7 +2211,7 @@ JsonValueListNext(const JsonValueList *jvl, JsonValueListIterator *it)
+ 	if (it->next)
+ 	{
+ 		it->value = lfirst(it->next);
+-		it->next = lnext(it->next);
++		it->next = lnext(it->list, it->next);
+ 	}
+ 	else
+ 	{
+diff --git a/src/backend/utils/adt/jsonpath_gram.y b/src/backend/utils/adt/jsonpath_gram.y
+index a0a930ccf0cb..91b4b2f5985c 100644
+--- a/src/backend/utils/adt/jsonpath_gram.y
++++ b/src/backend/utils/adt/jsonpath_gram.y
+@@ -416,18 +416,18 @@ makeItemList(List *list)
+ {
+ 	JsonPathParseItem  *head,
+ 					   *end;
+-	ListCell		   *cell = list_head(list);
++	ListCell		   *cell;
+ 
+-	head = end = (JsonPathParseItem *) lfirst(cell);
++	head = end = (JsonPathParseItem *) linitial(list);
+ 
+-	if (!lnext(cell))
++	if (list_length(list) == 1)
+ 		return head;
+ 
+ 	/* append items to the end of already existing list */
+ 	while (end->next)
+ 		end = end->next;
+ 
+-	for_each_cell(cell, lnext(cell))
++	for_each_cell(cell, list, list_second_cell(list))
+ 	{
+ 		JsonPathParseItem *c = (JsonPathParseItem *) lfirst(cell);
+ 
+diff --git a/src/backend/utils/adt/partitionfuncs.c b/src/backend/utils/adt/partitionfuncs.c
+index 714a0242a18a..e2e51563549a 100644
+--- a/src/backend/utils/adt/partitionfuncs.c
++++ b/src/backend/utils/adt/partitionfuncs.c
+@@ -67,14 +67,13 @@ pg_partition_tree(PG_FUNCTION_ARGS)
+ #define PG_PARTITION_TREE_COLS	4
+ 	Oid			rootrelid = PG_GETARG_OID(0);
+ 	FuncCallContext *funcctx;
+-	ListCell  **next;
++	List	   *partitions;
+ 
+ 	/* stuff done only on the first call of the function */
+ 	if (SRF_IS_FIRSTCALL())
+ 	{
+ 		MemoryContext oldcxt;
+ 		TupleDesc	tupdesc;
+-		List	   *partitions;
+ 
+ 		/* create a function context for cross-call persistence */
+ 		funcctx = SRF_FIRSTCALL_INIT();
+@@ -103,29 +102,27 @@ pg_partition_tree(PG_FUNCTION_ARGS)
+ 
+ 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+ 
+-		/* allocate memory for user context */
+-		next = (ListCell **) palloc(sizeof(ListCell *));
+-		*next = list_head(partitions);
+-		funcctx->user_fctx = (void *) next;
++		/* The only state we need is the partition list */
++		funcctx->user_fctx = (void *) partitions;
+ 
+ 		MemoryContextSwitchTo(oldcxt);
+ 	}
+ 
+ 	/* stuff done on every call of the function */
+ 	funcctx = SRF_PERCALL_SETUP();
+-	next = (ListCell **) funcctx->user_fctx;
++	partitions = (List *) funcctx->user_fctx;
+ 
+-	if (*next != NULL)
++	if (funcctx->call_cntr < list_length(partitions))
+ 	{
+ 		Datum		result;
+ 		Datum		values[PG_PARTITION_TREE_COLS];
+ 		bool		nulls[PG_PARTITION_TREE_COLS];
+ 		HeapTuple	tuple;
+ 		Oid			parentid = InvalidOid;
+-		Oid			relid = lfirst_oid(*next);
++		Oid			relid = list_nth_oid(partitions, funcctx->call_cntr);
+ 		char		relkind = get_rel_relkind(relid);
+ 		int			level = 0;
+-		List	   *ancestors = get_partition_ancestors(lfirst_oid(*next));
++		List	   *ancestors = get_partition_ancestors(relid);
+ 		ListCell   *lc;
+ 
+ 		/*
+@@ -161,8 +158,6 @@ pg_partition_tree(PG_FUNCTION_ARGS)
+ 		}
+ 		values[3] = Int32GetDatum(level);
+ 
+-		*next = lnext(*next);
+-
+ 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+ 		result = HeapTupleGetDatum(tuple);
+ 		SRF_RETURN_NEXT(funcctx, result);
+@@ -221,12 +216,11 @@ pg_partition_ancestors(PG_FUNCTION_ARGS)
+ {
+ 	Oid			relid = PG_GETARG_OID(0);
+ 	FuncCallContext *funcctx;
+-	ListCell  **next;
++	List	   *ancestors;
+ 
+ 	if (SRF_IS_FIRSTCALL())
+ 	{
+ 		MemoryContext oldcxt;
+-		List	   *ancestors;
+ 
+ 		funcctx = SRF_FIRSTCALL_INIT();
+ 
+@@ -238,21 +232,19 @@ pg_partition_ancestors(PG_FUNCTION_ARGS)
+ 		ancestors = get_partition_ancestors(relid);
+ 		ancestors = lcons_oid(relid, ancestors);
+ 
+-		next = (ListCell **) palloc(sizeof(ListCell *));
+-		*next = list_head(ancestors);
+-		funcctx->user_fctx = (void *) next;
++		/* The only state we need is the ancestors list */
++		funcctx->user_fctx = (void *) ancestors;
+ 
+ 		MemoryContextSwitchTo(oldcxt);
+ 	}
+ 
+ 	funcctx = SRF_PERCALL_SETUP();
+-	next = (ListCell **) funcctx->user_fctx;
++	ancestors = (List *) funcctx->user_fctx;
+ 
+-	if (*next != NULL)
++	if (funcctx->call_cntr < list_length(ancestors))
+ 	{
+-		Oid			relid = lfirst_oid(*next);
++		Oid			relid = list_nth_oid(ancestors, funcctx->call_cntr);
+ 
+-		*next = lnext(*next);
+ 		SRF_RETURN_NEXT(funcctx, ObjectIdGetDatum(relid));
+ 	}
+ 
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index 71adf700fc80..3e17032e56a1 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -1349,7 +1349,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
+ 			if (indexpr_item == NULL)
+ 				elog(ERROR, "too few entries in indexprs list");
+ 			indexkey = (Node *) lfirst(indexpr_item);
+-			indexpr_item = lnext(indexpr_item);
++			indexpr_item = lnext(indexprs, indexpr_item);
+ 			/* Deparse */
+ 			str = deparse_expression_pretty(indexkey, context, false, false,
+ 											prettyFlags, 0);
+@@ -1770,7 +1770,7 @@ pg_get_partkeydef_worker(Oid relid, int prettyFlags,
+ 			if (partexpr_item == NULL)
+ 				elog(ERROR, "too few entries in partexprs list");
+ 			partkey = (Node *) lfirst(partexpr_item);
+-			partexpr_item = lnext(partexpr_item);
++			partexpr_item = lnext(partexprs, partexpr_item);
+ 
+ 			/* Deparse */
+ 			str = deparse_expression_pretty(partkey, context, false, false,
+@@ -2764,7 +2764,7 @@ pg_get_functiondef(PG_FUNCTION_ARGS)
+ 						char	   *curname = (char *) lfirst(lc);
+ 
+ 						simple_quote_literal(&buf, curname);
+-						if (lnext(lc))
++						if (lnext(namelist, lc))
+ 							appendStringInfoString(&buf, ", ");
+ 					}
+ 				}
+@@ -2953,6 +2953,7 @@ print_function_arguments(StringInfo buf, HeapTuple proctup,
+ 	int			argsprinted;
+ 	int			inputargno;
+ 	int			nlackdefaults;
++	List	   *argdefaults = NIL;
+ 	ListCell   *nextargdefault = NULL;
+ 	int			i;
+ 
+@@ -2971,7 +2972,6 @@ print_function_arguments(StringInfo buf, HeapTuple proctup,
+ 		if (!isnull)
+ 		{
+ 			char	   *str;
+-			List	   *argdefaults;
+ 
+ 			str = TextDatumGetCString(proargdefaults);
+ 			argdefaults = castNode(List, stringToNode(str));
+@@ -3061,7 +3061,7 @@ print_function_arguments(StringInfo buf, HeapTuple proctup,
+ 
+ 			Assert(nextargdefault != NULL);
+ 			expr = (Node *) lfirst(nextargdefault);
+-			nextargdefault = lnext(nextargdefault);
++			nextargdefault = lnext(argdefaults, nextargdefault);
+ 
+ 			appendStringInfo(buf, " DEFAULT %s",
+ 							 deparse_expression(expr, NIL, false, false));
+@@ -4763,16 +4763,14 @@ push_ancestor_plan(deparse_namespace *dpns, ListCell *ancestor_cell,
+ 				   deparse_namespace *save_dpns)
+ {
+ 	PlanState  *ps = (PlanState *) lfirst(ancestor_cell);
+-	List	   *ancestors;
+ 
+ 	/* Save state for restoration later */
+ 	*save_dpns = *dpns;
+ 
+ 	/* Build a new ancestor list with just this node's ancestors */
+-	ancestors = NIL;
+-	while ((ancestor_cell = lnext(ancestor_cell)) != NULL)
+-		ancestors = lappend(ancestors, lfirst(ancestor_cell));
+-	dpns->ancestors = ancestors;
++	dpns->ancestors =
++		list_copy_tail(dpns->ancestors,
++					   list_cell_number(dpns->ancestors, ancestor_cell) + 1);
+ 
+ 	/* Set attention on selected ancestor */
+ 	set_deparse_planstate(dpns, ps);
+@@ -6511,7 +6509,7 @@ get_update_query_targetlist_def(Query *query, List *targetList,
+ 				((Param *) expr)->paramkind == PARAM_MULTIEXPR)
+ 			{
+ 				cur_ma_sublink = (SubLink *) lfirst(next_ma_cell);
+-				next_ma_cell = lnext(next_ma_cell);
++				next_ma_cell = lnext(ma_sublinks, next_ma_cell);
+ 				remaining_ma_columns = count_nonjunk_tlist_entries(
+ 																   ((Query *) cur_ma_sublink->subselect)->targetList);
+ 				Assert(((Param *) expr)->paramid ==
+@@ -8034,7 +8032,7 @@ get_rule_expr(Node *node, deparse_context *context,
+ 			{
+ 				BoolExpr   *expr = (BoolExpr *) node;
+ 				Node	   *first_arg = linitial(expr->args);
+-				ListCell   *arg = lnext(list_head(expr->args));
++				ListCell   *arg = list_second_cell(expr->args);
+ 
+ 				switch (expr->boolop)
+ 				{
+@@ -8048,7 +8046,7 @@ get_rule_expr(Node *node, deparse_context *context,
+ 							appendStringInfoString(buf, " AND ");
+ 							get_rule_expr_paren((Node *) lfirst(arg), context,
+ 												false, node);
+-							arg = lnext(arg);
++							arg = lnext(expr->args, arg);
+ 						}
+ 						if (!PRETTY_PAREN(context))
+ 							appendStringInfoChar(buf, ')');
+@@ -8064,7 +8062,7 @@ get_rule_expr(Node *node, deparse_context *context,
+ 							appendStringInfoString(buf, " OR ");
+ 							get_rule_expr_paren((Node *) lfirst(arg), context,
+ 												false, node);
+-							arg = lnext(arg);
++							arg = lnext(expr->args, arg);
+ 						}
+ 						if (!PRETTY_PAREN(context))
+ 							appendStringInfoChar(buf, ')');
+@@ -8123,7 +8121,7 @@ get_rule_expr(Node *node, deparse_context *context,
+ 						appendStringInfo(buf, "hashed %s", splan->plan_name);
+ 					else
+ 						appendStringInfoString(buf, splan->plan_name);
+-					if (lnext(lc))
++					if (lnext(asplan->subplans, lc))
+ 						appendStringInfoString(buf, " or ");
+ 				}
+ 				appendStringInfoChar(buf, ')');
+@@ -9231,7 +9229,7 @@ get_func_expr(FuncExpr *expr, deparse_context *context,
+ 	{
+ 		if (nargs++ > 0)
+ 			appendStringInfoString(buf, ", ");
+-		if (use_variadic && lnext(l) == NULL)
++		if (use_variadic && lnext(expr->args, l) == NULL)
+ 			appendStringInfoString(buf, "VARIADIC ");
+ 		get_rule_expr((Node *) lfirst(l), context, true);
+ 	}
+@@ -10604,7 +10602,7 @@ printSubscripts(SubscriptingRef *sbsref, deparse_context *context)
+ 			/* If subexpression is NULL, get_rule_expr prints nothing */
+ 			get_rule_expr((Node *) lfirst(lowlist_item), context, false);
+ 			appendStringInfoChar(buf, ':');
+-			lowlist_item = lnext(lowlist_item);
++			lowlist_item = lnext(sbsref->reflowerindexpr, lowlist_item);
+ 		}
+ 		/* If subexpression is NULL, get_rule_expr prints nothing */
+ 		get_rule_expr((Node *) lfirst(uplist_item), context, false);
+diff --git a/src/backend/utils/adt/selfuncs.c b/src/backend/utils/adt/selfuncs.c
+index a314ecc4fe31..66449b85b18c 100644
+--- a/src/backend/utils/adt/selfuncs.c
++++ b/src/backend/utils/adt/selfuncs.c
+@@ -2937,15 +2937,10 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
+ 
+ 	ndistinct = get_variable_numdistinct(vardata, &isdefault);
+ 
+-	/* cannot use foreach here because of possible list_delete */
+-	lc = list_head(varinfos);
+-	while (lc)
++	foreach(lc, varinfos)
+ 	{
+ 		varinfo = (GroupVarInfo *) lfirst(lc);
+ 
+-		/* must advance lc before list_delete possibly pfree's it */
+-		lc = lnext(lc);
+-
+ 		/* Drop exact duplicates */
+ 		if (equal(var, varinfo->var))
+ 			return varinfos;
+@@ -2965,7 +2960,7 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
+ 			else
+ 			{
+ 				/* Delete the older item */
+-				varinfos = list_delete_ptr(varinfos, varinfo);
++				varinfos = foreach_delete_current(varinfos, lc);
+ 			}
+ 		}
+ 	}
+@@ -3207,7 +3202,7 @@ estimate_num_groups(PlannerInfo *root, List *groupExprs, double input_rows,
+ 		 * for remaining Vars on other rels.
+ 		 */
+ 		relvarinfos = lcons(varinfo1, relvarinfos);
+-		for_each_cell(l, lnext(list_head(varinfos)))
++		for_each_cell(l, varinfos, list_second_cell(varinfos))
+ 		{
+ 			GroupVarInfo *varinfo2 = (GroupVarInfo *) lfirst(l);
+ 
+@@ -4631,7 +4626,7 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
+ 						if (vardata->statsTuple)
+ 							break;
+ 					}
+-					indexpr_item = lnext(indexpr_item);
++					indexpr_item = lnext(index->indexprs, indexpr_item);
+ 				}
+ 			}
+ 			if (vardata->statsTuple)
+diff --git a/src/backend/utils/cache/partcache.c b/src/backend/utils/cache/partcache.c
+index 29b4a76e1329..342ab4dbaa62 100644
+--- a/src/backend/utils/cache/partcache.c
++++ b/src/backend/utils/cache/partcache.c
+@@ -222,7 +222,7 @@ RelationBuildPartitionKey(Relation relation)
+ 			key->parttypmod[i] = exprTypmod(lfirst(partexprs_item));
+ 			key->parttypcoll[i] = exprCollation(lfirst(partexprs_item));
+ 
+-			partexprs_item = lnext(partexprs_item);
++			partexprs_item = lnext(key->partexprs, partexprs_item);
+ 		}
+ 		get_typlenbyvalalign(key->parttypid[i],
+ 							 &key->parttyplen[i],
+diff --git a/src/backend/utils/cache/relcache.c b/src/backend/utils/cache/relcache.c
+index 2b992d783273..3ca9a9f35867 100644
+--- a/src/backend/utils/cache/relcache.c
++++ b/src/backend/utils/cache/relcache.c
+@@ -4536,7 +4536,7 @@ insert_ordered_oid(List *list, Oid datum)
+ 	prev = list_head(list);
+ 	for (;;)
+ 	{
+-		ListCell   *curr = lnext(prev);
++		ListCell   *curr = lnext(list, prev);
+ 
+ 		if (curr == NULL || datum < lfirst_oid(curr))
+ 			break;				/* it belongs after 'prev', before 'curr' */
+diff --git a/src/backend/utils/init/postinit.c b/src/backend/utils/init/postinit.c
+index e9f72b506921..43b9f17f7226 100644
+--- a/src/backend/utils/init/postinit.c
++++ b/src/backend/utils/init/postinit.c
+@@ -1137,10 +1137,10 @@ process_startup_options(Port *port, bool am_superuser)
+ 		char	   *value;
+ 
+ 		name = lfirst(gucopts);
+-		gucopts = lnext(gucopts);
++		gucopts = lnext(port->guc_options, gucopts);
+ 
+ 		value = lfirst(gucopts);
+-		gucopts = lnext(gucopts);
++		gucopts = lnext(port->guc_options, gucopts);
+ 
+ 		SetConfigOption(name, value, gucctx, PGC_S_CLIENT);
+ 	}
+diff --git a/src/backend/utils/mb/mbutils.c b/src/backend/utils/mb/mbutils.c
+index 4630e8958679..bec54bb5cbc3 100644
+--- a/src/backend/utils/mb/mbutils.c
++++ b/src/backend/utils/mb/mbutils.c
+@@ -203,8 +203,6 @@ SetClientEncoding(int encoding)
+ 	int			current_server_encoding;
+ 	bool		found;
+ 	ListCell   *lc;
+-	ListCell   *prev;
+-	ListCell   *next;
+ 
+ 	if (!PG_VALID_FE_ENCODING(encoding))
+ 		return -1;
+@@ -238,13 +236,10 @@ SetClientEncoding(int encoding)
+ 	 * leak memory.
+ 	 */
+ 	found = false;
+-	prev = NULL;
+-	for (lc = list_head(ConvProcList); lc; lc = next)
++	foreach(lc, ConvProcList)
+ 	{
+ 		ConvProcInfo *convinfo = (ConvProcInfo *) lfirst(lc);
+ 
+-		next = lnext(lc);
+-
+ 		if (convinfo->s_encoding == current_server_encoding &&
+ 			convinfo->c_encoding == encoding)
+ 		{
+@@ -259,13 +254,10 @@ SetClientEncoding(int encoding)
+ 			else
+ 			{
+ 				/* Duplicate entry, release it */
+-				ConvProcList = list_delete_cell(ConvProcList, lc, prev);
++				ConvProcList = foreach_delete_current(ConvProcList, lc);
+ 				pfree(convinfo);
+-				continue;		/* prev mustn't advance */
+ 			}
+ 		}
+-
+-		prev = lc;
+ 	}
+ 
+ 	if (found)
+diff --git a/src/include/nodes/pg_list.h b/src/include/nodes/pg_list.h
+index 8dd22e795ef0..8b1e4fb69e0e 100644
+--- a/src/include/nodes/pg_list.h
++++ b/src/include/nodes/pg_list.h
+@@ -1,19 +1,19 @@
+ /*-------------------------------------------------------------------------
+  *
+  * pg_list.h
+- *	  interface for PostgreSQL generic linked list package
++ *	  interface for PostgreSQL generic list package
+  *
+- * This package implements singly-linked homogeneous lists.
++ * Once upon a time, parts of Postgres were written in Lisp and used real
++ * cons-cell lists for major data structures.  When that code was rewritten
++ * in C, we initially had a faithful emulation of cons-cell lists, which
++ * unsurprisingly was a performance bottleneck.  A couple of major rewrites
++ * later, these data structures are actually simple expansible arrays;
++ * but the "List" name and a lot of the notation survives.
+  *
+- * It is important to have constant-time length, append, and prepend
+- * operations. To achieve this, we deal with two distinct data
+- * structures:
+- *
+- *		1. A set of "list cells": each cell contains a data field and
+- *		   a link to the next cell in the list or NULL.
+- *		2. A single structure containing metadata about the list: the
+- *		   type of the list, pointers to the head and tail cells, and
+- *		   the length of the list.
++ * One important concession to the original implementation is that an empty
++ * list is always represented by a null pointer (preferentially written NIL).
++ * Non-empty lists have a header, which will not be relocated as long as the
++ * list remains non-empty, and an expansible data array.
+  *
+  * We support three types of lists:
+  *
+@@ -40,51 +40,131 @@
+ #include "nodes/nodes.h"
+ 
+ 
+-typedef struct ListCell ListCell;
++typedef union ListCell
++{
++	void	   *ptr_value;
++	int			int_value;
++	Oid			oid_value;
++} ListCell;
+ 
+ typedef struct List
+ {
+ 	NodeTag		type;			/* T_List, T_IntList, or T_OidList */
+-	int			length;
+-	ListCell   *head;
+-	ListCell   *tail;
++	int			length;			/* number of elements currently present */
++	int			max_length;		/* allocated length of elements[] */
++	ListCell   *elements;		/* re-allocatable array of cells */
++	/* We may allocate some cells along with the List header: */
++	ListCell	initial_elements[FLEXIBLE_ARRAY_MEMBER];
++	/* If elements == initial_elements, it's not a separate allocation */
+ } List;
+ 
+-struct ListCell
+-{
+-	union
+-	{
+-		void	   *ptr_value;
+-		int			int_value;
+-		Oid			oid_value;
+-	}			data;
+-	ListCell   *next;
+-};
+-
+ /*
+  * The *only* valid representation of an empty list is NIL; in other
+- * words, a non-NIL list is guaranteed to have length >= 1 and
+- * head/tail != NULL
++ * words, a non-NIL list is guaranteed to have length >= 1.
+  */
+ #define NIL						((List *) NULL)
+ 
+ /*
+- * These routines are used frequently. However, we can't implement
+- * them as macros, since we want to avoid double-evaluation of macro
+- * arguments.
++ * State structs for various looping macros below.
+  */
++typedef struct ForEachState
++{
++	const List *l;				/* list we're looping through */
++	int			i;				/* current element index */
++} ForEachState;
++
++typedef struct ForBothState
++{
++	const List *l1;				/* lists we're looping through */
++	const List *l2;
++	int			i;				/* common element index */
++} ForBothState;
++
++typedef struct ForBothCellState
++{
++	const List *l1;				/* lists we're looping through */
++	const List *l2;
++	int			i1;				/* current element indexes */
++	int			i2;
++} ForBothCellState;
++
++typedef struct ForThreeState
++{
++	const List *l1;				/* lists we're looping through */
++	const List *l2;
++	const List *l3;
++	int			i;				/* common element index */
++} ForThreeState;
++
++typedef struct ForFourState
++{
++	const List *l1;				/* lists we're looping through */
++	const List *l2;
++	const List *l3;
++	const List *l4;
++	int			i;				/* common element index */
++} ForFourState;
++
++typedef struct ForFiveState
++{
++	const List *l1;				/* lists we're looping through */
++	const List *l2;
++	const List *l3;
++	const List *l4;
++	const List *l5;
++	int			i;				/* common element index */
++} ForFiveState;
++
++/*
++ * These routines are small enough, and used often enough, to justify being
++ * inline.
++ */
++
++/* Fetch address of list's first cell; NULL if empty list */
+ static inline ListCell *
+ list_head(const List *l)
+ {
+-	return l ? l->head : NULL;
++	return l ? &l->elements[0] : NULL;
++}
++
++/* Fetch address of list's last cell; NULL if empty list */
++static inline ListCell *
++list_tail(const List *l)
++{
++	return l ? &l->elements[l->length - 1] : NULL;
+ }
+ 
++/* Fetch address of list's second cell, if it has one, else NULL */
+ static inline ListCell *
+-list_tail(List *l)
++list_second_cell(const List *l)
+ {
+-	return l ? l->tail : NULL;
++	if (l && l->length >= 2)
++		return &l->elements[1];
++	else
++		return NULL;
+ }
+ 
++/* Fetch address of list's third cell, if it has one, else NULL */
++static inline ListCell *
++list_third_cell(const List *l)
++{
++	if (l && l->length >= 3)
++		return &l->elements[2];
++	else
++		return NULL;
++}
++
++/* Fetch address of list's fourth cell, if it has one, else NULL */
++static inline ListCell *
++list_fourth_cell(const List *l)
++{
++	if (l && l->length >= 4)
++		return &l->elements[3];
++	else
++		return NULL;
++}
++
++/* Fetch list's length */
+ static inline int
+ list_length(const List *l)
+ {
+@@ -92,6 +172,11 @@ list_length(const List *l)
+ }
+ 
+ /*
++ * Macros to access the data values within List cells.
++ *
++ * Note that with the exception of the "xxx_node" macros, these are
++ * lvalues and can be assigned to.
++ *
+  * NB: There is an unfortunate legacy from a previous incarnation of
+  * the List API: the macro lfirst() was used to mean "the data in this
+  * cons cell". To avoid changing every usage of lfirst(), that meaning
+@@ -99,13 +184,12 @@ list_length(const List *l)
+  * the data it contains; to get the data in the first cell of a
+  * List, use linitial(). Worse, lsecond() is more closely related to
+  * linitial() than lfirst(): given a List, lsecond() returns the data
+- * in the second cons cell.
++ * in the second list cell.
+  */
+ 
+-#define lnext(lc)				((lc)->next)
+-#define lfirst(lc)				((lc)->data.ptr_value)
+-#define lfirst_int(lc)			((lc)->data.int_value)
+-#define lfirst_oid(lc)			((lc)->data.oid_value)
++#define lfirst(lc)				((lc)->ptr_value)
++#define lfirst_int(lc)			((lc)->int_value)
++#define lfirst_oid(lc)			((lc)->oid_value)
+ #define lfirst_node(type,lc)	castNode(type, lfirst(lc))
+ 
+ #define linitial(l)				lfirst(list_head(l))
+@@ -113,19 +197,19 @@ list_length(const List *l)
+ #define linitial_oid(l)			lfirst_oid(list_head(l))
+ #define linitial_node(type,l)	castNode(type, linitial(l))
+ 
+-#define lsecond(l)				lfirst(lnext(list_head(l)))
+-#define lsecond_int(l)			lfirst_int(lnext(list_head(l)))
+-#define lsecond_oid(l)			lfirst_oid(lnext(list_head(l)))
++#define lsecond(l)				lfirst(list_second_cell(l))
++#define lsecond_int(l)			lfirst_int(list_second_cell(l))
++#define lsecond_oid(l)			lfirst_oid(list_second_cell(l))
+ #define lsecond_node(type,l)	castNode(type, lsecond(l))
+ 
+-#define lthird(l)				lfirst(lnext(lnext(list_head(l))))
+-#define lthird_int(l)			lfirst_int(lnext(lnext(list_head(l))))
+-#define lthird_oid(l)			lfirst_oid(lnext(lnext(list_head(l))))
++#define lthird(l)				lfirst(list_third_cell(l))
++#define lthird_int(l)			lfirst_int(list_third_cell(l))
++#define lthird_oid(l)			lfirst_oid(list_third_cell(l))
+ #define lthird_node(type,l)		castNode(type, lthird(l))
+ 
+-#define lfourth(l)				lfirst(lnext(lnext(lnext(list_head(l)))))
+-#define lfourth_int(l)			lfirst_int(lnext(lnext(lnext(list_head(l)))))
+-#define lfourth_oid(l)			lfirst_oid(lnext(lnext(lnext(list_head(l)))))
++#define lfourth(l)				lfirst(list_fourth_cell(l))
++#define lfourth_int(l)			lfirst_int(list_fourth_cell(l))
++#define lfourth_oid(l)			lfirst_oid(list_fourth_cell(l))
+ #define lfourth_node(type,l)	castNode(type, lfourth(l))
+ 
+ #define llast(l)				lfirst(list_tail(l))
+@@ -136,38 +220,189 @@ list_length(const List *l)
+ /*
+  * Convenience macros for building fixed-length lists
+  */
+-#define list_make1(x1)				lcons(x1, NIL)
+-#define list_make2(x1,x2)			lcons(x1, list_make1(x2))
+-#define list_make3(x1,x2,x3)		lcons(x1, list_make2(x2, x3))
+-#define list_make4(x1,x2,x3,x4)		lcons(x1, list_make3(x2, x3, x4))
+-#define list_make5(x1,x2,x3,x4,x5)	lcons(x1, list_make4(x2, x3, x4, x5))
+-
+-#define list_make1_int(x1)			lcons_int(x1, NIL)
+-#define list_make2_int(x1,x2)		lcons_int(x1, list_make1_int(x2))
+-#define list_make3_int(x1,x2,x3)	lcons_int(x1, list_make2_int(x2, x3))
+-#define list_make4_int(x1,x2,x3,x4) lcons_int(x1, list_make3_int(x2, x3, x4))
+-#define list_make5_int(x1,x2,x3,x4,x5)	lcons_int(x1, list_make4_int(x2, x3, x4, x5))
+-
+-#define list_make1_oid(x1)			lcons_oid(x1, NIL)
+-#define list_make2_oid(x1,x2)		lcons_oid(x1, list_make1_oid(x2))
+-#define list_make3_oid(x1,x2,x3)	lcons_oid(x1, list_make2_oid(x2, x3))
+-#define list_make4_oid(x1,x2,x3,x4) lcons_oid(x1, list_make3_oid(x2, x3, x4))
+-#define list_make5_oid(x1,x2,x3,x4,x5)	lcons_oid(x1, list_make4_oid(x2, x3, x4, x5))
++#define list_make_ptr_cell(v)	((ListCell) {.ptr_value = (v)})
++#define list_make_int_cell(v)	((ListCell) {.int_value = (v)})
++#define list_make_oid_cell(v)	((ListCell) {.oid_value = (v)})
++
++#define list_make1(x1) \
++	list_make1_impl(T_List, list_make_ptr_cell(x1))
++#define list_make2(x1,x2) \
++	list_make2_impl(T_List, list_make_ptr_cell(x1), list_make_ptr_cell(x2))
++#define list_make3(x1,x2,x3) \
++	list_make3_impl(T_List, list_make_ptr_cell(x1), list_make_ptr_cell(x2), \
++					list_make_ptr_cell(x3))
++#define list_make4(x1,x2,x3,x4) \
++	list_make4_impl(T_List, list_make_ptr_cell(x1), list_make_ptr_cell(x2), \
++					list_make_ptr_cell(x3), list_make_ptr_cell(x4))
++
++#define list_make1_int(x1) \
++	list_make1_impl(T_IntList, list_make_int_cell(x1))
++#define list_make2_int(x1,x2) \
++	list_make2_impl(T_IntList, list_make_int_cell(x1), list_make_int_cell(x2))
++#define list_make3_int(x1,x2,x3) \
++	list_make3_impl(T_IntList, list_make_int_cell(x1), list_make_int_cell(x2), \
++					list_make_int_cell(x3))
++#define list_make4_int(x1,x2,x3,x4) \
++	list_make4_impl(T_IntList, list_make_int_cell(x1), list_make_int_cell(x2), \
++					list_make_int_cell(x3), list_make_int_cell(x4))
++
++#define list_make1_oid(x1) \
++	list_make1_impl(T_OidList, list_make_oid_cell(x1))
++#define list_make2_oid(x1,x2) \
++	list_make2_impl(T_OidList, list_make_oid_cell(x1), list_make_oid_cell(x2))
++#define list_make3_oid(x1,x2,x3) \
++	list_make3_impl(T_OidList, list_make_oid_cell(x1), list_make_oid_cell(x2), \
++					list_make_oid_cell(x3))
++#define list_make4_oid(x1,x2,x3,x4) \
++	list_make4_impl(T_OidList, list_make_oid_cell(x1), list_make_oid_cell(x2), \
++					list_make_oid_cell(x3), list_make_oid_cell(x4))
++
++/*
++ * Locate the n'th cell (counting from 0) of the list.
++ * It is an assertion failure if there is no such cell.
++ */
++static inline ListCell *
++list_nth_cell(const List *list, int n)
++{
++	Assert(list != NIL);
++	Assert(n >= 0 && n < list->length);
++	return &list->elements[n];
++}
++
++/*
++ * Return the pointer value contained in the n'th element of the
++ * specified list. (List elements begin at 0.)
++ */
++static inline void *
++list_nth(const List *list, int n)
++{
++	Assert(IsA(list, List));
++	return lfirst(list_nth_cell(list, n));
++}
++
++/*
++ * Return the integer value contained in the n'th element of the
++ * specified list.
++ */
++static inline int
++list_nth_int(const List *list, int n)
++{
++	Assert(IsA(list, IntList));
++	return lfirst_int(list_nth_cell(list, n));
++}
++
++/*
++ * Return the OID value contained in the n'th element of the specified
++ * list.
++ */
++static inline Oid
++list_nth_oid(const List *list, int n)
++{
++	Assert(IsA(list, OidList));
++	return lfirst_oid(list_nth_cell(list, n));
++}
++
++#define list_nth_node(type,list,n)	castNode(type, list_nth(list, n))
++
++/*
++ * Get the given ListCell's index (from 0) in the given List.
++ */
++static inline int
++list_cell_number(const List *l, const ListCell *c)
++{
++	Assert(c >= &l->elements[0] && c < &l->elements[l->length]);
++	return c - l->elements;
++}
++
++/*
++ * Get the address of the next cell after "c" within list "l", or NULL if none.
++ */
++static inline ListCell *
++lnext(const List *l, const ListCell *c)
++{
++	Assert(c >= &l->elements[0] && c < &l->elements[l->length]);
++	c++;
++	if (c < &l->elements[l->length])
++		return (ListCell *) c;
++	else
++		return NULL;
++}
+ 
+ /*
+  * foreach -
+- *	  a convenience macro which loops through the list
++ *	  a convenience macro for looping through a list
++ *
++ * "cell" must be the name of a "ListCell *" variable; it's made to point
++ * to each List element in turn.  "cell" will be NULL after normal exit from
++ * the loop, but an early "break" will leave it pointing at the current
++ * List element.
++ *
++ * Beware of changing the List object while the loop is iterating.
++ * The current semantics are that we examine successive list indices in
++ * each iteration, so that insertion or deletion of list elements could
++ * cause elements to be re-visited or skipped unexpectedly.  Previous
++ * implementations of foreach() behaved differently.  However, it's safe
++ * to append elements to the List (or in general, insert them after the
++ * current element); such new elements are guaranteed to be visited.
++ * Also, the current element of the List can be deleted, if you use
++ * foreach_delete_current() to do so.  BUT: either of these actions will
++ * invalidate the "cell" pointer for the remainder of the current iteration.
++ */
++#define foreach(cell, lst)	\
++	for (ForEachState cell##__state = {(lst), 0}; \
++		 (cell##__state.l != NIL && \
++		  cell##__state.i < cell##__state.l->length) ? \
++		 (cell = &cell##__state.l->elements[cell##__state.i], true) : \
++		 (cell = NULL, false); \
++		 cell##__state.i++)
++
++/*
++ * foreach_delete_current -
++ *	  delete the current list element from the List associated with a
++ *	  surrounding foreach() loop, returning the new List pointer.
++ *
++ * This is equivalent to list_delete_cell(), but it also adjusts the foreach
++ * loop's state so that no list elements will be missed.  Do not delete
++ * elements from an active foreach loop's list in any other way!
++ */
++#define foreach_delete_current(lst, cell)	\
++	(cell##__state.i--, \
++	 (List *) (cell##__state.l = list_delete_cell(lst, cell)))
++
++/*
++ * foreach_current_index -
++ *	  get the zero-based list index of a surrounding foreach() loop's
++ *	  current element; pass the name of the "ListCell *" iterator variable.
++ *
++ * Beware of using this after foreach_delete_current(); the value will be
++ * out of sync for the rest of the current loop iteration.  Anyway, since
++ * you just deleted the current element, the value is pretty meaningless.
+  */
+-#define foreach(cell, l)	\
+-	for ((cell) = list_head(l); (cell) != NULL; (cell) = lnext(cell))
++#define foreach_current_index(cell)  (cell##__state.i)
+ 
+ /*
+  * for_each_cell -
+  *	  a convenience macro which loops through a list starting from a
+  *	  specified cell
++ *
++ * The caveats for foreach() apply equally here.
+  */
+-#define for_each_cell(cell, initcell)	\
+-	for ((cell) = (initcell); (cell) != NULL; (cell) = lnext(cell))
++#define for_each_cell(cell, lst, initcell)	\
++	for (ForEachState cell##__state = for_each_cell_setup(lst, initcell); \
++		 (cell##__state.l != NIL && \
++		  cell##__state.i < cell##__state.l->length) ? \
++		 (cell = &cell##__state.l->elements[cell##__state.i], true) : \
++		 (cell = NULL, false); \
++		 cell##__state.i++)
++
++static inline ForEachState
++for_each_cell_setup(List *lst, ListCell *initcell)
++{
++	ForEachState r = {lst,
++	initcell ? list_cell_number(lst, initcell) : list_length(lst)};
++
++	return r;
++}
+ 
+ /*
+  * forboth -
+@@ -175,12 +410,22 @@ list_length(const List *l)
+  *	  simultaneously. This macro loops through both lists at the same
+  *	  time, stopping when either list runs out of elements. Depending
+  *	  on the requirements of the call site, it may also be wise to
+- *	  assert that the lengths of the two lists are equal.
++ *	  assert that the lengths of the two lists are equal. (But, if they
++ *	  are not, some callers rely on the ending cell values being separately
++ *	  NULL or non-NULL as defined here; don't try to optimize that.)
++ *
++ * The caveats for foreach() apply equally here.
+  */
+ #define forboth(cell1, list1, cell2, list2)							\
+-	for ((cell1) = list_head(list1), (cell2) = list_head(list2);	\
+-		 (cell1) != NULL && (cell2) != NULL;						\
+-		 (cell1) = lnext(cell1), (cell2) = lnext(cell2))
++	for (ForBothState cell1##__state = {(list1), (list2), 0}; \
++		 multi_for_advance_cell(cell1, cell1##__state, l1, i), \
++		 multi_for_advance_cell(cell2, cell1##__state, l2, i), \
++		 (cell1 != NULL && cell2 != NULL); \
++		 cell1##__state.i++)
++
++#define multi_for_advance_cell(cell, state, l, i) \
++	(cell = (state.l != NIL && state.i < state.l->length) ? \
++	 &state.l->elements[state.i] : NULL)
+ 
+ /*
+  * for_both_cell -
+@@ -190,68 +435,96 @@ list_length(const List *l)
+  *	  requirements of the call site, it may also be wise to assert that the
+  *	  lengths of the two lists are equal, and initcell1 and initcell2 are at
+  *	  the same position in the respective lists.
++ *
++ * The caveats for foreach() apply equally here.
+  */
+-#define for_both_cell(cell1, initcell1, cell2, initcell2)	\
+-	for ((cell1) = (initcell1), (cell2) = (initcell2);		\
+-		 (cell1) != NULL && (cell2) != NULL;				\
+-		 (cell1) = lnext(cell1), (cell2) = lnext(cell2))
++#define for_both_cell(cell1, list1, initcell1, cell2, list2, initcell2)	\
++	for (ForBothCellState cell1##__state = \
++			 for_both_cell_setup(list1, initcell1, list2, initcell2); \
++		 multi_for_advance_cell(cell1, cell1##__state, l1, i1), \
++		 multi_for_advance_cell(cell2, cell1##__state, l2, i2), \
++		 (cell1 != NULL && cell2 != NULL); \
++		 cell1##__state.i1++, cell1##__state.i2++)
++
++static inline ForBothCellState
++for_both_cell_setup(List *list1, ListCell *initcell1,
++					List *list2, ListCell *initcell2)
++{
++	ForBothCellState r = {list1, list2,
++		initcell1 ? list_cell_number(list1, initcell1) : list_length(list1),
++	initcell2 ? list_cell_number(list2, initcell2) : list_length(list2)};
++
++	return r;
++}
+ 
+ /*
+  * forthree -
+  *	  the same for three lists
+  */
+-#define forthree(cell1, list1, cell2, list2, cell3, list3)			\
+-	for ((cell1) = list_head(list1), (cell2) = list_head(list2), (cell3) = list_head(list3); \
+-		 (cell1) != NULL && (cell2) != NULL && (cell3) != NULL;		\
+-		 (cell1) = lnext(cell1), (cell2) = lnext(cell2), (cell3) = lnext(cell3))
++#define forthree(cell1, list1, cell2, list2, cell3, list3) \
++	for (ForThreeState cell1##__state = {(list1), (list2), (list3), 0}; \
++		 multi_for_advance_cell(cell1, cell1##__state, l1, i), \
++		 multi_for_advance_cell(cell2, cell1##__state, l2, i), \
++		 multi_for_advance_cell(cell3, cell1##__state, l3, i), \
++		 (cell1 != NULL && cell2 != NULL && cell3 != NULL); \
++		 cell1##__state.i++)
+ 
+ /*
+  * forfour -
+  *	  the same for four lists
+  */
+ #define forfour(cell1, list1, cell2, list2, cell3, list3, cell4, list4) \
+-	for ((cell1) = list_head(list1), (cell2) = list_head(list2), \
+-		 (cell3) = list_head(list3), (cell4) = list_head(list4); \
+-		 (cell1) != NULL && (cell2) != NULL && \
+-		 (cell3) != NULL && (cell4) != NULL; \
+-		 (cell1) = lnext(cell1), (cell2) = lnext(cell2), \
+-		 (cell3) = lnext(cell3), (cell4) = lnext(cell4))
++	for (ForFourState cell1##__state = {(list1), (list2), (list3), (list4), 0}; \
++		 multi_for_advance_cell(cell1, cell1##__state, l1, i), \
++		 multi_for_advance_cell(cell2, cell1##__state, l2, i), \
++		 multi_for_advance_cell(cell3, cell1##__state, l3, i), \
++		 multi_for_advance_cell(cell4, cell1##__state, l4, i), \
++		 (cell1 != NULL && cell2 != NULL && cell3 != NULL && cell4 != NULL); \
++		 cell1##__state.i++)
+ 
+ /*
+  * forfive -
+  *	  the same for five lists
+  */
+ #define forfive(cell1, list1, cell2, list2, cell3, list3, cell4, list4, cell5, list5) \
+-	for ((cell1) = list_head(list1), (cell2) = list_head(list2), \
+-		 (cell3) = list_head(list3), (cell4) = list_head(list4), \
+-		 (cell5) = list_head(list5); \
+-		 (cell1) != NULL && (cell2) != NULL && (cell3) != NULL && \
+-		 (cell4) != NULL && (cell5) != NULL; \
+-		 (cell1) = lnext(cell1), (cell2) = lnext(cell2), \
+-		 (cell3) = lnext(cell3), (cell4) = lnext(cell4), \
+-		 (cell5) = lnext(cell5))
++	for (ForFiveState cell1##__state = {(list1), (list2), (list3), (list4), (list5), 0}; \
++		 multi_for_advance_cell(cell1, cell1##__state, l1, i), \
++		 multi_for_advance_cell(cell2, cell1##__state, l2, i), \
++		 multi_for_advance_cell(cell3, cell1##__state, l3, i), \
++		 multi_for_advance_cell(cell4, cell1##__state, l4, i), \
++		 multi_for_advance_cell(cell5, cell1##__state, l5, i), \
++		 (cell1 != NULL && cell2 != NULL && cell3 != NULL && \
++		  cell4 != NULL && cell5 != NULL); \
++		 cell1##__state.i++)
++
++/* Functions in src/backend/nodes/list.c */
++
++extern List *list_make1_impl(NodeTag t, ListCell datum1);
++extern List *list_make2_impl(NodeTag t, ListCell datum1, ListCell datum2);
++extern List *list_make3_impl(NodeTag t, ListCell datum1, ListCell datum2,
++							 ListCell datum3);
++extern List *list_make4_impl(NodeTag t, ListCell datum1, ListCell datum2,
++							 ListCell datum3, ListCell datum4);
+ 
+ extern List *lappend(List *list, void *datum);
+ extern List *lappend_int(List *list, int datum);
+ extern List *lappend_oid(List *list, Oid datum);
+ 
+-extern ListCell *lappend_cell(List *list, ListCell *prev, void *datum);
+-extern ListCell *lappend_cell_int(List *list, ListCell *prev, int datum);
+-extern ListCell *lappend_cell_oid(List *list, ListCell *prev, Oid datum);
++extern List *list_insert_nth(List *list, int pos, void *datum);
++extern List *list_insert_nth_int(List *list, int pos, int datum);
++extern List *list_insert_nth_oid(List *list, int pos, Oid datum);
++
++extern void lappend_cell(List *list, ListCell *prev, void *datum);
++extern void lappend_cell_int(List *list, ListCell *prev, int datum);
++extern void lappend_cell_oid(List *list, ListCell *prev, Oid datum);
+ 
+ extern List *lcons(void *datum, List *list);
+ extern List *lcons_int(int datum, List *list);
+ extern List *lcons_oid(Oid datum, List *list);
+ 
+-extern List *list_concat(List *list1, List *list2);
++extern List *list_concat(List *list1, const List *list2);
+ extern List *list_truncate(List *list, int new_size);
+ 
+-extern ListCell *list_nth_cell(const List *list, int n);
+-extern void *list_nth(const List *list, int n);
+-extern int	list_nth_int(const List *list, int n);
+-extern Oid	list_nth_oid(const List *list, int n);
+-#define list_nth_node(type,list,n)	castNode(type, list_nth(list, n))
+-
+ extern bool list_member(const List *list, const void *datum);
+ extern bool list_member_ptr(const List *list, const void *datum);
+ extern bool list_member_int(const List *list, int datum);
+@@ -262,7 +535,8 @@ extern List *list_delete_ptr(List *list, void *datum);
+ extern List *list_delete_int(List *list, int datum);
+ extern List *list_delete_oid(List *list, Oid datum);
+ extern List *list_delete_first(List *list);
+-extern List *list_delete_cell(List *list, ListCell *cell, ListCell *prev);
++extern List *list_delete_nth_cell(List *list, int n);
++extern List *list_delete_cell(List *list, ListCell *cell);
+ 
+ extern List *list_union(const List *list1, const List *list2);
+ extern List *list_union_ptr(const List *list1, const List *list2);
+@@ -284,87 +558,19 @@ extern List *list_append_unique_ptr(List *list, void *datum);
+ extern List *list_append_unique_int(List *list, int datum);
+ extern List *list_append_unique_oid(List *list, Oid datum);
+ 
+-extern List *list_concat_unique(List *list1, List *list2);
+-extern List *list_concat_unique_ptr(List *list1, List *list2);
+-extern List *list_concat_unique_int(List *list1, List *list2);
+-extern List *list_concat_unique_oid(List *list1, List *list2);
++extern List *list_concat_unique(List *list1, const List *list2);
++extern List *list_concat_unique_ptr(List *list1, const List *list2);
++extern List *list_concat_unique_int(List *list1, const List *list2);
++extern List *list_concat_unique_oid(List *list1, const List *list2);
+ 
+ extern void list_free(List *list);
+ extern void list_free_deep(List *list);
+ 
+ extern List *list_copy(const List *list);
+ extern List *list_copy_tail(const List *list, int nskip);
++extern List *list_copy_deep(const List *oldlist);
+ 
+ typedef int (*list_qsort_comparator) (const void *a, const void *b);
+ extern List *list_qsort(const List *list, list_qsort_comparator cmp);
+ 
+-/*
+- * To ease migration to the new list API, a set of compatibility
+- * macros are provided that reduce the impact of the list API changes
+- * as far as possible. Until client code has been rewritten to use the
+- * new list API, the ENABLE_LIST_COMPAT symbol can be defined before
+- * including pg_list.h
+- */
+-#ifdef ENABLE_LIST_COMPAT
+-
+-#define lfirsti(lc)					lfirst_int(lc)
+-#define lfirsto(lc)					lfirst_oid(lc)
+-
+-#define makeList1(x1)				list_make1(x1)
+-#define makeList2(x1, x2)			list_make2(x1, x2)
+-#define makeList3(x1, x2, x3)		list_make3(x1, x2, x3)
+-#define makeList4(x1, x2, x3, x4)	list_make4(x1, x2, x3, x4)
+-
+-#define makeListi1(x1)				list_make1_int(x1)
+-#define makeListi2(x1, x2)			list_make2_int(x1, x2)
+-
+-#define makeListo1(x1)				list_make1_oid(x1)
+-#define makeListo2(x1, x2)			list_make2_oid(x1, x2)
+-
+-#define lconsi(datum, list)			lcons_int(datum, list)
+-#define lconso(datum, list)			lcons_oid(datum, list)
+-
+-#define lappendi(list, datum)		lappend_int(list, datum)
+-#define lappendo(list, datum)		lappend_oid(list, datum)
+-
+-#define nconc(l1, l2)				list_concat(l1, l2)
+-
+-#define nth(n, list)				list_nth(list, n)
+-
+-#define member(datum, list)			list_member(list, datum)
+-#define ptrMember(datum, list)		list_member_ptr(list, datum)
+-#define intMember(datum, list)		list_member_int(list, datum)
+-#define oidMember(datum, list)		list_member_oid(list, datum)
+-
+-/*
+- * Note that the old lremove() determined equality via pointer
+- * comparison, whereas the new list_delete() uses equal(); in order to
+- * keep the same behavior, we therefore need to map lremove() calls to
+- * list_delete_ptr() rather than list_delete()
+- */
+-#define lremove(elem, list)			list_delete_ptr(list, elem)
+-#define LispRemove(elem, list)		list_delete(list, elem)
+-#define lremovei(elem, list)		list_delete_int(list, elem)
+-#define lremoveo(elem, list)		list_delete_oid(list, elem)
+-
+-#define ltruncate(n, list)			list_truncate(list, n)
+-
+-#define set_union(l1, l2)			list_union(l1, l2)
+-#define set_uniono(l1, l2)			list_union_oid(l1, l2)
+-#define set_ptrUnion(l1, l2)		list_union_ptr(l1, l2)
+-
+-#define set_difference(l1, l2)		list_difference(l1, l2)
+-#define set_differenceo(l1, l2)		list_difference_oid(l1, l2)
+-#define set_ptrDifference(l1, l2)	list_difference_ptr(l1, l2)
+-
+-#define equali(l1, l2)				equal(l1, l2)
+-#define equalo(l1, l2)				equal(l1, l2)
+-
+-#define freeList(list)				list_free(list)
+-
+-#define listCopy(list)				list_copy(list)
+-
+-extern int	length(List *list);
+-#endif							/* ENABLE_LIST_COMPAT */
+-
+ #endif							/* PG_LIST_H */
+diff --git a/src/pl/plpgsql/src/pl_exec.c b/src/pl/plpgsql/src/pl_exec.c
+index a718bccc24a2..f5fdf93d0a4a 100644
+--- a/src/pl/plpgsql/src/pl_exec.c
++++ b/src/pl/plpgsql/src/pl_exec.c
+@@ -3704,7 +3704,7 @@ exec_stmt_raise(PLpgSQL_execstate *estate, PLpgSQL_stmt_raise *stmt)
+ 													 paramvalue,
+ 													 paramtypeid);
+ 				appendStringInfoString(&ds, extval);
+-				current_param = lnext(current_param);
++				current_param = lnext(stmt->params, current_param);
+ 				exec_eval_cleanup(estate);
+ 			}
+ 			else

@@ -1,0 +1,515 @@
+From 1f51c17c68d05c28d5b9294d8013cb9e7e653160 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Thu, 13 Aug 2020 16:25:21 -0700
+Subject: [PATCH] snapshot scalability: Move PGXACT->xmin back to PGPROC.
+
+Now that xmin isn't needed for GetSnapshotData() anymore, it leads to
+unnecessary cacheline ping-pong to have it in PGXACT, as it is updated
+considerably more frequently than the other PGXACT members.
+
+After the changes in dc7420c2c92, this is a very straight-forward change.
+
+For highly concurrent, snapshot acquisition heavy, workloads this change alone
+can significantly increase scalability. E.g. plain pgbench on a smaller 2
+socket machine gains 1.07x for read-only pgbench, 1.22x for read-only pgbench
+when submitting queries in batches of 100, and 2.85x for batches of 100
+'SELECT';.  The latter numbers are obviously not to be expected in the
+real-world, but micro-benchmark the snapshot computation
+scalability (previously spending ~80% of the time in GetSnapshotData()).
+
+Author: Andres Freund <andres@anarazel.de>
+Reviewed-By: Robert Haas <robertmhaas@gmail.com>
+Reviewed-By: Thomas Munro <thomas.munro@gmail.com>
+Reviewed-By: David Rowley <dgrowleyml@gmail.com>
+Discussion: https://postgr.es/m/20200301083601.ews6hz5dduc3w2se@alap3.anarazel.de
+---
+ src/backend/access/gist/gistxlog.c          |  2 +-
+ src/backend/access/nbtree/nbtpage.c         |  2 +-
+ src/backend/access/transam/README           |  4 +--
+ src/backend/access/transam/twophase.c       |  2 +-
+ src/backend/commands/indexcmds.c            |  2 +-
+ src/backend/replication/logical/snapbuild.c |  6 ++--
+ src/backend/replication/walsender.c         | 10 +++---
+ src/backend/storage/ipc/procarray.c         | 36 +++++++++------------
+ src/backend/storage/ipc/sinvaladt.c         |  2 +-
+ src/backend/storage/lmgr/proc.c             |  4 +--
+ src/backend/utils/time/snapmgr.c            | 28 ++++++++--------
+ src/include/storage/proc.h                  | 10 +++---
+ 12 files changed, 52 insertions(+), 56 deletions(-)
+
+diff --git a/src/backend/access/gist/gistxlog.c b/src/backend/access/gist/gistxlog.c
+index a63b05388c5d..dcd28f678b3d 100644
+--- a/src/backend/access/gist/gistxlog.c
++++ b/src/backend/access/gist/gistxlog.c
+@@ -389,7 +389,7 @@ gistRedoPageReuse(XLogReaderState *record)
+ 	 *
+ 	 * latestRemovedXid was the page's deleteXid.  The
+ 	 * GlobalVisIsRemovableFullXid(deleteXid) test in gistPageRecyclable()
+-	 * conceptually mirrors the pgxact->xmin > limitXmin test in
++	 * conceptually mirrors the PGPROC->xmin > limitXmin test in
+ 	 * GetConflictingVirtualXIDs().  Consequently, one XID value achieves the
+ 	 * same exclusion effect on primary and standby.
+ 	 */
+diff --git a/src/backend/access/nbtree/nbtpage.c b/src/backend/access/nbtree/nbtpage.c
+index 74be3807bb7d..7f392480ac0f 100644
+--- a/src/backend/access/nbtree/nbtpage.c
++++ b/src/backend/access/nbtree/nbtpage.c
+@@ -2317,7 +2317,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
+ 	 * we're in VACUUM and would not otherwise have an XID.  Having already
+ 	 * updated links to the target, ReadNewTransactionId() suffices as an
+ 	 * upper bound.  Any scan having retained a now-stale link is advertising
+-	 * in its PGXACT an xmin less than or equal to the value we read here.  It
++	 * in its PGPROC an xmin less than or equal to the value we read here.  It
+ 	 * will continue to do so, holding back the xmin horizon, for the duration
+ 	 * of that scan.
+ 	 */
+diff --git a/src/backend/access/transam/README b/src/backend/access/transam/README
+index 98acb429b67e..eab8edd20ec2 100644
+--- a/src/backend/access/transam/README
++++ b/src/backend/access/transam/README
+@@ -296,7 +296,7 @@ ensure that the C compiler does exactly what you tell it to.)
+ Another important activity that uses the shared ProcArray is
+ ComputeXidHorizons, which must determine a lower bound for the oldest xmin
+ of any active MVCC snapshot, system-wide.  Each individual backend
+-advertises the smallest xmin of its own snapshots in MyPgXact->xmin, or zero
++advertises the smallest xmin of its own snapshots in MyProc->xmin, or zero
+ if it currently has no live snapshots (eg, if it's between transactions or
+ hasn't yet set a snapshot for a new transaction).  ComputeXidHorizons takes
+ the MIN() of the valid xmin fields.  It does this with only shared lock on
+@@ -331,7 +331,7 @@ necessary.
+ Note that while it is certain that two concurrent executions of
+ GetSnapshotData will compute the same xmin for their own snapshots, there is
+ no such guarantee for the horizons computed by ComputeXidHorizons.  This is
+-because we allow XID-less transactions to clear their MyPgXact->xmin
++because we allow XID-less transactions to clear their MyProc->xmin
+ asynchronously (without taking ProcArrayLock), so one execution might see
+ what had been the oldest xmin, and another not.  This is OK since the
+ thresholds need only be a valid lower bound.  As noted above, we are already
+diff --git a/src/backend/access/transam/twophase.c b/src/backend/access/transam/twophase.c
+index 31f135f5cedc..eb5f4680a3d9 100644
+--- a/src/backend/access/transam/twophase.c
++++ b/src/backend/access/transam/twophase.c
+@@ -464,7 +464,7 @@ MarkAsPreparingGuts(GlobalTransaction gxact, TransactionId xid, const char *gid,
+ 	/* We set up the gxact's VXID as InvalidBackendId/XID */
+ 	proc->lxid = (LocalTransactionId) xid;
+ 	pgxact->xid = xid;
+-	pgxact->xmin = InvalidTransactionId;
++	Assert(proc->xmin == InvalidTransactionId);
+ 	proc->delayChkpt = false;
+ 	pgxact->vacuumFlags = 0;
+ 	proc->pid = 0;
+diff --git a/src/backend/commands/indexcmds.c b/src/backend/commands/indexcmds.c
+index 7819266a6306..254dbcdce52b 100644
+--- a/src/backend/commands/indexcmds.c
++++ b/src/backend/commands/indexcmds.c
+@@ -1535,7 +1535,7 @@ DefineIndex(Oid relationId,
+ 	StartTransactionCommand();
+ 
+ 	/* We should now definitely not be advertising any xmin. */
+-	Assert(MyPgXact->xmin == InvalidTransactionId);
++	Assert(MyProc->xmin == InvalidTransactionId);
+ 
+ 	/*
+ 	 * The index is now valid in the sense that it contains all currently
+diff --git a/src/backend/replication/logical/snapbuild.c b/src/backend/replication/logical/snapbuild.c
+index 3089f0d5ddcd..e9701ea72215 100644
+--- a/src/backend/replication/logical/snapbuild.c
++++ b/src/backend/replication/logical/snapbuild.c
+@@ -553,8 +553,8 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
+ 		elog(ERROR, "cannot build an initial slot snapshot, not all transactions are monitored anymore");
+ 
+ 	/* so we don't overwrite the existing value */
+-	if (TransactionIdIsValid(MyPgXact->xmin))
+-		elog(ERROR, "cannot build an initial slot snapshot when MyPgXact->xmin already is valid");
++	if (TransactionIdIsValid(MyProc->xmin))
++		elog(ERROR, "cannot build an initial slot snapshot when MyProc->xmin already is valid");
+ 
+ 	snap = SnapBuildBuildSnapshot(builder);
+ 
+@@ -575,7 +575,7 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
+ 	}
+ #endif
+ 
+-	MyPgXact->xmin = snap->xmin;
++	MyProc->xmin = snap->xmin;
+ 
+ 	/* allocate in transaction context */
+ 	newxip = (TransactionId *)
+diff --git a/src/backend/replication/walsender.c b/src/backend/replication/walsender.c
+index 460ca3f947f4..3f756b470af1 100644
+--- a/src/backend/replication/walsender.c
++++ b/src/backend/replication/walsender.c
+@@ -1964,7 +1964,7 @@ PhysicalReplicationSlotNewXmin(TransactionId feedbackXmin, TransactionId feedbac
+ 	ReplicationSlot *slot = MyReplicationSlot;
+ 
+ 	SpinLockAcquire(&slot->mutex);
+-	MyPgXact->xmin = InvalidTransactionId;
++	MyProc->xmin = InvalidTransactionId;
+ 
+ 	/*
+ 	 * For physical replication we don't need the interlock provided by xmin
+@@ -2093,7 +2093,7 @@ ProcessStandbyHSFeedbackMessage(void)
+ 	if (!TransactionIdIsNormal(feedbackXmin)
+ 		&& !TransactionIdIsNormal(feedbackCatalogXmin))
+ 	{
+-		MyPgXact->xmin = InvalidTransactionId;
++		MyProc->xmin = InvalidTransactionId;
+ 		if (MyReplicationSlot != NULL)
+ 			PhysicalReplicationSlotNewXmin(feedbackXmin, feedbackCatalogXmin);
+ 		return;
+@@ -2135,7 +2135,7 @@ ProcessStandbyHSFeedbackMessage(void)
+ 	 * risk already since a VACUUM could already have determined the horizon.)
+ 	 *
+ 	 * If we're using a replication slot we reserve the xmin via that,
+-	 * otherwise via the walsender's PGXACT entry. We can only track the
++	 * otherwise via the walsender's PGPROC entry. We can only track the
+ 	 * catalog xmin separately when using a slot, so we store the least of the
+ 	 * two provided when not using a slot.
+ 	 *
+@@ -2148,9 +2148,9 @@ ProcessStandbyHSFeedbackMessage(void)
+ 	{
+ 		if (TransactionIdIsNormal(feedbackCatalogXmin)
+ 			&& TransactionIdPrecedes(feedbackCatalogXmin, feedbackXmin))
+-			MyPgXact->xmin = feedbackCatalogXmin;
++			MyProc->xmin = feedbackCatalogXmin;
+ 		else
+-			MyPgXact->xmin = feedbackXmin;
++			MyProc->xmin = feedbackXmin;
+ 	}
+ }
+ 
+diff --git a/src/backend/storage/ipc/procarray.c b/src/backend/storage/ipc/procarray.c
+index e582d5af4291..185f581c8b6f 100644
+--- a/src/backend/storage/ipc/procarray.c
++++ b/src/backend/storage/ipc/procarray.c
+@@ -587,9 +587,9 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
+ 		Assert(!TransactionIdIsValid(allPgXact[proc->pgprocno].xid));
+ 
+ 		proc->lxid = InvalidLocalTransactionId;
+-		pgxact->xmin = InvalidTransactionId;
+ 		/* must be cleared with xid/xmin: */
+ 		pgxact->vacuumFlags &= ~PROC_VACUUM_STATE_MASK;
++		proc->xmin = InvalidTransactionId;
+ 		proc->delayChkpt = false;	/* be sure this is cleared in abort */
+ 		proc->recoveryConflictPending = false;
+ 
+@@ -609,9 +609,9 @@ ProcArrayEndTransactionInternal(PGPROC *proc, PGXACT *pgxact,
+ {
+ 	pgxact->xid = InvalidTransactionId;
+ 	proc->lxid = InvalidLocalTransactionId;
+-	pgxact->xmin = InvalidTransactionId;
+ 	/* must be cleared with xid/xmin: */
+ 	pgxact->vacuumFlags &= ~PROC_VACUUM_STATE_MASK;
++	proc->xmin = InvalidTransactionId;
+ 	proc->delayChkpt = false;	/* be sure this is cleared in abort */
+ 	proc->recoveryConflictPending = false;
+ 
+@@ -763,7 +763,7 @@ ProcArrayClearTransaction(PGPROC *proc)
+ 	 */
+ 	pgxact->xid = InvalidTransactionId;
+ 	proc->lxid = InvalidLocalTransactionId;
+-	pgxact->xmin = InvalidTransactionId;
++	proc->xmin = InvalidTransactionId;
+ 	proc->recoveryConflictPending = false;
+ 
+ 	/* redundant, but just in case */
+@@ -1563,7 +1563,7 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
+ 
+ 		/* Fetch xid just once - see GetNewTransactionId */
+ 		xid = UINT32_ACCESS_ONCE(pgxact->xid);
+-		xmin = UINT32_ACCESS_ONCE(pgxact->xmin);
++		xmin = UINT32_ACCESS_ONCE(proc->xmin);
+ 
+ 		/*
+ 		 * Consider both the transaction's Xmin, and its Xid.
+@@ -1838,7 +1838,7 @@ GetMaxSnapshotSubxidCount(void)
+  *
+  * We also update the following backend-global variables:
+  *		TransactionXmin: the oldest xmin of any snapshot in use in the
+- *			current transaction (this is the same as MyPgXact->xmin).
++ *			current transaction (this is the same as MyProc->xmin).
+  *		RecentXmin: the xmin computed for the most recent snapshot.  XIDs
+  *			older than this are known not running any more.
+  *
+@@ -1899,7 +1899,7 @@ GetSnapshotData(Snapshot snapshot)
+ 
+ 	/*
+ 	 * It is sufficient to get shared lock on ProcArrayLock, even if we are
+-	 * going to set MyPgXact->xmin.
++	 * going to set MyProc->xmin.
+ 	 */
+ 	LWLockAcquire(ProcArrayLock, LW_SHARED);
+ 
+@@ -2051,8 +2051,8 @@ GetSnapshotData(Snapshot snapshot)
+ 	replication_slot_xmin = procArray->replication_slot_xmin;
+ 	replication_slot_catalog_xmin = procArray->replication_slot_catalog_xmin;
+ 
+-	if (!TransactionIdIsValid(MyPgXact->xmin))
+-		MyPgXact->xmin = TransactionXmin = xmin;
++	if (!TransactionIdIsValid(MyProc->xmin))
++		MyProc->xmin = TransactionXmin = xmin;
+ 
+ 	LWLockRelease(ProcArrayLock);
+ 
+@@ -2172,7 +2172,7 @@ GetSnapshotData(Snapshot snapshot)
+ }
+ 
+ /*
+- * ProcArrayInstallImportedXmin -- install imported xmin into MyPgXact->xmin
++ * ProcArrayInstallImportedXmin -- install imported xmin into MyProc->xmin
+  *
+  * This is called when installing a snapshot imported from another
+  * transaction.  To ensure that OldestXmin doesn't go backwards, we must
+@@ -2225,7 +2225,7 @@ ProcArrayInstallImportedXmin(TransactionId xmin,
+ 		/*
+ 		 * Likewise, let's just make real sure its xmin does cover us.
+ 		 */
+-		xid = UINT32_ACCESS_ONCE(pgxact->xmin);
++		xid = UINT32_ACCESS_ONCE(proc->xmin);
+ 		if (!TransactionIdIsNormal(xid) ||
+ 			!TransactionIdPrecedesOrEquals(xid, xmin))
+ 			continue;
+@@ -2236,7 +2236,7 @@ ProcArrayInstallImportedXmin(TransactionId xmin,
+ 		 * GetSnapshotData first, we'll be overwriting a valid xmin here, so
+ 		 * we don't check that.)
+ 		 */
+-		MyPgXact->xmin = TransactionXmin = xmin;
++		MyProc->xmin = TransactionXmin = xmin;
+ 
+ 		result = true;
+ 		break;
+@@ -2248,7 +2248,7 @@ ProcArrayInstallImportedXmin(TransactionId xmin,
+ }
+ 
+ /*
+- * ProcArrayInstallRestoredXmin -- install restored xmin into MyPgXact->xmin
++ * ProcArrayInstallRestoredXmin -- install restored xmin into MyProc->xmin
+  *
+  * This is like ProcArrayInstallImportedXmin, but we have a pointer to the
+  * PGPROC of the transaction from which we imported the snapshot, rather than
+@@ -2261,7 +2261,6 @@ ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
+ {
+ 	bool		result = false;
+ 	TransactionId xid;
+-	PGXACT	   *pgxact;
+ 
+ 	Assert(TransactionIdIsNormal(xmin));
+ 	Assert(proc != NULL);
+@@ -2269,20 +2268,18 @@ ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
+ 	/* Get lock so source xact can't end while we're doing this */
+ 	LWLockAcquire(ProcArrayLock, LW_SHARED);
+ 
+-	pgxact = &allPgXact[proc->pgprocno];
+-
+ 	/*
+ 	 * Be certain that the referenced PGPROC has an advertised xmin which is
+ 	 * no later than the one we're installing, so that the system-wide xmin
+ 	 * can't go backwards.  Also, make sure it's running in the same database,
+ 	 * so that the per-database xmin cannot go backwards.
+ 	 */
+-	xid = UINT32_ACCESS_ONCE(pgxact->xmin);
++	xid = UINT32_ACCESS_ONCE(proc->xmin);
+ 	if (proc->databaseId == MyDatabaseId &&
+ 		TransactionIdIsNormal(xid) &&
+ 		TransactionIdPrecedesOrEquals(xid, xmin))
+ 	{
+-		MyPgXact->xmin = TransactionXmin = xmin;
++		MyProc->xmin = TransactionXmin = xmin;
+ 		result = true;
+ 	}
+ 
+@@ -2908,7 +2905,7 @@ GetCurrentVirtualXIDs(TransactionId limitXmin, bool excludeXmin0,
+ 		if (allDbs || proc->databaseId == MyDatabaseId)
+ 		{
+ 			/* Fetch xmin just once - might change on us */
+-			TransactionId pxmin = UINT32_ACCESS_ONCE(pgxact->xmin);
++			TransactionId pxmin = UINT32_ACCESS_ONCE(proc->xmin);
+ 
+ 			if (excludeXmin0 && !TransactionIdIsValid(pxmin))
+ 				continue;
+@@ -2994,7 +2991,6 @@ GetConflictingVirtualXIDs(TransactionId limitXmin, Oid dbOid)
+ 	{
+ 		int			pgprocno = arrayP->pgprocnos[index];
+ 		PGPROC	   *proc = &allProcs[pgprocno];
+-		PGXACT	   *pgxact = &allPgXact[pgprocno];
+ 
+ 		/* Exclude prepared transactions */
+ 		if (proc->pid == 0)
+@@ -3004,7 +3000,7 @@ GetConflictingVirtualXIDs(TransactionId limitXmin, Oid dbOid)
+ 			proc->databaseId == dbOid)
+ 		{
+ 			/* Fetch xmin just once - can't change on us, but good coding */
+-			TransactionId pxmin = UINT32_ACCESS_ONCE(pgxact->xmin);
++			TransactionId pxmin = UINT32_ACCESS_ONCE(proc->xmin);
+ 
+ 			/*
+ 			 * We ignore an invalid pxmin because this means that backend has
+diff --git a/src/backend/storage/ipc/sinvaladt.c b/src/backend/storage/ipc/sinvaladt.c
+index e5c115b92f2b..ad048bc85fab 100644
+--- a/src/backend/storage/ipc/sinvaladt.c
++++ b/src/backend/storage/ipc/sinvaladt.c
+@@ -420,7 +420,7 @@ BackendIdGetTransactionIds(int backendID, TransactionId *xid, TransactionId *xmi
+ 			PGXACT	   *xact = &ProcGlobal->allPgXact[proc->pgprocno];
+ 
+ 			*xid = xact->xid;
+-			*xmin = xact->xmin;
++			*xmin = proc->xmin;
+ 		}
+ 	}
+ 
+diff --git a/src/backend/storage/lmgr/proc.c b/src/backend/storage/lmgr/proc.c
+index e57fcd253880..de346cd87fcd 100644
+--- a/src/backend/storage/lmgr/proc.c
++++ b/src/backend/storage/lmgr/proc.c
+@@ -388,7 +388,7 @@ InitProcess(void)
+ 	MyProc->fpVXIDLock = false;
+ 	MyProc->fpLocalTransactionId = InvalidLocalTransactionId;
+ 	MyPgXact->xid = InvalidTransactionId;
+-	MyPgXact->xmin = InvalidTransactionId;
++	MyProc->xmin = InvalidTransactionId;
+ 	MyProc->pid = MyProcPid;
+ 	/* backendId, databaseId and roleId will be filled in later */
+ 	MyProc->backendId = InvalidBackendId;
+@@ -572,7 +572,7 @@ InitAuxiliaryProcess(void)
+ 	MyProc->fpVXIDLock = false;
+ 	MyProc->fpLocalTransactionId = InvalidLocalTransactionId;
+ 	MyPgXact->xid = InvalidTransactionId;
+-	MyPgXact->xmin = InvalidTransactionId;
++	MyProc->xmin = InvalidTransactionId;
+ 	MyProc->backendId = InvalidBackendId;
+ 	MyProc->databaseId = InvalidOid;
+ 	MyProc->roleId = InvalidOid;
+diff --git a/src/backend/utils/time/snapmgr.c b/src/backend/utils/time/snapmgr.c
+index 604d823f6861..752af0c10dfc 100644
+--- a/src/backend/utils/time/snapmgr.c
++++ b/src/backend/utils/time/snapmgr.c
+@@ -27,11 +27,11 @@
+  * their lifetime is managed separately (as they live longer than one xact.c
+  * transaction).
+  *
+- * These arrangements let us reset MyPgXact->xmin when there are no snapshots
++ * These arrangements let us reset MyProc->xmin when there are no snapshots
+  * referenced by this transaction, and advance it when the one with oldest
+  * Xmin is no longer referenced.  For simplicity however, only registered
+  * snapshots not active snapshots participate in tracking which one is oldest;
+- * we don't try to change MyPgXact->xmin except when the active-snapshot
++ * we don't try to change MyProc->xmin except when the active-snapshot
+  * stack is empty.
+  *
+  *
+@@ -187,7 +187,7 @@ static ActiveSnapshotElt *OldestActiveSnapshot = NULL;
+ 
+ /*
+  * Currently registered Snapshots.  Ordered in a heap by xmin, so that we can
+- * quickly find the one with lowest xmin, to advance our MyPgXact->xmin.
++ * quickly find the one with lowest xmin, to advance our MyProc->xmin.
+  */
+ static int	xmin_cmp(const pairingheap_node *a, const pairingheap_node *b,
+ 					 void *arg);
+@@ -475,7 +475,7 @@ GetNonHistoricCatalogSnapshot(Oid relid)
+ 
+ 		/*
+ 		 * Make sure the catalog snapshot will be accounted for in decisions
+-		 * about advancing PGXACT->xmin.  We could apply RegisterSnapshot, but
++		 * about advancing PGPROC->xmin.  We could apply RegisterSnapshot, but
+ 		 * that would result in making a physical copy, which is overkill; and
+ 		 * it would also create a dependency on some resource owner, which we
+ 		 * do not want for reasons explained at the head of this file. Instead
+@@ -596,7 +596,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
+ 	/* NB: curcid should NOT be copied, it's a local matter */
+ 
+ 	/*
+-	 * Now we have to fix what GetSnapshotData did with MyPgXact->xmin and
++	 * Now we have to fix what GetSnapshotData did with MyProc->xmin and
+ 	 * TransactionXmin.  There is a race condition: to make sure we are not
+ 	 * causing the global xmin to go backwards, we have to test that the
+ 	 * source transaction is still running, and that has to be done
+@@ -950,13 +950,13 @@ xmin_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+ /*
+  * SnapshotResetXmin
+  *
+- * If there are no more snapshots, we can reset our PGXACT->xmin to InvalidXid.
++ * If there are no more snapshots, we can reset our PGPROC->xmin to InvalidXid.
+  * Note we can do this without locking because we assume that storing an Xid
+  * is atomic.
+  *
+  * Even if there are some remaining snapshots, we may be able to advance our
+- * PGXACT->xmin to some degree.  This typically happens when a portal is
+- * dropped.  For efficiency, we only consider recomputing PGXACT->xmin when
++ * PGPROC->xmin to some degree.  This typically happens when a portal is
++ * dropped.  For efficiency, we only consider recomputing PGPROC->xmin when
+  * the active snapshot stack is empty; this allows us not to need to track
+  * which active snapshot is oldest.
+  *
+@@ -977,15 +977,15 @@ SnapshotResetXmin(void)
+ 
+ 	if (pairingheap_is_empty(&RegisteredSnapshots))
+ 	{
+-		MyPgXact->xmin = InvalidTransactionId;
++		MyProc->xmin = InvalidTransactionId;
+ 		return;
+ 	}
+ 
+ 	minSnapshot = pairingheap_container(SnapshotData, ph_node,
+ 										pairingheap_first(&RegisteredSnapshots));
+ 
+-	if (TransactionIdPrecedes(MyPgXact->xmin, minSnapshot->xmin))
+-		MyPgXact->xmin = minSnapshot->xmin;
++	if (TransactionIdPrecedes(MyProc->xmin, minSnapshot->xmin))
++		MyProc->xmin = minSnapshot->xmin;
+ }
+ 
+ /*
+@@ -1132,13 +1132,13 @@ AtEOXact_Snapshot(bool isCommit, bool resetXmin)
+ 
+ 	/*
+ 	 * During normal commit processing, we call ProcArrayEndTransaction() to
+-	 * reset the MyPgXact->xmin. That call happens prior to the call to
++	 * reset the MyProc->xmin. That call happens prior to the call to
+ 	 * AtEOXact_Snapshot(), so we need not touch xmin here at all.
+ 	 */
+ 	if (resetXmin)
+ 		SnapshotResetXmin();
+ 
+-	Assert(resetXmin || MyPgXact->xmin == 0);
++	Assert(resetXmin || MyProc->xmin == 0);
+ }
+ 
+ 
+@@ -1830,7 +1830,7 @@ TransactionIdLimitedForOldSnapshots(TransactionId recentXmin,
+ 	 */
+ 	if (old_snapshot_threshold == 0)
+ 	{
+-		if (TransactionIdPrecedes(latest_xmin, MyPgXact->xmin)
++		if (TransactionIdPrecedes(latest_xmin, MyProc->xmin)
+ 			&& TransactionIdFollows(latest_xmin, xlimit))
+ 			xlimit = latest_xmin;
+ 
+diff --git a/src/include/storage/proc.h b/src/include/storage/proc.h
+index 52ff43cabaaf..5e4b028a5f98 100644
+--- a/src/include/storage/proc.h
++++ b/src/include/storage/proc.h
+@@ -101,6 +101,11 @@ struct PGPROC
+ 
+ 	Latch		procLatch;		/* generic latch for process */
+ 
++	TransactionId xmin;			/* minimal running XID as it was when we were
++								 * starting our xact, excluding LAZY VACUUM:
++								 * vacuum must not remove tuples deleted by
++								 * xid >= xmin ! */
++
+ 	LocalTransactionId lxid;	/* local id of top-level transaction currently
+ 								 * being executed by this proc, if running;
+ 								 * else InvalidLocalTransactionId */
+@@ -223,11 +228,6 @@ typedef struct PGXACT
+ 								 * executed by this proc, if running and XID
+ 								 * is assigned; else InvalidTransactionId */
+ 
+-	TransactionId xmin;			/* minimal running XID as it was when we were
+-								 * starting our xact, excluding LAZY VACUUM:
+-								 * vacuum must not remove tuples deleted by
+-								 * xid >= xmin ! */
+-
+ 	uint8		vacuumFlags;	/* vacuum-related flags, see above */
+ 	bool		overflowed;
+ 

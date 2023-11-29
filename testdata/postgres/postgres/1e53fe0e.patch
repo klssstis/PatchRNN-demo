@@ -1,0 +1,568 @@
+From 1e53fe0e70f610c34f4c9e770d108cd94151342c Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Tue, 17 Dec 2019 13:03:57 -0500
+Subject: [PATCH] Use PostgresSigHupHandler in more places.
+
+There seems to be no reason for every background process to have
+its own flag indicating that a config-file reload is needed.
+Instead, let's just use ConfigFilePending for that purpose
+everywhere.
+
+Patch by me, reviewed by Andres Freund and Daniel Gustafsson.
+
+Discussion: http://postgr.es/m/CA+TgmoZwDk=BguVDVa+qdA6SBKef=PKbaKDQALTC_9qoz1mJqg@mail.gmail.com
+---
+ src/backend/postmaster/autovacuum.c        | 30 ++++++----------------
+ src/backend/postmaster/bgwriter.c          | 20 +++------------
+ src/backend/postmaster/checkpointer.c      | 24 ++++-------------
+ src/backend/postmaster/pgarch.c            | 25 ++++--------------
+ src/backend/postmaster/pgstat.c            | 28 +++++---------------
+ src/backend/postmaster/walwriter.c         | 20 +++------------
+ src/backend/replication/logical/launcher.c | 23 +++--------------
+ src/backend/replication/logical/worker.c   | 23 +++--------------
+ 8 files changed, 37 insertions(+), 156 deletions(-)
+
+diff --git a/src/backend/postmaster/autovacuum.c b/src/backend/postmaster/autovacuum.c
+index 5766203aafc9..b1c2b0a01c23 100644
+--- a/src/backend/postmaster/autovacuum.c
++++ b/src/backend/postmaster/autovacuum.c
+@@ -138,7 +138,6 @@ static bool am_autovacuum_launcher = false;
+ static bool am_autovacuum_worker = false;
+ 
+ /* Flags set by signal handlers */
+-static volatile sig_atomic_t got_SIGHUP = false;
+ static volatile sig_atomic_t got_SIGUSR2 = false;
+ static volatile sig_atomic_t got_SIGTERM = false;
+ 
+@@ -344,7 +343,6 @@ static void perform_work_item(AutoVacuumWorkItem *workitem);
+ static void autovac_report_activity(autovac_table *tab);
+ static void autovac_report_workitem(AutoVacuumWorkItem *workitem,
+ 									const char *nspname, const char *relname);
+-static void av_sighup_handler(SIGNAL_ARGS);
+ static void avl_sigusr2_handler(SIGNAL_ARGS);
+ static void avl_sigterm_handler(SIGNAL_ARGS);
+ static void autovac_refresh_stats(void);
+@@ -452,7 +450,7 @@ AutoVacLauncherMain(int argc, char *argv[])
+ 	 * backend, so we use the same signal handling.  See equivalent code in
+ 	 * tcop/postgres.c.
+ 	 */
+-	pqsignal(SIGHUP, av_sighup_handler);
++	pqsignal(SIGHUP, PostgresSigHupHandler);
+ 	pqsignal(SIGINT, StatementCancelHandler);
+ 	pqsignal(SIGTERM, avl_sigterm_handler);
+ 
+@@ -805,9 +803,9 @@ HandleAutoVacLauncherInterrupts(void)
+ 	if (got_SIGTERM)
+ 		AutoVacLauncherShutdown();
+ 
+-	if (got_SIGHUP)
++	if (ConfigReloadPending)
+ 	{
+-		got_SIGHUP = false;
++		ConfigReloadPending = false;
+ 		ProcessConfigFile(PGC_SIGHUP);
+ 
+ 		/* shutdown requested in config file? */
+@@ -1405,18 +1403,6 @@ AutoVacWorkerFailed(void)
+ 	AutoVacuumShmem->av_signal[AutoVacForkFailed] = true;
+ }
+ 
+-/* SIGHUP: set flag to re-read config file at next convenient time */
+-static void
+-av_sighup_handler(SIGNAL_ARGS)
+-{
+-	int			save_errno = errno;
+-
+-	got_SIGHUP = true;
+-	SetLatch(MyLatch);
+-
+-	errno = save_errno;
+-}
+-
+ /* SIGUSR2: a worker is up and running, or just finished, or failed to fork */
+ static void
+ avl_sigusr2_handler(SIGNAL_ARGS)
+@@ -1539,7 +1525,7 @@ AutoVacWorkerMain(int argc, char *argv[])
+ 	 * backend, so we use the same signal handling.  See equivalent code in
+ 	 * tcop/postgres.c.
+ 	 */
+-	pqsignal(SIGHUP, av_sighup_handler);
++	pqsignal(SIGHUP, PostgresSigHupHandler);
+ 
+ 	/*
+ 	 * SIGINT is used to signal canceling the current table's vacuum; SIGTERM
+@@ -2332,9 +2318,9 @@ do_autovacuum(void)
+ 		/*
+ 		 * Check for config changes before processing each collected table.
+ 		 */
+-		if (got_SIGHUP)
++		if (ConfigReloadPending)
+ 		{
+-			got_SIGHUP = false;
++			ConfigReloadPending = false;
+ 			ProcessConfigFile(PGC_SIGHUP);
+ 
+ 			/*
+@@ -2580,9 +2566,9 @@ do_autovacuum(void)
+ 		 * Check for config changes before acquiring lock for further jobs.
+ 		 */
+ 		CHECK_FOR_INTERRUPTS();
+-		if (got_SIGHUP)
++		if (ConfigReloadPending)
+ 		{
+-			got_SIGHUP = false;
++			ConfigReloadPending = false;
+ 			ProcessConfigFile(PGC_SIGHUP);
+ 		}
+ 
+diff --git a/src/backend/postmaster/bgwriter.c b/src/backend/postmaster/bgwriter.c
+index c7500f1d7155..bca46de6d563 100644
+--- a/src/backend/postmaster/bgwriter.c
++++ b/src/backend/postmaster/bgwriter.c
+@@ -89,7 +89,6 @@ static XLogRecPtr last_snapshot_lsn = InvalidXLogRecPtr;
+ /*
+  * Flags set by interrupt handlers for later service in the main loop.
+  */
+-static volatile sig_atomic_t got_SIGHUP = false;
+ static volatile sig_atomic_t shutdown_requested = false;
+ 
+ static void HandleBackgroundWriterInterrupts(void);
+@@ -97,7 +96,6 @@ static void HandleBackgroundWriterInterrupts(void);
+ /* Signal handlers */
+ 
+ static void bg_quickdie(SIGNAL_ARGS);
+-static void BgSigHupHandler(SIGNAL_ARGS);
+ static void ReqShutdownHandler(SIGNAL_ARGS);
+ 
+ 
+@@ -118,7 +116,7 @@ BackgroundWriterMain(void)
+ 	/*
+ 	 * Properly accept or ignore signals that might be sent to us.
+ 	 */
+-	pqsignal(SIGHUP, BgSigHupHandler);	/* set flag to read config file */
++	pqsignal(SIGHUP, PostgresSigHupHandler);	/* set flag to read config file */
+ 	pqsignal(SIGINT, SIG_IGN);
+ 	pqsignal(SIGTERM, ReqShutdownHandler);	/* shutdown */
+ 	pqsignal(SIGQUIT, bg_quickdie); /* hard crash time */
+@@ -363,9 +361,9 @@ BackgroundWriterMain(void)
+ static void
+ HandleBackgroundWriterInterrupts(void)
+ {
+-	if (got_SIGHUP)
++	if (ConfigReloadPending)
+ 	{
+-		got_SIGHUP = false;
++		ConfigReloadPending = false;
+ 		ProcessConfigFile(PGC_SIGHUP);
+ 	}
+ 
+@@ -413,18 +411,6 @@ bg_quickdie(SIGNAL_ARGS)
+ 	_exit(2);
+ }
+ 
+-/* SIGHUP: set flag to re-read config file at next convenient time */
+-static void
+-BgSigHupHandler(SIGNAL_ARGS)
+-{
+-	int			save_errno = errno;
+-
+-	got_SIGHUP = true;
+-	SetLatch(MyLatch);
+-
+-	errno = save_errno;
+-}
+-
+ /* SIGTERM: set flag to shutdown and exit */
+ static void
+ ReqShutdownHandler(SIGNAL_ARGS)
+diff --git a/src/backend/postmaster/checkpointer.c b/src/backend/postmaster/checkpointer.c
+index d087ee9c7436..9cf91b0d35cf 100644
+--- a/src/backend/postmaster/checkpointer.c
++++ b/src/backend/postmaster/checkpointer.c
+@@ -151,7 +151,6 @@ double		CheckPointCompletionTarget = 0.5;
+ /*
+  * Flags set by interrupt handlers for later service in the main loop.
+  */
+-static volatile sig_atomic_t got_SIGHUP = false;
+ static volatile sig_atomic_t shutdown_requested = false;
+ 
+ /*
+@@ -179,7 +178,6 @@ static void UpdateSharedMemoryConfig(void);
+ /* Signal handlers */
+ 
+ static void chkpt_quickdie(SIGNAL_ARGS);
+-static void ChkptSigHupHandler(SIGNAL_ARGS);
+ static void ReqCheckpointHandler(SIGNAL_ARGS);
+ static void ReqShutdownHandler(SIGNAL_ARGS);
+ 
+@@ -206,7 +204,7 @@ CheckpointerMain(void)
+ 	 * want to wait for the backends to exit, whereupon the postmaster will
+ 	 * tell us it's okay to shut down (via SIGUSR2).
+ 	 */
+-	pqsignal(SIGHUP, ChkptSigHupHandler);	/* set flag to read config file */
++	pqsignal(SIGHUP, PostgresSigHupHandler);	/* set flag to read config file */
+ 	pqsignal(SIGINT, ReqCheckpointHandler); /* request checkpoint */
+ 	pqsignal(SIGTERM, SIG_IGN); /* ignore SIGTERM */
+ 	pqsignal(SIGQUIT, chkpt_quickdie);	/* hard crash time */
+@@ -535,9 +533,9 @@ CheckpointerMain(void)
+ static void
+ HandleCheckpointerInterrupts(void)
+ {
+-	if (got_SIGHUP)
++	if (ConfigReloadPending)
+ 	{
+-		got_SIGHUP = false;
++		ConfigReloadPending = false;
+ 		ProcessConfigFile(PGC_SIGHUP);
+ 
+ 		/*
+@@ -685,9 +683,9 @@ CheckpointWriteDelay(int flags, double progress)
+ 		!ImmediateCheckpointRequested() &&
+ 		IsCheckpointOnSchedule(progress))
+ 	{
+-		if (got_SIGHUP)
++		if (ConfigReloadPending)
+ 		{
+-			got_SIGHUP = false;
++			ConfigReloadPending = false;
+ 			ProcessConfigFile(PGC_SIGHUP);
+ 			/* update shmem copies of config variables */
+ 			UpdateSharedMemoryConfig();
+@@ -835,18 +833,6 @@ chkpt_quickdie(SIGNAL_ARGS)
+ 	_exit(2);
+ }
+ 
+-/* SIGHUP: set flag to re-read config file at next convenient time */
+-static void
+-ChkptSigHupHandler(SIGNAL_ARGS)
+-{
+-	int			save_errno = errno;
+-
+-	got_SIGHUP = true;
+-	SetLatch(MyLatch);
+-
+-	errno = save_errno;
+-}
+-
+ /* SIGINT: set flag to run a normal checkpoint right away */
+ static void
+ ReqCheckpointHandler(SIGNAL_ARGS)
+diff --git a/src/backend/postmaster/pgarch.c b/src/backend/postmaster/pgarch.c
+index f84f882c4cb2..09a9c66b4b27 100644
+--- a/src/backend/postmaster/pgarch.c
++++ b/src/backend/postmaster/pgarch.c
+@@ -83,7 +83,6 @@ static time_t last_sigterm_time = 0;
+ /*
+  * Flags set by interrupt handlers for later service in the main loop.
+  */
+-static volatile sig_atomic_t got_SIGHUP = false;
+ static volatile sig_atomic_t got_SIGTERM = false;
+ static volatile sig_atomic_t wakened = false;
+ static volatile sig_atomic_t ready_to_stop = false;
+@@ -98,7 +97,6 @@ static pid_t pgarch_forkexec(void);
+ 
+ NON_EXEC_STATIC void PgArchiverMain(int argc, char *argv[]) pg_attribute_noreturn();
+ static void pgarch_exit(SIGNAL_ARGS);
+-static void ArchSigHupHandler(SIGNAL_ARGS);
+ static void ArchSigTermHandler(SIGNAL_ARGS);
+ static void pgarch_waken(SIGNAL_ARGS);
+ static void pgarch_waken_stop(SIGNAL_ARGS);
+@@ -229,7 +227,7 @@ PgArchiverMain(int argc, char *argv[])
+ 	 * Ignore all signals usually bound to some action in the postmaster,
+ 	 * except for SIGHUP, SIGTERM, SIGUSR1, SIGUSR2, and SIGQUIT.
+ 	 */
+-	pqsignal(SIGHUP, ArchSigHupHandler);
++	pqsignal(SIGHUP, PostgresSigHupHandler);
+ 	pqsignal(SIGINT, SIG_IGN);
+ 	pqsignal(SIGTERM, ArchSigTermHandler);
+ 	pqsignal(SIGQUIT, pgarch_exit);
+@@ -259,19 +257,6 @@ pgarch_exit(SIGNAL_ARGS)
+ 	exit(1);
+ }
+ 
+-/* SIGHUP signal handler for archiver process */
+-static void
+-ArchSigHupHandler(SIGNAL_ARGS)
+-{
+-	int			save_errno = errno;
+-
+-	/* set flag to re-read config file at next convenient time */
+-	got_SIGHUP = true;
+-	SetLatch(MyLatch);
+-
+-	errno = save_errno;
+-}
+-
+ /* SIGTERM signal handler for archiver process */
+ static void
+ ArchSigTermHandler(SIGNAL_ARGS)
+@@ -348,9 +333,9 @@ pgarch_MainLoop(void)
+ 		time_to_stop = ready_to_stop;
+ 
+ 		/* Check for config update */
+-		if (got_SIGHUP)
++		if (ConfigReloadPending)
+ 		{
+-			got_SIGHUP = false;
++			ConfigReloadPending = false;
+ 			ProcessConfigFile(PGC_SIGHUP);
+ 		}
+ 
+@@ -457,9 +442,9 @@ pgarch_ArchiverCopyLoop(void)
+ 			 * setting for archive_command as soon as possible, even if there
+ 			 * is a backlog of files to be archived.
+ 			 */
+-			if (got_SIGHUP)
++			if (ConfigReloadPending)
+ 			{
+-				got_SIGHUP = false;
++				ConfigReloadPending = false;
+ 				ProcessConfigFile(PGC_SIGHUP);
+ 			}
+ 
+diff --git a/src/backend/postmaster/pgstat.c b/src/backend/postmaster/pgstat.c
+index fabcf31de8c3..96a9e09cedc6 100644
+--- a/src/backend/postmaster/pgstat.c
++++ b/src/backend/postmaster/pgstat.c
+@@ -264,7 +264,6 @@ static List *pending_write_requests = NIL;
+ 
+ /* Signal handler flags */
+ static volatile bool need_exit = false;
+-static volatile bool got_SIGHUP = false;
+ 
+ /*
+  * Total time charged to functions so far in the current backend.
+@@ -285,7 +284,6 @@ static pid_t pgstat_forkexec(void);
+ NON_EXEC_STATIC void PgstatCollectorMain(int argc, char *argv[]) pg_attribute_noreturn();
+ static void pgstat_exit(SIGNAL_ARGS);
+ static void pgstat_beshutdown_hook(int code, Datum arg);
+-static void pgstat_sighup_handler(SIGNAL_ARGS);
+ 
+ static PgStat_StatDBEntry *pgstat_get_db_entry(Oid databaseid, bool create);
+ static PgStat_StatTabEntry *pgstat_get_tab_entry(PgStat_StatDBEntry *dbentry,
+@@ -4434,7 +4432,7 @@ PgstatCollectorMain(int argc, char *argv[])
+ 	 * except SIGHUP and SIGQUIT.  Note we don't need a SIGUSR1 handler to
+ 	 * support latch operations, because we only use a local latch.
+ 	 */
+-	pqsignal(SIGHUP, pgstat_sighup_handler);
++	pqsignal(SIGHUP, PostgresSigHupHandler);
+ 	pqsignal(SIGINT, SIG_IGN);
+ 	pqsignal(SIGTERM, SIG_IGN);
+ 	pqsignal(SIGQUIT, pgstat_exit);
+@@ -4466,10 +4464,10 @@ PgstatCollectorMain(int argc, char *argv[])
+ 	 * message.  (This effectively means that if backends are sending us stuff
+ 	 * like mad, we won't notice postmaster death until things slack off a
+ 	 * bit; which seems fine.)	To do that, we have an inner loop that
+-	 * iterates as long as recv() succeeds.  We do recognize got_SIGHUP inside
+-	 * the inner loop, which means that such interrupts will get serviced but
+-	 * the latch won't get cleared until next time there is a break in the
+-	 * action.
++	 * iterates as long as recv() succeeds.  We do check ConfigReloadPending
++	 * inside the inner loop, which means that such interrupts will get
++	 * serviced but the latch won't get cleared until next time there is a
++	 * break in the action.
+ 	 */
+ 	for (;;)
+ 	{
+@@ -4491,9 +4489,9 @@ PgstatCollectorMain(int argc, char *argv[])
+ 			/*
+ 			 * Reload configuration if we got SIGHUP from the postmaster.
+ 			 */
+-			if (got_SIGHUP)
++			if (ConfigReloadPending)
+ 			{
+-				got_SIGHUP = false;
++				ConfigReloadPending = false;
+ 				ProcessConfigFile(PGC_SIGHUP);
+ 			}
+ 
+@@ -4691,18 +4689,6 @@ pgstat_exit(SIGNAL_ARGS)
+ 	errno = save_errno;
+ }
+ 
+-/* SIGHUP handler for collector process */
+-static void
+-pgstat_sighup_handler(SIGNAL_ARGS)
+-{
+-	int			save_errno = errno;
+-
+-	got_SIGHUP = true;
+-	SetLatch(MyLatch);
+-
+-	errno = save_errno;
+-}
+-
+ /*
+  * Subroutine to clear stats in a database entry
+  *
+diff --git a/src/backend/postmaster/walwriter.c b/src/backend/postmaster/walwriter.c
+index 5a3573503c63..599478530f9d 100644
+--- a/src/backend/postmaster/walwriter.c
++++ b/src/backend/postmaster/walwriter.c
+@@ -80,14 +80,12 @@ int			WalWriterFlushAfter = 128;
+ /*
+  * Flags set by interrupt handlers for later service in the main loop.
+  */
+-static volatile sig_atomic_t got_SIGHUP = false;
+ static volatile sig_atomic_t shutdown_requested = false;
+ 
+ static void HandleWalWriterInterrupts(void);
+ 
+ /* Signal handlers */
+ static void wal_quickdie(SIGNAL_ARGS);
+-static void WalSigHupHandler(SIGNAL_ARGS);
+ static void WalShutdownHandler(SIGNAL_ARGS);
+ 
+ /*
+@@ -110,7 +108,7 @@ WalWriterMain(void)
+ 	 * We have no particular use for SIGINT at the moment, but seems
+ 	 * reasonable to treat like SIGTERM.
+ 	 */
+-	pqsignal(SIGHUP, WalSigHupHandler); /* set flag to read config file */
++	pqsignal(SIGHUP, PostgresSigHupHandler); /* set flag to read config file */
+ 	pqsignal(SIGINT, WalShutdownHandler);	/* request shutdown */
+ 	pqsignal(SIGTERM, WalShutdownHandler);	/* request shutdown */
+ 	pqsignal(SIGQUIT, wal_quickdie);	/* hard crash time */
+@@ -278,9 +276,9 @@ WalWriterMain(void)
+ static void
+ HandleWalWriterInterrupts(void)
+ {
+-	if (got_SIGHUP)
++	if (ConfigReloadPending)
+ 	{
+-		got_SIGHUP = false;
++		ConfigReloadPending = false;
+ 		ProcessConfigFile(PGC_SIGHUP);
+ 	}
+ 	if (shutdown_requested)
+@@ -322,18 +320,6 @@ wal_quickdie(SIGNAL_ARGS)
+ 	_exit(2);
+ }
+ 
+-/* SIGHUP: set flag to re-read config file at next convenient time */
+-static void
+-WalSigHupHandler(SIGNAL_ARGS)
+-{
+-	int			save_errno = errno;
+-
+-	got_SIGHUP = true;
+-	SetLatch(MyLatch);
+-
+-	errno = save_errno;
+-}
+-
+ /* SIGTERM: set flag to exit normally */
+ static void
+ WalShutdownHandler(SIGNAL_ARGS)
+diff --git a/src/backend/replication/logical/launcher.c b/src/backend/replication/logical/launcher.c
+index 4643af95fee7..edca70c58c38 100644
+--- a/src/backend/replication/logical/launcher.c
++++ b/src/backend/replication/logical/launcher.c
+@@ -92,9 +92,6 @@ static void logicalrep_worker_onexit(int code, Datum arg);
+ static void logicalrep_worker_detach(void);
+ static void logicalrep_worker_cleanup(LogicalRepWorker *worker);
+ 
+-/* Flags set by signal handlers */
+-static volatile sig_atomic_t got_SIGHUP = false;
+-
+ static bool on_commit_launcher_wakeup = false;
+ 
+ Datum		pg_stat_get_subscription(PG_FUNCTION_ARGS);
+@@ -714,20 +711,6 @@ logicalrep_worker_onexit(int code, Datum arg)
+ 	ApplyLauncherWakeup();
+ }
+ 
+-/* SIGHUP: set flag to reload configuration at next convenient time */
+-static void
+-logicalrep_launcher_sighup(SIGNAL_ARGS)
+-{
+-	int			save_errno = errno;
+-
+-	got_SIGHUP = true;
+-
+-	/* Waken anything waiting on the process latch */
+-	SetLatch(MyLatch);
+-
+-	errno = save_errno;
+-}
+-
+ /*
+  * Count the number of registered (not necessarily running) sync workers
+  * for a subscription.
+@@ -972,7 +955,7 @@ ApplyLauncherMain(Datum main_arg)
+ 	LogicalRepCtx->launcher_pid = MyProcPid;
+ 
+ 	/* Establish signal handlers. */
+-	pqsignal(SIGHUP, logicalrep_launcher_sighup);
++	pqsignal(SIGTERM, PostgresSigHupHandler);
+ 	pqsignal(SIGTERM, die);
+ 	BackgroundWorkerUnblockSignals();
+ 
+@@ -1061,9 +1044,9 @@ ApplyLauncherMain(Datum main_arg)
+ 			CHECK_FOR_INTERRUPTS();
+ 		}
+ 
+-		if (got_SIGHUP)
++		if (ConfigReloadPending)
+ 		{
+-			got_SIGHUP = false;
++			ConfigReloadPending = false;
+ 			ProcessConfigFile(PGC_SIGHUP);
+ 		}
+ 	}
+diff --git a/src/backend/replication/logical/worker.c b/src/backend/replication/logical/worker.c
+index ced0d191c2ee..3b12ad64006f 100644
+--- a/src/backend/replication/logical/worker.c
++++ b/src/backend/replication/logical/worker.c
+@@ -111,9 +111,6 @@ static void store_flush_position(XLogRecPtr remote_lsn);
+ 
+ static void maybe_reread_subscription(void);
+ 
+-/* Flags set by signal handlers */
+-static volatile sig_atomic_t got_SIGHUP = false;
+-
+ /*
+  * Should this worker apply changes for given relation.
+  *
+@@ -1270,9 +1267,9 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
+ 			CHECK_FOR_INTERRUPTS();
+ 		}
+ 
+-		if (got_SIGHUP)
++		if (ConfigReloadPending)
+ 		{
+-			got_SIGHUP = false;
++			ConfigReloadPending = false;
+ 			ProcessConfigFile(PGC_SIGHUP);
+ 		}
+ 
+@@ -1563,20 +1560,6 @@ subscription_change_cb(Datum arg, int cacheid, uint32 hashvalue)
+ 	MySubscriptionValid = false;
+ }
+ 
+-/* SIGHUP: set flag to reload configuration at next convenient time */
+-static void
+-logicalrep_worker_sighup(SIGNAL_ARGS)
+-{
+-	int			save_errno = errno;
+-
+-	got_SIGHUP = true;
+-
+-	/* Waken anything waiting on the process latch */
+-	SetLatch(MyLatch);
+-
+-	errno = save_errno;
+-}
+-
+ /* Logical Replication Apply worker entry point */
+ void
+ ApplyWorkerMain(Datum main_arg)
+@@ -1592,7 +1575,7 @@ ApplyWorkerMain(Datum main_arg)
+ 	logicalrep_worker_attach(worker_slot);
+ 
+ 	/* Setup signal handling */
+-	pqsignal(SIGHUP, logicalrep_worker_sighup);
++	pqsignal(SIGHUP, PostgresSigHupHandler);
+ 	pqsignal(SIGTERM, die);
+ 	BackgroundWorkerUnblockSignals();
+ 

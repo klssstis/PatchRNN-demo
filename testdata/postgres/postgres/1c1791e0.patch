@@ -1,0 +1,954 @@
+From 1c1791e00065f6986f9d44a78ce7c28b2d1322dd Mon Sep 17 00:00:00 2001
+From: Teodor Sigaev <teodor@sigaev.ru>
+Date: Sat, 7 Apr 2018 20:58:03 +0300
+Subject: [PATCH] Add json(b)_to_tsvector function
+
+Jsonb has a complex nature so there isn't best-for-everything way to convert it
+to tsvector for full text search. Current to_tsvector(json(b)) suggests to
+convert only string values, but it's possible to index keys, numerics and even
+booleans value. To solve that json(b)_to_tsvector has a second required
+argument contained a list of desired types of json fields. Second argument is
+a jsonb scalar or array right now with possibility to add new options in a
+future.
+
+Bump catalog version
+
+Author: Dmitry Dolgov with some editorization by me
+Reviewed by: Teodor Sigaev
+Discussion: https://www.postgresql.org/message-id/CA+q6zcXJQbS1b4kJ_HeAOoOc=unfnOrUEL=KGgE32QKDww7d8g@mail.gmail.com
+---
+ doc/src/sgml/func.sgml              |  20 ++++
+ src/backend/tsearch/to_tsany.c      | 128 ++++++++++++++++----
+ src/backend/utils/adt/jsonfuncs.c   | 179 +++++++++++++++++++++++++---
+ src/include/catalog/catversion.h    |   2 +-
+ src/include/catalog/pg_proc.h       |  24 ++--
+ src/include/utils/jsonapi.h         |  21 +++-
+ src/test/regress/expected/json.out  | 122 +++++++++++++++++++
+ src/test/regress/expected/jsonb.out | 122 +++++++++++++++++++
+ src/test/regress/sql/json.sql       |  30 +++++
+ src/test/regress/sql/jsonb.sql      |  30 +++++
+ 10 files changed, 629 insertions(+), 49 deletions(-)
+
+diff --git a/doc/src/sgml/func.sgml b/doc/src/sgml/func.sgml
+index a86d3f40f17d..3dbfa1dec342 100644
+--- a/doc/src/sgml/func.sgml
++++ b/doc/src/sgml/func.sgml
+@@ -9727,6 +9727,26 @@ CREATE TYPE rainbow AS ENUM ('red', 'orange', 'yellow', 'green', 'blue', 'purple
+         <entry><literal>to_tsvector('english', '{"a": "The Fat Rats"}'::json)</literal></entry>
+         <entry><literal>'fat':2 'rat':3</literal></entry>
+        </row>
++       <row>
++        <entry>
++         <literal><function>json(b)_to_tsvector(<optional> <replaceable class="parameter">config</replaceable> <type>regconfig</type>,
++         </optional> <replaceable class="parameter">document</replaceable> <type>json(b)</type>,
++         <replaceable class="parameter">filter</replaceable> <type>json(b)</type>)</function></literal>
++        </entry>
++        <entry><type>tsvector</type></entry>
++        <entry>
++          reduce each value in the document, specified by <replaceable class="parameter">filter</replaceable> to a <type>tsvector</type>,
++          and then concatenate those in document order to produce a single <type>tsvector</type>.
++          <replaceable class="parameter">filter</replaceable> is a jsonb array, that enumerates what kind of elements need to be included
++          into the resulting <type>tsvector</type>. Possible values for <replaceable class="parameter">filter</replaceable> are
++          <literal>"string"</literal> (to include all string values), <literal>"numeric"</literal> (to include all numeric values in the string format),
++          <literal>"boolean"</literal> (to include all boolean values in the string format "true"/"false"),
++          <literal>"key"</literal> (to include all keys) or <literal>"all"</literal> (to include all above). These values
++          can be combined together to include, e.g. all string and numeric values.
++        </entry>
++        <entry><literal>json_to_tsvector('english', '{"a": "The Fat Rats", "b": 123}'::json, '["string", "numeric"]')</literal></entry>
++        <entry><literal>'123':5 'fat':2 'rat':3</literal></entry>
++       </row>
+        <row>
+         <entry>
+          <indexterm>
+diff --git a/src/backend/tsearch/to_tsany.c b/src/backend/tsearch/to_tsany.c
+index 6055fb6b4e57..2474b723b414 100644
+--- a/src/backend/tsearch/to_tsany.c
++++ b/src/backend/tsearch/to_tsany.c
+@@ -267,12 +267,12 @@ to_tsvector(PG_FUNCTION_ARGS)
+ 										PointerGetDatum(in)));
+ }
+ 
+-Datum
+-jsonb_to_tsvector_byid(PG_FUNCTION_ARGS)
++/*
++ * Worker function for jsonb(_string)_to_tsvector(_byid)
++ */
++static TSVector
++jsonb_to_tsvector_worker(Oid cfgId, Jsonb *jb, uint32 flags)
+ {
+-	Oid			cfgId = PG_GETARG_OID(0);
+-	Jsonb	   *jb = PG_GETARG_JSONB_P(1);
+-	TSVector	result;
+ 	TSVectorBuildState state;
+ 	ParsedText	prs;
+ 
+@@ -281,33 +281,77 @@ jsonb_to_tsvector_byid(PG_FUNCTION_ARGS)
+ 	state.prs = &prs;
+ 	state.cfgId = cfgId;
+ 
+-	iterate_jsonb_string_values(jb, &state, add_to_tsvector);
++	iterate_jsonb_values(jb, flags, &state, add_to_tsvector);
+ 
+-	PG_FREE_IF_COPY(jb, 1);
++	return make_tsvector(&prs);
++}
++
++Datum
++jsonb_string_to_tsvector_byid(PG_FUNCTION_ARGS)
++{
++	Oid			cfgId = PG_GETARG_OID(0);
++	Jsonb	   *jb = PG_GETARG_JSONB_P(1);
++	TSVector	result;
+ 
+-	result = make_tsvector(&prs);
++	result = jsonb_to_tsvector_worker(cfgId, jb, jtiString);
++	PG_FREE_IF_COPY(jb, 1);
+ 
+ 	PG_RETURN_TSVECTOR(result);
+ }
+ 
+ Datum
+-jsonb_to_tsvector(PG_FUNCTION_ARGS)
++jsonb_string_to_tsvector(PG_FUNCTION_ARGS)
+ {
+ 	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+ 	Oid			cfgId;
++	TSVector	result;
+ 
+ 	cfgId = getTSCurrentConfig(true);
+-	PG_RETURN_DATUM(DirectFunctionCall2(jsonb_to_tsvector_byid,
+-										ObjectIdGetDatum(cfgId),
+-										JsonbPGetDatum(jb)));
++	result = jsonb_to_tsvector_worker(cfgId, jb, jtiString);
++	PG_FREE_IF_COPY(jb, 0);
++
++	PG_RETURN_TSVECTOR(result);
+ }
+ 
+ Datum
+-json_to_tsvector_byid(PG_FUNCTION_ARGS)
++jsonb_to_tsvector_byid(PG_FUNCTION_ARGS)
+ {
+ 	Oid			cfgId = PG_GETARG_OID(0);
+-	text	   *json = PG_GETARG_TEXT_P(1);
++	Jsonb	   *jb = PG_GETARG_JSONB_P(1);
++	Jsonb	   *jbFlags = PG_GETARG_JSONB_P(2);
++	TSVector	result;
++	uint32		flags = parse_jsonb_index_flags(jbFlags);
++
++	result = jsonb_to_tsvector_worker(cfgId, jb, flags);
++	PG_FREE_IF_COPY(jb, 1);
++	PG_FREE_IF_COPY(jbFlags, 2);
++
++	PG_RETURN_TSVECTOR(result);
++}
++
++Datum
++jsonb_to_tsvector(PG_FUNCTION_ARGS)
++{
++	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
++	Jsonb	   *jbFlags = PG_GETARG_JSONB_P(1);
++	Oid			cfgId;
+ 	TSVector	result;
++	uint32		flags = parse_jsonb_index_flags(jbFlags);
++
++	cfgId = getTSCurrentConfig(true);
++	result = jsonb_to_tsvector_worker(cfgId, jb, flags);
++	PG_FREE_IF_COPY(jb, 0);
++	PG_FREE_IF_COPY(jbFlags, 1);
++
++	PG_RETURN_TSVECTOR(result);
++}
++
++/*
++ * Worker function for json(_string)_to_tsvector(_byid)
++ */
++static TSVector
++json_to_tsvector_worker(Oid cfgId, text *json, uint32 flags)
++{
+ 	TSVectorBuildState state;
+ 	ParsedText	prs;
+ 
+@@ -316,11 +360,50 @@ json_to_tsvector_byid(PG_FUNCTION_ARGS)
+ 	state.prs = &prs;
+ 	state.cfgId = cfgId;
+ 
+-	iterate_json_string_values(json, &state, add_to_tsvector);
++	iterate_json_values(json, flags, &state, add_to_tsvector);
++
++	return make_tsvector(&prs);
++}
++
++Datum
++json_string_to_tsvector_byid(PG_FUNCTION_ARGS)
++{
++	Oid			cfgId = PG_GETARG_OID(0);
++	text	   *json = PG_GETARG_TEXT_P(1);
++	TSVector	result;
+ 
++	result = json_to_tsvector_worker(cfgId, json, jtiString);
+ 	PG_FREE_IF_COPY(json, 1);
+ 
+-	result = make_tsvector(&prs);
++	PG_RETURN_TSVECTOR(result);
++}
++
++Datum
++json_string_to_tsvector(PG_FUNCTION_ARGS)
++{
++	text	   *json = PG_GETARG_TEXT_P(0);
++	Oid			cfgId;
++	TSVector	result;
++
++	cfgId = getTSCurrentConfig(true);
++	result = json_to_tsvector_worker(cfgId, json, jtiString);
++	PG_FREE_IF_COPY(json, 0);
++
++	PG_RETURN_TSVECTOR(result);
++}
++
++Datum
++json_to_tsvector_byid(PG_FUNCTION_ARGS)
++{
++	Oid			cfgId = PG_GETARG_OID(0);
++	text	   *json = PG_GETARG_TEXT_P(1);
++	Jsonb	   *jbFlags = PG_GETARG_JSONB_P(2);
++	TSVector	result;
++	uint32		flags = parse_jsonb_index_flags(jbFlags);
++
++	result = json_to_tsvector_worker(cfgId, json, flags);
++	PG_FREE_IF_COPY(json, 1);
++	PG_FREE_IF_COPY(jbFlags, 2);
+ 
+ 	PG_RETURN_TSVECTOR(result);
+ }
+@@ -329,12 +412,17 @@ Datum
+ json_to_tsvector(PG_FUNCTION_ARGS)
+ {
+ 	text	   *json = PG_GETARG_TEXT_P(0);
++	Jsonb	   *jbFlags = PG_GETARG_JSONB_P(1);
+ 	Oid			cfgId;
++	TSVector	result;
++	uint32		flags = parse_jsonb_index_flags(jbFlags);
+ 
+ 	cfgId = getTSCurrentConfig(true);
+-	PG_RETURN_DATUM(DirectFunctionCall2(json_to_tsvector_byid,
+-										ObjectIdGetDatum(cfgId),
+-										PointerGetDatum(json)));
++	result = json_to_tsvector_worker(cfgId, json, flags);
++	PG_FREE_IF_COPY(json, 0);
++	PG_FREE_IF_COPY(jbFlags, 1);
++
++	PG_RETURN_TSVECTOR(result);
+ }
+ 
+ /*
+@@ -353,7 +441,7 @@ add_to_tsvector(void *_state, char *elem_value, int elem_len)
+ 		 * First time through: initialize words array to a reasonable size.
+ 		 * (parsetext() will realloc it bigger as needed.)
+ 		 */
+-		prs->lenwords = Max(elem_len / 6, 64);
++		prs->lenwords = 16;
+ 		prs->words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs->lenwords);
+ 		prs->curwords = 0;
+ 		prs->pos = 0;
+diff --git a/src/backend/utils/adt/jsonfuncs.c b/src/backend/utils/adt/jsonfuncs.c
+index 805a1a089401..2f12d0325abe 100644
+--- a/src/backend/utils/adt/jsonfuncs.c
++++ b/src/backend/utils/adt/jsonfuncs.c
+@@ -60,6 +60,7 @@ typedef struct IterateJsonStringValuesState
+ 	JsonIterateStringValuesAction action;	/* an action that will be applied
+ 											 * to each json value */
+ 	void	   *action_state;	/* any necessary context for iteration */
++	uint32      flags;			/* what kind of elements from a json we want to iterate */
+ } IterateJsonStringValuesState;
+ 
+ /* state for transform_json_string_values function */
+@@ -474,8 +475,9 @@ static void setPathArray(JsonbIterator **it, Datum *path_elems,
+ 			 int level, Jsonb *newval, uint32 nelems, int op_type);
+ static void addJsonbToParseState(JsonbParseState **jbps, Jsonb *jb);
+ 
+-/* function supporting iterate_json_string_values */
+-static void iterate_string_values_scalar(void *state, char *token, JsonTokenType tokentype);
++/* function supporting iterate_json_values */
++static void iterate_values_scalar(void *state, char *token, JsonTokenType tokentype);
++static void iterate_values_object_field_start(void *state, char *fname, bool isnull);
+ 
+ /* functions supporting transform_json_string_values */
+ static void transform_string_values_object_start(void *state);
+@@ -4939,11 +4941,79 @@ setPathArray(JsonbIterator **it, Datum *path_elems, bool *path_nulls,
+ }
+ 
+ /*
+- * Iterate over jsonb string values or elements, and pass them together with an
+- * iteration state to a specified JsonIterateStringValuesAction.
++ * Parse information about what elements of a jsonb document we want to iterate
++ * in functions iterate_json(b)_values. This information is presented in jsonb
++ * format, so that it can be easily extended in the future.
++ */
++uint32
++parse_jsonb_index_flags(Jsonb *jb)
++{
++	JsonbIterator	   *it;
++	JsonbValue			v;
++	JsonbIteratorToken	type;
++	uint32				flags = 0;
++
++	it = JsonbIteratorInit(&jb->root);
++
++	type = JsonbIteratorNext(&it, &v, false);
++
++	/*
++	 * We iterate over array (scalar internally is represented as array, so, we
++	 * will accept it too) to check all its elements. Flag's names are choosen
++	 * the same as jsonb_typeof uses.
++	 */
++	if (type != WJB_BEGIN_ARRAY)
++		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						errmsg("wrong flag type, only arrays and scalars are allowed")));
++
++	while ((type = JsonbIteratorNext(&it, &v, false)) == WJB_ELEM)
++	{
++		if (v.type != jbvString)
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("flag array element is not a string"),
++					 errhint("Possible values are: \"string\", \"numeric\", \"boolean\", \"key\" and \"all\"")));
++
++		if (v.val.string.len == 3 &&
++				 pg_strncasecmp(v.val.string.val, "all", 3) == 0)
++			flags |= jtiAll;
++		else if (v.val.string.len == 3 &&
++				 pg_strncasecmp(v.val.string.val, "key", 3) == 0)
++			flags |= jtiKey;
++		else if (v.val.string.len == 6 &&
++				 pg_strncasecmp(v.val.string.val, "string", 5) == 0)
++			flags |= jtiString;
++		else if (v.val.string.len == 7 &&
++				 pg_strncasecmp(v.val.string.val, "numeric", 7) == 0)
++			flags |= jtiNumeric;
++		else if (v.val.string.len == 7 &&
++				 pg_strncasecmp(v.val.string.val, "boolean", 7) == 0)
++			flags |= jtiBool;
++		else
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("wrong flag in flag array: \"%s\"",
++							pnstrdup(v.val.string.val, v.val.string.len)),
++					 errhint("Possible values are: \"string\", \"numeric\", \"boolean\", \"key\" and \"all\"")));
++	}
++
++	/* user should not get it */
++	if (type != WJB_END_ARRAY)
++		elog(ERROR, "unexpected end of flag array");
++
++	/* get final WJB_DONE and free iterator */
++	JsonbIteratorNext(&it, &v, false);
++
++	return flags;
++}
++
++/*
++ * Iterate over jsonb values or elements, specified by flags, and pass them
++ * together with an iteration state to a specified JsonIterateStringValuesAction.
+  */
+ void
+-iterate_jsonb_string_values(Jsonb *jb, void *state, JsonIterateStringValuesAction action)
++iterate_jsonb_values(Jsonb *jb, uint32 flags, void *state,
++					 JsonIterateStringValuesAction action)
+ {
+ 	JsonbIterator *it;
+ 	JsonbValue	v;
+@@ -4951,21 +5021,67 @@ iterate_jsonb_string_values(Jsonb *jb, void *state, JsonIterateStringValuesActio
+ 
+ 	it = JsonbIteratorInit(&jb->root);
+ 
++	/*
++	 * Just recursively iterating over jsonb and call callback on all
++	 * correspoding elements
++	 */
+ 	while ((type = JsonbIteratorNext(&it, &v, false)) != WJB_DONE)
+ 	{
+-		if ((type == WJB_VALUE || type == WJB_ELEM) && v.type == jbvString)
++		if (type == WJB_KEY)
++		{
++			if (flags & jtiKey)
++				action(state, v.val.string.val, v.val.string.len);
++
++			continue;
++		}
++		else if (!(type == WJB_VALUE || type == WJB_ELEM))
+ 		{
+-			action(state, v.val.string.val, v.val.string.len);
++			/* do not call callback for composite JsonbValue */
++			continue;
++		}
++
++		/* JsonbValue is a value of object or element of array */
++		switch(v.type)
++		{
++			case jbvString:
++				if (flags & jtiString)
++					action(state, v.val.string.val, v.val.string.len);
++				break;
++			case jbvNumeric:
++				if (flags & jtiNumeric)
++				{
++					char *val;
++
++					val = DatumGetCString(DirectFunctionCall1(numeric_out,
++								NumericGetDatum(v.val.numeric)));
++
++					action(state, val, strlen(val));
++					pfree(val);
++				}
++				break;
++			case jbvBool:
++				if (flags & jtiBool)
++				{
++					if (v.val.boolean)
++						action(state, "true", 4);
++					else
++						action(state, "false", 5);
++				}
++				break;
++			default:
++				/* do not call callback for composite JsonbValue */
++				break;
+ 		}
+ 	}
+ }
+ 
+ /*
+- * Iterate over json string values or elements, and pass them together with an
+- * iteration state to a specified JsonIterateStringValuesAction.
++ * Iterate over json values and elements, specified by flags, and pass them
++ * together with an iteration state to a specified JsonIterateStringValuesAction.
+  */
+ void
+-iterate_json_string_values(text *json, void *action_state, JsonIterateStringValuesAction action)
++iterate_json_values(text *json, uint32 flags, void *action_state,
++					JsonIterateStringValuesAction action)
+ {
+ 	JsonLexContext *lex = makeJsonLexContext(json, true);
+ 	JsonSemAction *sem = palloc0(sizeof(JsonSemAction));
+@@ -4974,24 +5090,55 @@ iterate_json_string_values(text *json, void *action_state, JsonIterateStringValu
+ 	state->lex = lex;
+ 	state->action = action;
+ 	state->action_state = action_state;
++	state->flags = flags;
+ 
+ 	sem->semstate = (void *) state;
+-	sem->scalar = iterate_string_values_scalar;
++	sem->scalar = iterate_values_scalar;
++	sem->object_field_start = iterate_values_object_field_start;
+ 
+ 	pg_parse_json(lex, sem);
+ }
+ 
+ /*
+- * An auxiliary function for iterate_json_string_values to invoke a specified
+- * JsonIterateStringValuesAction.
++ * An auxiliary function for iterate_json_values to invoke a specified
++ * JsonIterateStringValuesAction for specified values.
+  */
+ static void
+-iterate_string_values_scalar(void *state, char *token, JsonTokenType tokentype)
++iterate_values_scalar(void *state, char *token, JsonTokenType tokentype)
+ {
+ 	IterateJsonStringValuesState *_state = (IterateJsonStringValuesState *) state;
+ 
+-	if (tokentype == JSON_TOKEN_STRING)
+-		_state->action(_state->action_state, token, strlen(token));
++	switch(tokentype)
++	{
++		case JSON_TOKEN_STRING:
++			if (_state->flags & jtiString)
++				_state->action(_state->action_state, token, strlen(token));
++			break;
++		case JSON_TOKEN_NUMBER:
++			if (_state->flags & jtiNumeric)
++				_state->action(_state->action_state, token, strlen(token));
++			break;
++		case JSON_TOKEN_TRUE:
++		case JSON_TOKEN_FALSE:
++			if (_state->flags & jtiBool)
++				_state->action(_state->action_state, token, strlen(token));
++			break;
++		default:
++			/* do not call callback for any other token */
++			break;
++	}
++}
++
++static void
++iterate_values_object_field_start(void *state, char *fname, bool isnull)
++{
++	IterateJsonStringValuesState *_state = (IterateJsonStringValuesState *) state;
++
++	if (_state->flags & jtiKey)
++	{
++		char *val = pstrdup(fname);
++		_state->action(_state->action_state, val, strlen(val));
++	}
+ }
+ 
+ /*
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index d88a6bb4c1c5..5641c60593b6 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	201804071
++#define CATALOG_VERSION_NO	201804072
+ 
+ #endif
+diff --git a/src/include/catalog/pg_proc.h b/src/include/catalog/pg_proc.h
+index 8dc30345b80a..42c2c429b40b 100644
+--- a/src/include/catalog/pg_proc.h
++++ b/src/include/catalog/pg_proc.h
+@@ -4987,14 +4987,22 @@ DATA(insert OID = 5001 (  phraseto_tsquery	PGNSP PGUID 12 100 0 0 0 f f f t f s
+ DESCR("transform to tsquery");
+ DATA(insert OID = 8890 (  websearch_to_tsquery	PGNSP PGUID 12 100 0 0 0 f f f t f s s 1 0 3615 "25" _null_ _null_ _null_ _null_ _null_ websearch_to_tsquery _null_ _null_ _null_ ));
+ DESCR("transform to tsquery");
+-DATA(insert OID = 4209 (  to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f s s 1 0 3614 "3802" _null_ _null_ _null_ _null_ _null_ jsonb_to_tsvector _null_ _null_ _null_ ));
+-DESCR("transform jsonb to tsvector");
+-DATA(insert OID = 4210 (  to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f s s 1 0 3614 "114" _null_ _null_ _null_ _null_ _null_ json_to_tsvector _null_ _null_ _null_ ));
+-DESCR("transform json to tsvector");
+-DATA(insert OID = 4211 (  to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f i s 2 0 3614 "3734 3802" _null_ _null_ _null_ _null_ _null_ jsonb_to_tsvector_byid _null_ _null_ _null_ ));
+-DESCR("transform jsonb to tsvector");
+-DATA(insert OID = 4212 (  to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f i s 2 0 3614 "3734 114" _null_ _null_ _null_ _null_ _null_ json_to_tsvector_byid _null_ _null_ _null_ ));
+-DESCR("transform json to tsvector");
++DATA(insert OID = 4209 (  to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f s s 1 0 3614 "3802" _null_ _null_ _null_ _null_ _null_ jsonb_string_to_tsvector _null_ _null_ _null_ ));
++DESCR("transform string values from jsonb to tsvector");
++DATA(insert OID = 4213 (  jsonb_to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f s s 2 0 3614 "3802 3802" _null_ _null_ _null_ _null_ _null_ jsonb_to_tsvector _null_ _null_ _null_ ));
++DESCR("transform specified values from jsonb to tsvector");
++DATA(insert OID = 4210 (  to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f s s 1 0 3614 "114" _null_ _null_ _null_ _null_ _null_ json_string_to_tsvector _null_ _null_ _null_ ));
++DESCR("transform string values from json to tsvector");
++DATA(insert OID = 4215 (  json_to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f s s 2 0 3614 "114 3802" _null_ _null_ _null_ _null_ _null_ json_to_tsvector _null_ _null_ _null_ ));
++DESCR("transform specified values from json to tsvector");
++DATA(insert OID = 4211 (  to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f i s 2 0 3614 "3734 3802" _null_ _null_ _null_ _null_ _null_ jsonb_string_to_tsvector_byid _null_ _null_ _null_ ));
++DESCR("transform string values from jsonb to tsvector");
++DATA(insert OID = 4214 (  jsonb_to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f i s 3 0 3614 "3734 3802 3802" _null_ _null_ _null_ _null_ _null_ jsonb_to_tsvector_byid _null_ _null_ _null_ ));
++DESCR("transform specified values from jsonb to tsvector");
++DATA(insert OID = 4212 (  to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f i s 2 0 3614 "3734 114" _null_ _null_ _null_ _null_ _null_ json_string_to_tsvector_byid _null_ _null_ _null_ ));
++DESCR("transform string values from json to tsvector");
++DATA(insert OID = 4216 (  json_to_tsvector		PGNSP PGUID 12 100 0 0 0 f f f t f i s 3 0 3614 "3734 114 3802" _null_ _null_ _null_ _null_ _null_ json_to_tsvector_byid _null_ _null_ _null_ ));
++DESCR("transform specified values from json to tsvector");
+ 
+ DATA(insert OID = 3752 (  tsvector_update_trigger			PGNSP PGUID 12 1 0 0 0 f f f f f v s 0 0 2279 "" _null_ _null_ _null_ _null_ _null_ tsvector_update_trigger_byid _null_ _null_ _null_ ));
+ DESCR("trigger for automatic update of tsvector column");
+diff --git a/src/include/utils/jsonapi.h b/src/include/utils/jsonapi.h
+index e39572e00f2e..b28201c2bc65 100644
+--- a/src/include/utils/jsonapi.h
++++ b/src/include/utils/jsonapi.h
+@@ -132,15 +132,28 @@ extern JsonLexContext *makeJsonLexContextCstringLen(char *json,
+  */
+ extern bool IsValidJsonNumber(const char *str, int len);
+ 
+-/* an action that will be applied to each value in iterate_json(b)_string_vaues functions */
++/*
++ * Flag types for iterate_json(b)_values to specify what elements from a
++ * json(b) document we want to iterate.
++ */
++typedef enum JsonToIndex {
++	jtiKey		= 0x01,
++	jtiString	= 0x02,
++	jtiNumeric	= 0x04,
++	jtiBool		= 0x08,
++	jtiAll		= jtiKey | jtiString | jtiNumeric | jtiBool
++} JsonToIndex;
++
++/* an action that will be applied to each value in iterate_json(b)_vaues functions */
+ typedef void (*JsonIterateStringValuesAction) (void *state, char *elem_value, int elem_len);
+ 
+-/* an action that will be applied to each value in transform_json(b)_string_values functions */
++/* an action that will be applied to each value in transform_json(b)_values functions */
+ typedef text *(*JsonTransformStringValuesAction) (void *state, char *elem_value, int elem_len);
+ 
+-extern void iterate_jsonb_string_values(Jsonb *jb, void *state,
++extern uint32 parse_jsonb_index_flags(Jsonb *jb);
++extern void iterate_jsonb_values(Jsonb *jb, uint32 flags, void *state,
+ 							JsonIterateStringValuesAction action);
+-extern void iterate_json_string_values(text *json, void *action_state,
++extern void iterate_json_values(text *json, uint32 flags, void *action_state,
+ 						   JsonIterateStringValuesAction action);
+ extern Jsonb *transform_jsonb_string_values(Jsonb *jsonb, void *action_state,
+ 							  JsonTransformStringValuesAction transform_action);
+diff --git a/src/test/regress/expected/json.out b/src/test/regress/expected/json.out
+index 06c728e363d8..54d06e38f2db 100644
+--- a/src/test/regress/expected/json.out
++++ b/src/test/regress/expected/json.out
+@@ -2324,6 +2324,86 @@ select to_tsvector('english', '{"a": "aaa in bbb ddd ccc", "b": ["the eee fff gg
+  'aaa':1 'bbb':3 'ccc':5 'ddd':4 'eee':8 'fff':9 'ggg':10 'hhh':12 'iii':13
+ (1 row)
+ 
++-- json to tsvector with numeric values
++select to_tsvector('english', '{"a": "aaa in bbb ddd ccc", "b": 123, "c": 456}'::json);
++           to_tsvector           
++---------------------------------
++ 'aaa':1 'bbb':3 'ccc':5 'ddd':4
++(1 row)
++
++-- json_to_tsvector
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"all"');
++                                    json_to_tsvector                                    
++----------------------------------------------------------------------------------------
++ '123':8 '456':12 'aaa':2 'b':6 'bbb':4 'c':10 'd':14 'f':18 'fals':20 'g':22 'true':16
++(1 row)
++
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"key"');
++        json_to_tsvector        
++--------------------------------
++ 'b':2 'c':4 'd':6 'f':8 'g':10
++(1 row)
++
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"string"');
++ json_to_tsvector 
++------------------
++ 'aaa':1 'bbb':3
++(1 row)
++
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"numeric"');
++ json_to_tsvector 
++------------------
++ '123':1 '456':3
++(1 row)
++
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"boolean"');
++ json_to_tsvector  
++-------------------
++ 'fals':3 'true':1
++(1 row)
++
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '["string", "numeric"]');
++        json_to_tsvector         
++---------------------------------
++ '123':5 '456':7 'aaa':1 'bbb':3
++(1 row)
++
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"all"');
++                                    json_to_tsvector                                    
++----------------------------------------------------------------------------------------
++ '123':8 '456':12 'aaa':2 'b':6 'bbb':4 'c':10 'd':14 'f':18 'fals':20 'g':22 'true':16
++(1 row)
++
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"key"');
++        json_to_tsvector        
++--------------------------------
++ 'b':2 'c':4 'd':6 'f':8 'g':10
++(1 row)
++
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"string"');
++ json_to_tsvector 
++------------------
++ 'aaa':1 'bbb':3
++(1 row)
++
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"numeric"');
++ json_to_tsvector 
++------------------
++ '123':1 '456':3
++(1 row)
++
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"boolean"');
++ json_to_tsvector  
++-------------------
++ 'fals':3 'true':1
++(1 row)
++
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '["string", "numeric"]');
++        json_to_tsvector         
++---------------------------------
++ '123':5 '456':7 'aaa':1 'bbb':3
++(1 row)
++
+ -- ts_vector corner cases
+ select to_tsvector('""'::json);
+  to_tsvector 
+@@ -2349,6 +2429,48 @@ select to_tsvector('null'::json);
+  
+ (1 row)
+ 
++-- json_to_tsvector corner cases
++select json_to_tsvector('""'::json, '"all"');
++ json_to_tsvector 
++------------------
++ 
++(1 row)
++
++select json_to_tsvector('{}'::json, '"all"');
++ json_to_tsvector 
++------------------
++ 
++(1 row)
++
++select json_to_tsvector('[]'::json, '"all"');
++ json_to_tsvector 
++------------------
++ 
++(1 row)
++
++select json_to_tsvector('null'::json, '"all"');
++ json_to_tsvector 
++------------------
++ 
++(1 row)
++
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '""');
++ERROR:  wrong flag in flag array: ""
++HINT:  Possible values are: "string", "numeric", "boolean", "key" and "all"
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '{}');
++ERROR:  wrong flag type, only arrays and scalars are allowed
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '[]');
++ json_to_tsvector 
++------------------
++ 
++(1 row)
++
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, 'null');
++ERROR:  flag array element is not a string
++HINT:  Possible values are: "string", "numeric", "boolean", "key" and "all"
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '["all", null]');
++ERROR:  flag array element is not a string
++HINT:  Possible values are: "string", "numeric", "boolean", "key" and "all"
+ -- ts_headline for json
+ select ts_headline('{"a": "aaa bbb", "b": {"c": "ccc ddd fff", "c1": "ccc1 ddd1"}, "d": ["ggg hhh", "iii jjj"]}'::json, tsquery('bbb & ddd & hhh'));
+                                                ts_headline                                               
+diff --git a/src/test/regress/expected/jsonb.out b/src/test/regress/expected/jsonb.out
+index f8d6e6f7ccd1..dd9ae4f7a092 100644
+--- a/src/test/regress/expected/jsonb.out
++++ b/src/test/regress/expected/jsonb.out
+@@ -4122,6 +4122,86 @@ select to_tsvector('english', '{"a": "aaa in bbb ddd ccc", "b": ["the eee fff gg
+  'aaa':1 'bbb':3 'ccc':5 'ddd':4 'eee':8 'fff':9 'ggg':10 'hhh':12 'iii':13
+ (1 row)
+ 
++-- jsonb to tsvector with numeric values
++select to_tsvector('english', '{"a": "aaa in bbb ddd ccc", "b": 123, "c": 456}'::jsonb);
++           to_tsvector           
++---------------------------------
++ 'aaa':1 'bbb':3 'ccc':5 'ddd':4
++(1 row)
++
++-- jsonb_to_tsvector
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"all"');
++                                   jsonb_to_tsvector                                    
++----------------------------------------------------------------------------------------
++ '123':8 '456':12 'aaa':2 'b':6 'bbb':4 'c':10 'd':14 'f':18 'fals':20 'g':22 'true':16
++(1 row)
++
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"key"');
++       jsonb_to_tsvector        
++--------------------------------
++ 'b':2 'c':4 'd':6 'f':8 'g':10
++(1 row)
++
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"string"');
++ jsonb_to_tsvector 
++-------------------
++ 'aaa':1 'bbb':3
++(1 row)
++
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"numeric"');
++ jsonb_to_tsvector 
++-------------------
++ '123':1 '456':3
++(1 row)
++
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"boolean"');
++ jsonb_to_tsvector 
++-------------------
++ 'fals':3 'true':1
++(1 row)
++
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '["string", "numeric"]');
++        jsonb_to_tsvector        
++---------------------------------
++ '123':5 '456':7 'aaa':1 'bbb':3
++(1 row)
++
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"all"');
++                                   jsonb_to_tsvector                                    
++----------------------------------------------------------------------------------------
++ '123':8 '456':12 'aaa':2 'b':6 'bbb':4 'c':10 'd':14 'f':18 'fals':20 'g':22 'true':16
++(1 row)
++
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"key"');
++       jsonb_to_tsvector        
++--------------------------------
++ 'b':2 'c':4 'd':6 'f':8 'g':10
++(1 row)
++
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"string"');
++ jsonb_to_tsvector 
++-------------------
++ 'aaa':1 'bbb':3
++(1 row)
++
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"numeric"');
++ jsonb_to_tsvector 
++-------------------
++ '123':1 '456':3
++(1 row)
++
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"boolean"');
++ jsonb_to_tsvector 
++-------------------
++ 'fals':3 'true':1
++(1 row)
++
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '["string", "numeric"]');
++        jsonb_to_tsvector        
++---------------------------------
++ '123':5 '456':7 'aaa':1 'bbb':3
++(1 row)
++
+ -- ts_vector corner cases
+ select to_tsvector('""'::jsonb);
+  to_tsvector 
+@@ -4147,6 +4227,48 @@ select to_tsvector('null'::jsonb);
+  
+ (1 row)
+ 
++-- jsonb_to_tsvector corner cases
++select jsonb_to_tsvector('""'::jsonb, '"all"');
++ jsonb_to_tsvector 
++-------------------
++ 
++(1 row)
++
++select jsonb_to_tsvector('{}'::jsonb, '"all"');
++ jsonb_to_tsvector 
++-------------------
++ 
++(1 row)
++
++select jsonb_to_tsvector('[]'::jsonb, '"all"');
++ jsonb_to_tsvector 
++-------------------
++ 
++(1 row)
++
++select jsonb_to_tsvector('null'::jsonb, '"all"');
++ jsonb_to_tsvector 
++-------------------
++ 
++(1 row)
++
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '""');
++ERROR:  wrong flag in flag array: ""
++HINT:  Possible values are: "string", "numeric", "boolean", "key" and "all"
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '{}');
++ERROR:  wrong flag type, only arrays and scalars are allowed
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '[]');
++ jsonb_to_tsvector 
++-------------------
++ 
++(1 row)
++
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, 'null');
++ERROR:  flag array element is not a string
++HINT:  Possible values are: "string", "numeric", "boolean", "key" and "all"
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '["all", null]');
++ERROR:  flag array element is not a string
++HINT:  Possible values are: "string", "numeric", "boolean", "key" and "all"
+ -- ts_headline for jsonb
+ select ts_headline('{"a": "aaa bbb", "b": {"c": "ccc ddd fff", "c1": "ccc1 ddd1"}, "d": ["ggg hhh", "iii jjj"]}'::jsonb, tsquery('bbb & ddd & hhh'));
+                                                    ts_headline                                                    
+diff --git a/src/test/regress/sql/json.sql b/src/test/regress/sql/json.sql
+index 256652c41f70..add1e01cbaa8 100644
+--- a/src/test/regress/sql/json.sql
++++ b/src/test/regress/sql/json.sql
+@@ -763,12 +763,42 @@ select to_tsvector('simple', '{"a": "aaa bbb ddd ccc", "b": ["eee fff ggg"], "c"
+ -- json to tsvector with stop words
+ select to_tsvector('english', '{"a": "aaa in bbb ddd ccc", "b": ["the eee fff ggg"], "c": {"d": "hhh. iii"}}'::json);
+ 
++-- json to tsvector with numeric values
++select to_tsvector('english', '{"a": "aaa in bbb ddd ccc", "b": 123, "c": 456}'::json);
++
++-- json_to_tsvector
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"all"');
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"key"');
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"string"');
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"numeric"');
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"boolean"');
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '["string", "numeric"]');
++
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"all"');
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"key"');
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"string"');
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"numeric"');
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '"boolean"');
++select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '["string", "numeric"]');
++
+ -- ts_vector corner cases
+ select to_tsvector('""'::json);
+ select to_tsvector('{}'::json);
+ select to_tsvector('[]'::json);
+ select to_tsvector('null'::json);
+ 
++-- json_to_tsvector corner cases
++select json_to_tsvector('""'::json, '"all"');
++select json_to_tsvector('{}'::json, '"all"');
++select json_to_tsvector('[]'::json, '"all"');
++select json_to_tsvector('null'::json, '"all"');
++
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '""');
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '{}');
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '[]');
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, 'null');
++select json_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '["all", null]');
++
+ -- ts_headline for json
+ select ts_headline('{"a": "aaa bbb", "b": {"c": "ccc ddd fff", "c1": "ccc1 ddd1"}, "d": ["ggg hhh", "iii jjj"]}'::json, tsquery('bbb & ddd & hhh'));
+ select ts_headline('english', '{"a": "aaa bbb", "b": {"c": "ccc ddd fff"}, "d": ["ggg hhh", "iii jjj"]}'::json, tsquery('bbb & ddd & hhh'));
+diff --git a/src/test/regress/sql/jsonb.sql b/src/test/regress/sql/jsonb.sql
+index 2439f949bd51..f31dd2ac759c 100644
+--- a/src/test/regress/sql/jsonb.sql
++++ b/src/test/regress/sql/jsonb.sql
+@@ -1089,12 +1089,42 @@ select to_tsvector('simple', '{"a": "aaa bbb ddd ccc", "b": ["eee fff ggg"], "c"
+ -- jsonb to tsvector with stop words
+ select to_tsvector('english', '{"a": "aaa in bbb ddd ccc", "b": ["the eee fff ggg"], "c": {"d": "hhh. iii"}}'::jsonb);
+ 
++-- jsonb to tsvector with numeric values
++select to_tsvector('english', '{"a": "aaa in bbb ddd ccc", "b": 123, "c": 456}'::jsonb);
++
++-- jsonb_to_tsvector
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"all"');
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"key"');
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"string"');
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"numeric"');
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"boolean"');
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '["string", "numeric"]');
++
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"all"');
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"key"');
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"string"');
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"numeric"');
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '"boolean"');
++select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '["string", "numeric"]');
++
+ -- ts_vector corner cases
+ select to_tsvector('""'::jsonb);
+ select to_tsvector('{}'::jsonb);
+ select to_tsvector('[]'::jsonb);
+ select to_tsvector('null'::jsonb);
+ 
++-- jsonb_to_tsvector corner cases
++select jsonb_to_tsvector('""'::jsonb, '"all"');
++select jsonb_to_tsvector('{}'::jsonb, '"all"');
++select jsonb_to_tsvector('[]'::jsonb, '"all"');
++select jsonb_to_tsvector('null'::jsonb, '"all"');
++
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '""');
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '{}');
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '[]');
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, 'null');
++select jsonb_to_tsvector('{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '["all", null]');
++
+ -- ts_headline for jsonb
+ select ts_headline('{"a": "aaa bbb", "b": {"c": "ccc ddd fff", "c1": "ccc1 ddd1"}, "d": ["ggg hhh", "iii jjj"]}'::jsonb, tsquery('bbb & ddd & hhh'));
+ select ts_headline('english', '{"a": "aaa bbb", "b": {"c": "ccc ddd fff"}, "d": ["ggg hhh", "iii jjj"]}'::jsonb, tsquery('bbb & ddd & hhh'));

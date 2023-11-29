@@ -1,0 +1,176 @@
+From 1fa846f1c9afe6bb185d4bb60bed8102a8eacb8f Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Thu, 2 Jan 2020 17:04:24 -0300
+Subject: [PATCH] Fix cloning of row triggers to sub-partitions
+
+When row triggers exist in partitioned partitions that are not either
+part of FKs or deferred unique constraints, they are not correctly
+cloned to their partitions.  That's because they are marked "internal",
+and those are purposefully skipped when doing the clone triggers dance.
+Fix by relaxing the condition on which internal triggers are skipped.
+
+Amit Langote initially diagnosed the problem and proposed a fix, but I
+used a different approach.
+
+Reported-by: Petr Fedorov
+Discussion: https://postgr.es/m/6b3f0646-ba8c-b3a9-c62d-1c6651a1920f@phystech.edu
+---
+ src/backend/commands/tablecmds.c       | 65 +++++++++++++++++++++++++-
+ src/test/regress/expected/triggers.out | 36 ++++++++------
+ src/test/regress/sql/triggers.sql      |  4 ++
+ 3 files changed, 90 insertions(+), 15 deletions(-)
+
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index 01bc292ada0b..1c4394abea15 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -15931,6 +15931,54 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
+ 	MemoryContextDelete(cxt);
+ }
+ 
++/*
++ * isPartitionTrigger
++ *		Subroutine for CloneRowTriggersToPartition: determine whether
++ *		the given trigger has been cloned from another one.
++ *
++ * We use pg_depend as a proxy for this, since we don't have any direct
++ * evidence.  This is an ugly hack to cope with a catalog deficiency.
++ * Keep away from children.  Do not stare with naked eyes.  Do not propagate.
++ */
++static bool
++isPartitionTrigger(Oid trigger_oid)
++{
++	Relation	pg_depend;
++	ScanKeyData key[2];
++	SysScanDesc	scan;
++	HeapTuple	tup;
++	bool		found = false;
++
++	pg_depend = table_open(DependRelationId, AccessShareLock);
++
++	ScanKeyInit(&key[0], Anum_pg_depend_classid,
++				BTEqualStrategyNumber,
++				F_OIDEQ,
++				ObjectIdGetDatum(TriggerRelationId));
++	ScanKeyInit(&key[1], Anum_pg_depend_objid,
++				BTEqualStrategyNumber,
++				F_OIDEQ,
++				ObjectIdGetDatum(trigger_oid));
++
++	scan = systable_beginscan(pg_depend, DependDependerIndexId,
++							  true, NULL, 2, key);
++	while ((tup = systable_getnext(scan)) != NULL)
++	{
++		Form_pg_depend	dep = (Form_pg_depend) GETSTRUCT(tup);
++
++		if (dep->refclassid == TriggerRelationId)
++		{
++			found = true;
++			break;
++		}
++	}
++
++	systable_endscan(scan);
++	table_close(pg_depend, AccessShareLock);
++
++	return found;
++}
++
+ /*
+  * CloneRowTriggersToPartition
+  *		subroutine for ATExecAttachPartition/DefineRelation to create row
+@@ -15971,8 +16019,21 @@ CloneRowTriggersToPartition(Relation parent, Relation partition)
+ 		if (!TRIGGER_FOR_ROW(trigForm->tgtype))
+ 			continue;
+ 
+-		/* We don't clone internal triggers, either */
+-		if (trigForm->tgisinternal)
++		/*
++		 * Internal triggers require careful examination.  Ideally, we don't
++		 * clone them.
++		 *
++		 * However, if our parent is a partitioned relation, there might be
++		 * internal triggers that need cloning.  In that case, we must
++		 * skip clone it if the trigger on parent depends on another trigger.
++		 *
++		 * Note we dare not verify that the other trigger belongs to an
++		 * ancestor relation of our parent, because that creates deadlock
++		 * opportunities.
++		 */
++		if (trigForm->tgisinternal &&
++			(!parent->rd_rel->relispartition ||
++			 !isPartitionTrigger(trigForm->oid)))
+ 			continue;
+ 
+ 		/*
+diff --git a/src/test/regress/expected/triggers.out b/src/test/regress/expected/triggers.out
+index 1e4053ceed9b..b91fbd064816 100644
+--- a/src/test/regress/expected/triggers.out
++++ b/src/test/regress/expected/triggers.out
+@@ -1981,15 +1981,22 @@ create trigger trg1 after insert on trigpart for each row execute procedure trig
+ create table trigpart2 partition of trigpart for values from (1000) to (2000);
+ create table trigpart3 (like trigpart);
+ alter table trigpart attach partition trigpart3 for values from (2000) to (3000);
++create table trigpart4 partition of trigpart for values from (3000) to (4000) partition by range (a);
++create table trigpart41 partition of trigpart4 for values from (3000) to (3500);
++create table trigpart42 (like trigpart);
++alter table trigpart4 attach partition trigpart42 for values from (3500) to (4000);
+ select tgrelid::regclass, tgname, tgfoid::regproc from pg_trigger
+   where tgrelid::regclass::text like 'trigpart%' order by tgrelid::regclass::text;
+-  tgrelid  | tgname |     tgfoid      
+------------+--------+-----------------
+- trigpart  | trg1   | trigger_nothing
+- trigpart1 | trg1   | trigger_nothing
+- trigpart2 | trg1   | trigger_nothing
+- trigpart3 | trg1   | trigger_nothing
+-(4 rows)
++  tgrelid   | tgname |     tgfoid      
++------------+--------+-----------------
++ trigpart   | trg1   | trigger_nothing
++ trigpart1  | trg1   | trigger_nothing
++ trigpart2  | trg1   | trigger_nothing
++ trigpart3  | trg1   | trigger_nothing
++ trigpart4  | trg1   | trigger_nothing
++ trigpart41 | trg1   | trigger_nothing
++ trigpart42 | trg1   | trigger_nothing
++(7 rows)
+ 
+ drop trigger trg1 on trigpart1;	-- fail
+ ERROR:  cannot drop trigger trg1 on table trigpart1 because trigger trg1 on table trigpart requires it
+@@ -2003,12 +2010,15 @@ HINT:  You can drop trigger trg1 on table trigpart instead.
+ drop table trigpart2;			-- ok, trigger should be gone in that partition
+ select tgrelid::regclass, tgname, tgfoid::regproc from pg_trigger
+   where tgrelid::regclass::text like 'trigpart%' order by tgrelid::regclass::text;
+-  tgrelid  | tgname |     tgfoid      
+------------+--------+-----------------
+- trigpart  | trg1   | trigger_nothing
+- trigpart1 | trg1   | trigger_nothing
+- trigpart3 | trg1   | trigger_nothing
+-(3 rows)
++  tgrelid   | tgname |     tgfoid      
++------------+--------+-----------------
++ trigpart   | trg1   | trigger_nothing
++ trigpart1  | trg1   | trigger_nothing
++ trigpart3  | trg1   | trigger_nothing
++ trigpart4  | trg1   | trigger_nothing
++ trigpart41 | trg1   | trigger_nothing
++ trigpart42 | trg1   | trigger_nothing
++(6 rows)
+ 
+ drop trigger trg1 on trigpart;		-- ok, all gone
+ select tgrelid::regclass, tgname, tgfoid::regproc from pg_trigger
+diff --git a/src/test/regress/sql/triggers.sql b/src/test/regress/sql/triggers.sql
+index c21b6c124e09..7cd835449c5f 100644
+--- a/src/test/regress/sql/triggers.sql
++++ b/src/test/regress/sql/triggers.sql
+@@ -1366,6 +1366,10 @@ create trigger trg1 after insert on trigpart for each row execute procedure trig
+ create table trigpart2 partition of trigpart for values from (1000) to (2000);
+ create table trigpart3 (like trigpart);
+ alter table trigpart attach partition trigpart3 for values from (2000) to (3000);
++create table trigpart4 partition of trigpart for values from (3000) to (4000) partition by range (a);
++create table trigpart41 partition of trigpart4 for values from (3000) to (3500);
++create table trigpart42 (like trigpart);
++alter table trigpart4 attach partition trigpart42 for values from (3500) to (4000);
+ select tgrelid::regclass, tgname, tgfoid::regproc from pg_trigger
+   where tgrelid::regclass::text like 'trigpart%' order by tgrelid::regclass::text;
+ drop trigger trg1 on trigpart1;	-- fail

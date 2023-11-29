@@ -1,0 +1,677 @@
+From 1d338584062b3e53b738f987ecb0d2b67745232a Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 7 Mar 2019 14:21:52 -0500
+Subject: [PATCH] Fix handling of targetlist SRFs when scan/join relation is
+ known empty.
+
+When we introduced separate ProjectSetPath nodes for application of
+set-returning functions in v10, we inadvertently broke some cases where
+we're supposed to recognize that the result of a subquery is known to be
+empty (contain zero rows).  That's because IS_DUMMY_REL was just looking
+for a childless AppendPath without allowing for a ProjectSetPath being
+possibly stuck on top.  In itself, this didn't do anything much worse
+than produce slightly worse plans for some corner cases.
+
+Then in v11, commit 11cf92f6e rearranged things to allow the scan/join
+targetlist to be applied directly to partial paths before they get
+gathered.  But it inserted a short-circuit path for dummy relations
+that was a little too short: it failed to insert a ProjectSetPath node
+at all for a targetlist containing set-returning functions, resulting in
+bogus "set-valued function called in context that cannot accept a set"
+errors, as reported in bug #15669 from Madelaine Thibaut.
+
+The best way to fix this mess seems to be to reimplement IS_DUMMY_REL
+so that it drills down through any ProjectSetPath nodes that might be
+there (and it seems like we'd better allow for ProjectionPath as well).
+
+While we're at it, make it look at rel->pathlist not cheapest_total_path,
+so that it gives the right answer independently of whether set_cheapest
+has been done lately.  That dependency looks pretty shaky in the context
+of code like apply_scanjoin_target_to_paths, and even if it's not broken
+today it'd certainly bite us at some point.  (Nastily, unsafe use of the
+old coding would almost always work; the hazard comes down to possibly
+looking through a dangling pointer, and only once in a blue moon would
+you find something there that resulted in the wrong answer.)
+
+It now looks like it was a mistake for IS_DUMMY_REL to be a macro: if
+there are any extensions using it, they'll continue to use the old
+inadequate logic until they're recompiled, after which they'll fail
+to load into server versions predating this fix.  Hopefully there are
+few such extensions.
+
+Having fixed IS_DUMMY_REL, the special path for dummy rels in
+apply_scanjoin_target_to_paths is unnecessary as well as being wrong,
+so we can just drop it.
+
+Also change a few places that were testing for partitioned-ness of a
+planner relation but not using IS_PARTITIONED_REL for the purpose; that
+seems unsafe as well as inconsistent, plus it required an ugly hack in
+apply_scanjoin_target_to_paths.
+
+In passing, save a few cycles in apply_scanjoin_target_to_paths by
+skipping processing of pre-existing paths for partitioned rels,
+and do some cosmetic cleanup and comment adjustment in that function.
+
+I renamed IS_DUMMY_PATH to IS_DUMMY_APPEND with the intention of breaking
+any code that might be using it, since in almost every case that would
+be wrong; IS_DUMMY_REL is what to be using instead.
+
+In HEAD, also make set_dummy_rel_pathlist static (since it's no longer
+used from outside allpaths.c), and delete is_dummy_plan, since it's no
+longer used anywhere.
+
+Back-patch as appropriate into v11 and v10.
+
+Tom Lane and Julien Rouhaud
+
+Discussion: https://postgr.es/m/15669-02fb3296cca26203@postgresql.org
+---
+ src/backend/optimizer/path/allpaths.c   |  24 ++--
+ src/backend/optimizer/path/joinrels.c   |  33 ++++-
+ src/backend/optimizer/plan/createplan.c |  11 +-
+ src/backend/optimizer/plan/planner.c    | 180 ++++++++++--------------
+ src/include/nodes/pathnodes.h           |  25 ++--
+ src/include/optimizer/paths.h           |   1 -
+ src/include/optimizer/planner.h         |   2 -
+ src/test/regress/expected/tsrf.out      |  33 +++++
+ src/test/regress/sql/tsrf.sql           |  12 ++
+ 9 files changed, 182 insertions(+), 139 deletions(-)
+
+diff --git a/src/backend/optimizer/path/allpaths.c b/src/backend/optimizer/path/allpaths.c
+index 0debac75c626..d8ba7add1363 100644
+--- a/src/backend/optimizer/path/allpaths.c
++++ b/src/backend/optimizer/path/allpaths.c
+@@ -105,6 +105,7 @@ static Path *get_cheapest_parameterized_child_path(PlannerInfo *root,
+ 									  Relids required_outer);
+ static void accumulate_append_subpath(Path *path,
+ 						  List **subpaths, List **special_subpaths);
++static void set_dummy_rel_pathlist(RelOptInfo *rel);
+ static void set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
+ 					  Index rti, RangeTblEntry *rte);
+ static void set_function_pathlist(PlannerInfo *root, RelOptInfo *rel,
+@@ -1557,7 +1558,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
+ 	 * Consider an append of unordered, unparameterized partial paths.  Make
+ 	 * it parallel-aware if possible.
+ 	 */
+-	if (partial_subpaths_valid)
++	if (partial_subpaths_valid && partial_subpaths != NIL)
+ 	{
+ 		AppendPath *appendpath;
+ 		ListCell   *lc;
+@@ -1954,11 +1955,13 @@ accumulate_append_subpath(Path *path, List **subpaths, List **special_subpaths)
+  *	  Build a dummy path for a relation that's been excluded by constraints
+  *
+  * Rather than inventing a special "dummy" path type, we represent this as an
+- * AppendPath with no members (see also IS_DUMMY_PATH/IS_DUMMY_REL macros).
++ * AppendPath with no members (see also IS_DUMMY_APPEND/IS_DUMMY_REL macros).
+  *
+- * This is exported because inheritance_planner() has need for it.
++ * (See also mark_dummy_rel, which does basically the same thing, but is
++ * typically used to change a rel into dummy state after we already made
++ * paths for it.)
+  */
+-void
++static void
+ set_dummy_rel_pathlist(RelOptInfo *rel)
+ {
+ 	/* Set dummy size estimates --- we leave attr_widths[] as zeroes */
+@@ -1969,14 +1972,15 @@ set_dummy_rel_pathlist(RelOptInfo *rel)
+ 	rel->pathlist = NIL;
+ 	rel->partial_pathlist = NIL;
+ 
++	/* Set up the dummy path */
+ 	add_path(rel, (Path *) create_append_path(NULL, rel, NIL, NIL, NULL,
+ 											  0, false, NIL, -1));
+ 
+ 	/*
+-	 * We set the cheapest path immediately, to ensure that IS_DUMMY_REL()
+-	 * will recognize the relation as dummy if anyone asks.  This is redundant
+-	 * when we're called from set_rel_size(), but not when called from
+-	 * elsewhere, and doing it twice is harmless anyway.
++	 * We set the cheapest-path fields immediately, just in case they were
++	 * pointing at some discarded path.  This is redundant when we're called
++	 * from set_rel_size(), but not when called from elsewhere, and doing it
++	 * twice is harmless anyway.
+ 	 */
+ 	set_cheapest(rel);
+ }
+@@ -3532,12 +3536,12 @@ generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
+ 		/* Add partitionwise join paths for partitioned child-joins. */
+ 		generate_partitionwise_join_paths(root, child_rel);
+ 
++		set_cheapest(child_rel);
++
+ 		/* Dummy children will not be scanned, so ignore those. */
+ 		if (IS_DUMMY_REL(child_rel))
+ 			continue;
+ 
+-		set_cheapest(child_rel);
+-
+ #ifdef OPTIMIZER_DEBUG
+ 		debug_print_rel(root, child_rel);
+ #endif
+diff --git a/src/backend/optimizer/path/joinrels.c b/src/backend/optimizer/path/joinrels.c
+index dfbbfdac6d74..699a34d6cfed 100644
+--- a/src/backend/optimizer/path/joinrels.c
++++ b/src/backend/optimizer/path/joinrels.c
+@@ -34,7 +34,6 @@ static void make_rels_by_clauseless_joins(PlannerInfo *root,
+ 							  ListCell *other_rels);
+ static bool has_join_restriction(PlannerInfo *root, RelOptInfo *rel);
+ static bool has_legal_joinclause(PlannerInfo *root, RelOptInfo *rel);
+-static bool is_dummy_rel(RelOptInfo *rel);
+ static bool restriction_is_constant_false(List *restrictlist,
+ 							  RelOptInfo *joinrel,
+ 							  bool only_pushed_down);
+@@ -1196,10 +1195,38 @@ have_dangerous_phv(PlannerInfo *root,
+ /*
+  * is_dummy_rel --- has relation been proven empty?
+  */
+-static bool
++bool
+ is_dummy_rel(RelOptInfo *rel)
+ {
+-	return IS_DUMMY_REL(rel);
++	Path	   *path;
++
++	/*
++	 * A rel that is known dummy will have just one path that is a childless
++	 * Append.  (Even if somehow it has more paths, a childless Append will
++	 * have cost zero and hence should be at the front of the pathlist.)
++	 */
++	if (rel->pathlist == NIL)
++		return false;
++	path = (Path *) linitial(rel->pathlist);
++
++	/*
++	 * Initially, a dummy path will just be a childless Append.  But in later
++	 * planning stages we might stick a ProjectSetPath and/or ProjectionPath
++	 * on top, since Append can't project.  Rather than make assumptions about
++	 * which combinations can occur, just descend through whatever we find.
++	 */
++	for (;;)
++	{
++		if (IsA(path, ProjectionPath))
++			path = ((ProjectionPath *) path)->subpath;
++		else if (IsA(path, ProjectSetPath))
++			path = ((ProjectSetPath *) path)->subpath;
++		else
++			break;
++	}
++	if (IS_DUMMY_APPEND(path))
++		return true;
++	return false;
+ }
+ 
+ /*
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index 236f506cfb2e..9fbe5b2a5fbe 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -1072,7 +1072,7 @@ create_append_plan(PlannerInfo *root, AppendPath *best_path)
+ 	 *
+ 	 * Note that an AppendPath with no members is also generated in certain
+ 	 * cases where there was no appending construct at all, but we know the
+-	 * relation is empty (see set_dummy_rel_pathlist).
++	 * relation is empty (see set_dummy_rel_pathlist and mark_dummy_rel).
+ 	 */
+ 	if (best_path->subpaths == NIL)
+ 	{
+@@ -6585,12 +6585,11 @@ is_projection_capable_path(Path *path)
+ 		case T_Append:
+ 
+ 			/*
+-			 * Append can't project, but if it's being used to represent a
+-			 * dummy path, claim that it can project.  This prevents us from
+-			 * converting a rel from dummy to non-dummy status by applying a
+-			 * projection to its dummy path.
++			 * Append can't project, but if an AppendPath is being used to
++			 * represent a dummy path, what will actually be generated is a
++			 * Result which can project.
+ 			 */
+-			return IS_DUMMY_PATH(path);
++			return IS_DUMMY_APPEND(path);
+ 		case T_ProjectSet:
+ 
+ 			/*
+diff --git a/src/backend/optimizer/plan/planner.c b/src/backend/optimizer/plan/planner.c
+index 98dd5281ad56..5e3a7120ffdc 100644
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -1521,7 +1521,7 @@ inheritance_planner(PlannerInfo *root)
+ 		 * If this child rel was excluded by constraint exclusion, exclude it
+ 		 * from the result plan.
+ 		 */
+-		if (IS_DUMMY_PATH(subpath))
++		if (IS_DUMMY_REL(sub_final_rel))
+ 			continue;
+ 
+ 		/*
+@@ -2512,38 +2512,6 @@ remap_to_groupclause_idx(List *groupClause,
+ }
+ 
+ 
+-
+-/*
+- * Detect whether a plan node is a "dummy" plan created when a relation
+- * is deemed not to need scanning due to constraint exclusion.
+- *
+- * Currently, such dummy plans are Result nodes with constant FALSE
+- * filter quals (see set_dummy_rel_pathlist and create_append_plan).
+- *
+- * XXX this probably ought to be somewhere else, but not clear where.
+- */
+-bool
+-is_dummy_plan(Plan *plan)
+-{
+-	if (IsA(plan, Result))
+-	{
+-		List	   *rcqual = (List *) ((Result *) plan)->resconstantqual;
+-
+-		if (list_length(rcqual) == 1)
+-		{
+-			Const	   *constqual = (Const *) linitial(rcqual);
+-
+-			if (constqual && IsA(constqual, Const))
+-			{
+-				if (!constqual->constisnull &&
+-					!DatumGetBool(constqual->constvalue))
+-					return true;
+-			}
+-		}
+-	}
+-	return false;
+-}
+-
+ /*
+  * preprocess_rowmarks - set up PlanRowMarks if needed
+  */
+@@ -3967,12 +3935,10 @@ create_ordinary_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
+ 	 * If this is the topmost grouping relation or if the parent relation is
+ 	 * doing some form of partitionwise aggregation, then we may be able to do
+ 	 * it at this level also.  However, if the input relation is not
+-	 * partitioned, partitionwise aggregate is impossible, and if it is dummy,
+-	 * partitionwise aggregate is pointless.
++	 * partitioned, partitionwise aggregate is impossible.
+ 	 */
+ 	if (extra->patype != PARTITIONWISE_AGGREGATE_NONE &&
+-		input_rel->part_scheme && input_rel->part_rels &&
+-		!IS_DUMMY_REL(input_rel))
++		IS_PARTITIONED_REL(input_rel))
+ 	{
+ 		/*
+ 		 * If this is the topmost relation or if the parent relation is doing
+@@ -6905,12 +6871,34 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
+ 							   bool scanjoin_target_parallel_safe,
+ 							   bool tlist_same_exprs)
+ {
+-	ListCell   *lc;
++	bool		rel_is_partitioned = IS_PARTITIONED_REL(rel);
+ 	PathTarget *scanjoin_target;
+-	bool		is_dummy_rel = IS_DUMMY_REL(rel);
++	ListCell   *lc;
+ 
++	/* This recurses, so be paranoid. */
+ 	check_stack_depth();
+ 
++	/*
++	 * If the rel is partitioned, we want to drop its existing paths and
++	 * generate new ones.  This function would still be correct if we kept the
++	 * existing paths: we'd modify them to generate the correct target above
++	 * the partitioning Append, and then they'd compete on cost with paths
++	 * generating the target below the Append.  However, in our current cost
++	 * model the latter way is always the same or cheaper cost, so modifying
++	 * the existing paths would just be useless work.  Moreover, when the cost
++	 * is the same, varying roundoff errors might sometimes allow an existing
++	 * path to be picked, resulting in undesirable cross-platform plan
++	 * variations.  So we drop old paths and thereby force the work to be done
++	 * below the Append, except in the case of a non-parallel-safe target.
++	 *
++	 * Some care is needed, because we have to allow generate_gather_paths to
++	 * see the old partial paths in the next stanza.  Hence, zap the main
++	 * pathlist here, then allow generate_gather_paths to add path(s) to the
++	 * main list, and finally zap the partial pathlist.
++	 */
++	if (rel_is_partitioned)
++		rel->pathlist = NIL;
++
+ 	/*
+ 	 * If the scan/join target is not parallel-safe, partial paths cannot
+ 	 * generate it.
+@@ -6918,14 +6906,13 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
+ 	if (!scanjoin_target_parallel_safe)
+ 	{
+ 		/*
+-		 * Since we can't generate the final scan/join target, this is our
+-		 * last opportunity to use any partial paths that exist.  We don't do
+-		 * this if the case where the target is parallel-safe, since we will
+-		 * be able to generate superior paths by doing it after the final
+-		 * scan/join target has been applied.
+-		 *
+-		 * Note that this may invalidate rel->cheapest_total_path, so we must
+-		 * not rely on it after this point without first calling set_cheapest.
++		 * Since we can't generate the final scan/join target in parallel
++		 * workers, this is our last opportunity to use any partial paths that
++		 * exist; so build Gather path(s) that use them and emit whatever the
++		 * current reltarget is.  We don't do this in the case where the
++		 * target is parallel-safe, since we will be able to generate superior
++		 * paths by doing it after the final scan/join target has been
++		 * applied.
+ 		 */
+ 		generate_gather_paths(root, rel, false);
+ 
+@@ -6934,61 +6921,27 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
+ 		rel->consider_parallel = false;
+ 	}
+ 
+-	/*
+-	 * Update the reltarget.  This may not be strictly necessary in all cases,
+-	 * but it is at least necessary when create_append_path() gets called
+-	 * below directly or indirectly, since that function uses the reltarget as
+-	 * the pathtarget for the resulting path.  It seems like a good idea to do
+-	 * it unconditionally.
+-	 */
+-	rel->reltarget = llast_node(PathTarget, scanjoin_targets);
+-
+-	/* Special case: handle dummy relations separately. */
+-	if (is_dummy_rel)
+-	{
+-		/*
+-		 * Since this is a dummy rel, it's got a single Append path with no
+-		 * child paths.  Replace it with a new path having the final scan/join
+-		 * target.  (Note that since Append is not projection-capable, it
+-		 * would be bad to handle this using the general purpose code below;
+-		 * we'd end up putting a ProjectionPath on top of the existing Append
+-		 * node, which would cause this relation to stop appearing to be a
+-		 * dummy rel.)
+-		 */
+-		rel->pathlist = list_make1(create_append_path(root, rel, NIL, NIL,
+-													  NULL, 0, false, NIL,
+-													  -1));
++	/* Finish dropping old paths for a partitioned rel, per comment above */
++	if (rel_is_partitioned)
+ 		rel->partial_pathlist = NIL;
+-		set_cheapest(rel);
+-		Assert(IS_DUMMY_REL(rel));
+-
+-		/*
+-		 * Forget about any child relations.  There's no point in adjusting
+-		 * them and no point in using them for later planning stages (in
+-		 * particular, partitionwise aggregate).
+-		 */
+-		rel->nparts = 0;
+-		rel->part_rels = NULL;
+-		rel->boundinfo = NULL;
+-
+-		return;
+-	}
+ 
+ 	/* Extract SRF-free scan/join target. */
+ 	scanjoin_target = linitial_node(PathTarget, scanjoin_targets);
+ 
+ 	/*
+-	 * Adjust each input path.  If the tlist exprs are the same, we can just
+-	 * inject the sortgroupref information into the existing pathtarget.
+-	 * Otherwise, replace each path with a projection path that generates the
+-	 * SRF-free scan/join target.  This can't change the ordering of paths
+-	 * within rel->pathlist, so we just modify the list in place.
++	 * Apply the SRF-free scan/join target to each existing path.
++	 *
++	 * If the tlist exprs are the same, we can just inject the sortgroupref
++	 * information into the existing pathtargets.  Otherwise, replace each
++	 * path with a projection path that generates the SRF-free scan/join
++	 * target.  This can't change the ordering of paths within rel->pathlist,
++	 * so we just modify the list in place.
+ 	 */
+ 	foreach(lc, rel->pathlist)
+ 	{
+ 		Path	   *subpath = (Path *) lfirst(lc);
+-		Path	   *newpath;
+ 
++		/* Shouldn't have any parameterized paths anymore */
+ 		Assert(subpath->param_info == NULL);
+ 
+ 		if (tlist_same_exprs)
+@@ -6996,17 +6949,18 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
+ 				scanjoin_target->sortgrouprefs;
+ 		else
+ 		{
++			Path	   *newpath;
++
+ 			newpath = (Path *) create_projection_path(root, rel, subpath,
+ 													  scanjoin_target);
+ 			lfirst(lc) = newpath;
+ 		}
+ 	}
+ 
+-	/* Same for partial paths. */
++	/* Likewise adjust the targets for any partial paths. */
+ 	foreach(lc, rel->partial_pathlist)
+ 	{
+ 		Path	   *subpath = (Path *) lfirst(lc);
+-		Path	   *newpath;
+ 
+ 		/* Shouldn't have any parameterized paths anymore */
+ 		Assert(subpath->param_info == NULL);
+@@ -7016,39 +6970,54 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
+ 				scanjoin_target->sortgrouprefs;
+ 		else
+ 		{
+-			newpath = (Path *) create_projection_path(root,
+-													  rel,
+-													  subpath,
++			Path	   *newpath;
++
++			newpath = (Path *) create_projection_path(root, rel, subpath,
+ 													  scanjoin_target);
+ 			lfirst(lc) = newpath;
+ 		}
+ 	}
+ 
+-	/* Now fix things up if scan/join target contains SRFs */
++	/*
++	 * Now, if final scan/join target contains SRFs, insert ProjectSetPath(s)
++	 * atop each existing path.  (Note that this function doesn't look at the
++	 * cheapest-path fields, which is a good thing because they're bogus right
++	 * now.)
++	 */
+ 	if (root->parse->hasTargetSRFs)
+ 		adjust_paths_for_srfs(root, rel,
+ 							  scanjoin_targets,
+ 							  scanjoin_targets_contain_srfs);
+ 
+ 	/*
+-	 * If the relation is partitioned, recursively apply the same changes to
+-	 * all partitions and generate new Append paths.  Since Append is not
+-	 * projection-capable, that might save a separate Result node, and it also
+-	 * is important for partitionwise aggregate.
++	 * Update the rel's target to be the final (with SRFs) scan/join target.
++	 * This now matches the actual output of all the paths, and we might get
++	 * confused in createplan.c if they don't agree.  We must do this now so
++	 * that any append paths made in the next part will use the correct
++	 * pathtarget (cf. create_append_path).
+ 	 */
+-	if (rel->part_scheme && rel->part_rels)
++	rel->reltarget = llast_node(PathTarget, scanjoin_targets);
++
++	/*
++	 * If the relation is partitioned, recursively apply the scan/join target
++	 * to all partitions, and generate brand-new Append paths in which the
++	 * scan/join target is computed below the Append rather than above it.
++	 * Since Append is not projection-capable, that might save a separate
++	 * Result node, and it also is important for partitionwise aggregate.
++	 */
++	if (rel_is_partitioned)
+ 	{
+-		int			partition_idx;
+ 		List	   *live_children = NIL;
++		int			partition_idx;
+ 
+ 		/* Adjust each partition. */
+ 		for (partition_idx = 0; partition_idx < rel->nparts; partition_idx++)
+ 		{
+ 			RelOptInfo *child_rel = rel->part_rels[partition_idx];
+-			ListCell   *lc;
+ 			AppendRelInfo **appinfos;
+ 			int			nappinfos;
+ 			List	   *child_scanjoin_targets = NIL;
++			ListCell   *lc;
+ 
+ 			/* Translate scan/join targets for this child. */
+ 			appinfos = find_appinfos_by_relids(root, child_rel->relids,
+@@ -7080,8 +7049,7 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
+ 		}
+ 
+ 		/* Build new paths for this relation by appending child paths. */
+-		if (live_children != NIL)
+-			add_paths_to_append_rel(root, rel, live_children);
++		add_paths_to_append_rel(root, rel, live_children);
+ 	}
+ 
+ 	/*
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index 7b2cbdbefcb7..253e0b7e484c 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -717,15 +717,12 @@ typedef struct RelOptInfo
+  *
+  * It's not enough to test whether rel->part_scheme is set, because it might
+  * be that the basic partitioning properties of the input relations matched
+- * but the partition bounds did not.
+- *
+- * We treat dummy relations as unpartitioned.  We could alternatively
+- * treat them as partitioned, but it's not clear whether that's a useful thing
+- * to do.
++ * but the partition bounds did not.  Also, if we are able to prove a rel
++ * dummy (empty), we should henceforth treat it as unpartitioned.
+  */
+ #define IS_PARTITIONED_REL(rel) \
+ 	((rel)->part_scheme && (rel)->boundinfo && (rel)->nparts > 0 && \
+-	 (rel)->part_rels && !(IS_DUMMY_REL(rel)))
++	 (rel)->part_rels && !IS_DUMMY_REL(rel))
+ 
+ /*
+  * Convenience macro to make sure that a partitioned relation has all the
+@@ -1351,6 +1348,9 @@ typedef struct CustomPath
+  * elements.  These cases are optimized during create_append_plan.
+  * In particular, an AppendPath with no subpaths is a "dummy" path that
+  * is created to represent the case that a relation is provably empty.
++ * (This is a convenient representation because it means that when we build
++ * an appendrel and find that all its children have been excluded, no extra
++ * action is needed to recognize the relation as dummy.)
+  */
+ typedef struct AppendPath
+ {
+@@ -1363,13 +1363,16 @@ typedef struct AppendPath
+ 	int			first_partial_path;
+ } AppendPath;
+ 
+-#define IS_DUMMY_PATH(p) \
++#define IS_DUMMY_APPEND(p) \
+ 	(IsA((p), AppendPath) && ((AppendPath *) (p))->subpaths == NIL)
+ 
+-/* A relation that's been proven empty will have one path that is dummy */
+-#define IS_DUMMY_REL(r) \
+-	((r)->cheapest_total_path != NULL && \
+-	 IS_DUMMY_PATH((r)->cheapest_total_path))
++/*
++ * A relation that's been proven empty will have one path that is dummy
++ * (but might have projection paths on top).  For historical reasons,
++ * this is provided as a macro that wraps is_dummy_rel().
++ */
++#define IS_DUMMY_REL(r) is_dummy_rel(r)
++extern bool is_dummy_rel(RelOptInfo *rel);
+ 
+ /*
+  * MergeAppendPath represents a MergeAppend plan, ie, the merging of sorted
+diff --git a/src/include/optimizer/paths.h b/src/include/optimizer/paths.h
+index 040335a7c54b..36d12bc37644 100644
+--- a/src/include/optimizer/paths.h
++++ b/src/include/optimizer/paths.h
+@@ -49,7 +49,6 @@ extern PGDLLIMPORT join_search_hook_type join_search_hook;
+ 
+ 
+ extern RelOptInfo *make_one_rel(PlannerInfo *root, List *joinlist);
+-extern void set_dummy_rel_pathlist(RelOptInfo *rel);
+ extern RelOptInfo *standard_join_search(PlannerInfo *root, int levels_needed,
+ 					 List *initial_rels);
+ 
+diff --git a/src/include/optimizer/planner.h b/src/include/optimizer/planner.h
+index cb41e409dc35..830557e4c218 100644
+--- a/src/include/optimizer/planner.h
++++ b/src/include/optimizer/planner.h
+@@ -44,8 +44,6 @@ extern PlannerInfo *subquery_planner(PlannerGlobal *glob, Query *parse,
+ 				 PlannerInfo *parent_root,
+ 				 bool hasRecursion, double tuple_fraction);
+ 
+-extern bool is_dummy_plan(Plan *plan);
+-
+ extern RowMarkType select_rowmark_type(RangeTblEntry *rte,
+ 					LockClauseStrength strength);
+ 
+diff --git a/src/test/regress/expected/tsrf.out b/src/test/regress/expected/tsrf.out
+index 25be6b9ab134..d47b5f6ec574 100644
+--- a/src/test/regress/expected/tsrf.out
++++ b/src/test/regress/expected/tsrf.out
+@@ -83,6 +83,39 @@ SELECT generate_series(1, generate_series(1, 3)), generate_series(2, 4);
+ 
+ CREATE TABLE few(id int, dataa text, datab text);
+ INSERT INTO few VALUES(1, 'a', 'foo'),(2, 'a', 'bar'),(3, 'b', 'bar');
++-- SRF with a provably-dummy relation
++explain (verbose, costs off)
++SELECT unnest(ARRAY[1, 2]) FROM few WHERE false;
++              QUERY PLAN              
++--------------------------------------
++ ProjectSet
++   Output: unnest('{1,2}'::integer[])
++   ->  Result
++         One-Time Filter: false
++(4 rows)
++
++SELECT unnest(ARRAY[1, 2]) FROM few WHERE false;
++ unnest 
++--------
++(0 rows)
++
++-- SRF shouldn't prevent upper query from recognizing lower as dummy
++explain (verbose, costs off)
++SELECT * FROM few f1,
++  (SELECT unnest(ARRAY[1,2]) FROM few f2 WHERE false OFFSET 0) ss;
++                   QUERY PLAN                   
++------------------------------------------------
++ Result
++   Output: f1.id, f1.dataa, f1.datab, ss.unnest
++   One-Time Filter: false
++(3 rows)
++
++SELECT * FROM few f1,
++  (SELECT unnest(ARRAY[1,2]) FROM few f2 WHERE false OFFSET 0) ss;
++ id | dataa | datab | unnest 
++----+-------+-------+--------
++(0 rows)
++
+ -- SRF output order of sorting is maintained, if SRF is not referenced
+ SELECT few.id, generate_series(1,3) g FROM few ORDER BY id DESC;
+  id | g 
+diff --git a/src/test/regress/sql/tsrf.sql b/src/test/regress/sql/tsrf.sql
+index 0a1e8e566604..7c22529a0db0 100644
+--- a/src/test/regress/sql/tsrf.sql
++++ b/src/test/regress/sql/tsrf.sql
+@@ -28,6 +28,18 @@ SELECT generate_series(1, generate_series(1, 3)), generate_series(2, 4);
+ CREATE TABLE few(id int, dataa text, datab text);
+ INSERT INTO few VALUES(1, 'a', 'foo'),(2, 'a', 'bar'),(3, 'b', 'bar');
+ 
++-- SRF with a provably-dummy relation
++explain (verbose, costs off)
++SELECT unnest(ARRAY[1, 2]) FROM few WHERE false;
++SELECT unnest(ARRAY[1, 2]) FROM few WHERE false;
++
++-- SRF shouldn't prevent upper query from recognizing lower as dummy
++explain (verbose, costs off)
++SELECT * FROM few f1,
++  (SELECT unnest(ARRAY[1,2]) FROM few f2 WHERE false OFFSET 0) ss;
++SELECT * FROM few f1,
++  (SELECT unnest(ARRAY[1,2]) FROM few f2 WHERE false OFFSET 0) ss;
++
+ -- SRF output order of sorting is maintained, if SRF is not referenced
+ SELECT few.id, generate_series(1,3) g FROM few ORDER BY id DESC;
+ 

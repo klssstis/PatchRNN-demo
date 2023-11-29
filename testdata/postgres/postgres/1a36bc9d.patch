@@ -1,0 +1,6100 @@
+From 1a36bc9dba8eae90963a586d37b6457b32b2fed4 Mon Sep 17 00:00:00 2001
+From: Andrew Dunstan <andrew@dunslane.net>
+Date: Thu, 3 Mar 2022 13:11:14 -0500
+Subject: [PATCH] SQL/JSON query functions
+
+This introduces the SQL/JSON functions for querying JSON data using
+jsonpath expressions. The functions are:
+
+JSON_EXISTS()
+JSON_QUERY()
+JSON_VALUE()
+
+All of these functions only operate on jsonb. The workaround for now is
+to cast the argument to jsonb.
+
+JSON_EXISTS() tests if the jsonpath expression applied to the jsonb
+value yields any values. JSON_VALUE() must return a single value, and an
+error occurs if it tries to return multiple values. JSON_QUERY() must
+return a json object or array, and there are various WRAPPER options for
+handling scalar or multi-value results. Both these functions have
+options for handling EMPTY and ERROR conditions.
+
+Nikita Glukhov
+
+Reviewers have included (in no particular order) Andres Freund, Alexander
+Korotkov, Pavel Stehule, Andrew Alsup, Erik Rijkers, Zihong Yu,
+Himanshu Upadhyaya, Daniel Gustafsson, Justin Pryzby.
+
+Discussion: https://postgr.es/m/cd0bb935-0158-78a7-08b5-904886deac4b@postgrespro.ru
+---
+ src/backend/executor/execExpr.c             |  206 +++-
+ src/backend/executor/execExprInterp.c       |  543 ++++++++++
+ src/backend/jit/llvm/llvmjit_expr.c         |    6 +
+ src/backend/jit/llvm/llvmjit_types.c        |    1 +
+ src/backend/nodes/copyfuncs.c               |  150 +++
+ src/backend/nodes/equalfuncs.c              |  127 +++
+ src/backend/nodes/makefuncs.c               |   15 +
+ src/backend/nodes/nodeFuncs.c               |  186 +++-
+ src/backend/nodes/outfuncs.c                |   70 ++
+ src/backend/nodes/readfuncs.c               |   86 ++
+ src/backend/optimizer/path/costsize.c       |    3 +-
+ src/backend/optimizer/util/clauses.c        |   32 +
+ src/backend/parser/gram.y                   |  333 +++++-
+ src/backend/parser/parse_collate.c          |    4 +
+ src/backend/parser/parse_expr.c             |  490 ++++++++-
+ src/backend/parser/parse_target.c           |   15 +
+ src/backend/utils/adt/formatting.c          |   45 +-
+ src/backend/utils/adt/jsonb.c               |   62 ++
+ src/backend/utils/adt/jsonfuncs.c           |   50 +-
+ src/backend/utils/adt/jsonpath.c            |  257 +++++
+ src/backend/utils/adt/jsonpath_exec.c       |  350 ++++++-
+ src/backend/utils/adt/ruleutils.c           |  135 +++
+ src/backend/utils/misc/queryjumble.c        |   21 +
+ src/include/executor/execExpr.h             |   54 +
+ src/include/executor/executor.h             |    2 +
+ src/include/nodes/makefuncs.h               |    1 +
+ src/include/nodes/nodes.h                   |    7 +
+ src/include/nodes/parsenodes.h              |   59 ++
+ src/include/nodes/primnodes.h               |  109 ++
+ src/include/parser/kwlist.h                 |   11 +
+ src/include/utils/formatting.h              |    4 +
+ src/include/utils/jsonb.h                   |    3 +
+ src/include/utils/jsonfuncs.h               |    4 +
+ src/include/utils/jsonpath.h                |   33 +
+ src/test/regress/expected/json_sqljson.out  |   15 +
+ src/test/regress/expected/jsonb_sqljson.out | 1018 +++++++++++++++++++
+ src/test/regress/parallel_schedule          |    2 +-
+ src/test/regress/sql/json_sqljson.sql       |   11 +
+ src/test/regress/sql/jsonb_sqljson.sql      |  317 ++++++
+ 39 files changed, 4716 insertions(+), 121 deletions(-)
+ create mode 100644 src/test/regress/expected/json_sqljson.out
+ create mode 100644 src/test/regress/expected/jsonb_sqljson.out
+ create mode 100644 src/test/regress/sql/json_sqljson.sql
+ create mode 100644 src/test/regress/sql/jsonb_sqljson.sql
+
+diff --git a/src/backend/executor/execExpr.c b/src/backend/executor/execExpr.c
+index acd3ea613440..1c364a7f4c59 100644
+--- a/src/backend/executor/execExpr.c
++++ b/src/backend/executor/execExpr.c
+@@ -47,6 +47,7 @@
+ #include "utils/array.h"
+ #include "utils/builtins.h"
+ #include "utils/datum.h"
++#include "utils/jsonpath.h"
+ #include "utils/lsyscache.h"
+ #include "utils/typcache.h"
+ 
+@@ -85,6 +86,40 @@ static void ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
+ 								  bool nullcheck);
+ 
+ 
++static ExprState *
++ExecInitExprInternal(Expr *node, PlanState *parent, ParamListInfo ext_params,
++					 Datum *caseval, bool *casenull)
++{
++	ExprState  *state;
++	ExprEvalStep scratch = {0};
++
++	/* Special case: NULL expression produces a NULL ExprState pointer */
++	if (node == NULL)
++		return NULL;
++
++	/* Initialize ExprState with empty step list */
++	state = makeNode(ExprState);
++	state->expr = node;
++	state->parent = parent;
++	state->ext_params = ext_params;
++	state->innermost_caseval = caseval;
++	state->innermost_casenull = casenull;
++
++	/* Insert EEOP_*_FETCHSOME steps as needed */
++	ExecInitExprSlots(state, (Node *) node);
++
++	/* Compile the expression proper */
++	ExecInitExprRec(node, state, &state->resvalue, &state->resnull);
++
++	/* Finally, append a DONE step */
++	scratch.opcode = EEOP_DONE;
++	ExprEvalPushStep(state, &scratch);
++
++	ExecReadyExpr(state);
++
++	return state;
++}
++
+ /*
+  * ExecInitExpr: prepare an expression tree for execution
+  *
+@@ -122,32 +157,7 @@ static void ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
+ ExprState *
+ ExecInitExpr(Expr *node, PlanState *parent)
+ {
+-	ExprState  *state;
+-	ExprEvalStep scratch = {0};
+-
+-	/* Special case: NULL expression produces a NULL ExprState pointer */
+-	if (node == NULL)
+-		return NULL;
+-
+-	/* Initialize ExprState with empty step list */
+-	state = makeNode(ExprState);
+-	state->expr = node;
+-	state->parent = parent;
+-	state->ext_params = NULL;
+-
+-	/* Insert EEOP_*_FETCHSOME steps as needed */
+-	ExecInitExprSlots(state, (Node *) node);
+-
+-	/* Compile the expression proper */
+-	ExecInitExprRec(node, state, &state->resvalue, &state->resnull);
+-
+-	/* Finally, append a DONE step */
+-	scratch.opcode = EEOP_DONE;
+-	ExprEvalPushStep(state, &scratch);
+-
+-	ExecReadyExpr(state);
+-
+-	return state;
++	return ExecInitExprInternal(node, parent, NULL, NULL, NULL);
+ }
+ 
+ /*
+@@ -159,32 +169,20 @@ ExecInitExpr(Expr *node, PlanState *parent)
+ ExprState *
+ ExecInitExprWithParams(Expr *node, ParamListInfo ext_params)
+ {
+-	ExprState  *state;
+-	ExprEvalStep scratch = {0};
+-
+-	/* Special case: NULL expression produces a NULL ExprState pointer */
+-	if (node == NULL)
+-		return NULL;
+-
+-	/* Initialize ExprState with empty step list */
+-	state = makeNode(ExprState);
+-	state->expr = node;
+-	state->parent = NULL;
+-	state->ext_params = ext_params;
+-
+-	/* Insert EEOP_*_FETCHSOME steps as needed */
+-	ExecInitExprSlots(state, (Node *) node);
+-
+-	/* Compile the expression proper */
+-	ExecInitExprRec(node, state, &state->resvalue, &state->resnull);
+-
+-	/* Finally, append a DONE step */
+-	scratch.opcode = EEOP_DONE;
+-	ExprEvalPushStep(state, &scratch);
+-
+-	ExecReadyExpr(state);
++	return ExecInitExprInternal(node, NULL, ext_params, NULL, NULL);
++}
+ 
+-	return state;
++/*
++ * ExecInitExprWithCaseValue: prepare an expression tree for execution
++ *
++ * This is the same as ExecInitExpr, except that a pointer to the value for
++ * CasTestExpr is passed here.
++ */
++ExprState *
++ExecInitExprWithCaseValue(Expr *node, PlanState *parent,
++						  Datum *caseval, bool *casenull)
++{
++	return ExecInitExprInternal(node, parent, NULL, caseval, casenull);
+ }
+ 
+ /*
+@@ -2526,6 +2524,112 @@ ExecInitExprRec(Expr *node, ExprState *state,
+ 				break;
+ 			}
+ 
++		case T_JsonExpr:
++			{
++				JsonExpr   *jexpr = castNode(JsonExpr, node);
++				ListCell   *argexprlc;
++				ListCell   *argnamelc;
++
++				scratch.opcode = EEOP_JSONEXPR;
++				scratch.d.jsonexpr.jsexpr = jexpr;
++
++				scratch.d.jsonexpr.formatted_expr =
++					palloc(sizeof(*scratch.d.jsonexpr.formatted_expr));
++
++				ExecInitExprRec((Expr *) jexpr->formatted_expr, state,
++								&scratch.d.jsonexpr.formatted_expr->value,
++								&scratch.d.jsonexpr.formatted_expr->isnull);
++
++				scratch.d.jsonexpr.pathspec =
++					palloc(sizeof(*scratch.d.jsonexpr.pathspec));
++
++				ExecInitExprRec((Expr *) jexpr->path_spec, state,
++								&scratch.d.jsonexpr.pathspec->value,
++								&scratch.d.jsonexpr.pathspec->isnull);
++
++				scratch.d.jsonexpr.res_expr =
++					palloc(sizeof(*scratch.d.jsonexpr.res_expr));
++
++				scratch.d.jsonexpr.result_expr = jexpr->result_coercion
++					? ExecInitExprWithCaseValue((Expr *) jexpr->result_coercion->expr,
++												state->parent,
++												&scratch.d.jsonexpr.res_expr->value,
++												&scratch.d.jsonexpr.res_expr->isnull)
++					: NULL;
++
++				scratch.d.jsonexpr.default_on_empty = !jexpr->on_empty ? NULL :
++					ExecInitExpr((Expr *) jexpr->on_empty->default_expr,
++								 state->parent);
++
++				scratch.d.jsonexpr.default_on_error =
++					ExecInitExpr((Expr *) jexpr->on_error->default_expr,
++								 state->parent);
++
++				if (jexpr->omit_quotes ||
++					(jexpr->result_coercion && jexpr->result_coercion->via_io))
++				{
++					Oid			typinput;
++
++					/* lookup the result type's input function */
++					getTypeInputInfo(jexpr->returning->typid, &typinput,
++									 &scratch.d.jsonexpr.input.typioparam);
++					fmgr_info(typinput, &scratch.d.jsonexpr.input.func);
++				}
++
++				scratch.d.jsonexpr.args = NIL;
++
++				forboth(argexprlc, jexpr->passing_values,
++						argnamelc, jexpr->passing_names)
++				{
++					Expr	   *argexpr = (Expr *) lfirst(argexprlc);
++					String	   *argname = lfirst_node(String, argnamelc);
++					JsonPathVariableEvalContext *var = palloc(sizeof(*var));
++
++					var->name = pstrdup(argname->sval);
++					var->typid = exprType((Node *) argexpr);
++					var->typmod = exprTypmod((Node *) argexpr);
++					var->estate = ExecInitExpr(argexpr, state->parent);
++					var->econtext = NULL;
++					var->evaluated = false;
++					var->value = (Datum) 0;
++					var->isnull = true;
++
++					scratch.d.jsonexpr.args =
++						lappend(scratch.d.jsonexpr.args, var);
++				}
++
++				scratch.d.jsonexpr.cache = NULL;
++
++				if (jexpr->coercions)
++				{
++					JsonCoercion **coercion;
++					struct JsonCoercionState *cstate;
++					Datum	   *caseval;
++					bool	   *casenull;
++
++					scratch.d.jsonexpr.coercion_expr =
++						palloc(sizeof(*scratch.d.jsonexpr.coercion_expr));
++
++					caseval = &scratch.d.jsonexpr.coercion_expr->value;
++					casenull = &scratch.d.jsonexpr.coercion_expr->isnull;
++
++					for (cstate = &scratch.d.jsonexpr.coercions.null,
++						 coercion = &jexpr->coercions->null;
++						 coercion <= &jexpr->coercions->composite;
++						 coercion++, cstate++)
++					{
++						cstate->coercion = *coercion;
++						cstate->estate = *coercion ?
++							ExecInitExprWithCaseValue((Expr *)(*coercion)->expr,
++													  state->parent,
++													  caseval, casenull) : NULL;
++					}
++				}
++
++				ExprEvalPushStep(state, &scratch);
++				break;
++			}
++
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+diff --git a/src/backend/executor/execExprInterp.c b/src/backend/executor/execExprInterp.c
+index c0bd9556209d..1215f707e284 100644
+--- a/src/backend/executor/execExprInterp.c
++++ b/src/backend/executor/execExprInterp.c
+@@ -57,14 +57,18 @@
+ #include "postgres.h"
+ 
+ #include "access/heaptoast.h"
++#include "access/xact.h"
++#include "catalog/pg_proc.h"
+ #include "catalog/pg_type.h"
+ #include "commands/sequence.h"
+ #include "executor/execExpr.h"
+ #include "executor/nodeSubplan.h"
+ #include "funcapi.h"
+ #include "miscadmin.h"
++#include "nodes/makefuncs.h"
+ #include "nodes/nodeFuncs.h"
+ #include "parser/parsetree.h"
++#include "parser/parse_expr.h"
+ #include "pgstat.h"
+ #include "utils/array.h"
+ #include "utils/builtins.h"
+@@ -74,8 +78,10 @@
+ #include "utils/json.h"
+ #include "utils/jsonb.h"
+ #include "utils/jsonfuncs.h"
++#include "utils/jsonpath.h"
+ #include "utils/lsyscache.h"
+ #include "utils/memutils.h"
++#include "utils/resowner.h"
+ #include "utils/timestamp.h"
+ #include "utils/typcache.h"
+ #include "utils/xml.h"
+@@ -482,6 +488,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
+ 		&&CASE_EEOP_SUBPLAN,
+ 		&&CASE_EEOP_JSON_CONSTRUCTOR,
+ 		&&CASE_EEOP_IS_JSON,
++		&&CASE_EEOP_JSONEXPR,
+ 		&&CASE_EEOP_AGG_STRICT_DESERIALIZE,
+ 		&&CASE_EEOP_AGG_DESERIALIZE,
+ 		&&CASE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS,
+@@ -1805,7 +1812,13 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
+ 		{
+ 			/* too complex for an inline implementation */
+ 			ExecEvalJsonIsPredicate(state, op);
++			EEO_NEXT();
++		}
+ 
++		EEO_CASE(EEOP_JSONEXPR)
++		{
++			/* too complex for an inline implementation */
++			ExecEvalJson(state, op, econtext);
+ 			EEO_NEXT();
+ 		}
+ 
+@@ -4523,3 +4536,533 @@ ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
+ 	*op->resvalue = res;
+ 	*op->resnull = isnull;
+ }
++
++/*
++ * Evaluate a JSON error/empty behavior result.
++ */
++static Datum
++ExecEvalJsonBehavior(ExprContext *econtext, JsonBehavior *behavior,
++					 ExprState *default_estate, bool *is_null)
++{
++	*is_null = false;
++
++	switch (behavior->btype)
++	{
++		case JSON_BEHAVIOR_EMPTY_ARRAY:
++			return JsonbPGetDatum(JsonbMakeEmptyArray());
++
++		case JSON_BEHAVIOR_EMPTY_OBJECT:
++			return JsonbPGetDatum(JsonbMakeEmptyObject());
++
++		case JSON_BEHAVIOR_TRUE:
++			return BoolGetDatum(true);
++
++		case JSON_BEHAVIOR_FALSE:
++			return BoolGetDatum(false);
++
++		case JSON_BEHAVIOR_NULL:
++		case JSON_BEHAVIOR_UNKNOWN:
++			*is_null = true;
++			return (Datum) 0;
++
++		case JSON_BEHAVIOR_DEFAULT:
++			return ExecEvalExpr(default_estate, econtext, is_null);
++
++		default:
++			elog(ERROR, "unrecognized SQL/JSON behavior %d", behavior->btype);
++			return (Datum) 0;
++	}
++}
++
++/*
++ * Evaluate a coercion of a JSON item to the target type.
++ */
++static Datum
++ExecEvalJsonExprCoercion(ExprEvalStep *op, ExprContext *econtext,
++						 Datum res, bool *isNull, void *p, bool *error)
++{
++	ExprState *estate = p;
++
++	if (estate)		/* coerce using specified expression */
++		return ExecEvalExpr(estate, econtext, isNull);
++
++	if (op->d.jsonexpr.jsexpr->op != JSON_EXISTS_OP)
++	{
++		JsonCoercion *coercion = op->d.jsonexpr.jsexpr->result_coercion;
++		JsonExpr   *jexpr = op->d.jsonexpr.jsexpr;
++		Jsonb	   *jb = *isNull ? NULL : DatumGetJsonbP(res);
++
++		if ((coercion && coercion->via_io) ||
++			(jexpr->omit_quotes && !*isNull &&
++			 JB_ROOT_IS_SCALAR(jb)))
++		{
++			/* strip quotes and call typinput function */
++			char	   *str = *isNull ? NULL : JsonbUnquote(jb);
++
++			return InputFunctionCall(&op->d.jsonexpr.input.func, str,
++									 op->d.jsonexpr.input.typioparam,
++									 jexpr->returning->typmod);
++		}
++		else if (coercion && coercion->via_populate)
++			return json_populate_type(res, JSONBOID,
++									  jexpr->returning->typid,
++									  jexpr->returning->typmod,
++									  &op->d.jsonexpr.cache,
++									  econtext->ecxt_per_query_memory,
++									  isNull);
++	}
++
++	if (op->d.jsonexpr.result_expr)
++	{
++		op->d.jsonexpr.res_expr->value = res;
++		op->d.jsonexpr.res_expr->isnull = *isNull;
++
++		res = ExecEvalExpr(op->d.jsonexpr.result_expr, econtext, isNull);
++	}
++
++	return res;
++}
++
++/*
++ * Evaluate a JSON path variable caching computed value.
++ */
++int
++EvalJsonPathVar(void *cxt, char *varName, int varNameLen,
++				JsonbValue *val, JsonbValue *baseObject)
++{
++	JsonPathVariableEvalContext *var = NULL;
++	List	   *vars = cxt;
++	ListCell   *lc;
++	int			id = 1;
++
++	if (!varName)
++		return list_length(vars);
++
++	foreach(lc, vars)
++	{
++		var = lfirst(lc);
++
++		if (!strncmp(var->name, varName, varNameLen))
++			break;
++
++		var = NULL;
++		id++;
++	}
++
++	if (!var)
++		return -1;
++
++	if (!var->evaluated)
++	{
++		var->value = ExecEvalExpr(var->estate, var->econtext, &var->isnull);
++		var->evaluated = true;
++	}
++
++	if (var->isnull)
++	{
++		val->type = jbvNull;
++		return 0;
++	}
++
++	JsonItemFromDatum(var->value, var->typid, var->typmod, val);
++
++	*baseObject = *val;
++	return id;
++}
++
++/*
++ * Prepare SQL/JSON item coercion to the output type. Returned a datum of the
++ * corresponding SQL type and a pointer to the coercion state.
++ */
++Datum
++ExecPrepareJsonItemCoercion(JsonbValue *item,
++							JsonReturning *returning,
++							struct JsonCoercionsState *coercions,
++							struct JsonCoercionState **pcoercion)
++{
++	struct JsonCoercionState *coercion;
++	Datum		res;
++	JsonbValue	buf;
++
++	if (item->type == jbvBinary &&
++		JsonContainerIsScalar(item->val.binary.data))
++	{
++		bool		res PG_USED_FOR_ASSERTS_ONLY;
++
++		res = JsonbExtractScalar(item->val.binary.data, &buf);
++		item = &buf;
++		Assert(res);
++	}
++
++	/* get coercion state reference and datum of the corresponding SQL type */
++	switch (item->type)
++	{
++		case jbvNull:
++			coercion = &coercions->null;
++			res = (Datum) 0;
++			break;
++
++		case jbvString:
++			coercion = &coercions->string;
++			res = PointerGetDatum(
++				cstring_to_text_with_len(item->val.string.val,
++										 item->val.string.len));
++			break;
++
++		case jbvNumeric:
++			coercion = &coercions->numeric;
++			res = NumericGetDatum(item->val.numeric);
++			break;
++
++		case jbvBool:
++			coercion = &coercions->boolean;
++			res = BoolGetDatum(item->val.boolean);
++			break;
++
++		case jbvDatetime:
++			res = item->val.datetime.value;
++			switch (item->val.datetime.typid)
++			{
++				case DATEOID:
++					coercion = &coercions->date;
++					break;
++				case TIMEOID:
++					coercion = &coercions->time;
++					break;
++				case TIMETZOID:
++					coercion = &coercions->timetz;
++					break;
++				case TIMESTAMPOID:
++					coercion = &coercions->timestamp;
++					break;
++				case TIMESTAMPTZOID:
++					coercion = &coercions->timestamptz;
++					break;
++				default:
++					elog(ERROR, "unexpected jsonb datetime type oid %d",
++						 item->val.datetime.typid);
++					return (Datum) 0;
++			}
++			break;
++
++		case jbvArray:
++		case jbvObject:
++		case jbvBinary:
++			coercion = &coercions->composite;
++			res = JsonbPGetDatum(JsonbValueToJsonb(item));
++			break;
++
++		default:
++			elog(ERROR, "unexpected jsonb value type %d", item->type);
++			return (Datum) 0;
++	}
++
++	*pcoercion = coercion;
++
++	return res;
++}
++
++typedef Datum (*JsonFunc)(ExprEvalStep *op, ExprContext *econtext,
++						  Datum item, bool *resnull, void *p, bool *error);
++
++static Datum
++ExecEvalJsonExprSubtrans(JsonFunc func, ExprEvalStep *op,
++						 ExprContext *econtext,
++						 Datum res, bool *resnull,
++						 void *p, bool *error, bool subtrans)
++{
++	MemoryContext oldcontext;
++	ResourceOwner oldowner;
++
++	if (!subtrans)
++		/* No need to use subtransactions. */
++		return func(op, econtext, res, resnull, p, error);
++
++	/*
++	 * We should catch exceptions of category ERRCODE_DATA_EXCEPTION
++	 * and execute the corresponding ON ERROR behavior then.
++	 */
++	oldcontext = CurrentMemoryContext;
++	oldowner = CurrentResourceOwner;
++
++	Assert(error);
++
++	BeginInternalSubTransaction(NULL);
++	/* Want to execute expressions inside function's memory context */
++	MemoryContextSwitchTo(oldcontext);
++
++	PG_TRY();
++	{
++		res = func(op, econtext, res, resnull, p, error);
++
++		/* Commit the inner transaction, return to outer xact context */
++		ReleaseCurrentSubTransaction();
++		MemoryContextSwitchTo(oldcontext);
++		CurrentResourceOwner = oldowner;
++	}
++	PG_CATCH();
++	{
++		ErrorData  *edata;
++
++		/* Save error info in oldcontext */
++		MemoryContextSwitchTo(oldcontext);
++		edata = CopyErrorData();
++		FlushErrorState();
++
++		/* Abort the inner transaction */
++		RollbackAndReleaseCurrentSubTransaction();
++		MemoryContextSwitchTo(oldcontext);
++		CurrentResourceOwner = oldowner;
++
++		if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) !=
++			ERRCODE_DATA_EXCEPTION)
++			ReThrowError(edata);
++
++		res = (Datum) 0;
++		*error = true;
++	}
++	PG_END_TRY();
++
++	return res;
++}
++
++
++typedef struct
++{
++	JsonPath   *path;
++	bool	   *error;
++	bool		coercionInSubtrans;
++} ExecEvalJsonExprContext;
++
++static Datum
++ExecEvalJsonExpr(ExprEvalStep *op, ExprContext *econtext,
++				 Datum item, bool *resnull, void *pcxt,
++				 bool *error)
++{
++	ExecEvalJsonExprContext *cxt = pcxt;
++	JsonPath   *path = cxt->path;
++	JsonExpr   *jexpr = op->d.jsonexpr.jsexpr;
++	ExprState  *estate = NULL;
++	bool		empty = false;
++	Datum		res = (Datum) 0;
++
++	switch (jexpr->op)
++	{
++		case JSON_QUERY_OP:
++			res = JsonPathQuery(item, path, jexpr->wrapper, &empty, error,
++								op->d.jsonexpr.args);
++			if (error && *error)
++			{
++				*resnull = true;
++				return (Datum) 0;
++			}
++			*resnull = !DatumGetPointer(res);
++			break;
++
++		case JSON_VALUE_OP:
++			{
++				struct JsonCoercionState *jcstate;
++				JsonbValue *jbv = JsonPathValue(item, path, &empty, error,
++												op->d.jsonexpr.args);
++
++				if (error && *error)
++					return (Datum) 0;
++
++				if (!jbv)	/* NULL or empty */
++					break;
++
++				Assert(!empty);
++
++				*resnull = false;
++
++				/* coerce scalar item to the output type */
++				if (jexpr->returning->typid == JSONOID ||
++					jexpr->returning->typid == JSONBOID)
++				{
++					/* Use result coercion from json[b] to the output type */
++					res = JsonbPGetDatum(JsonbValueToJsonb(jbv));
++					break;
++				}
++
++				/* Use coercion from SQL/JSON item type to the output type */
++				res = ExecPrepareJsonItemCoercion(jbv,
++												  op->d.jsonexpr.jsexpr->returning,
++												  &op->d.jsonexpr.coercions,
++												  &jcstate);
++
++				if (jcstate->coercion &&
++					(jcstate->coercion->via_io ||
++					 jcstate->coercion->via_populate))
++				{
++					if (error)
++					{
++						*error = true;
++						return (Datum) 0;
++					}
++					/*
++					 * Coercion via I/O means here that the cast to the target
++					 * type simply does not exist.
++					 */
++					ereport(ERROR,
++							/*
++							 * XXX Standard says about a separate error code
++							 * ERRCODE_SQL_JSON_ITEM_CANNOT_BE_CAST_TO_TARGET_TYPE
++							 * but does not define its number.
++							 */
++							(errcode(ERRCODE_SQL_JSON_SCALAR_REQUIRED),
++							 errmsg("SQL/JSON item cannot be cast to target type")));
++				}
++				else if (!jcstate->estate)
++					return res;		/* no coercion */
++
++				/* coerce using specific expression */
++				estate = jcstate->estate;
++				op->d.jsonexpr.coercion_expr->value = res;
++				op->d.jsonexpr.coercion_expr->isnull = *resnull;
++				break;
++			}
++
++		case JSON_EXISTS_OP:
++			{
++				bool		exists = JsonPathExists(item, path,
++													op->d.jsonexpr.args,
++													error);
++
++				*resnull = error && *error;
++				res = BoolGetDatum(exists);
++
++				if (!op->d.jsonexpr.result_expr)
++					return res;
++
++				/* coerce using result expression */
++				estate = op->d.jsonexpr.result_expr;
++				op->d.jsonexpr.res_expr->value = res;
++				op->d.jsonexpr.res_expr->isnull = *resnull;
++				break;
++			}
++
++		default:
++			elog(ERROR, "unrecognized SQL/JSON expression op %d", jexpr->op);
++			return (Datum) 0;
++	}
++
++	if (empty)
++	{
++		Assert(jexpr->on_empty);	/* it is not JSON_EXISTS */
++
++		if (jexpr->on_empty->btype == JSON_BEHAVIOR_ERROR)
++		{
++			if (error)
++			{
++				*error = true;
++				return (Datum) 0;
++			}
++
++			ereport(ERROR,
++					(errcode(ERRCODE_NO_SQL_JSON_ITEM),
++					 errmsg("no SQL/JSON item")));
++		}
++
++		if (jexpr->on_empty->btype == JSON_BEHAVIOR_DEFAULT)
++			/*
++			 * Execute DEFAULT expression as a coercion expression, because
++			 * its result is already coerced to the target type.
++			 */
++			estate = op->d.jsonexpr.default_on_empty;
++		else
++			/* Execute ON EMPTY behavior */
++			res = ExecEvalJsonBehavior(econtext, jexpr->on_empty,
++									   op->d.jsonexpr.default_on_empty,
++									   resnull);
++	}
++
++	return ExecEvalJsonExprSubtrans(ExecEvalJsonExprCoercion, op, econtext,
++									res, resnull, estate, error,
++									cxt->coercionInSubtrans);
++}
++
++bool
++ExecEvalJsonNeedsSubTransaction(JsonExpr *jsexpr,
++								struct JsonCoercionsState *coercions)
++{
++	if (jsexpr->on_error->btype == JSON_BEHAVIOR_ERROR)
++		return false;
++
++	if (jsexpr->op == JSON_EXISTS_OP && !jsexpr->result_coercion)
++		return false;
++
++	if (!coercions)
++		return true;
++
++	return false;
++}
++
++/* ----------------------------------------------------------------
++ *		ExecEvalJson
++ * ----------------------------------------------------------------
++ */
++void
++ExecEvalJson(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
++{
++	ExecEvalJsonExprContext cxt;
++	JsonExpr   *jexpr = op->d.jsonexpr.jsexpr;
++	Datum		item;
++	Datum		res = (Datum) 0;
++	JsonPath   *path;
++	ListCell   *lc;
++	bool		error = false;
++	bool		needSubtrans;
++	bool		throwErrors = jexpr->on_error->btype == JSON_BEHAVIOR_ERROR;
++
++	*op->resnull = true;		/* until we get a result */
++	*op->resvalue = (Datum) 0;
++
++	if (op->d.jsonexpr.formatted_expr->isnull || op->d.jsonexpr.pathspec->isnull)
++	{
++		/* execute domain checks for NULLs */
++		(void) ExecEvalJsonExprCoercion(op, econtext, res, op->resnull,
++										NULL, NULL);
++
++		Assert(*op->resnull);
++		return;
++	}
++
++	item = op->d.jsonexpr.formatted_expr->value;
++	path = DatumGetJsonPathP(op->d.jsonexpr.pathspec->value);
++
++	/* reset JSON path variable contexts */
++	foreach(lc, op->d.jsonexpr.args)
++	{
++		JsonPathVariableEvalContext *var = lfirst(lc);
++
++		var->econtext = econtext;
++		var->evaluated = false;
++	}
++
++	needSubtrans = ExecEvalJsonNeedsSubTransaction(jexpr, &op->d.jsonexpr.coercions);
++
++	cxt.path = path;
++	cxt.error = throwErrors ? NULL : &error;
++	cxt.coercionInSubtrans = !needSubtrans && !throwErrors;
++	Assert(!needSubtrans || cxt.error);
++
++	res = ExecEvalJsonExprSubtrans(ExecEvalJsonExpr, op, econtext, item,
++								   op->resnull, &cxt, cxt.error,
++								   needSubtrans);
++
++	if (error)
++	{
++		/* Execute ON ERROR behavior */
++		res = ExecEvalJsonBehavior(econtext, jexpr->on_error,
++								   op->d.jsonexpr.default_on_error,
++								   op->resnull);
++
++		/* result is already coerced in DEFAULT behavior case */
++		if (jexpr->on_error->btype != JSON_BEHAVIOR_DEFAULT)
++			res = ExecEvalJsonExprCoercion(op, econtext, res,
++										   op->resnull,
++										   NULL, NULL);
++	}
++
++	*op->resvalue = res;
++}
+diff --git a/src/backend/jit/llvm/llvmjit_expr.c b/src/backend/jit/llvm/llvmjit_expr.c
+index 02511c6aecc4..9c8f341d9666 100644
+--- a/src/backend/jit/llvm/llvmjit_expr.c
++++ b/src/backend/jit/llvm/llvmjit_expr.c
+@@ -2360,6 +2360,12 @@ llvm_compile_expr(ExprState *state)
+ 				LLVMBuildBr(b, opblocks[opno + 1]);
+ 				break;
+ 
++			case EEOP_JSONEXPR:
++				build_EvalXFunc(b, mod, "ExecEvalJson",
++								v_state, op, v_econtext);
++				LLVMBuildBr(b, opblocks[opno + 1]);
++				break;
++
+ 			case EEOP_LAST:
+ 				Assert(false);
+ 				break;
+diff --git a/src/backend/jit/llvm/llvmjit_types.c b/src/backend/jit/llvm/llvmjit_types.c
+index 4d7029a27f10..b2bda868893d 100644
+--- a/src/backend/jit/llvm/llvmjit_types.c
++++ b/src/backend/jit/llvm/llvmjit_types.c
+@@ -133,6 +133,7 @@ void	   *referenced_functions[] =
+ 	ExecEvalXmlExpr,
+ 	ExecEvalJsonConstructor,
+ 	ExecEvalJsonIsPredicate,
++	ExecEvalJson,
+ 	MakeExpandedObjectReadOnlyInternal,
+ 	slot_getmissingattrs,
+ 	slot_getsomeattrs_int,
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index cb4b4d01f800..c42d2ed814c6 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -2491,6 +2491,90 @@ _copyJsonArrayQueryConstructor(const JsonArrayQueryConstructor *from)
+ 	return newnode;
+ }
+ 
++/*
++ * _copyJsonExpr
++ */
++static JsonExpr *
++_copyJsonExpr(const JsonExpr *from)
++{
++	JsonExpr    *newnode = makeNode(JsonExpr);
++
++	COPY_SCALAR_FIELD(op);
++	COPY_NODE_FIELD(formatted_expr);
++	COPY_NODE_FIELD(result_coercion);
++	COPY_NODE_FIELD(format);
++	COPY_NODE_FIELD(path_spec);
++	COPY_NODE_FIELD(passing_values);
++	COPY_NODE_FIELD(passing_names);
++	COPY_NODE_FIELD(returning);
++	COPY_NODE_FIELD(on_error);
++	COPY_NODE_FIELD(on_empty);
++	COPY_NODE_FIELD(coercions);
++	COPY_SCALAR_FIELD(wrapper);
++	COPY_SCALAR_FIELD(omit_quotes);
++	COPY_LOCATION_FIELD(location);
++
++	return newnode;
++}
++
++/*
++ * _copyJsonCoercion
++ */
++static JsonCoercion *
++_copyJsonCoercion(const JsonCoercion *from)
++{
++	JsonCoercion *newnode = makeNode(JsonCoercion);
++
++	COPY_NODE_FIELD(expr);
++	COPY_SCALAR_FIELD(via_populate);
++	COPY_SCALAR_FIELD(via_io);
++	COPY_SCALAR_FIELD(collation);
++
++	return newnode;
++}
++
++/*
++ * _copyJsonItemCoercions
++ */
++static JsonItemCoercions *
++_copyJsonItemCoercions(const JsonItemCoercions *from)
++{
++	JsonItemCoercions *newnode = makeNode(JsonItemCoercions);
++
++	COPY_NODE_FIELD(null);
++	COPY_NODE_FIELD(string);
++	COPY_NODE_FIELD(numeric);
++	COPY_NODE_FIELD(boolean);
++	COPY_NODE_FIELD(date);
++	COPY_NODE_FIELD(time);
++	COPY_NODE_FIELD(timetz);
++	COPY_NODE_FIELD(timestamp);
++	COPY_NODE_FIELD(timestamptz);
++	COPY_NODE_FIELD(composite);
++
++	return newnode;
++}
++
++/*
++ * _copyJsonFuncExpr
++ */
++static JsonFuncExpr *
++_copyJsonFuncExpr(const JsonFuncExpr *from)
++{
++	JsonFuncExpr   *newnode = makeNode(JsonFuncExpr);
++
++	COPY_SCALAR_FIELD(op);
++	COPY_NODE_FIELD(common);
++	COPY_NODE_FIELD(output);
++	COPY_NODE_FIELD(on_empty);
++	COPY_NODE_FIELD(on_error);
++	COPY_SCALAR_FIELD(wrapper);
++	COPY_SCALAR_FIELD(omit_quotes);
++	COPY_LOCATION_FIELD(location);
++
++	return newnode;
++}
++
+ /*
+  * _copyJsonIsPredicate
+  */
+@@ -2508,6 +2592,51 @@ _copyJsonIsPredicate(const JsonIsPredicate *from)
+ 	return newnode;
+ }
+ 
++/*
++ * _copyJsonBehavior
++ */
++static JsonBehavior *
++_copyJsonBehavior(const JsonBehavior *from)
++{
++	JsonBehavior   *newnode = makeNode(JsonBehavior);
++
++	COPY_SCALAR_FIELD(btype);
++	COPY_NODE_FIELD(default_expr);
++
++	return newnode;
++}
++
++/*
++ * _copyJsonCommon
++ */
++static JsonCommon *
++_copyJsonCommon(const JsonCommon *from)
++{
++	JsonCommon	   *newnode = makeNode(JsonCommon);
++
++	COPY_NODE_FIELD(expr);
++	COPY_NODE_FIELD(pathspec);
++	COPY_STRING_FIELD(pathname);
++	COPY_NODE_FIELD(passing);
++	COPY_LOCATION_FIELD(location);
++
++	return newnode;
++}
++
++/*
++ * _copyJsonArgument
++ */
++static JsonArgument *
++_copyJsonArgument(const JsonArgument *from)
++{
++	JsonArgument   *newnode = makeNode(JsonArgument);
++
++	COPY_NODE_FIELD(val);
++	COPY_STRING_FIELD(name);
++
++	return newnode;
++}
++
+ /* ****************************************************************
+  *						pathnodes.h copy functions
+  *
+@@ -5645,6 +5774,27 @@ copyObjectImpl(const void *from)
+ 		case T_JsonIsPredicate:
+ 			retval = _copyJsonIsPredicate(from);
+ 			break;
++		case T_JsonFuncExpr:
++			retval = _copyJsonFuncExpr(from);
++			break;
++		case T_JsonExpr:
++			retval = _copyJsonExpr(from);
++			break;
++		case T_JsonCommon:
++			retval = _copyJsonCommon(from);
++			break;
++		case T_JsonBehavior:
++			retval = _copyJsonBehavior(from);
++			break;
++		case T_JsonArgument:
++			retval = _copyJsonArgument(from);
++			break;
++		case T_JsonCoercion:
++			retval = _copyJsonCoercion(from);
++			break;
++		case T_JsonItemCoercions:
++			retval = _copyJsonItemCoercions(from);
++			break;
+ 
+ 			/*
+ 			 * RELATION NODES
+diff --git a/src/backend/nodes/equalfuncs.c b/src/backend/nodes/equalfuncs.c
+index 084d98b34cc8..f6dd61370c02 100644
+--- a/src/backend/nodes/equalfuncs.c
++++ b/src/backend/nodes/equalfuncs.c
+@@ -976,6 +976,42 @@ _equalJsonArrayQueryConstructor(const JsonArrayQueryConstructor *a,
+ 	return true;
+ }
+ 
++static bool
++_equalJsonFuncExpr(const JsonFuncExpr *a, const JsonFuncExpr *b)
++{
++	COMPARE_SCALAR_FIELD(op);
++	COMPARE_NODE_FIELD(common);
++	COMPARE_NODE_FIELD(output);
++	COMPARE_NODE_FIELD(on_empty);
++	COMPARE_NODE_FIELD(on_error);
++	COMPARE_SCALAR_FIELD(wrapper);
++	COMPARE_SCALAR_FIELD(omit_quotes);
++	COMPARE_LOCATION_FIELD(location);
++
++	return true;
++}
++
++static bool
++_equalJsonCommon(const JsonCommon *a, const JsonCommon *b)
++{
++	COMPARE_NODE_FIELD(expr);
++	COMPARE_NODE_FIELD(pathspec);
++	COMPARE_STRING_FIELD(pathname);
++	COMPARE_NODE_FIELD(passing);
++	COMPARE_LOCATION_FIELD(location);
++
++	return true;
++}
++
++static bool
++_equalJsonArgument(const JsonArgument *a, const JsonArgument *b)
++{
++	COMPARE_NODE_FIELD(val);
++	COMPARE_STRING_FIELD(name);
++
++	return true;
++}
++
+ static bool
+ _equalJsonIsPredicate(const JsonIsPredicate *a,
+ 					  const JsonIsPredicate *b)
+@@ -988,6 +1024,76 @@ _equalJsonIsPredicate(const JsonIsPredicate *a,
+ 	return true;
+ }
+ 
++/*
++ * _equalJsonBehavior
++ */
++static bool
++_equalJsonBehavior(const JsonBehavior *a, const JsonBehavior *b)
++{
++	COMPARE_SCALAR_FIELD(btype);
++	COMPARE_NODE_FIELD(default_expr);
++
++	return true;
++}
++
++/*
++ * _equalJsonExpr
++ */
++static bool
++_equalJsonExpr(const JsonExpr *a, const JsonExpr *b)
++{
++	COMPARE_SCALAR_FIELD(op);
++	COMPARE_NODE_FIELD(formatted_expr);
++	COMPARE_NODE_FIELD(result_coercion);
++	COMPARE_NODE_FIELD(format);
++	COMPARE_NODE_FIELD(path_spec);
++	COMPARE_NODE_FIELD(passing_values);
++	COMPARE_NODE_FIELD(passing_names);
++	COMPARE_NODE_FIELD(returning);
++	COMPARE_NODE_FIELD(on_error);
++	COMPARE_NODE_FIELD(on_empty);
++	COMPARE_NODE_FIELD(coercions);
++	COMPARE_SCALAR_FIELD(wrapper);
++	COMPARE_SCALAR_FIELD(omit_quotes);
++	COMPARE_LOCATION_FIELD(location);
++
++	return true;
++}
++
++/*
++ * _equalJsonCoercion
++ */
++static bool
++_equalJsonCoercion(const JsonCoercion *a, const JsonCoercion *b)
++{
++	COMPARE_NODE_FIELD(expr);
++	COMPARE_SCALAR_FIELD(via_populate);
++	COMPARE_SCALAR_FIELD(via_io);
++	COMPARE_SCALAR_FIELD(collation);
++
++	return true;
++}
++
++/*
++ * _equalJsonItemCoercions
++ */
++static bool
++_equalJsonItemCoercions(const JsonItemCoercions *a, const JsonItemCoercions *b)
++{
++	COMPARE_NODE_FIELD(null);
++	COMPARE_NODE_FIELD(string);
++	COMPARE_NODE_FIELD(numeric);
++	COMPARE_NODE_FIELD(boolean);
++	COMPARE_NODE_FIELD(date);
++	COMPARE_NODE_FIELD(time);
++	COMPARE_NODE_FIELD(timetz);
++	COMPARE_NODE_FIELD(timestamp);
++	COMPARE_NODE_FIELD(timestamptz);
++	COMPARE_NODE_FIELD(composite);
++
++	return true;
++}
++
+ /*
+  * Stuff from pathnodes.h
+  */
+@@ -3561,6 +3667,18 @@ equal(const void *a, const void *b)
+ 		case T_JsonIsPredicate:
+ 			retval = _equalJsonIsPredicate(a, b);
+ 			break;
++		case T_JsonBehavior:
++			retval = _equalJsonBehavior(a, b);
++			break;
++		case T_JsonExpr:
++			retval = _equalJsonExpr(a, b);
++			break;
++		case T_JsonCoercion:
++			retval = _equalJsonCoercion(a, b);
++			break;
++		case T_JsonItemCoercions:
++			retval = _equalJsonItemCoercions(a, b);
++			break;
+ 
+ 			/*
+ 			 * RELATION NODES
+@@ -4174,6 +4292,15 @@ equal(const void *a, const void *b)
+ 		case T_JsonArrayAgg:
+ 			retval = _equalJsonArrayAgg(a, b);
+ 			break;
++		case T_JsonFuncExpr:
++			retval = _equalJsonFuncExpr(a, b);
++			break;
++		case T_JsonCommon:
++			retval = _equalJsonCommon(a, b);
++			break;
++		case T_JsonArgument:
++			retval = _equalJsonArgument(a, b);
++			break;
+ 
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+diff --git a/src/backend/nodes/makefuncs.c b/src/backend/nodes/makefuncs.c
+index b67e7c52973c..cd6c300e7bfa 100644
+--- a/src/backend/nodes/makefuncs.c
++++ b/src/backend/nodes/makefuncs.c
+@@ -852,6 +852,21 @@ makeJsonValueExpr(Expr *expr, JsonFormat *format)
+ 	return jve;
+ }
+ 
++/*
++ * makeJsonBehavior -
++ *	  creates a JsonBehavior node
++ */
++JsonBehavior *
++makeJsonBehavior(JsonBehaviorType type, Node *default_expr)
++{
++	JsonBehavior *behavior = makeNode(JsonBehavior);
++
++	behavior->btype = type;
++	behavior->default_expr = default_expr;
++
++	return behavior;
++}
++
+ /*
+  * makeJsonEncoding -
+  *	  converts JSON encoding name to enum JsonEncoding
+diff --git a/src/backend/nodes/nodeFuncs.c b/src/backend/nodes/nodeFuncs.c
+index d697c7abd8c8..c0a83471e157 100644
+--- a/src/backend/nodes/nodeFuncs.c
++++ b/src/backend/nodes/nodeFuncs.c
+@@ -263,6 +263,12 @@ exprType(const Node *expr)
+ 		case T_JsonIsPredicate:
+ 			type = BOOLOID;
+ 			break;
++		case T_JsonExpr:
++			type = ((const JsonExpr *) expr)->returning->typid;
++			break;
++		case T_JsonCoercion:
++			type = exprType(((const JsonCoercion *) expr)->expr);
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			type = InvalidOid;	/* keep compiler quiet */
+@@ -498,7 +504,11 @@ exprTypmod(const Node *expr)
+ 		case T_JsonValueExpr:
+ 			return exprTypmod((Node *) ((const JsonValueExpr *) expr)->formatted_expr);
+ 		case T_JsonConstructorExpr:
+-			return -1; /* ((const JsonConstructorExpr *) expr)->returning->typmod; */
++			return ((const JsonConstructorExpr *) expr)->returning->typmod;
++		case T_JsonExpr:
++			return ((JsonExpr *) expr)->returning->typmod;
++		case T_JsonCoercion:
++			return exprTypmod(((const JsonCoercion *) expr)->expr);
+ 		default:
+ 			break;
+ 	}
+@@ -991,6 +1001,21 @@ exprCollation(const Node *expr)
+ 		case T_JsonIsPredicate:
+ 			coll = InvalidOid;	/* result is always an boolean type */
+ 			break;
++		case T_JsonExpr:
++			{
++				JsonExpr *jexpr = (JsonExpr *) expr;
++				JsonCoercion *coercion = jexpr->result_coercion;
++
++				if (!coercion)
++					coll = InvalidOid;
++				else if (coercion->expr)
++					coll = exprCollation(coercion->expr);
++				else if (coercion->via_io || coercion->via_populate)
++					coll = coercion->collation;
++				else
++					coll = InvalidOid;
++			}
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			coll = InvalidOid;	/* keep compiler quiet */
+@@ -1220,6 +1245,21 @@ exprSetCollation(Node *expr, Oid collation)
+ 		case T_JsonIsPredicate:
+ 			Assert(!OidIsValid(collation)); /* result is always boolean */
+ 			break;
++		case T_JsonExpr:
++			{
++				JsonExpr *jexpr = (JsonExpr *) expr;
++				JsonCoercion *coercion = jexpr->result_coercion;
++
++				if (!coercion)
++					Assert(!OidIsValid(collation));
++				else if (coercion->expr)
++					exprSetCollation(coercion->expr, collation);
++				else if (coercion->via_io || coercion->via_populate)
++					coercion->collation = collation;
++				else
++					Assert(!OidIsValid(collation));
++			}
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			break;
+@@ -1675,6 +1715,15 @@ exprLocation(const Node *expr)
+ 		case T_JsonIsPredicate:
+ 			loc = ((const JsonIsPredicate *) expr)->location;
+ 			break;
++		case T_JsonExpr:
++			{
++				const JsonExpr *jsexpr = (const JsonExpr *) expr;
++
++				/* consider both function name and leftmost arg */
++				loc = leftmostLoc(jsexpr->location,
++								  exprLocation(jsexpr->formatted_expr));
++			}
++			break;
+ 		default:
+ 			/* for any other node type it's just unknown... */
+ 			loc = -1;
+@@ -2443,6 +2492,54 @@ expression_tree_walker(Node *node,
+ 			break;
+ 		case T_JsonIsPredicate:
+ 			return walker(((JsonIsPredicate *) node)->expr, context);
++		case T_JsonExpr:
++			{
++				JsonExpr    *jexpr = (JsonExpr *) node;
++
++				if (walker(jexpr->formatted_expr, context))
++					return true;
++				if (walker(jexpr->result_coercion, context))
++					return true;
++				if (walker(jexpr->passing_values, context))
++					return true;
++				/* we assume walker doesn't care about passing_names */
++				if (jexpr->on_empty &&
++					walker(jexpr->on_empty->default_expr, context))
++					return true;
++				if (walker(jexpr->on_error->default_expr, context))
++					return true;
++				if (walker(jexpr->coercions, context))
++					return true;
++			}
++			break;
++		case T_JsonCoercion:
++			return walker(((JsonCoercion *) node)->expr, context);
++		case T_JsonItemCoercions:
++			{
++				JsonItemCoercions *coercions = (JsonItemCoercions *) node;
++
++				if (walker(coercions->null, context))
++					return true;
++				if (walker(coercions->string, context))
++					return true;
++				if (walker(coercions->numeric, context))
++					return true;
++				if (walker(coercions->boolean, context))
++					return true;
++				if (walker(coercions->date, context))
++					return true;
++				if (walker(coercions->time, context))
++					return true;
++				if (walker(coercions->timetz, context))
++					return true;
++				if (walker(coercions->timestamp, context))
++					return true;
++				if (walker(coercions->timestamptz, context))
++					return true;
++				if (walker(coercions->composite, context))
++					return true;
++			}
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+@@ -3454,6 +3551,7 @@ expression_tree_mutator(Node *node,
+ 
+ 				return (Node *) newnode;
+ 			}
++			break;
+ 		case T_JsonIsPredicate:
+ 			{
+ 				JsonIsPredicate *pred = (JsonIsPredicate *) node;
+@@ -3464,6 +3562,55 @@ expression_tree_mutator(Node *node,
+ 
+ 				return (Node *) newnode;
+ 			}
++			break;
++		case T_JsonExpr:
++			{
++				JsonExpr    *jexpr = (JsonExpr *) node;
++				JsonExpr    *newnode;
++
++				FLATCOPY(newnode, jexpr, JsonExpr);
++				MUTATE(newnode->path_spec, jexpr->path_spec, Node *);
++				MUTATE(newnode->formatted_expr, jexpr->formatted_expr, Node *);
++				MUTATE(newnode->result_coercion, jexpr->result_coercion, JsonCoercion *);
++				MUTATE(newnode->passing_values, jexpr->passing_values, List *);
++				/* assume mutator does not care about passing_names */
++				if (newnode->on_empty)
++					MUTATE(newnode->on_empty->default_expr,
++						   jexpr->on_empty->default_expr, Node *);
++				MUTATE(newnode->on_error->default_expr,
++					   jexpr->on_error->default_expr, Node *);
++				return (Node *) newnode;
++			}
++			break;
++		case T_JsonCoercion:
++			{
++				JsonCoercion *coercion = (JsonCoercion *) node;
++				JsonCoercion *newnode;
++
++				FLATCOPY(newnode, coercion, JsonCoercion);
++				MUTATE(newnode->expr, coercion->expr, Node *);
++				return (Node *) newnode;
++			}
++			break;
++		case T_JsonItemCoercions:
++			{
++				JsonItemCoercions *coercions = (JsonItemCoercions *) node;
++				JsonItemCoercions *newnode;
++
++				FLATCOPY(newnode, coercions, JsonItemCoercions);
++				MUTATE(newnode->null, coercions->null, JsonCoercion *);
++				MUTATE(newnode->string, coercions->string, JsonCoercion *);
++				MUTATE(newnode->numeric, coercions->numeric, JsonCoercion *);
++				MUTATE(newnode->boolean, coercions->boolean, JsonCoercion *);
++				MUTATE(newnode->date, coercions->date, JsonCoercion *);
++				MUTATE(newnode->time, coercions->time, JsonCoercion *);
++				MUTATE(newnode->timetz, coercions->timetz, JsonCoercion *);
++				MUTATE(newnode->timestamp, coercions->timestamp, JsonCoercion *);
++				MUTATE(newnode->timestamptz, coercions->timestamptz, JsonCoercion *);
++				MUTATE(newnode->composite, coercions->composite, JsonCoercion *);
++				return (Node *) newnode;
++			}
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+@@ -4316,6 +4463,43 @@ raw_expression_tree_walker(Node *node,
+ 			break;
+ 		case T_JsonIsPredicate:
+ 			return walker(((JsonIsPredicate *) node)->expr, context);
++		case T_JsonArgument:
++			return walker(((JsonArgument *) node)->val, context);
++		case T_JsonCommon:
++			{
++				JsonCommon *jc = (JsonCommon *) node;
++
++				if (walker(jc->expr, context))
++					return true;
++				if (walker(jc->pathspec, context))
++					return true;
++				if (walker(jc->passing, context))
++					return true;
++			}
++			break;
++		case T_JsonBehavior:
++			{
++				JsonBehavior *jb = (JsonBehavior *) node;
++
++				if (jb->btype == JSON_BEHAVIOR_DEFAULT &&
++					walker(jb->default_expr, context))
++					return true;
++			}
++			break;
++		case T_JsonFuncExpr:
++			{
++				JsonFuncExpr *jfe = (JsonFuncExpr *) node;
++
++				if (walker(jfe->common, context))
++					return true;
++				if (jfe->output && walker(jfe->output, context))
++					return true;
++				if (walker(jfe->on_empty, context))
++					return true;
++				if (walker(jfe->on_error, context))
++					return true;
++			}
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index 278e87259dc5..6e39590730a4 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -1808,6 +1808,64 @@ _outJsonIsPredicate(StringInfo str, const JsonIsPredicate *node)
+ 	WRITE_LOCATION_FIELD(location);
+ }
+ 
++static void
++_outJsonBehavior(StringInfo str, const JsonBehavior *node)
++{
++	WRITE_NODE_TYPE("JSONBEHAVIOR");
++
++	WRITE_ENUM_FIELD(btype, JsonBehaviorType);
++	WRITE_NODE_FIELD(default_expr);
++}
++
++static void
++_outJsonExpr(StringInfo str, const JsonExpr *node)
++{
++	WRITE_NODE_TYPE("JSONEXPR");
++
++	WRITE_ENUM_FIELD(op, JsonExprOp);
++	WRITE_NODE_FIELD(formatted_expr);
++	WRITE_NODE_FIELD(result_coercion);
++	WRITE_NODE_FIELD(format);
++	WRITE_NODE_FIELD(path_spec);
++	WRITE_NODE_FIELD(passing_values);
++	WRITE_NODE_FIELD(passing_names);
++	WRITE_NODE_FIELD(returning);
++	WRITE_NODE_FIELD(on_error);
++	WRITE_NODE_FIELD(on_empty);
++	WRITE_NODE_FIELD(coercions);
++	WRITE_ENUM_FIELD(wrapper, JsonWrapper);
++	WRITE_BOOL_FIELD(omit_quotes);
++	WRITE_LOCATION_FIELD(location);
++}
++
++static void
++_outJsonCoercion(StringInfo str, const JsonCoercion *node)
++{
++	WRITE_NODE_TYPE("JSONCOERCION");
++
++	WRITE_NODE_FIELD(expr);
++	WRITE_BOOL_FIELD(via_populate);
++	WRITE_BOOL_FIELD(via_io);
++	WRITE_OID_FIELD(collation);
++}
++
++static void
++_outJsonItemCoercions(StringInfo str, const JsonItemCoercions *node)
++{
++	WRITE_NODE_TYPE("JSONITEMCOERCIONS");
++
++	WRITE_NODE_FIELD(null);
++	WRITE_NODE_FIELD(string);
++	WRITE_NODE_FIELD(numeric);
++	WRITE_NODE_FIELD(boolean);
++	WRITE_NODE_FIELD(date);
++	WRITE_NODE_FIELD(time);
++	WRITE_NODE_FIELD(timetz);
++	WRITE_NODE_FIELD(timestamp);
++	WRITE_NODE_FIELD(timestamptz);
++	WRITE_NODE_FIELD(composite);
++}
++
+ /*****************************************************************************
+  *
+  *	Stuff from pathnodes.h.
+@@ -4644,6 +4702,18 @@ outNode(StringInfo str, const void *obj)
+ 			case T_JsonIsPredicate:
+ 				_outJsonIsPredicate(str, obj);
+ 				break;
++			case T_JsonBehavior:
++				_outJsonBehavior(str, obj);
++				break;
++			case T_JsonExpr:
++				_outJsonExpr(str, obj);
++				break;
++			case T_JsonCoercion:
++				_outJsonCoercion(str, obj);
++				break;
++			case T_JsonItemCoercions:
++				_outJsonItemCoercions(str, obj);
++				break;
+ 
+ 			default:
+ 
+diff --git a/src/backend/nodes/readfuncs.c b/src/backend/nodes/readfuncs.c
+index 5b9e235e9ad7..c94b2561f05b 100644
+--- a/src/backend/nodes/readfuncs.c
++++ b/src/backend/nodes/readfuncs.c
+@@ -1492,6 +1492,84 @@ _readJsonConstructorExpr(void)
+ 	READ_DONE();
+ }
+ 
++/*
++ * _readJsonBehavior
++ */
++static JsonBehavior *
++_readJsonBehavior(void)
++{
++	READ_LOCALS(JsonBehavior);
++
++	READ_ENUM_FIELD(btype, JsonBehaviorType);
++	READ_NODE_FIELD(default_expr);
++
++	READ_DONE();
++}
++
++/*
++ * _readJsonExpr
++ */
++static JsonExpr *
++_readJsonExpr(void)
++{
++	READ_LOCALS(JsonExpr);
++
++	READ_ENUM_FIELD(op, JsonExprOp);
++	READ_NODE_FIELD(formatted_expr);
++	READ_NODE_FIELD(result_coercion);
++	READ_NODE_FIELD(format);
++	READ_NODE_FIELD(path_spec);
++	READ_NODE_FIELD(passing_values);
++	READ_NODE_FIELD(passing_names);
++	READ_NODE_FIELD(returning);
++	READ_NODE_FIELD(on_error);
++	READ_NODE_FIELD(on_empty);
++	READ_NODE_FIELD(coercions);
++	READ_ENUM_FIELD(wrapper, JsonWrapper);
++	READ_BOOL_FIELD(omit_quotes);
++	READ_LOCATION_FIELD(location);
++
++	READ_DONE();
++}
++
++/*
++ * _readJsonCoercion
++ */
++static JsonCoercion *
++_readJsonCoercion(void)
++{
++	READ_LOCALS(JsonCoercion);
++
++	READ_NODE_FIELD(expr);
++	READ_BOOL_FIELD(via_populate);
++	READ_BOOL_FIELD(via_io);
++	READ_OID_FIELD(collation);
++
++	READ_DONE();
++}
++
++/*
++ * _readJsonItemCoercions
++ */
++static JsonItemCoercions *
++_readJsonItemCoercions(void)
++{
++	READ_LOCALS(JsonItemCoercions);
++
++	READ_NODE_FIELD(null);
++	READ_NODE_FIELD(string);
++	READ_NODE_FIELD(numeric);
++	READ_NODE_FIELD(boolean);
++	READ_NODE_FIELD(date);
++	READ_NODE_FIELD(time);
++	READ_NODE_FIELD(timetz);
++	READ_NODE_FIELD(timestamp);
++	READ_NODE_FIELD(timestamptz);
++	READ_NODE_FIELD(composite);
++
++	READ_DONE();
++}
++
+ /*
+  * _readJsonIsPredicate
+  */
+@@ -3108,6 +3186,14 @@ parseNodeString(void)
+ 		return_value = _readJsonConstructorExpr();
+ 	else if (MATCH("JSONISPREDICATE", 15))
+ 		return_value = _readJsonIsPredicate();
++	else if (MATCH("JSONBEHAVIOR", 12))
++		return_value = _readJsonBehavior();
++	else if (MATCH("JSONEXPR", 8))
++		return_value = _readJsonExpr();
++	else if (MATCH("JSONCOERCION", 12))
++		return_value = _readJsonCoercion();
++	else if (MATCH("JSONITEMCOERCIONS", 17))
++		return_value = _readJsonItemCoercions();
+ 	else
+ 	{
+ 		elog(ERROR, "badly formatted node string \"%.32s\"...", token);
+diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
+index 1b07ea392d90..679d8ed597ec 100644
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -4547,7 +4547,8 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
+ 			 IsA(node, SQLValueFunction) ||
+ 			 IsA(node, XmlExpr) ||
+ 			 IsA(node, CoerceToDomain) ||
+-			 IsA(node, NextValueExpr))
++			 IsA(node, NextValueExpr) ||
++			 IsA(node, JsonExpr))
+ 	{
+ 		/* Treat all these as having cost 1 */
+ 		context->total.per_tuple += cpu_operator_cost;
+diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
+index e1147c431e68..e381ae512a29 100644
+--- a/src/backend/optimizer/util/clauses.c
++++ b/src/backend/optimizer/util/clauses.c
+@@ -28,6 +28,7 @@
+ #include "catalog/pg_type.h"
+ #include "executor/executor.h"
+ #include "executor/functions.h"
++#include "executor/execExpr.h"
+ #include "funcapi.h"
+ #include "miscadmin.h"
+ #include "nodes/makefuncs.h"
+@@ -52,6 +53,7 @@
+ #include "utils/fmgroids.h"
+ #include "utils/json.h"
+ #include "utils/jsonb.h"
++#include "utils/jsonpath.h"
+ #include "utils/lsyscache.h"
+ #include "utils/memutils.h"
+ #include "utils/syscache.h"
+@@ -405,6 +407,24 @@ contain_mutable_functions_walker(Node *node, void *context)
+ 		/* Check all subnodes */
+ 	}
+ 
++	if (IsA(node, JsonExpr))
++	{
++		JsonExpr   *jexpr = castNode(JsonExpr, node);
++		Const	   *cnst;
++
++		if (!IsA(jexpr->path_spec, Const))
++			return true;
++
++		cnst = castNode(Const, jexpr->path_spec);
++
++		Assert(cnst->consttype == JSONPATHOID);
++		if (cnst->constisnull)
++			return false;
++
++		return jspIsMutable(DatumGetJsonPathP(cnst->constvalue),
++							jexpr->passing_names, jexpr->passing_values);
++	}
++
+ 	if (IsA(node, SQLValueFunction))
+ 	{
+ 		/* all variants of SQLValueFunction are stable */
+@@ -876,6 +896,18 @@ max_parallel_hazard_walker(Node *node, max_parallel_hazard_context *context)
+ 								 context, 0);
+ 	}
+ 
++	/* JsonExpr is parallel-unsafe if subtransactions can be used. */
++	else if (IsA(node, JsonExpr))
++	{
++		JsonExpr  *jsexpr = (JsonExpr *) node;
++
++		if (ExecEvalJsonNeedsSubTransaction(jsexpr, NULL))
++		{
++			context->max_hazard = PROPARALLEL_UNSAFE;
++			return true;
++		}
++	}
++
+ 	/* Recurse to check arguments */
+ 	return expression_tree_walker(node,
+ 								  max_parallel_hazard_walker,
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index b658bcc182c6..8ad8512e4c75 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -281,6 +281,13 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	MergeWhenClause		*mergewhen;
+ 	struct KeyActions	*keyactions;
+ 	struct KeyAction	*keyaction;
++	JsonBehavior		*jsbehavior;
++	struct
++	{
++		JsonBehavior		*on_empty;
++		JsonBehavior		*on_error;
++	} 					on_behavior;
++	JsonQuotes			js_quotes;
+ }
+ 
+ %type <node>	stmt toplevel_stmt schema_stmt routine_body_stmt
+@@ -646,7 +653,14 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 					json_representation
+ 					json_value_expr
+ 					json_func_expr
++					json_value_func_expr
++					json_query_expr
++					json_exists_predicate
++					json_api_common_syntax
++					json_context_item
++					json_argument
+ 					json_output_clause_opt
++					json_returning_clause_opt
+ 					json_value_constructor
+ 					json_object_constructor
+ 					json_object_constructor_args
+@@ -658,15 +672,43 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 					json_aggregate_func
+ 					json_object_aggregate_constructor
+ 					json_array_aggregate_constructor
++					json_path_specification
+ 
+ %type <list>		json_name_and_value_list
+ 					json_value_expr_list
+ 					json_array_aggregate_order_by_clause_opt
++					json_arguments
++					json_passing_clause_opt
++
++%type <str>			json_table_path_name
++					json_as_path_name_clause_opt
+ 
+ %type <ival>		json_encoding
+ 					json_encoding_clause_opt
++					json_wrapper_clause_opt
++					json_wrapper_behavior
++					json_conditional_or_unconditional_opt
+ 					json_predicate_type_constraint_opt
+ 
++%type <jsbehavior>	json_behavior_error
++					json_behavior_null
++					json_behavior_true
++					json_behavior_false
++					json_behavior_unknown
++					json_behavior_empty_array
++					json_behavior_empty_object
++					json_behavior_default
++					json_value_behavior
++					json_query_behavior
++					json_exists_error_behavior
++					json_exists_error_clause_opt
++
++%type <on_behavior> json_value_on_behavior_clause_opt
++					json_query_on_behavior_clause_opt
++
++%type <js_quotes>	json_quotes_behavior
++					json_quotes_clause_opt
++
+ %type <boolean>		json_key_uniqueness_constraint_opt
+ 					json_object_constructor_null_clause_opt
+ 					json_array_constructor_null_clause_opt
+@@ -706,7 +748,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	CACHE CALL CALLED CASCADE CASCADED CASE CAST CATALOG_P CHAIN CHAR_P
+ 	CHARACTER CHARACTERISTICS CHECK CHECKPOINT CLASS CLOSE
+ 	CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMENTS COMMIT
+-	COMMITTED COMPRESSION CONCURRENTLY CONFIGURATION CONFLICT
++	COMMITTED COMPRESSION CONCURRENTLY CONDITIONAL CONFIGURATION CONFLICT
+ 	CONNECTION CONSTRAINT CONSTRAINTS CONTENT_P CONTINUE_P CONVERSION_P COPY
+ 	COST CREATE CROSS CSV CUBE CURRENT_P
+ 	CURRENT_CATALOG CURRENT_DATE CURRENT_ROLE CURRENT_SCHEMA
+@@ -717,8 +759,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	DETACH DICTIONARY DISABLE_P DISCARD DISTINCT DO DOCUMENT_P DOMAIN_P
+ 	DOUBLE_P DROP
+ 
+-	EACH ELSE ENABLE_P ENCODING ENCRYPTED END_P ENUM_P ESCAPE EVENT EXCEPT
+-	EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXPLAIN EXPRESSION
++	EACH ELSE EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENUM_P ERROR_P ESCAPE
++	EVENT EXCEPT EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXPLAIN EXPRESSION
+ 	EXTENSION EXTERNAL EXTRACT
+ 
+ 	FALSE_P FAMILY FETCH FILTER FINALIZE FIRST_P FLOAT_P FOLLOWING FOR
+@@ -733,7 +775,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	INNER_P INOUT INPUT_P INSENSITIVE INSERT INSTEAD INT_P INTEGER
+ 	INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION
+ 
+-	JOIN JSON JSON_ARRAY JSON_ARRAYAGG JSON_OBJECT JSON_OBJECTAGG
++	JOIN JSON JSON_ARRAY JSON_ARRAYAGG JSON_EXISTS JSON_OBJECT JSON_OBJECTAGG
++	JSON_QUERY JSON_VALUE
+ 
+ 	KEY KEYS KEEP
+ 
+@@ -749,7 +792,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	NOT NOTHING NOTIFY NOTNULL NOWAIT NULL_P NULLIF
+ 	NULLS_P NUMERIC
+ 
+-	OBJECT_P OF OFF OFFSET OIDS OLD ON ONLY OPERATOR OPTION OPTIONS OR
++	OBJECT_P OF OFF OFFSET OIDS OLD OMIT ON ONLY OPERATOR OPTION OPTIONS OR
+ 	ORDER ORDINALITY OTHERS OUT_P OUTER_P
+ 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
+ 
+@@ -757,7 +800,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
+ 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
+ 
+-	QUOTE
++	QUOTE QUOTES
+ 
+ 	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF REFERENCES REFERENCING
+ 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
+@@ -767,7 +810,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
+ 	SEQUENCE SEQUENCES SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF
+ 	SHARE SHOW SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SQL_P STABLE STANDALONE_P
+-	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRIP_P
++	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRING STRIP_P
+ 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P
+ 
+ 	TABLE TABLES TABLESAMPLE TABLESPACE TEMP TEMPLATE TEMPORARY TEXT_P THEN
+@@ -775,7 +818,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	TREAT TRIGGER TRIM TRUE_P
+ 	TRUNCATE TRUSTED TYPE_P TYPES_P
+ 
+-	UESCAPE UNBOUNDED UNCOMMITTED UNENCRYPTED UNION UNIQUE UNKNOWN
++	UESCAPE UNBOUNDED UNCONDITIONAL UNCOMMITTED UNENCRYPTED UNION UNIQUE UNKNOWN
+ 	UNLISTEN UNLOGGED UNTIL UPDATE USER USING
+ 
+ 	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARYING
+@@ -854,7 +897,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+  * Using the same precedence as IDENT seems right for the reasons given above.
+  */
+ %nonassoc	UNBOUNDED		/* ideally would have same precedence as IDENT */
+-%nonassoc	ABSENT UNIQUE JSON
++%nonassoc	ERROR_P EMPTY_P DEFAULT ABSENT /* JSON error/empty behavior */
++%nonassoc	FALSE_P KEEP OMIT PASSING TRUE_P UNKNOWN UNIQUE JSON
+ %nonassoc	IDENT PARTITION RANGE ROWS GROUPS PRECEDING FOLLOWING CUBE ROLLUP
+ %left		Op OPERATOR		/* multi-character ops and user-defined operators */
+ %left		'+' '-'
+@@ -15549,6 +15593,80 @@ opt_asymmetric: ASYMMETRIC
+ /* SQL/JSON support */
+ json_func_expr:
+ 			json_value_constructor
++			| json_value_func_expr
++			| json_query_expr
++			| json_exists_predicate
++		;
++
++
++json_value_func_expr:
++			JSON_VALUE '('
++				json_api_common_syntax
++				json_returning_clause_opt
++				json_value_on_behavior_clause_opt
++			')'
++				{
++					JsonFuncExpr *n = makeNode(JsonFuncExpr);
++					n->op = JSON_VALUE_OP;
++					n->common = (JsonCommon *) $3;
++					n->output = (JsonOutput *) $4;
++					n->on_empty = $5.on_empty;
++					n->on_error = $5.on_error;
++					n->location = @1;
++					$$ = (Node *) n;
++				}
++		;
++
++json_api_common_syntax:
++			json_context_item ',' json_path_specification
++			json_as_path_name_clause_opt
++			json_passing_clause_opt
++				{
++					JsonCommon *n = makeNode(JsonCommon);
++					n->expr = (JsonValueExpr *) $1;
++					n->pathspec = $3;
++					n->pathname = $4;
++					n->passing = $5;
++					n->location = @1;
++					$$ = (Node *) n;
++				}
++		;
++
++json_context_item:
++			json_value_expr							{ $$ = $1; }
++		;
++
++json_path_specification:
++			a_expr									{ $$ = $1; }
++		;
++
++json_as_path_name_clause_opt:
++			 AS json_table_path_name				{ $$ = $2; }
++			 | /* EMPTY */							{ $$ = NULL; }
++		;
++
++json_table_path_name:
++			name									{ $$ = $1; }
++		;
++
++json_passing_clause_opt:
++			PASSING json_arguments					{ $$ = $2; }
++			| /* EMPTY */							{ $$ = NIL; }
++		;
++
++json_arguments:
++			json_argument							{ $$ = list_make1($1); }
++			| json_arguments ',' json_argument		{ $$ = lappend($1, $3); }
++		;
++
++json_argument:
++			json_value_expr AS ColLabel
++			{
++				JsonArgument *n = makeNode(JsonArgument);
++				n->val = (JsonValueExpr *) $1;
++				n->name = $3;
++				$$ = (Node *) n;
++			}
+ 		;
+ 
+ json_value_expr:
+@@ -15587,6 +15705,153 @@ json_encoding:
+ 			name									{ $$ = makeJsonEncoding($1); }
+ 		;
+ 
++json_behavior_error:
++			ERROR_P		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_ERROR, NULL); }
++		;
++
++json_behavior_null:
++			NULL_P		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_NULL, NULL); }
++		;
++
++json_behavior_true:
++			TRUE_P		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_TRUE, NULL); }
++		;
++
++json_behavior_false:
++			FALSE_P		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_FALSE, NULL); }
++		;
++
++json_behavior_unknown:
++			UNKNOWN		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_UNKNOWN, NULL); }
++		;
++
++json_behavior_empty_array:
++			EMPTY_P ARRAY	{ $$ = makeJsonBehavior(JSON_BEHAVIOR_EMPTY_ARRAY, NULL); }
++			/* non-standard, for Oracle compatibility only */
++			| EMPTY_P 		{ $$ = makeJsonBehavior(JSON_BEHAVIOR_EMPTY_ARRAY, NULL); }
++		;
++
++json_behavior_empty_object:
++			EMPTY_P OBJECT_P	{ $$ = makeJsonBehavior(JSON_BEHAVIOR_EMPTY_OBJECT, NULL); }
++		;
++
++json_behavior_default:
++			DEFAULT a_expr	{ $$ = makeJsonBehavior(JSON_BEHAVIOR_DEFAULT, $2); }
++		;
++
++
++json_value_behavior:
++			json_behavior_null
++			| json_behavior_error
++			| json_behavior_default
++		;
++
++json_value_on_behavior_clause_opt:
++			json_value_behavior ON EMPTY_P
++									{ $$.on_empty = $1; $$.on_error = NULL; }
++			| json_value_behavior ON EMPTY_P json_value_behavior ON ERROR_P
++									{ $$.on_empty = $1; $$.on_error = $4; }
++			| json_value_behavior ON ERROR_P
++									{ $$.on_empty = NULL; $$.on_error = $1; }
++			|  /* EMPTY */
++									{ $$.on_empty = NULL; $$.on_error = NULL; }
++		;
++
++json_query_expr:
++			JSON_QUERY '('
++				json_api_common_syntax
++				json_output_clause_opt
++				json_wrapper_clause_opt
++				json_quotes_clause_opt
++				json_query_on_behavior_clause_opt
++			')'
++				{
++					JsonFuncExpr *n = makeNode(JsonFuncExpr);
++					n->op = JSON_QUERY_OP;
++					n->common = (JsonCommon *) $3;
++					n->output = (JsonOutput *) $4;
++					n->wrapper = $5;
++					if (n->wrapper != JSW_NONE && $6 != JS_QUOTES_UNSPEC)
++						ereport(ERROR,
++								(errcode(ERRCODE_SYNTAX_ERROR),
++								 errmsg("SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used"),
++								 parser_errposition(@6)));
++					n->omit_quotes = $6 == JS_QUOTES_OMIT;
++					n->on_empty = $7.on_empty;
++					n->on_error = $7.on_error;
++					n->location = @1;
++					$$ = (Node *) n;
++				}
++		;
++
++json_wrapper_clause_opt:
++			json_wrapper_behavior WRAPPER			{ $$ = $1; }
++			| /* EMPTY */							{ $$ = 0; }
++		;
++
++json_wrapper_behavior:
++			WITHOUT array_opt						{ $$ = JSW_NONE; }
++			| WITH json_conditional_or_unconditional_opt array_opt { $$ = $2; }
++		;
++
++array_opt:
++			ARRAY									{ }
++			| /* EMPTY */							{ }
++		;
++
++json_conditional_or_unconditional_opt:
++			CONDITIONAL								{ $$ = JSW_CONDITIONAL; }
++			| UNCONDITIONAL							{ $$ = JSW_UNCONDITIONAL; }
++			| /* EMPTY */							{ $$ = JSW_UNCONDITIONAL; }
++		;
++
++json_quotes_clause_opt:
++			json_quotes_behavior QUOTES json_on_scalar_string_opt { $$ = $1; }
++			| /* EMPTY */							{ $$ = JS_QUOTES_UNSPEC; }
++		;
++
++json_quotes_behavior:
++			KEEP									{ $$ = JS_QUOTES_KEEP; }
++			| OMIT									{ $$ = JS_QUOTES_OMIT; }
++		;
++
++json_on_scalar_string_opt:
++			ON SCALAR STRING						{ }
++			| /* EMPTY */							{ }
++		;
++
++json_query_behavior:
++			json_behavior_error
++			| json_behavior_null
++			| json_behavior_empty_array
++			| json_behavior_empty_object
++			| json_behavior_default
++		;
++
++json_query_on_behavior_clause_opt:
++			json_query_behavior ON EMPTY_P
++									{ $$.on_empty = $1; $$.on_error = NULL; }
++			| json_query_behavior ON EMPTY_P json_query_behavior ON ERROR_P
++									{ $$.on_empty = $1; $$.on_error = $4; }
++			| json_query_behavior ON ERROR_P
++									{ $$.on_empty = NULL; $$.on_error = $1; }
++			|  /* EMPTY */
++									{ $$.on_empty = NULL; $$.on_error = NULL; }
++		;
++
++json_returning_clause_opt:
++			RETURNING Typename
++				{
++					JsonOutput *n = makeNode(JsonOutput);
++					n->typeName = $2;
++					n->returning = makeNode(JsonReturning);
++					n->returning->format =
++						makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, @2);
++					$$ = (Node *) n;
++				}
++			| /* EMPTY */							{ $$ = NULL; }
++			;
++
+ json_output_clause_opt:
+ 			RETURNING Typename json_format_clause_opt
+ 				{
+@@ -15599,6 +15864,35 @@ json_output_clause_opt:
+ 			| /* EMPTY */							{ $$ = NULL; }
+ 			;
+ 
++json_exists_predicate:
++			JSON_EXISTS '('
++				json_api_common_syntax
++				json_returning_clause_opt
++				json_exists_error_clause_opt
++			')'
++				{
++					JsonFuncExpr *p = makeNode(JsonFuncExpr);
++					p->op = JSON_EXISTS_OP;
++					p->common = (JsonCommon *) $3;
++					p->output = (JsonOutput *) $4;
++					p->on_error = $5;
++					p->location = @1;
++					$$ = (Node *) p;
++				}
++		;
++
++json_exists_error_clause_opt:
++			json_exists_error_behavior ON ERROR_P		{ $$ = $1; }
++			| /* EMPTY */								{ $$ = NULL; }
++		;
++
++json_exists_error_behavior:
++			json_behavior_error
++			| json_behavior_true
++			| json_behavior_false
++			| json_behavior_unknown
++		;
++
+ json_value_constructor:
+ 			json_object_constructor
+ 			| json_array_constructor
+@@ -16269,6 +16563,7 @@ unreserved_keyword:
+ 			| COMMIT
+ 			| COMMITTED
+ 			| COMPRESSION
++			| CONDITIONAL
+ 			| CONFIGURATION
+ 			| CONFLICT
+ 			| CONNECTION
+@@ -16305,10 +16600,12 @@ unreserved_keyword:
+ 			| DOUBLE_P
+ 			| DROP
+ 			| EACH
++			| EMPTY_P
+ 			| ENABLE_P
+ 			| ENCODING
+ 			| ENCRYPTED
+ 			| ENUM_P
++			| ERROR_P
+ 			| ESCAPE
+ 			| EVENT
+ 			| EXCLUDE
+@@ -16358,6 +16655,7 @@ unreserved_keyword:
+ 			| INVOKER
+ 			| ISOLATION
+ 			| JSON
++			| KEEP
+ 			| KEY
+ 			| KEYS
+ 			| LABEL
+@@ -16404,6 +16702,7 @@ unreserved_keyword:
+ 			| OFF
+ 			| OIDS
+ 			| OLD
++			| OMIT
+ 			| OPERATOR
+ 			| OPTION
+ 			| OPTIONS
+@@ -16433,6 +16732,7 @@ unreserved_keyword:
+ 			| PROGRAM
+ 			| PUBLICATION
+ 			| QUOTE
++			| QUOTES
+ 			| RANGE
+ 			| READ
+ 			| REASSIGN
+@@ -16514,6 +16814,7 @@ unreserved_keyword:
+ 			| UESCAPE
+ 			| UNBOUNDED
+ 			| UNCOMMITTED
++			| UNCONDITIONAL
+ 			| UNENCRYPTED
+ 			| UNKNOWN
+ 			| UNLISTEN
+@@ -16573,8 +16874,11 @@ col_name_keyword:
+ 			| INTERVAL
+ 			| JSON_ARRAY
+ 			| JSON_ARRAYAGG
++			| JSON_EXISTS
+ 			| JSON_OBJECT
+ 			| JSON_OBJECTAGG
++			| JSON_QUERY
++			| JSON_VALUE
+ 			| LEAST
+ 			| NATIONAL
+ 			| NCHAR
+@@ -16642,6 +16946,7 @@ type_func_name_keyword:
+ 			| OVERLAPS
+ 			| RIGHT
+ 			| SIMILAR
++			| STRING
+ 			| TABLESAMPLE
+ 			| VERBOSE
+ 		;
+@@ -16806,6 +17111,7 @@ bare_label_keyword:
+ 			| COMMITTED
+ 			| COMPRESSION
+ 			| CONCURRENTLY
++			| CONDITIONAL
+ 			| CONFIGURATION
+ 			| CONFLICT
+ 			| CONNECTION
+@@ -16858,11 +17164,13 @@ bare_label_keyword:
+ 			| DROP
+ 			| EACH
+ 			| ELSE
++			| EMPTY_P
+ 			| ENABLE_P
+ 			| ENCODING
+ 			| ENCRYPTED
+ 			| END_P
+ 			| ENUM_P
++			| ERROR_P
+ 			| ESCAPE
+ 			| EVENT
+ 			| EXCLUDE
+@@ -16931,8 +17239,11 @@ bare_label_keyword:
+ 			| JSON
+ 			| JSON_ARRAY
+ 			| JSON_ARRAYAGG
++			| JSON_EXISTS
+ 			| JSON_OBJECT
+ 			| JSON_OBJECTAGG
++			| JSON_QUERY
++			| JSON_VALUE
+ 			| KEEP
+ 			| KEY
+ 			| KEYS
+@@ -16994,6 +17305,7 @@ bare_label_keyword:
+ 			| OFF
+ 			| OIDS
+ 			| OLD
++			| OMIT
+ 			| ONLY
+ 			| OPERATOR
+ 			| OPTION
+@@ -17030,6 +17342,7 @@ bare_label_keyword:
+ 			| PROGRAM
+ 			| PUBLICATION
+ 			| QUOTE
++			| QUOTES
+ 			| RANGE
+ 			| READ
+ 			| REAL
+@@ -17098,6 +17411,7 @@ bare_label_keyword:
+ 			| STORAGE
+ 			| STORED
+ 			| STRICT_P
++			| STRING
+ 			| STRIP_P
+ 			| SUBSCRIPTION
+ 			| SUBSTRING
+@@ -17131,6 +17445,7 @@ bare_label_keyword:
+ 			| UESCAPE
+ 			| UNBOUNDED
+ 			| UNCOMMITTED
++			| UNCONDITIONAL
+ 			| UNENCRYPTED
+ 			| UNIQUE
+ 			| UNKNOWN
+diff --git a/src/backend/parser/parse_collate.c b/src/backend/parser/parse_collate.c
+index 7582faabb377..45dacc6c4c5f 100644
+--- a/src/backend/parser/parse_collate.c
++++ b/src/backend/parser/parse_collate.c
+@@ -691,6 +691,10 @@ assign_collations_walker(Node *node, assign_collations_context *context)
+ 															&loccontext);
+ 						}
+ 						break;
++					case T_JsonExpr:
++						/* Context item and PASSING arguments are already
++						 * marked with collations in parse_expr.c. */
++						break;
+ 					default:
+ 
+ 						/*
+diff --git a/src/backend/parser/parse_expr.c b/src/backend/parser/parse_expr.c
+index 0b972ea6322c..ee316a919796 100644
+--- a/src/backend/parser/parse_expr.c
++++ b/src/backend/parser/parse_expr.c
+@@ -86,6 +86,8 @@ static Node *transformJsonArrayQueryConstructor(ParseState *pstate,
+ static Node *transformJsonObjectAgg(ParseState *pstate, JsonObjectAgg *agg);
+ static Node *transformJsonArrayAgg(ParseState *pstate, JsonArrayAgg *agg);
+ static Node *transformJsonIsPredicate(ParseState *pstate, JsonIsPredicate *p);
++static Node *transformJsonFuncExpr(ParseState *pstate, JsonFuncExpr *p);
++static Node *transformJsonValueExpr(ParseState *pstate, JsonValueExpr *jve);
+ static Node *make_row_comparison_op(ParseState *pstate, List *opname,
+ 									List *largs, List *rargs, int location);
+ static Node *make_row_distinct_op(ParseState *pstate, List *opname,
+@@ -337,6 +339,14 @@ transformExprRecurse(ParseState *pstate, Node *expr)
+ 			result = transformJsonIsPredicate(pstate, (JsonIsPredicate *) expr);
+ 			break;
+ 
++		case T_JsonFuncExpr:
++			result = transformJsonFuncExpr(pstate, (JsonFuncExpr *) expr);
++			break;
++
++		case T_JsonValueExpr:
++			result = transformJsonValueExpr(pstate, (JsonValueExpr *) expr);
++			break;
++
+ 		default:
+ 			/* should not reach here */
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+@@ -3218,8 +3228,8 @@ makeCaseTestExpr(Node *expr)
+  * default format otherwise.
+  */
+ static Node *
+-transformJsonValueExpr(ParseState *pstate, JsonValueExpr *ve,
+-					   JsonFormatType default_format)
++transformJsonValueExprExt(ParseState *pstate, JsonValueExpr *ve,
++						  JsonFormatType default_format, bool isarg)
+ {
+ 	Node	   *expr = transformExprRecurse(pstate, (Node *) ve->raw_expr);
+ 	Node	   *rawexpr;
+@@ -3238,6 +3248,8 @@ transformJsonValueExpr(ParseState *pstate, JsonValueExpr *ve,
+ 
+ 	get_type_category_preferred(exprtype, &typcategory, &typispreferred);
+ 
++	rawexpr = expr;
++
+ 	if (ve->format->format_type != JS_FORMAT_DEFAULT)
+ 	{
+ 		if (ve->format->encoding != JS_ENC_DEFAULT && exprtype != BYTEAOID)
+@@ -3256,12 +3268,44 @@ transformJsonValueExpr(ParseState *pstate, JsonValueExpr *ve,
+ 		else
+ 			format = ve->format->format_type;
+ 	}
++	else if (isarg)
++	{
++		/* Pass SQL/JSON item types directly without conversion to json[b]. */
++		switch (exprtype)
++		{
++			case TEXTOID:
++			case NUMERICOID:
++			case BOOLOID:
++			case INT2OID:
++			case INT4OID:
++			case INT8OID:
++			case FLOAT4OID:
++			case FLOAT8OID:
++			case DATEOID:
++			case TIMEOID:
++			case TIMETZOID:
++			case TIMESTAMPOID:
++			case TIMESTAMPTZOID:
++				return expr;
++
++			default:
++				if (typcategory == TYPCATEGORY_STRING)
++					return coerce_to_specific_type(pstate, expr, TEXTOID,
++												   "JSON_VALUE_EXPR");
++				/* else convert argument to json[b] type */
++				break;
++		}
++
++		format = default_format;
++	}
+ 	else if (exprtype == JSONOID || exprtype == JSONBOID)
+ 		format = JS_FORMAT_DEFAULT;	/* do not format json[b] types */
+ 	else
+ 		format = default_format;
+ 
+-	if (format != JS_FORMAT_DEFAULT)
++	if (format == JS_FORMAT_DEFAULT)
++		expr = rawexpr;
++	else
+ 	{
+ 		Oid			targettype = format == JS_FORMAT_JSONB ? JSONBOID : JSONOID;
+ 		Node	   *orig = makeCaseTestExpr(expr);
+@@ -3269,7 +3313,7 @@ transformJsonValueExpr(ParseState *pstate, JsonValueExpr *ve,
+ 
+ 		expr = orig;
+ 
+-		if (exprtype != BYTEAOID && typcategory != TYPCATEGORY_STRING)
++		if (!isarg && exprtype != BYTEAOID && typcategory != TYPCATEGORY_STRING)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_DATATYPE_MISMATCH),
+ 					 errmsg(ve->format->format_type == JS_FORMAT_DEFAULT ?
+@@ -3320,6 +3364,24 @@ transformJsonValueExpr(ParseState *pstate, JsonValueExpr *ve,
+ 	return expr;
+ }
+ 
++/*
++ * Transform JSON value expression using FORMAT JSON by default.
++ */
++static Node *
++transformJsonValueExpr(ParseState *pstate, JsonValueExpr *jve)
++{
++	return transformJsonValueExprExt(pstate, jve, JS_FORMAT_JSON, false);
++}
++
++/*
++ * Transform JSON value expression using unspecified format by default.
++ */
++static Node *
++transformJsonValueExprDefault(ParseState *pstate, JsonValueExpr *jve)
++{
++	return transformJsonValueExprExt(pstate, jve, JS_FORMAT_DEFAULT, false);
++}
++
+ /*
+  * Checks specified output format for its applicability to the target type.
+  */
+@@ -3576,8 +3638,7 @@ transformJsonObjectConstructor(ParseState *pstate, JsonObjectConstructor *ctor)
+ 		{
+ 			JsonKeyValue *kv = castNode(JsonKeyValue, lfirst(lc));
+ 			Node	   *key = transformExprRecurse(pstate, (Node *) kv->key);
+-			Node	   *val = transformJsonValueExpr(pstate, kv->value,
+-													 JS_FORMAT_DEFAULT);
++			Node	   *val = transformJsonValueExprDefault(pstate, kv->value);
+ 
+ 			args = lappend(args, key);
+ 			args = lappend(args, val);
+@@ -3755,7 +3816,7 @@ transformJsonObjectAgg(ParseState *pstate, JsonObjectAgg *agg)
+ 	Oid			aggtype;
+ 
+ 	key = transformExprRecurse(pstate, (Node *) agg->arg->key);
+-	val = transformJsonValueExpr(pstate, agg->arg->value, JS_FORMAT_DEFAULT);
++	val = transformJsonValueExprDefault(pstate, agg->arg->value);
+ 	args = list_make2(key, val);
+ 
+ 	returning = transformJsonConstructorOutput(pstate, agg->constructor->output,
+@@ -3813,7 +3874,7 @@ transformJsonArrayAgg(ParseState *pstate, JsonArrayAgg *agg)
+ 	const char *aggfnname;
+ 	Oid			aggtype;
+ 
+-	arg = transformJsonValueExpr(pstate, agg->arg, JS_FORMAT_DEFAULT);
++	arg = transformJsonValueExprDefault(pstate, agg->arg);
+ 
+ 	returning = transformJsonConstructorOutput(pstate, agg->constructor->output,
+ 											   list_make1(arg));
+@@ -3861,8 +3922,7 @@ transformJsonArrayConstructor(ParseState *pstate, JsonArrayConstructor *ctor)
+ 		foreach(lc, ctor->exprs)
+ 		{
+ 			JsonValueExpr *jsval = castNode(JsonValueExpr, lfirst(lc));
+-			Node	   *val = transformJsonValueExpr(pstate, jsval,
+-													 JS_FORMAT_DEFAULT);
++			Node	   *val = transformJsonValueExprDefault(pstate, jsval);
+ 
+ 			args = lappend(args, val);
+ 		}
+@@ -3945,3 +4005,413 @@ transformJsonIsPredicate(ParseState *pstate, JsonIsPredicate *pred)
+ 	return makeJsonIsPredicate(expr, NULL, pred->value_type,
+ 							   pred->unique_keys, pred->location);
+ }
++
++/*
++ * Transform a JSON PASSING clause.
++ */
++static void
++transformJsonPassingArgs(ParseState *pstate, JsonFormatType format, List *args,
++						 List **passing_values, List **passing_names)
++{
++	ListCell   *lc;
++
++	*passing_values = NIL;
++	*passing_names = NIL;
++
++	foreach(lc, args)
++	{
++		JsonArgument *arg = castNode(JsonArgument, lfirst(lc));
++		Node	   *expr = transformJsonValueExprExt(pstate, arg->val,
++													 format, true);
++
++		assign_expr_collations(pstate, expr);
++
++		*passing_values = lappend(*passing_values, expr);
++		*passing_names = lappend(*passing_names, makeString(arg->name));
++	}
++}
++
++/*
++ * Transform a JSON BEHAVIOR clause.
++ */
++static JsonBehavior *
++transformJsonBehavior(ParseState *pstate, JsonBehavior *behavior,
++					  JsonBehaviorType default_behavior)
++{
++	JsonBehaviorType behavior_type;
++	Node	   *default_expr;
++
++	behavior_type = behavior ? behavior->btype : default_behavior;
++	default_expr = behavior_type != JSON_BEHAVIOR_DEFAULT ? NULL :
++		transformExprRecurse(pstate, behavior->default_expr);
++
++	return makeJsonBehavior(behavior_type, default_expr);
++}
++
++/*
++ * Common code for JSON_VALUE, JSON_QUERY, JSON_EXISTS transformation
++ * into a JsonExpr node.
++ */
++static JsonExpr *
++transformJsonExprCommon(ParseState *pstate, JsonFuncExpr *func)
++{
++	JsonExpr   *jsexpr = makeNode(JsonExpr);
++	Node	   *pathspec;
++	JsonFormatType format;
++
++	if (func->common->pathname)
++		ereport(ERROR,
++				(errcode(ERRCODE_SYNTAX_ERROR),
++				 errmsg("JSON_TABLE path name is not allowed here"),
++				 parser_errposition(pstate, func->location)));
++
++	jsexpr->location = func->location;
++	jsexpr->op = func->op;
++	jsexpr->formatted_expr = transformJsonValueExpr(pstate, func->common->expr);
++
++	assign_expr_collations(pstate, jsexpr->formatted_expr);
++
++	/* format is determined by context item type */
++	format = exprType(jsexpr->formatted_expr) == JSONBOID ? JS_FORMAT_JSONB : JS_FORMAT_JSON;
++
++	jsexpr->result_coercion = NULL;
++	jsexpr->omit_quotes = false;
++
++	jsexpr->format = func->common->expr->format;
++
++	pathspec = transformExprRecurse(pstate, func->common->pathspec);
++
++	jsexpr->path_spec =
++		coerce_to_target_type(pstate, pathspec, exprType(pathspec),
++							  JSONPATHOID, -1,
++							  COERCION_EXPLICIT, COERCE_IMPLICIT_CAST,
++							  exprLocation(pathspec));
++	if (!jsexpr->path_spec)
++		ereport(ERROR,
++				(errcode(ERRCODE_DATATYPE_MISMATCH),
++				 errmsg("JSON path expression must be type %s, not type %s",
++						"jsonpath", format_type_be(exprType(pathspec))),
++				 parser_errposition(pstate, exprLocation(pathspec))));
++
++	/* transform and coerce to json[b] passing arguments */
++	transformJsonPassingArgs(pstate, format, func->common->passing,
++							 &jsexpr->passing_values, &jsexpr->passing_names);
++
++	if (func->op != JSON_EXISTS_OP)
++		jsexpr->on_empty = transformJsonBehavior(pstate, func->on_empty,
++												 JSON_BEHAVIOR_NULL);
++
++	jsexpr->on_error = transformJsonBehavior(pstate, func->on_error,
++											 func->op == JSON_EXISTS_OP ?
++											 JSON_BEHAVIOR_FALSE :
++											 JSON_BEHAVIOR_NULL);
++
++	return jsexpr;
++}
++
++/*
++ * Assign default JSON returning type from the specified format or from
++ * the context item type.
++ */
++static void
++assignDefaultJsonReturningType(Node *context_item, JsonFormat *context_format,
++							   JsonReturning *ret)
++{
++	bool		is_jsonb;
++
++	ret->format = copyObject(context_format);
++
++	if (ret->format->format_type == JS_FORMAT_DEFAULT)
++		is_jsonb = exprType(context_item) == JSONBOID;
++	else
++		is_jsonb = ret->format->format_type == JS_FORMAT_JSONB;
++
++	ret->typid = is_jsonb ? JSONBOID : JSONOID;
++	ret->typmod = -1;
++}
++
++/*
++ * Try to coerce expression to the output type or
++ * use json_populate_type() for composite, array and domain types or
++ * use coercion via I/O.
++ */
++static JsonCoercion *
++coerceJsonExpr(ParseState *pstate, Node *expr, const JsonReturning *returning)
++{
++	char		typtype;
++	JsonCoercion *coercion = makeNode(JsonCoercion);
++
++	coercion->expr = coerceJsonFuncExpr(pstate, expr, returning, false);
++
++	if (coercion->expr)
++	{
++		if (coercion->expr == expr)
++			coercion->expr = NULL;
++
++		return coercion;
++	}
++
++	typtype = get_typtype(returning->typid);
++
++	if (returning->typid == RECORDOID ||
++		typtype == TYPTYPE_COMPOSITE ||
++		typtype == TYPTYPE_DOMAIN ||
++		type_is_array(returning->typid))
++		coercion->via_populate = true;
++	else
++		coercion->via_io = true;
++
++	return coercion;
++}
++
++/*
++ * Transform a JSON output clause of JSON_VALUE and JSON_QUERY.
++ */
++static void
++transformJsonFuncExprOutput(ParseState *pstate,	JsonFuncExpr *func,
++							JsonExpr *jsexpr)
++{
++	Node	   *expr = jsexpr->formatted_expr;
++
++	jsexpr->returning = transformJsonOutput(pstate, func->output, false);
++
++	/* JSON_VALUE returns text by default */
++	if (func->op == JSON_VALUE_OP && !OidIsValid(jsexpr->returning->typid))
++	{
++		jsexpr->returning->typid = TEXTOID;
++		jsexpr->returning->typmod = -1;
++	}
++
++	if (OidIsValid(jsexpr->returning->typid))
++	{
++		JsonReturning ret;
++
++		if (func->op == JSON_VALUE_OP &&
++			jsexpr->returning->typid != JSONOID &&
++			jsexpr->returning->typid != JSONBOID)
++		{
++			/* Forced coercion via I/O for JSON_VALUE for non-JSON types */
++			jsexpr->result_coercion = makeNode(JsonCoercion);
++			jsexpr->result_coercion->expr = NULL;
++			jsexpr->result_coercion->via_io = true;
++			return;
++		}
++
++		assignDefaultJsonReturningType(jsexpr->formatted_expr, jsexpr->format, &ret);
++
++		if (ret.typid != jsexpr->returning->typid ||
++			ret.typmod != jsexpr->returning->typmod)
++		{
++			Node	   *placeholder = makeCaseTestExpr(expr);
++
++			Assert(((CaseTestExpr *) placeholder)->typeId == ret.typid);
++			Assert(((CaseTestExpr *) placeholder)->typeMod == ret.typmod);
++
++			jsexpr->result_coercion = coerceJsonExpr(pstate, placeholder,
++													 jsexpr->returning);
++		}
++	}
++	else
++		assignDefaultJsonReturningType(jsexpr->formatted_expr, jsexpr->format,
++									   jsexpr->returning);
++}
++
++/*
++ * Coerce a expression in JSON DEFAULT behavior to the target output type.
++ */
++static Node *
++coerceDefaultJsonExpr(ParseState *pstate, JsonExpr *jsexpr, Node *defexpr)
++{
++	int			location;
++	Oid			exprtype;
++
++	if (!defexpr)
++		return NULL;
++
++	exprtype = exprType(defexpr);
++	location = exprLocation(defexpr);
++
++	if (location < 0)
++		location = jsexpr->location;
++
++	defexpr = coerce_to_target_type(pstate,
++									defexpr,
++									exprtype,
++									jsexpr->returning->typid,
++									jsexpr->returning->typmod,
++									COERCION_EXPLICIT,
++									COERCE_IMPLICIT_CAST,
++									location);
++
++	if (!defexpr)
++		ereport(ERROR,
++				(errcode(ERRCODE_CANNOT_COERCE),
++				 errmsg("cannot cast DEFAULT expression type %s to %s",
++						format_type_be(exprtype),
++						format_type_be(jsexpr->returning->typid)),
++				 parser_errposition(pstate, location)));
++
++	return defexpr;
++}
++
++/*
++ * Initialize SQL/JSON item coercion from the SQL type "typid" to the target
++ * "returning" type.
++ */
++static JsonCoercion *
++initJsonItemCoercion(ParseState *pstate, Oid typid,
++					 const JsonReturning *returning)
++{
++	Node	   *expr;
++
++	if (typid == UNKNOWNOID)
++	{
++		expr = (Node *) makeNullConst(UNKNOWNOID, -1, InvalidOid);
++	}
++	else
++	{
++		CaseTestExpr *placeholder = makeNode(CaseTestExpr);
++
++		placeholder->typeId = typid;
++		placeholder->typeMod = -1;
++		placeholder->collation = InvalidOid;
++
++		expr = (Node *) placeholder;
++	}
++
++	return coerceJsonExpr(pstate, expr, returning);
++}
++
++static void
++initJsonItemCoercions(ParseState *pstate, JsonItemCoercions *coercions,
++					  const JsonReturning *returning, Oid contextItemTypeId)
++{
++	struct
++	{
++		JsonCoercion **coercion;
++		Oid			typid;
++	}		   *p,
++				coercionTypids[] =
++				{
++					{ &coercions->null, UNKNOWNOID },
++					{ &coercions->string, TEXTOID },
++					{ &coercions->numeric, NUMERICOID },
++					{ &coercions->boolean, BOOLOID },
++					{ &coercions->date, DATEOID },
++					{ &coercions->time, TIMEOID },
++					{ &coercions->timetz, TIMETZOID },
++					{ &coercions->timestamp, TIMESTAMPOID },
++					{ &coercions->timestamptz, TIMESTAMPTZOID },
++					{ &coercions->composite, contextItemTypeId },
++					{ NULL, InvalidOid }
++				};
++
++	for (p = coercionTypids; p->coercion; p++)
++		*p->coercion = initJsonItemCoercion(pstate, p->typid, returning);
++}
++
++/*
++ * Transform JSON_VALUE, JSON_QUERY, JSON_EXISTS functions into a JsonExpr node.
++ */
++static Node *
++transformJsonFuncExpr(ParseState *pstate, JsonFuncExpr *func)
++{
++	JsonExpr   *jsexpr = transformJsonExprCommon(pstate, func);
++	const char *func_name = NULL;
++	Node	   *contextItemExpr = jsexpr->formatted_expr;
++
++	switch (func->op)
++	{
++		case JSON_VALUE_OP:
++			func_name = "JSON_VALUE";
++
++			transformJsonFuncExprOutput(pstate, func, jsexpr);
++
++			jsexpr->returning->format->format_type = JS_FORMAT_DEFAULT;
++			jsexpr->returning->format->encoding = JS_ENC_DEFAULT;
++
++			jsexpr->on_empty->default_expr =
++				coerceDefaultJsonExpr(pstate, jsexpr,
++									  jsexpr->on_empty->default_expr);
++
++			jsexpr->on_error->default_expr =
++				coerceDefaultJsonExpr(pstate, jsexpr,
++									  jsexpr->on_error->default_expr);
++
++			jsexpr->coercions = makeNode(JsonItemCoercions);
++			initJsonItemCoercions(pstate, jsexpr->coercions, jsexpr->returning,
++								  exprType(contextItemExpr));
++
++			break;
++
++		case JSON_QUERY_OP:
++			func_name = "JSON_QUERY";
++
++			transformJsonFuncExprOutput(pstate, func, jsexpr);
++
++			jsexpr->on_empty->default_expr =
++				coerceDefaultJsonExpr(pstate, jsexpr,
++									  jsexpr->on_empty->default_expr);
++
++			jsexpr->on_error->default_expr =
++				coerceDefaultJsonExpr(pstate, jsexpr,
++									  jsexpr->on_error->default_expr);
++
++			jsexpr->wrapper = func->wrapper;
++			jsexpr->omit_quotes = func->omit_quotes;
++
++			break;
++
++		case JSON_EXISTS_OP:
++			func_name = "JSON_EXISTS";
++
++			jsexpr->returning = transformJsonOutput(pstate, func->output, false);
++
++			jsexpr->returning->format->format_type = JS_FORMAT_DEFAULT;
++			jsexpr->returning->format->encoding = JS_ENC_DEFAULT;
++
++			if (!OidIsValid(jsexpr->returning->typid))
++			{
++				jsexpr->returning->typid = BOOLOID;
++				jsexpr->returning->typmod = -1;
++			}
++			else if (jsexpr->returning->typid != BOOLOID)
++			{
++				CaseTestExpr *placeholder = makeNode(CaseTestExpr);
++				int			location = exprLocation((Node *) jsexpr);
++
++				placeholder->typeId = BOOLOID;
++				placeholder->typeMod = -1;
++				placeholder->collation = InvalidOid;
++
++				jsexpr->result_coercion = makeNode(JsonCoercion);
++				jsexpr->result_coercion->expr =
++					coerce_to_target_type(pstate, (Node *) placeholder, BOOLOID,
++										  jsexpr->returning->typid,
++										  jsexpr->returning->typmod,
++										  COERCION_EXPLICIT,
++										  COERCE_IMPLICIT_CAST,
++										  location);
++
++				if (!jsexpr->result_coercion->expr)
++					ereport(ERROR,
++							(errcode(ERRCODE_CANNOT_COERCE),
++							 errmsg("cannot cast type %s to %s",
++									format_type_be(BOOLOID),
++									format_type_be(jsexpr->returning->typid)),
++							 parser_coercion_errposition(pstate, location, (Node *) jsexpr)));
++
++				if (jsexpr->result_coercion->expr == (Node *) placeholder)
++					jsexpr->result_coercion->expr = NULL;
++			}
++			break;
++	}
++
++	if (exprType(contextItemExpr) != JSONBOID)
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("%s() is not yet implemented for json type", func_name),
++				 parser_errposition(pstate, func->location)));
++
++	return (Node *) jsexpr;
++}
+diff --git a/src/backend/parser/parse_target.c b/src/backend/parser/parse_target.c
+index e6445c7bafed..62d5d7d4395f 100644
+--- a/src/backend/parser/parse_target.c
++++ b/src/backend/parser/parse_target.c
+@@ -1971,6 +1971,21 @@ FigureColnameInternal(Node *node, char **name)
+ 		case T_JsonArrayAgg:
+ 			*name = "json_arrayagg";
+ 			return 2;
++		case T_JsonFuncExpr:
++			/* make SQL/JSON functions act like a regular function */
++			switch (((JsonFuncExpr *) node)->op)
++			{
++				case JSON_QUERY_OP:
++					*name = "json_query";
++					return 2;
++				case JSON_VALUE_OP:
++					*name = "json_value";
++					return 2;
++				case JSON_EXISTS_OP:
++					*name = "json_exists";
++					return 2;
++			}
++			break;
+ 		default:
+ 			break;
+ 	}
+diff --git a/src/backend/utils/adt/formatting.c b/src/backend/utils/adt/formatting.c
+index ed698f788deb..ac74333be514 100644
+--- a/src/backend/utils/adt/formatting.c
++++ b/src/backend/utils/adt/formatting.c
+@@ -1023,11 +1023,6 @@ typedef struct NUMProc
+ 			   *L_currency_symbol;
+ } NUMProc;
+ 
+-/* Return flags for DCH_from_char() */
+-#define DCH_DATED	0x01
+-#define DCH_TIMED	0x02
+-#define DCH_ZONED	0x04
+-
+ /* ----------
+  * Functions
+  * ----------
+@@ -6672,3 +6667,43 @@ float8_to_char(PG_FUNCTION_ARGS)
+ 	NUM_TOCHAR_finish;
+ 	PG_RETURN_TEXT_P(result);
+ }
++
++int
++datetime_format_flags(const char *fmt_str, bool *have_error)
++{
++	bool		incache;
++	int			fmt_len = strlen(fmt_str);
++	int			result;
++	FormatNode *format;
++
++	if (fmt_len > DCH_CACHE_SIZE)
++	{
++		/*
++		 * Allocate new memory if format picture is bigger than static cache
++		 * and do not use cache (call parser always)
++		 */
++		incache = false;
++
++		format = (FormatNode *) palloc((fmt_len + 1) * sizeof(FormatNode));
++
++		parse_format(format, fmt_str, DCH_keywords,
++					 DCH_suff, DCH_index, DCH_FLAG, NULL);
++	}
++	else
++	{
++		/*
++		 * Use cache buffers
++		 */
++		DCHCacheEntry *ent = DCH_cache_fetch(fmt_str, false);
++
++		incache = true;
++		format = ent->format;
++	}
++
++	result = DCH_datetime_type(format, have_error);
++
++	if (!incache)
++		pfree(format);
++
++	return result;
++}
+diff --git a/src/backend/utils/adt/jsonb.c b/src/backend/utils/adt/jsonb.c
+index a103cbc7c69e..d383cbdfedb6 100644
+--- a/src/backend/utils/adt/jsonb.c
++++ b/src/backend/utils/adt/jsonb.c
+@@ -2227,3 +2227,65 @@ jsonb_float8(PG_FUNCTION_ARGS)
+ 
+ 	PG_RETURN_DATUM(retValue);
+ }
++
++/*
++ * Construct an empty array jsonb.
++ */
++Jsonb *
++JsonbMakeEmptyArray(void)
++{
++	JsonbValue jbv;
++
++	jbv.type = jbvArray;
++	jbv.val.array.elems = NULL;
++	jbv.val.array.nElems = 0;
++	jbv.val.array.rawScalar = false;
++
++	return JsonbValueToJsonb(&jbv);
++}
++
++/*
++ * Construct an empty object jsonb.
++ */
++Jsonb *
++JsonbMakeEmptyObject(void)
++{
++	JsonbValue jbv;
++
++	jbv.type = jbvObject;
++	jbv.val.object.pairs = NULL;
++	jbv.val.object.nPairs = 0;
++
++	return JsonbValueToJsonb(&jbv);
++}
++
++/*
++ * Convert jsonb to a C-string stripping quotes from scalar strings.
++ */
++char *
++JsonbUnquote(Jsonb *jb)
++{
++	if (JB_ROOT_IS_SCALAR(jb))
++	{
++		JsonbValue	v;
++
++		JsonbExtractScalar(&jb->root, &v);
++
++		if (v.type == jbvString)
++			return pnstrdup(v.val.string.val, v.val.string.len);
++		else if (v.type == jbvBool)
++			return pstrdup(v.val.boolean ? "true" : "false");
++		else if (v.type == jbvNumeric)
++			return DatumGetCString(DirectFunctionCall1(numeric_out,
++									   PointerGetDatum(v.val.numeric)));
++		else if (v.type == jbvNull)
++			return pstrdup("null");
++		else
++		{
++			elog(ERROR, "unrecognized jsonb value type %d", v.type);
++			return NULL;
++		}
++	}
++	else
++		return JsonbToCString(NULL, &jb->root, VARSIZE(jb));
++}
+diff --git a/src/backend/utils/adt/jsonfuncs.c b/src/backend/utils/adt/jsonfuncs.c
+index a24d498b0608..a682d9c97341 100644
+--- a/src/backend/utils/adt/jsonfuncs.c
++++ b/src/backend/utils/adt/jsonfuncs.c
+@@ -2658,11 +2658,11 @@ populate_array_dim_jsonb(PopulateArrayContext *ctx, /* context */
+ 
+ 	check_stack_depth();
+ 
+-	if (jbv->type != jbvBinary || !JsonContainerIsArray(jbc))
++	if (jbv->type != jbvBinary ||
++		!JsonContainerIsArray(jbc) ||
++		JsonContainerIsScalar(jbc))
+ 		populate_array_report_expected_array(ctx, ndim - 1);
+ 
+-	Assert(!JsonContainerIsScalar(jbc));
+-
+ 	it = JsonbIteratorInit(jbc);
+ 
+ 	tok = JsonbIteratorNext(&it, &val, true);
+@@ -3134,6 +3134,50 @@ populate_record_field(ColumnIOData *col,
+ 	}
+ }
+ 
++/* recursively populate specified type from a json/jsonb value */
++Datum
++json_populate_type(Datum json_val, Oid json_type, Oid typid, int32 typmod,
++				   void **cache, MemoryContext mcxt, bool *isnull)
++{
++	JsValue		jsv = { 0 };
++	JsonbValue	jbv;
++
++	jsv.is_json = json_type == JSONOID;
++
++	if (*isnull)
++	{
++		if (jsv.is_json)
++			jsv.val.json.str = NULL;
++		else
++			jsv.val.jsonb = NULL;
++	}
++	else if (jsv.is_json)
++	{
++		text	   *json = DatumGetTextPP(json_val);
++
++		jsv.val.json.str = VARDATA_ANY(json);
++		jsv.val.json.len = VARSIZE_ANY_EXHDR(json);
++		jsv.val.json.type = JSON_TOKEN_INVALID; /* not used in populate_composite() */
++	}
++	else
++	{
++		Jsonb	   *jsonb = DatumGetJsonbP(json_val);
++
++		jsv.val.jsonb = &jbv;
++
++		/* fill binary jsonb value pointing to jb */
++		jbv.type = jbvBinary;
++		jbv.val.binary.data = &jsonb->root;
++		jbv.val.binary.len = VARSIZE(jsonb) - VARHDRSZ;
++	}
++
++	if (!*cache)
++		*cache = MemoryContextAllocZero(mcxt, sizeof(ColumnIOData));
++
++	return populate_record_field(*cache , typid, typmod, NULL, mcxt,
++								 PointerGetDatum(NULL), &jsv, isnull);
++}
++
+ static RecordIOData *
+ allocate_record_info(MemoryContext mcxt, int ncolumns)
+ {
+diff --git a/src/backend/utils/adt/jsonpath.c b/src/backend/utils/adt/jsonpath.c
+index 91af03009523..0ac14153aaee 100644
+--- a/src/backend/utils/adt/jsonpath.c
++++ b/src/backend/utils/adt/jsonpath.c
+@@ -67,7 +67,9 @@
+ #include "lib/stringinfo.h"
+ #include "libpq/pqformat.h"
+ #include "miscadmin.h"
++#include "nodes/nodeFuncs.h"
+ #include "utils/builtins.h"
++#include "utils/formatting.h"
+ #include "utils/json.h"
+ #include "utils/jsonpath.h"
+ 
+@@ -1077,3 +1079,258 @@ jspGetArraySubscript(JsonPathItem *v, JsonPathItem *from, JsonPathItem *to,
+ 
+ 	return true;
+ }
++
++/* SQL/JSON datatype status: */
++typedef enum JsonPathDatatypeStatus
++{
++	jpdsNonDateTime,			/* null, bool, numeric, string, array, object */
++	jpdsUnknownDateTime,		/* unknown datetime type */
++	jpdsDateTimeZoned,			/* timetz, timestamptz */
++	jpdsDateTimeNonZoned		/* time, timestamp, date */
++} JsonPathDatatypeStatus;
++
++/* Context for jspIsMutableWalker() */
++typedef struct JsonPathMutableContext
++{
++	List	   *varnames;		/* list of variable names */
++	List	   *varexprs;		/* list of variable expressions */
++	JsonPathDatatypeStatus current;	/* status of @ item */
++	bool		lax;			/* jsonpath is lax or strict */
++	bool		mutable;		/* resulting mutability status */
++} JsonPathMutableContext;
++
++/*
++ * Recursive walker for jspIsMutable()
++ */
++static JsonPathDatatypeStatus
++jspIsMutableWalker(JsonPathItem *jpi, JsonPathMutableContext *cxt)
++{
++	JsonPathItem next;
++	JsonPathDatatypeStatus status = jpdsNonDateTime;
++
++	while (!cxt->mutable)
++	{
++		JsonPathItem arg;
++		JsonPathDatatypeStatus leftStatus;
++		JsonPathDatatypeStatus rightStatus;
++
++		switch (jpi->type)
++		{
++			case jpiRoot:
++				Assert(status == jpdsNonDateTime);
++				break;
++
++			case jpiCurrent:
++				Assert(status == jpdsNonDateTime);
++				status = cxt->current;
++				break;
++
++			case jpiFilter:
++				{
++					JsonPathDatatypeStatus prevStatus = cxt->current;
++
++					cxt->current = status;
++					jspGetArg(jpi, &arg);
++					jspIsMutableWalker(&arg, cxt);
++
++					cxt->current = prevStatus;
++					break;
++				}
++
++			case jpiVariable:
++				{
++					int32		len;
++					const char *name = jspGetString(jpi, &len);
++					ListCell   *lc1;
++					ListCell   *lc2;
++
++					Assert(status == jpdsNonDateTime);
++
++					forboth(lc1, cxt->varnames, lc2, cxt->varexprs)
++					{
++						String	   *varname = lfirst_node(String, lc1);
++						Node	   *varexpr = lfirst(lc2);
++
++						if (strncmp(varname->sval, name, len))
++							continue;
++
++						switch (exprType(varexpr))
++						{
++							case DATEOID:
++							case TIMEOID:
++							case TIMESTAMPOID:
++								status = jpdsDateTimeNonZoned;
++								break;
++
++							case TIMETZOID:
++							case TIMESTAMPTZOID:
++								status = jpdsDateTimeZoned;
++								break;
++
++							default:
++								status = jpdsNonDateTime;
++								break;
++						}
++
++						break;
++					}
++					break;
++				}
++
++			case jpiEqual:
++			case jpiNotEqual:
++			case jpiLess:
++			case jpiGreater:
++			case jpiLessOrEqual:
++			case jpiGreaterOrEqual:
++				Assert(status == jpdsNonDateTime);
++				jspGetLeftArg(jpi, &arg);
++				leftStatus = jspIsMutableWalker(&arg, cxt);
++
++				jspGetRightArg(jpi, &arg);
++				rightStatus = jspIsMutableWalker(&arg, cxt);
++
++				/*
++				 * Comparison of datetime type with different timezone status
++				 * is mutable.
++				 */
++				if (leftStatus != jpdsNonDateTime &&
++					rightStatus != jpdsNonDateTime &&
++					(leftStatus == jpdsUnknownDateTime ||
++					 rightStatus == jpdsUnknownDateTime ||
++					 leftStatus != rightStatus))
++					cxt->mutable = true;
++				break;
++
++			case jpiNot:
++			case jpiIsUnknown:
++			case jpiExists:
++			case jpiPlus:
++			case jpiMinus:
++				Assert(status == jpdsNonDateTime);
++				jspGetArg(jpi, &arg);
++				jspIsMutableWalker(&arg, cxt);
++				break;
++
++			case jpiAnd:
++			case jpiOr:
++			case jpiAdd:
++			case jpiSub:
++			case jpiMul:
++			case jpiDiv:
++			case jpiMod:
++			case jpiStartsWith:
++				Assert(status == jpdsNonDateTime);
++				jspGetLeftArg(jpi, &arg);
++				jspIsMutableWalker(&arg, cxt);
++				jspGetRightArg(jpi, &arg);
++				jspIsMutableWalker(&arg, cxt);
++				break;
++
++			case jpiIndexArray:
++				for (int i = 0; i < jpi->content.array.nelems; i++)
++				{
++					JsonPathItem from;
++					JsonPathItem to;
++
++					if (jspGetArraySubscript(jpi, &from, &to, i))
++						jspIsMutableWalker(&to, cxt);
++
++					jspIsMutableWalker(&from, cxt);
++				}
++				/* FALLTHROUGH */
++
++			case jpiAnyArray:
++				if (!cxt->lax)
++					status = jpdsNonDateTime;
++				break;
++
++			case jpiAny:
++				if (jpi->content.anybounds.first > 0)
++					status = jpdsNonDateTime;
++				break;
++
++			case jpiDatetime:
++				if (jpi->content.arg)
++				{
++					char	   *template;
++					int			flags;
++
++					jspGetArg(jpi, &arg);
++					if (arg.type != jpiString)
++					{
++						status = jpdsNonDateTime;
++						break;	/* there will be runtime error */
++					}
++
++					template = jspGetString(&arg, NULL);
++					flags = datetime_format_flags(template, NULL);
++					if (flags & DCH_ZONED)
++						status = jpdsDateTimeZoned;
++					else
++						status = jpdsDateTimeNonZoned;
++				}
++				else
++				{
++					status = jpdsUnknownDateTime;
++				}
++				break;
++
++			case jpiLikeRegex:
++				Assert(status == jpdsNonDateTime);
++				jspInitByBuffer(&arg, jpi->base, jpi->content.like_regex.expr);
++				jspIsMutableWalker(&arg, cxt);
++				break;
++
++			/* literals */
++			case jpiNull:
++			case jpiString:
++			case jpiNumeric:
++			case jpiBool:
++			/* accessors */
++			case jpiKey:
++			case jpiAnyKey:
++			/* special items */
++			case jpiSubscript:
++			case jpiLast:
++			/* item methods */
++			case jpiType:
++			case jpiSize:
++			case jpiAbs:
++			case jpiFloor:
++			case jpiCeiling:
++			case jpiDouble:
++			case jpiKeyValue:
++				status = jpdsNonDateTime;
++				break;
++		}
++
++		if (!jspGetNext(jpi, &next))
++			break;
++
++		jpi = &next;
++	}
++
++	return status;
++}
++
++/*
++ * Check whether jsonpath expression is immutable or not.
++ */
++bool
++jspIsMutable(JsonPath *path, List *varnames, List *varexprs)
++{
++	JsonPathMutableContext cxt;
++	JsonPathItem jpi;
++
++	cxt.varnames = varnames;
++	cxt.varexprs = varexprs;
++	cxt.current = jpdsNonDateTime;
++	cxt.lax = (path->header & JSONPATH_LAX) != 0;
++	cxt.mutable = false;
++
++	jspInit(&jpi, path);
++	jspIsMutableWalker(&jpi, &cxt);
++
++	return cxt.mutable;
++}
+diff --git a/src/backend/utils/adt/jsonpath_exec.c b/src/backend/utils/adt/jsonpath_exec.c
+index eff3734b6ab0..7811fa31e07d 100644
+--- a/src/backend/utils/adt/jsonpath_exec.c
++++ b/src/backend/utils/adt/jsonpath_exec.c
+@@ -86,12 +86,16 @@ typedef struct JsonBaseObjectInfo
+ 	int			id;
+ } JsonBaseObjectInfo;
+ 
++typedef int (*JsonPathVarCallback) (void *vars, char *varName, int varNameLen,
++									JsonbValue *val, JsonbValue *baseObject);
++
+ /*
+  * Context of jsonpath execution.
+  */
+ typedef struct JsonPathExecContext
+ {
+-	Jsonb	   *vars;			/* variables to substitute into jsonpath */
++	void	   *vars;			/* variables to substitute into jsonpath */
++	JsonPathVarCallback getVar;
+ 	JsonbValue *root;			/* for $ evaluation */
+ 	JsonbValue *current;		/* for @ evaluation */
+ 	JsonBaseObjectInfo baseObject;	/* "base object" for .keyvalue()
+@@ -173,7 +177,8 @@ typedef JsonPathBool (*JsonPathPredicateCallback) (JsonPathItem *jsp,
+ 												   void *param);
+ typedef Numeric (*BinaryArithmFunc) (Numeric num1, Numeric num2, bool *error);
+ 
+-static JsonPathExecResult executeJsonPath(JsonPath *path, Jsonb *vars,
++static JsonPathExecResult executeJsonPath(JsonPath *path, void *vars,
++										  JsonPathVarCallback getVar,
+ 										  Jsonb *json, bool throwErrors,
+ 										  JsonValueList *result, bool useTz);
+ static JsonPathExecResult executeItem(JsonPathExecContext *cxt,
+@@ -225,7 +230,10 @@ static JsonPathExecResult appendBoolResult(JsonPathExecContext *cxt,
+ static void getJsonPathItem(JsonPathExecContext *cxt, JsonPathItem *item,
+ 							JsonbValue *value);
+ static void getJsonPathVariable(JsonPathExecContext *cxt,
+-								JsonPathItem *variable, Jsonb *vars, JsonbValue *value);
++								JsonPathItem *variable, JsonbValue *value);
++static int getJsonPathVariableFromJsonb(void *varsJsonb, char *varName,
++										int varNameLen, JsonbValue *val,
++										JsonbValue *baseObject);
+ static int	JsonbArraySize(JsonbValue *jb);
+ static JsonPathBool executeComparison(JsonPathItem *cmp, JsonbValue *lv,
+ 									  JsonbValue *rv, void *p);
+@@ -283,7 +291,8 @@ jsonb_path_exists_internal(FunctionCallInfo fcinfo, bool tz)
+ 		silent = PG_GETARG_BOOL(3);
+ 	}
+ 
+-	res = executeJsonPath(jp, vars, jb, !silent, NULL, tz);
++	res = executeJsonPath(jp, vars, getJsonPathVariableFromJsonb,
++						  jb, !silent, NULL, tz);
+ 
+ 	PG_FREE_IF_COPY(jb, 0);
+ 	PG_FREE_IF_COPY(jp, 1);
+@@ -338,7 +347,8 @@ jsonb_path_match_internal(FunctionCallInfo fcinfo, bool tz)
+ 		silent = PG_GETARG_BOOL(3);
+ 	}
+ 
+-	(void) executeJsonPath(jp, vars, jb, !silent, &found, tz);
++	(void) executeJsonPath(jp, vars, getJsonPathVariableFromJsonb,
++						   jb, !silent, &found, tz);
+ 
+ 	PG_FREE_IF_COPY(jb, 0);
+ 	PG_FREE_IF_COPY(jp, 1);
+@@ -416,7 +426,8 @@ jsonb_path_query_internal(FunctionCallInfo fcinfo, bool tz)
+ 		vars = PG_GETARG_JSONB_P_COPY(2);
+ 		silent = PG_GETARG_BOOL(3);
+ 
+-		(void) executeJsonPath(jp, vars, jb, !silent, &found, tz);
++		(void) executeJsonPath(jp, vars, getJsonPathVariableFromJsonb,
++							   jb, !silent, &found, tz);
+ 
+ 		funcctx->user_fctx = JsonValueListGetList(&found);
+ 
+@@ -463,7 +474,8 @@ jsonb_path_query_array_internal(FunctionCallInfo fcinfo, bool tz)
+ 	Jsonb	   *vars = PG_GETARG_JSONB_P(2);
+ 	bool		silent = PG_GETARG_BOOL(3);
+ 
+-	(void) executeJsonPath(jp, vars, jb, !silent, &found, tz);
++	(void) executeJsonPath(jp, vars, getJsonPathVariableFromJsonb,
++						   jb, !silent, &found, tz);
+ 
+ 	PG_RETURN_JSONB_P(JsonbValueToJsonb(wrapItemsInArray(&found)));
+ }
+@@ -494,7 +506,8 @@ jsonb_path_query_first_internal(FunctionCallInfo fcinfo, bool tz)
+ 	Jsonb	   *vars = PG_GETARG_JSONB_P(2);
+ 	bool		silent = PG_GETARG_BOOL(3);
+ 
+-	(void) executeJsonPath(jp, vars, jb, !silent, &found, tz);
++	(void) executeJsonPath(jp, vars, getJsonPathVariableFromJsonb,
++						   jb, !silent, &found, tz);
+ 
+ 	if (JsonValueListLength(&found) >= 1)
+ 		PG_RETURN_JSONB_P(JsonbValueToJsonb(JsonValueListHead(&found)));
+@@ -536,8 +549,9 @@ jsonb_path_query_first_tz(PG_FUNCTION_ARGS)
+  * In other case it tries to find all the satisfied result items.
+  */
+ static JsonPathExecResult
+-executeJsonPath(JsonPath *path, Jsonb *vars, Jsonb *json, bool throwErrors,
+-				JsonValueList *result, bool useTz)
++executeJsonPath(JsonPath *path, void *vars, JsonPathVarCallback getVar,
++				Jsonb *json, bool throwErrors, JsonValueList *result,
++				bool useTz)
+ {
+ 	JsonPathExecContext cxt;
+ 	JsonPathExecResult res;
+@@ -549,22 +563,16 @@ executeJsonPath(JsonPath *path, Jsonb *vars, Jsonb *json, bool throwErrors,
+ 	if (!JsonbExtractScalar(&json->root, &jbv))
+ 		JsonbInitBinary(&jbv, json);
+ 
+-	if (vars && !JsonContainerIsObject(&vars->root))
+-	{
+-		ereport(ERROR,
+-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-				 errmsg("\"vars\" argument is not an object"),
+-				 errdetail("Jsonpath parameters should be encoded as key-value pairs of \"vars\" object.")));
+-	}
+-
+ 	cxt.vars = vars;
++	cxt.getVar = getVar;
+ 	cxt.laxMode = (path->header & JSONPATH_LAX) != 0;
+ 	cxt.ignoreStructuralErrors = cxt.laxMode;
+ 	cxt.root = &jbv;
+ 	cxt.current = &jbv;
+ 	cxt.baseObject.jbc = NULL;
+ 	cxt.baseObject.id = 0;
+-	cxt.lastGeneratedObjectId = vars ? 2 : 1;
++	/* 1 + number of base objects in vars */
++	cxt.lastGeneratedObjectId = 1 + getVar(vars, NULL, 0, NULL, NULL);
+ 	cxt.innermostArraySize = -1;
+ 	cxt.throwErrors = throwErrors;
+ 	cxt.useTz = useTz;
+@@ -2093,7 +2101,7 @@ getJsonPathItem(JsonPathExecContext *cxt, JsonPathItem *item,
+ 												 &value->val.string.len);
+ 			break;
+ 		case jpiVariable:
+-			getJsonPathVariable(cxt, item, cxt->vars, value);
++			getJsonPathVariable(cxt, item, value);
+ 			return;
+ 		default:
+ 			elog(ERROR, "unexpected jsonpath item type");
+@@ -2105,42 +2113,63 @@ getJsonPathItem(JsonPathExecContext *cxt, JsonPathItem *item,
+  */
+ static void
+ getJsonPathVariable(JsonPathExecContext *cxt, JsonPathItem *variable,
+-					Jsonb *vars, JsonbValue *value)
++					JsonbValue *value)
+ {
+ 	char	   *varName;
+ 	int			varNameLength;
++	JsonbValue	baseObject;
++	int			baseObjectId;
++
++	Assert(variable->type == jpiVariable);
++	varName = jspGetString(variable, &varNameLength);
++
++	if (!cxt->vars ||
++		(baseObjectId = cxt->getVar(cxt->vars, varName, varNameLength, value,
++									&baseObject)) < 0)
++		ereport(ERROR,
++				(errcode(ERRCODE_UNDEFINED_OBJECT),
++				 errmsg("could not find jsonpath variable \"%s\"",
++						pnstrdup(varName, varNameLength))));
++
++	if (baseObjectId > 0)
++		setBaseObject(cxt, &baseObject, baseObjectId);
++}
++
++static int
++getJsonPathVariableFromJsonb(void *varsJsonb, char *varName, int varNameLength,
++							 JsonbValue *value, JsonbValue *baseObject)
++{
++	Jsonb	   *vars = varsJsonb;
+ 	JsonbValue	tmp;
+ 	JsonbValue *v;
+ 
+-	if (!vars)
++	if (!varName)
+ 	{
+-		value->type = jbvNull;
+-		return;
++		if (vars && !JsonContainerIsObject(&vars->root))
++		{
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("\"vars\" argument is not an object"),
++					 errdetail("Jsonpath parameters should be encoded as key-value pairs of \"vars\" object.")));
++		}
++
++		return vars ? 1 : 0;	/* count of base objects */
+ 	}
+ 
+-	Assert(variable->type == jpiVariable);
+-	varName = jspGetString(variable, &varNameLength);
+ 	tmp.type = jbvString;
+ 	tmp.val.string.val = varName;
+ 	tmp.val.string.len = varNameLength;
+ 
+ 	v = findJsonbValueFromContainer(&vars->root, JB_FOBJECT, &tmp);
+ 
+-	if (v)
+-	{
+-		*value = *v;
+-		pfree(v);
+-	}
+-	else
+-	{
+-		ereport(ERROR,
+-				(errcode(ERRCODE_UNDEFINED_OBJECT),
+-				 errmsg("could not find jsonpath variable \"%s\"",
+-						pnstrdup(varName, varNameLength))));
+-	}
++	if (!v)
++		return -1;
+ 
+-	JsonbInitBinary(&tmp, vars);
+-	setBaseObject(cxt, &tmp, 1);
++	*value = *v;
++	pfree(v);
++
++	JsonbInitBinary(baseObject, vars);
++	return 1;
+ }
+ 
+ /**************** Support functions for JsonPath execution *****************/
+@@ -2797,3 +2826,244 @@ compareDatetime(Datum val1, Oid typid1, Datum val2, Oid typid2,
+ 
+ 	return DatumGetInt32(DirectFunctionCall2(cmpfunc, val1, val2));
+ }
++
++/********************Interface to pgsql's executor***************************/
++
++bool
++JsonPathExists(Datum jb, JsonPath *jp, List *vars, bool *error)
++{
++	JsonPathExecResult res = executeJsonPath(jp, vars, EvalJsonPathVar,
++											 DatumGetJsonbP(jb), !error, NULL,
++											 true);
++
++	Assert(error || !jperIsError(res));
++
++	if (error && jperIsError(res))
++		*error = true;
++
++	return res == jperOk;
++}
++
++Datum
++JsonPathQuery(Datum jb, JsonPath *jp, JsonWrapper wrapper, bool *empty,
++			  bool *error, List *vars)
++{
++	JsonbValue *first;
++	bool		wrap;
++	JsonValueList found = {0};
++	JsonPathExecResult res PG_USED_FOR_ASSERTS_ONLY;
++	int			count;
++
++	res = executeJsonPath(jp, vars, EvalJsonPathVar, DatumGetJsonbP(jb), !error,
++						  &found, true);
++
++	Assert(error || !jperIsError(res));
++
++	if (error && jperIsError(res))
++	{
++		*error = true;
++		*empty = false;
++		return (Datum) 0;
++	}
++
++	count = JsonValueListLength(&found);
++
++	first = count ? JsonValueListHead(&found) : NULL;
++
++	if (!first)
++		wrap = false;
++	else if (wrapper == JSW_NONE)
++		wrap = false;
++	else if (wrapper == JSW_UNCONDITIONAL)
++		wrap = true;
++	else if (wrapper == JSW_CONDITIONAL)
++		wrap = count > 1 ||
++			IsAJsonbScalar(first) ||
++			(first->type == jbvBinary &&
++			 JsonContainerIsScalar(first->val.binary.data));
++	else
++	{
++		elog(ERROR, "unrecognized json wrapper %d", wrapper);
++		wrap = false;
++	}
++
++	if (wrap)
++		return JsonbPGetDatum(JsonbValueToJsonb(wrapItemsInArray(&found)));
++
++	if (count > 1)
++	{
++		if (error)
++		{
++			*error = true;
++			return (Datum) 0;
++		}
++
++		ereport(ERROR,
++				(errcode(ERRCODE_MORE_THAN_ONE_SQL_JSON_ITEM),
++				 errmsg("JSON path expression in JSON_QUERY should return "
++						"singleton item without wrapper"),
++				 errhint("use WITH WRAPPER clause to wrap SQL/JSON item "
++						 "sequence into array")));
++	}
++
++	if (first)
++		return JsonbPGetDatum(JsonbValueToJsonb(first));
++
++	*empty = true;
++	return PointerGetDatum(NULL);
++}
++
++JsonbValue *
++JsonPathValue(Datum jb, JsonPath *jp, bool *empty, bool *error, List *vars)
++{
++	JsonbValue   *res;
++	JsonValueList found = { 0 };
++	JsonPathExecResult jper PG_USED_FOR_ASSERTS_ONLY;
++	int			count;
++
++	jper = executeJsonPath(jp, vars, EvalJsonPathVar, DatumGetJsonbP(jb), !error,
++						   &found, true);
++
++	Assert(error || !jperIsError(jper));
++
++	if (error && jperIsError(jper))
++	{
++		*error = true;
++		*empty = false;
++		return NULL;
++	}
++
++	count = JsonValueListLength(&found);
++
++	*empty = !count;
++
++	if (*empty)
++		return NULL;
++
++	if (count > 1)
++	{
++		if (error)
++		{
++			*error = true;
++			return NULL;
++		}
++
++		ereport(ERROR,
++				(errcode(ERRCODE_MORE_THAN_ONE_SQL_JSON_ITEM),
++				 errmsg("JSON path expression in JSON_VALUE should return "
++						"singleton scalar item")));
++	}
++
++	res = JsonValueListHead(&found);
++
++	if (res->type == jbvBinary &&
++		JsonContainerIsScalar(res->val.binary.data))
++		JsonbExtractScalar(res->val.binary.data, res);
++
++	if (!IsAJsonbScalar(res))
++	{
++		if (error)
++		{
++			*error = true;
++			return NULL;
++		}
++
++		ereport(ERROR,
++				(errcode(ERRCODE_SQL_JSON_SCALAR_REQUIRED),
++				 errmsg("JSON path expression in JSON_VALUE should return "
++						"singleton scalar item")));
++	}
++
++	if (res->type == jbvNull)
++		return NULL;
++
++	return res;
++}
++
++static void
++JsonbValueInitNumericDatum(JsonbValue *jbv, Datum num)
++{
++	jbv->type = jbvNumeric;
++	jbv->val.numeric = DatumGetNumeric(num);
++}
++
++void
++JsonItemFromDatum(Datum val, Oid typid, int32 typmod, JsonbValue *res)
++{
++	switch (typid)
++	{
++		case BOOLOID:
++			res->type = jbvBool;
++			res->val.boolean = DatumGetBool(val);
++			break;
++		case NUMERICOID:
++			JsonbValueInitNumericDatum(res, val);
++			break;
++		case INT2OID:
++			JsonbValueInitNumericDatum(res, DirectFunctionCall1(int2_numeric, val));
++			break;
++		case INT4OID:
++			JsonbValueInitNumericDatum(res, DirectFunctionCall1(int4_numeric, val));
++			break;
++		case INT8OID:
++			JsonbValueInitNumericDatum(res, DirectFunctionCall1(int8_numeric, val));
++			break;
++		case FLOAT4OID:
++			JsonbValueInitNumericDatum(res, DirectFunctionCall1(float4_numeric, val));
++			break;
++		case FLOAT8OID:
++			JsonbValueInitNumericDatum(res, DirectFunctionCall1(float8_numeric, val));
++			break;
++		case TEXTOID:
++		case VARCHAROID:
++			res->type = jbvString;
++			res->val.string.val = VARDATA_ANY(val);
++			res->val.string.len = VARSIZE_ANY_EXHDR(val);
++			break;
++		case DATEOID:
++		case TIMEOID:
++		case TIMETZOID:
++		case TIMESTAMPOID:
++		case TIMESTAMPTZOID:
++			res->type = jbvDatetime;
++			res->val.datetime.value = val;
++			res->val.datetime.typid = typid;
++			res->val.datetime.typmod = typmod;
++			res->val.datetime.tz = 0;
++			break;
++		case JSONBOID:
++			{
++				JsonbValue *jbv = res;
++				Jsonb	   *jb = DatumGetJsonbP(val);
++
++				if (JsonContainerIsScalar(&jb->root))
++				{
++					bool		res PG_USED_FOR_ASSERTS_ONLY;
++
++					res = JsonbExtractScalar(&jb->root, jbv);
++					Assert(res);
++				}
++				else
++					JsonbInitBinary(jbv, jb);
++				break;
++			}
++		case JSONOID:
++			{
++				text	   *txt = DatumGetTextP(val);
++				char	   *str = text_to_cstring(txt);
++				Jsonb	   *jb =
++					DatumGetJsonbP(DirectFunctionCall1(jsonb_in,
++													   CStringGetDatum(str)));
++
++				pfree(str);
++
++				JsonItemFromDatum(JsonbPGetDatum(jb), JSONBOID, -1, res);
++				break;
++			}
++		default:
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("only bool, numeric and text types could be "
++							"casted to supported jsonpath types.")));
++	}
++}
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index 0ed774f6e663..c2484fbceaec 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -501,6 +501,8 @@ static char *generate_qualified_type_name(Oid typid);
+ static text *string_to_text(char *str);
+ static char *flatten_reloptions(Oid relid);
+ static void get_reloptions(StringInfo buf, Datum reloptions);
++static void get_json_path_spec(Node *path_spec, deparse_context *context,
++							   bool showimplicit);
+ 
+ #define only_marker(rte)  ((rte)->inh ? "" : "ONLY ")
+ 
+@@ -8137,6 +8139,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
+ 		case T_WindowFunc:
+ 		case T_FuncExpr:
+ 		case T_JsonConstructorExpr:
++		case T_JsonExpr:
+ 			/* function-like: name(..) or name[..] */
+ 			return true;
+ 
+@@ -8255,6 +8258,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
+ 				case T_GroupingFunc:	/* own parentheses */
+ 				case T_WindowFunc:	/* own parentheses */
+ 				case T_CaseExpr:	/* other separators */
++				case T_JsonExpr: /* own parentheses */
+ 					return true;
+ 				default:
+ 					return false;
+@@ -8421,6 +8425,19 @@ get_rule_expr_paren(Node *node, deparse_context *context,
+ 		appendStringInfoChar(context->buf, ')');
+ }
+ 
++
++/*
++ * get_json_path_spec		- Parse back a JSON path specification
++ */
++static void
++get_json_path_spec(Node *path_spec, deparse_context *context, bool showimplicit)
++{
++	if (IsA(path_spec, Const))
++		get_const_expr((Const *) path_spec, context, -1);
++	else
++		get_rule_expr(path_spec, context, showimplicit);
++}
++
+ /*
+  * get_json_format			- Parse back a JsonFormat node
+  */
+@@ -8464,6 +8481,66 @@ get_json_returning(JsonReturning *returning, StringInfo buf,
+ 		get_json_format(returning->format, buf);
+ }
+ 
++static void
++get_json_behavior(JsonBehavior *behavior, deparse_context *context,
++				  const char *on)
++{
++	/*
++	 * The order of array elements must correspond to the order of
++	 * JsonBehaviorType members.
++	 */
++	const char *behavior_names[] =
++	{
++		" NULL",
++		" ERROR",
++		" EMPTY",
++		" TRUE",
++		" FALSE",
++		" UNKNOWN",
++		" EMPTY ARRAY",
++		" EMPTY OBJECT",
++		" DEFAULT "
++	};
++
++	if ((int) behavior->btype < 0 || behavior->btype >= lengthof(behavior_names))
++		elog(ERROR, "invalid json behavior type: %d", behavior->btype);
++
++	appendStringInfoString(context->buf, behavior_names[behavior->btype]);
++
++	if (behavior->btype == JSON_BEHAVIOR_DEFAULT)
++		get_rule_expr(behavior->default_expr, context, false);
++
++	appendStringInfo(context->buf, " ON %s", on);
++}
++
++/*
++ * get_json_expr_options
++ *
++ * Parse back common options for JSON_QUERY, JSON_VALUE, JSON_EXISTS.
++ */
++static void
++get_json_expr_options(JsonExpr *jsexpr, deparse_context *context,
++					  JsonBehaviorType default_behavior)
++{
++	if (jsexpr->op == JSON_QUERY_OP)
++	{
++		if (jsexpr->wrapper == JSW_CONDITIONAL)
++			appendStringInfo(context->buf, " WITH CONDITIONAL WRAPPER");
++		else if (jsexpr->wrapper == JSW_UNCONDITIONAL)
++			appendStringInfo(context->buf, " WITH UNCONDITIONAL WRAPPER");
++
++		if (jsexpr->omit_quotes)
++			appendStringInfo(context->buf, " OMIT QUOTES");
++	}
++
++	if (jsexpr->op != JSON_EXISTS_OP &&
++		jsexpr->on_empty->btype != default_behavior)
++		get_json_behavior(jsexpr->on_empty, context, "EMPTY");
++
++	if (jsexpr->on_error->btype != default_behavior)
++		get_json_behavior(jsexpr->on_error, context, "ERROR");
++}
++
+ /* ----------
+  * get_rule_expr			- Parse back an expression
+  *
+@@ -9623,6 +9700,7 @@ get_rule_expr(Node *node, deparse_context *context,
+ 			}
+ 			break;
+ 
++
+ 		case T_JsonValueExpr:
+ 			{
+ 				JsonValueExpr *jve = (JsonValueExpr *) node;
+@@ -9670,6 +9748,62 @@ get_rule_expr(Node *node, deparse_context *context,
+ 			}
+ 			break;
+ 
++		case T_JsonExpr:
++			{
++				JsonExpr   *jexpr = (JsonExpr *) node;
++
++				switch (jexpr->op)
++				{
++					case JSON_QUERY_OP:
++						appendStringInfoString(buf, "JSON_QUERY(");
++						break;
++					case JSON_VALUE_OP:
++						appendStringInfoString(buf, "JSON_VALUE(");
++						break;
++					case JSON_EXISTS_OP:
++						appendStringInfoString(buf, "JSON_EXISTS(");
++						break;
++				}
++
++				get_rule_expr(jexpr->formatted_expr, context, showimplicit);
++
++				appendStringInfoString(buf, ", ");
++
++				get_json_path_spec(jexpr->path_spec, context, showimplicit);
++
++				if (jexpr->passing_values)
++				{
++					ListCell   *lc1, *lc2;
++					bool		needcomma = false;
++
++					appendStringInfoString(buf, " PASSING ");
++
++					forboth(lc1, jexpr->passing_names,
++							lc2, jexpr->passing_values)
++					{
++						if (needcomma)
++							appendStringInfoString(buf, ", ");
++						needcomma = true;
++
++						get_rule_expr((Node *) lfirst(lc2), context, showimplicit);
++						appendStringInfo(buf, " AS %s",
++										 ((String *) lfirst_node(String, lc1))->sval);
++					}
++				}
++
++				if (jexpr->op != JSON_EXISTS_OP ||
++					jexpr->returning->typid != BOOLOID)
++					get_json_returning(jexpr->returning, context->buf,
++									   jexpr->op == JSON_QUERY_OP);
++
++				get_json_expr_options(jexpr, context,
++									  jexpr->op == JSON_EXISTS_OP ?
++									  JSON_BEHAVIOR_FALSE : JSON_BEHAVIOR_NULL);
++
++				appendStringInfoString(buf, ")");
++			}
++			break;
++
+ 		case T_List:
+ 			{
+ 				char	   *sep;
+@@ -9793,6 +9927,7 @@ looks_like_function(Node *node)
+ 		case T_MinMaxExpr:
+ 		case T_SQLValueFunction:
+ 		case T_XmlExpr:
++		case T_JsonExpr:
+ 			/* these are all accepted by func_expr_common_subexpr */
+ 			return true;
+ 		default:
+diff --git a/src/backend/utils/misc/queryjumble.c b/src/backend/utils/misc/queryjumble.c
+index 831581279366..7120836c70fe 100644
+--- a/src/backend/utils/misc/queryjumble.c
++++ b/src/backend/utils/misc/queryjumble.c
+@@ -785,6 +785,27 @@ JumbleExpr(JumbleState *jstate, Node *node)
+ 				APP_JUMB(pred->value_type);
+ 			}
+ 			break;
++		case T_JsonExpr:
++			{
++				JsonExpr    *jexpr = (JsonExpr *) node;
++
++				APP_JUMB(jexpr->op);
++				JumbleExpr(jstate, jexpr->formatted_expr);
++				JumbleExpr(jstate, jexpr->path_spec);
++				foreach(temp, jexpr->passing_names)
++				{
++					APP_JUMB_STRING(lfirst_node(String, temp)->sval);
++				}
++				JumbleExpr(jstate, (Node *) jexpr->passing_values);
++				if (jexpr->on_empty)
++				{
++					APP_JUMB(jexpr->on_empty->btype);
++					JumbleExpr(jstate, jexpr->on_empty->default_expr);
++				}
++				APP_JUMB(jexpr->on_error->btype);
++				JumbleExpr(jstate, jexpr->on_error->default_expr);
++			}
++			break;
+ 		case T_List:
+ 			foreach(temp, (List *) node)
+ 			{
+diff --git a/src/include/executor/execExpr.h b/src/include/executor/execExpr.h
+index a41722ae1e41..240d07982abc 100644
+--- a/src/include/executor/execExpr.h
++++ b/src/include/executor/execExpr.h
+@@ -21,6 +21,7 @@
+ struct ExprEvalStep;
+ struct SubscriptingRefState;
+ struct ScalarArrayOpExprHashTable;
++struct JsonbValue;
+ 
+ /* Bits in ExprState->flags (see also execnodes.h for public flag bits): */
+ /* expression's interpreter has been initialized */
+@@ -241,6 +242,7 @@ typedef enum ExprEvalOp
+ 	EEOP_SUBPLAN,
+ 	EEOP_JSON_CONSTRUCTOR,
+ 	EEOP_IS_JSON,
++	EEOP_JSONEXPR,
+ 
+ 	/* aggregation related nodes */
+ 	EEOP_AGG_STRICT_DESERIALIZE,
+@@ -687,6 +689,50 @@ typedef struct ExprEvalStep
+ 					JsonIsPredicate *pred;	/* original expression node */
+ 		}			is_json;
+ 
++		/* for EEOP_JSONEXPR */
++		struct
++		{
++			JsonExpr   *jsexpr;			/* original expression node */
++
++			struct
++			{
++				FmgrInfo	func;		/* typinput function for output type */
++				Oid			typioparam;
++			} input;					/* I/O info for output type */
++
++			NullableDatum
++					   *formatted_expr,		/* formatted context item value */
++					   *res_expr,			/* result item */
++					   *coercion_expr,		/* input for JSON item coercion */
++					   *pathspec;			/* path specification value */
++
++			ExprState  *result_expr;		/* coerced to output type */
++			ExprState  *default_on_empty;	/* ON EMPTY DEFAULT expression */
++			ExprState  *default_on_error;	/* ON ERROR DEFAULT expression */
++			List	   *args;				/* passing arguments */
++
++			void	   *cache;				/* cache for json_populate_type() */
++
++			struct JsonCoercionsState
++			{
++				struct JsonCoercionState
++				{
++					JsonCoercion *coercion;		/* coercion expression */
++					ExprState  *estate;	/* coercion expression state */
++				} 			null,
++							string,
++							numeric,
++							boolean,
++							date,
++							time,
++							timetz,
++							timestamp,
++							timestamptz,
++							composite;
++			}			coercions;	/* states for coercion from SQL/JSON item
++									 * types directly to the output type */
++		}			jsonexpr;
++
+ 	}			d;
+ } ExprEvalStep;
+ 
+@@ -791,6 +837,14 @@ extern void ExecEvalSysVar(ExprState *state, ExprEvalStep *op,
+ 						   ExprContext *econtext, TupleTableSlot *slot);
+ extern void ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
+ 									ExprContext *econtext);
++extern void ExecEvalJson(ExprState *state, ExprEvalStep *op,
++						 ExprContext *econtext);
++extern Datum ExecPrepareJsonItemCoercion(struct JsonbValue *item,
++										 JsonReturning *returning,
++										 struct JsonCoercionsState *coercions,
++										 struct JsonCoercionState **pjcstate);
++extern bool ExecEvalJsonNeedsSubTransaction(JsonExpr *jsexpr,
++											struct JsonCoercionsState *);
+ 
+ extern void ExecAggInitGroup(AggState *aggstate, AggStatePerTrans pertrans, AggStatePerGroup pergroup,
+ 							 ExprContext *aggcontext);
+diff --git a/src/include/executor/executor.h b/src/include/executor/executor.h
+index 82925b4b6335..873772f18837 100644
+--- a/src/include/executor/executor.h
++++ b/src/include/executor/executor.h
+@@ -265,6 +265,8 @@ ExecProcNode(PlanState *node)
+  */
+ extern ExprState *ExecInitExpr(Expr *node, PlanState *parent);
+ extern ExprState *ExecInitExprWithParams(Expr *node, ParamListInfo ext_params);
++extern ExprState *ExecInitExprWithCaseValue(Expr *node, PlanState *parent,
++						  Datum *caseval, bool *casenull);
+ extern ExprState *ExecInitQual(List *qual, PlanState *parent);
+ extern ExprState *ExecInitCheck(List *qual, PlanState *parent);
+ extern List *ExecInitExprList(List *nodes, PlanState *parent);
+diff --git a/src/include/nodes/makefuncs.h b/src/include/nodes/makefuncs.h
+index 380940968bdb..872f2f0828fb 100644
+--- a/src/include/nodes/makefuncs.h
++++ b/src/include/nodes/makefuncs.h
+@@ -109,6 +109,7 @@ extern VacuumRelation *makeVacuumRelation(RangeVar *relation, Oid oid, List *va_
+ extern JsonFormat *makeJsonFormat(JsonFormatType type, JsonEncoding encoding,
+ 								  int location);
+ extern JsonValueExpr *makeJsonValueExpr(Expr *expr, JsonFormat *format);
++extern JsonBehavior *makeJsonBehavior(JsonBehaviorType type, Node *expr);
+ extern Node *makeJsonKeyValue(Node *key, Node *value);
+ extern Node *makeJsonIsPredicate(Node *expr, JsonFormat *format,
+ 								 JsonValueType vtype, bool unique_keys,
+diff --git a/src/include/nodes/nodes.h b/src/include/nodes/nodes.h
+index e8f30367a48a..d48147abeef8 100644
+--- a/src/include/nodes/nodes.h
++++ b/src/include/nodes/nodes.h
+@@ -206,6 +206,9 @@ typedef enum NodeTag
+ 	T_JsonReturning,
+ 	T_JsonValueExpr,
+ 	T_JsonConstructorExpr,
++	T_JsonExpr,
++	T_JsonCoercion,
++	T_JsonItemCoercions,
+ 
+ 	/*
+ 	 * TAGS FOR EXPRESSION STATE NODES (execnodes.h)
+@@ -505,8 +508,12 @@ typedef enum NodeTag
+ 	T_JsonAggConstructor,
+ 	T_JsonObjectAgg,
+ 	T_JsonArrayAgg,
++	T_JsonFuncExpr,
+ 	T_JsonIsPredicate,
++	T_JsonCommon,
++	T_JsonArgument,
+ 	T_JsonKeyValue,
++	T_JsonBehavior,
+ 	T_JsonOutput,
+ 
+ 	/*
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index 6bf212b01a16..0ff4ba088466 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -1594,6 +1594,23 @@ typedef struct TriggerTransition
+ 
+ /* Nodes for SQL/JSON support */
+ 
++/*
++ * JsonQuotes -
++ *		representation of [KEEP|OMIT] QUOTES clause for JSON_QUERY()
++ */
++typedef enum JsonQuotes
++{
++	JS_QUOTES_UNSPEC,			/* unspecified */
++	JS_QUOTES_KEEP,				/* KEEP QUOTES */
++	JS_QUOTES_OMIT				/* OMIT QUOTES */
++} JsonQuotes;
++
++/*
++ * JsonPathSpec -
++ *		representation of JSON path constant
++ */
++typedef char *JsonPathSpec;
++
+ /*
+  * JsonOutput -
+  *		representation of JSON output clause (RETURNING type [FORMAT format])
+@@ -1605,6 +1622,48 @@ typedef struct JsonOutput
+ 	JsonReturning *returning;	/* RETURNING FORMAT clause and type Oids */
+ } JsonOutput;
+ 
++/*
++ * JsonArgument -
++ *		representation of argument from JSON PASSING clause
++ */
++typedef struct JsonArgument
++{
++	NodeTag		type;
++	JsonValueExpr *val;			/* argument value expression */
++	char	   *name;			/* argument name */
++} JsonArgument;
++
++/*
++ * JsonCommon -
++ *		representation of common syntax of functions using JSON path
++ */
++typedef struct JsonCommon
++{
++	NodeTag		type;
++	JsonValueExpr *expr;		/* context item expression */
++	Node	   *pathspec;		/* JSON path specification expression */
++	char	   *pathname;		/* path name, if any */
++	List	   *passing;		/* list of PASSING clause arguments, if any */
++	int			location;		/* token location, or -1 if unknown */
++} JsonCommon;
++
++/*
++ * JsonFuncExpr -
++ *		untransformed representation of JSON function expressions
++ */
++typedef struct JsonFuncExpr
++{
++	NodeTag		type;
++	JsonExprOp	op;				/* expression type */
++	JsonCommon *common;			/* common syntax */
++	JsonOutput *output;			/* output clause, if specified */
++	JsonBehavior *on_empty;		/* ON EMPTY behavior, if specified */
++	JsonBehavior *on_error;		/* ON ERROR behavior, if specified */
++	JsonWrapper	wrapper;		/* array wrapper behavior (JSON_QUERY only) */
++	bool		omit_quotes;	/* omit or keep quotes? (JSON_QUERY only) */
++	int			location;		/* token location, or -1 if unknown */
++} JsonFuncExpr;
++
+ /*
+  * JsonKeyValue -
+  *		untransformed representation of JSON object key-value pair for
+diff --git a/src/include/nodes/primnodes.h b/src/include/nodes/primnodes.h
+index f4a39653ac67..7ebe868af91f 100644
+--- a/src/include/nodes/primnodes.h
++++ b/src/include/nodes/primnodes.h
+@@ -1233,6 +1233,17 @@ typedef struct XmlExpr
+ 	int			location;		/* token location, or -1 if unknown */
+ } XmlExpr;
+ 
++/*
++ * JsonExprOp -
++ *		enumeration of JSON functions using JSON path
++ */
++typedef enum JsonExprOp
++{
++	JSON_VALUE_OP,				/* JSON_VALUE() */
++	JSON_QUERY_OP,				/* JSON_QUERY() */
++	JSON_EXISTS_OP				/* JSON_EXISTS() */
++} JsonExprOp;
++
+ /*
+  * JsonEncoding -
+  *		representation of JSON ENCODING clause
+@@ -1256,6 +1267,37 @@ typedef enum JsonFormatType
+ 	JS_FORMAT_JSONB				/* implicit internal format for RETURNING jsonb */
+ } JsonFormatType;
+ 
++/*
++ * JsonBehaviorType -
++ *		enumeration of behavior types used in JSON ON ... BEHAVIOR clause
++ *
++ * 		If enum members are reordered, get_json_behavior() from ruleutils.c
++ * 		must be updated accordingly.
++ */
++typedef enum JsonBehaviorType
++{
++	JSON_BEHAVIOR_NULL = 0,
++	JSON_BEHAVIOR_ERROR,
++	JSON_BEHAVIOR_EMPTY,
++	JSON_BEHAVIOR_TRUE,
++	JSON_BEHAVIOR_FALSE,
++	JSON_BEHAVIOR_UNKNOWN,
++	JSON_BEHAVIOR_EMPTY_ARRAY,
++	JSON_BEHAVIOR_EMPTY_OBJECT,
++	JSON_BEHAVIOR_DEFAULT
++} JsonBehaviorType;
++
++/*
++ * JsonWrapper -
++ *		representation of WRAPPER clause for JSON_QUERY()
++ */
++typedef enum JsonWrapper
++{
++	JSW_NONE,
++	JSW_CONDITIONAL,
++	JSW_UNCONDITIONAL,
++} JsonWrapper;
++
+ /*
+  * JsonFormat -
+  *		representation of JSON FORMAT clause
+@@ -1343,6 +1385,73 @@ typedef struct JsonIsPredicate
+ 	int			location;		/* token location, or -1 if unknown */
+ } JsonIsPredicate;
+ 
++/*
++ * JsonBehavior -
++ *		representation of JSON ON ... BEHAVIOR clause
++ */
++typedef struct JsonBehavior
++{
++	NodeTag		type;
++	JsonBehaviorType btype;		/* behavior type */
++	Node	   *default_expr;	/* default expression, if any */
++} JsonBehavior;
++
++/*
++ * JsonCoercion -
++ *		coercion from SQL/JSON item types to SQL types
++ */
++typedef struct JsonCoercion
++{
++	NodeTag		type;
++	Node	   *expr;			/* resulting expression coerced to target type */
++	bool		via_populate;	/* coerce result using json_populate_type()? */
++	bool		via_io;			/* coerce result using type input function? */
++	Oid			collation;		/* collation for coercion via I/O or populate */
++} JsonCoercion;
++
++/*
++ * JsonItemCoercions -
++ *		expressions for coercion from SQL/JSON item types directly to the
++ *		output SQL type
++ */
++typedef struct JsonItemCoercions
++{
++	NodeTag		type;
++	JsonCoercion *null;
++	JsonCoercion *string;
++	JsonCoercion *numeric;
++	JsonCoercion *boolean;
++	JsonCoercion *date;
++	JsonCoercion *time;
++	JsonCoercion *timetz;
++	JsonCoercion *timestamp;
++	JsonCoercion *timestamptz;
++	JsonCoercion *composite;	/* arrays and objects */
++} JsonItemCoercions;
++
++/*
++ * JsonExpr -
++ *		transformed representation of JSON_VALUE(), JSON_QUERY(), JSON_EXISTS()
++ */
++typedef struct JsonExpr
++{
++	Expr		xpr;
++	JsonExprOp	op;				/* json function ID */
++	Node	   *formatted_expr;	/* formatted context item expression */
++	JsonCoercion *result_coercion;	/* resulting coercion to RETURNING type */
++	JsonFormat *format;			/* context item format (JSON/JSONB) */
++	Node	   *path_spec;		/* JSON path specification expression */
++	List	   *passing_names;	/* PASSING argument names */
++	List	   *passing_values;	/* PASSING argument values */
++	JsonReturning *returning;	/* RETURNING clause type/format info */
++	JsonBehavior *on_empty;		/* ON EMPTY behavior */
++	JsonBehavior *on_error;		/* ON ERROR behavior */
++	JsonItemCoercions *coercions; /* coercions for JSON_VALUE */
++	JsonWrapper	wrapper;		/* WRAPPER for JSON_QUERY */
++	bool		omit_quotes;	/* KEEP/OMIT QUOTES for JSON_QUERY */
++	int			location;		/* token location, or -1 if unknown */
++} JsonExpr;
++
+ /* ----------------
+  * NullTest
+  *
+diff --git a/src/include/parser/kwlist.h b/src/include/parser/kwlist.h
+index c0ffa516d063..5f3834ddf3ee 100644
+--- a/src/include/parser/kwlist.h
++++ b/src/include/parser/kwlist.h
+@@ -93,6 +93,7 @@ PG_KEYWORD("commit", COMMIT, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("committed", COMMITTED, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("compression", COMPRESSION, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("concurrently", CONCURRENTLY, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("conditional", CONDITIONAL, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("configuration", CONFIGURATION, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("conflict", CONFLICT, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("connection", CONNECTION, UNRESERVED_KEYWORD, BARE_LABEL)
+@@ -147,11 +148,13 @@ PG_KEYWORD("double", DOUBLE_P, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("drop", DROP, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("each", EACH, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("else", ELSE, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("empty", EMPTY_P, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("enable", ENABLE_P, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("encoding", ENCODING, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("encrypted", ENCRYPTED, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("end", END_P, RESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("enum", ENUM_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("error", ERROR_P, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("escape", ESCAPE, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("event", EVENT, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("except", EXCEPT, RESERVED_KEYWORD, AS_LABEL)
+@@ -232,8 +235,12 @@ PG_KEYWORD("join", JOIN, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json", JSON, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json_array", JSON_ARRAY, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json_arrayagg", JSON_ARRAYAGG, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("json_exists", JSON_EXISTS, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json_object", JSON_OBJECT, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json_objectagg", JSON_OBJECTAGG, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("json_query", JSON_QUERY, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("json_value", JSON_VALUE, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("keep", KEEP, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("key", KEY, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("keys", KEYS, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("label", LABEL, UNRESERVED_KEYWORD, BARE_LABEL)
+@@ -299,6 +306,7 @@ PG_KEYWORD("off", OFF, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("offset", OFFSET, RESERVED_KEYWORD, AS_LABEL)
+ PG_KEYWORD("oids", OIDS, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("old", OLD, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("omit", OMIT, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("on", ON, RESERVED_KEYWORD, AS_LABEL)
+ PG_KEYWORD("only", ONLY, RESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("operator", OPERATOR, UNRESERVED_KEYWORD, BARE_LABEL)
+@@ -340,6 +348,7 @@ PG_KEYWORD("procedures", PROCEDURES, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("program", PROGRAM, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("publication", PUBLICATION, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("quote", QUOTE, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("quotes", QUOTES, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("range", RANGE, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("read", READ, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("real", REAL, COL_NAME_KEYWORD, BARE_LABEL)
+@@ -410,6 +419,7 @@ PG_KEYWORD("stdout", STDOUT, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("storage", STORAGE, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("stored", STORED, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("strict", STRICT_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("string", STRING, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("strip", STRIP_P, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("subscription", SUBSCRIPTION, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("substring", SUBSTRING, COL_NAME_KEYWORD, BARE_LABEL)
+@@ -444,6 +454,7 @@ PG_KEYWORD("types", TYPES_P, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("uescape", UESCAPE, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("unbounded", UNBOUNDED, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("uncommitted", UNCOMMITTED, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("unconditional", UNCONDITIONAL, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("unencrypted", UNENCRYPTED, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("union", UNION, RESERVED_KEYWORD, AS_LABEL)
+ PG_KEYWORD("unique", UNIQUE, RESERVED_KEYWORD, BARE_LABEL)
+diff --git a/src/include/utils/formatting.h b/src/include/utils/formatting.h
+index 851e787bfdb8..0a22af80a217 100644
+--- a/src/include/utils/formatting.h
++++ b/src/include/utils/formatting.h
+@@ -17,6 +17,9 @@
+ #ifndef _FORMATTING_H_
+ #define _FORMATTING_H_
+ 
++#define DCH_DATED	0x01
++#define DCH_TIMED	0x02
++#define DCH_ZONED	0x04
+ 
+ extern char *str_tolower(const char *buff, size_t nbytes, Oid collid);
+ extern char *str_toupper(const char *buff, size_t nbytes, Oid collid);
+@@ -29,5 +32,6 @@ extern char *asc_initcap(const char *buff, size_t nbytes);
+ extern Datum parse_datetime(text *date_txt, text *fmt, Oid collid, bool strict,
+ 							Oid *typid, int32 *typmod, int *tz,
+ 							bool *have_error);
++extern int datetime_format_flags(const char *fmt_str, bool *have_error);
+ 
+ #endif
+diff --git a/src/include/utils/jsonb.h b/src/include/utils/jsonb.h
+index 6bcf35dd0afd..3fdff445cf6f 100644
+--- a/src/include/utils/jsonb.h
++++ b/src/include/utils/jsonb.h
+@@ -407,6 +407,9 @@ extern char *JsonbToCString(StringInfo out, JsonbContainer *in,
+ 							int estimated_len);
+ extern char *JsonbToCStringIndent(StringInfo out, JsonbContainer *in,
+ 								  int estimated_len);
++extern Jsonb *JsonbMakeEmptyArray(void);
++extern Jsonb *JsonbMakeEmptyObject(void);
++extern char *JsonbUnquote(Jsonb *jb);
+ extern bool JsonbExtractScalar(JsonbContainer *jbc, JsonbValue *res);
+ extern const char *JsonbTypeName(JsonbValue *jb);
+ 
+diff --git a/src/include/utils/jsonfuncs.h b/src/include/utils/jsonfuncs.h
+index cd16b6c0c846..62dc3d88a425 100644
+--- a/src/include/utils/jsonfuncs.h
++++ b/src/include/utils/jsonfuncs.h
+@@ -58,4 +58,8 @@ extern Jsonb *transform_jsonb_string_values(Jsonb *jsonb, void *action_state,
+ extern text *transform_json_string_values(text *json, void *action_state,
+ 										  JsonTransformStringValuesAction transform_action);
+ 
++extern Datum json_populate_type(Datum json_val, Oid json_type,
++								Oid typid, int32 typmod,
++								void **cache, MemoryContext mcxt, bool *isnull);
++
+ #endif
+diff --git a/src/include/utils/jsonpath.h b/src/include/utils/jsonpath.h
+index cd0b5d5b61cd..98a61d7f72f3 100644
+--- a/src/include/utils/jsonpath.h
++++ b/src/include/utils/jsonpath.h
+@@ -16,7 +16,9 @@
+ 
+ #include "fmgr.h"
+ #include "nodes/pg_list.h"
++#include "nodes/primnodes.h"
+ #include "utils/jsonb.h"
++#include "utils/jsonfuncs.h"
+ 
+ typedef struct
+ {
+@@ -174,6 +176,7 @@ extern bool jspGetBool(JsonPathItem *v);
+ extern char *jspGetString(JsonPathItem *v, int32 *len);
+ extern bool jspGetArraySubscript(JsonPathItem *v, JsonPathItem *from,
+ 								 JsonPathItem *to, int i);
++extern bool jspIsMutable(JsonPath *path, List *varnames, List *varexprs);
+ 
+ extern const char *jspOperationName(JsonPathItemType type);
+ 
+@@ -248,4 +251,34 @@ extern JsonPathParseResult *parsejsonpath(const char *str, int len);
+ 
+ extern int	jspConvertRegexFlags(uint32 xflags);
+ 
++/*
++ * Evaluation of jsonpath
++ */
++
++/* External variable passed into jsonpath. */
++typedef struct JsonPathVariableEvalContext
++{
++	char	   *name;
++	Oid			typid;
++	int32		typmod;
++	struct ExprContext *econtext;
++	struct ExprState  *estate;
++	Datum		value;
++	bool		isnull;
++	bool		evaluated;
++} JsonPathVariableEvalContext;
++
++/* SQL/JSON item */
++extern void JsonItemFromDatum(Datum val, Oid typid, int32 typmod,
++							  JsonbValue *res);
++
++extern bool  JsonPathExists(Datum jb, JsonPath *path, List *vars, bool *error);
++extern Datum JsonPathQuery(Datum jb, JsonPath *jp, JsonWrapper wrapper,
++						   bool *empty, bool *error, List *vars);
++extern JsonbValue *JsonPathValue(Datum jb, JsonPath *jp, bool *empty,
++								 bool *error, List *vars);
++
++extern int EvalJsonPathVar(void *vars, char *varName, int varNameLen,
++						   JsonbValue *val, JsonbValue *baseObject);
++
+ #endif
+diff --git a/src/test/regress/expected/json_sqljson.out b/src/test/regress/expected/json_sqljson.out
+new file mode 100644
+index 000000000000..bb62634314ad
+--- /dev/null
++++ b/src/test/regress/expected/json_sqljson.out
+@@ -0,0 +1,15 @@
++-- JSON_EXISTS
++SELECT JSON_EXISTS(NULL FORMAT JSON, '$');
++ERROR:  JSON_EXISTS() is not yet implemented for json type
++LINE 1: SELECT JSON_EXISTS(NULL FORMAT JSON, '$');
++               ^
++-- JSON_VALUE
++SELECT JSON_VALUE(NULL FORMAT JSON, '$');
++ERROR:  JSON_VALUE() is not yet implemented for json type
++LINE 1: SELECT JSON_VALUE(NULL FORMAT JSON, '$');
++               ^
++-- JSON_QUERY
++SELECT JSON_QUERY(NULL FORMAT JSON, '$');
++ERROR:  JSON_QUERY() is not yet implemented for json type
++LINE 1: SELECT JSON_QUERY(NULL FORMAT JSON, '$');
++               ^
+diff --git a/src/test/regress/expected/jsonb_sqljson.out b/src/test/regress/expected/jsonb_sqljson.out
+new file mode 100644
+index 000000000000..1126d7caf554
+--- /dev/null
++++ b/src/test/regress/expected/jsonb_sqljson.out
+@@ -0,0 +1,1018 @@
++-- JSON_EXISTS
++SELECT JSON_EXISTS(NULL::jsonb, '$');
++ json_exists 
++-------------
++ 
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '[]', '$');
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(JSON_OBJECT(RETURNING jsonb), '$');
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', '$');
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(jsonb 'null', '$');
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '[]', '$');
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', '$.a');
++ json_exists 
++-------------
++ f
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', 'strict $.a');
++ json_exists 
++-------------
++ f
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', 'strict $.a' ERROR ON ERROR);
++ERROR:  jsonpath member accessor can only be applied to an object
++SELECT JSON_EXISTS(jsonb 'null', '$.a');
++ json_exists 
++-------------
++ f
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '[]', '$.a');
++ json_exists 
++-------------
++ f
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '[1, "aaa", {"a": 1}]', 'strict $.a');
++ json_exists 
++-------------
++ f
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '[1, "aaa", {"a": 1}]', 'lax $.a');
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '{}', '$.a');
++ json_exists 
++-------------
++ f
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '{"b": 1, "a": 2}', '$.a');
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', '$.a.b');
++ json_exists 
++-------------
++ f
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '{"a": {"b": 1}}', '$.a.b');
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.a.b');
++ json_exists 
++-------------
++ f
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x)' PASSING 1 AS x);
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x)' PASSING '1' AS x);
++ json_exists 
++-------------
++ f
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x && @ < $y)' PASSING 0 AS x, 2 AS y);
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x && @ < $y)' PASSING 0 AS x, 1 AS y);
++ json_exists 
++-------------
++ f
++(1 row)
++
++-- extension: boolean expressions
++SELECT JSON_EXISTS(jsonb '1', '$ > 2');
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', '$.a > 2' ERROR ON ERROR);
++ json_exists 
++-------------
++ t
++(1 row)
++
++-- extension: RETURNING clause
++SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING bool);
++ json_exists 
++-------------
++ t
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', '$[1]' RETURNING bool);
++ json_exists 
++-------------
++ f
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING int);
++ json_exists 
++-------------
++           1
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', '$[1]' RETURNING int);
++ json_exists 
++-------------
++           0
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING text);
++ json_exists 
++-------------
++ true
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', '$[1]' RETURNING text);
++ json_exists 
++-------------
++ false
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', 'strict $[1]' RETURNING text FALSE ON ERROR);
++ json_exists 
++-------------
++ false
++(1 row)
++
++SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING jsonb);
++ERROR:  cannot cast type boolean to jsonb
++LINE 1: SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING jsonb);
++               ^
++SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING float4);
++ERROR:  cannot cast type boolean to real
++LINE 1: SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING float4);
++               ^
++-- JSON_VALUE
++SELECT JSON_VALUE(NULL::jsonb, '$');
++ json_value 
++------------
++ 
++(1 row)
++
++SELECT JSON_VALUE(jsonb 'null', '$');
++ json_value 
++------------
++ 
++(1 row)
++
++SELECT JSON_VALUE(jsonb 'null', '$' RETURNING int);
++ json_value 
++------------
++           
++(1 row)
++
++SELECT JSON_VALUE(jsonb 'true', '$');
++ json_value 
++------------
++ true
++(1 row)
++
++SELECT JSON_VALUE(jsonb 'true', '$' RETURNING bool);
++ json_value 
++------------
++ t
++(1 row)
++
++SELECT JSON_VALUE(jsonb '123', '$');
++ json_value 
++------------
++ 123
++(1 row)
++
++SELECT JSON_VALUE(jsonb '123', '$' RETURNING int) + 234;
++ ?column? 
++----------
++      357
++(1 row)
++
++SELECT JSON_VALUE(jsonb '123', '$' RETURNING text);
++ json_value 
++------------
++ 123
++(1 row)
++
++/* jsonb bytea ??? */
++SELECT JSON_VALUE(jsonb '123', '$' RETURNING bytea ERROR ON ERROR);
++ERROR:  SQL/JSON item cannot be cast to target type
++SELECT JSON_VALUE(jsonb '1.23', '$');
++ json_value 
++------------
++ 1.23
++(1 row)
++
++SELECT JSON_VALUE(jsonb '1.23', '$' RETURNING int);
++ json_value 
++------------
++          1
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"1.23"', '$' RETURNING numeric);
++ json_value 
++------------
++       1.23
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"1.23"', '$' RETURNING int ERROR ON ERROR);
++ERROR:  invalid input syntax for type integer: "1.23"
++SELECT JSON_VALUE(jsonb '"aaa"', '$');
++ json_value 
++------------
++ aaa
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING text);
++ json_value 
++------------
++ aaa
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING char(5));
++ json_value 
++------------
++ aaa  
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING char(2));
++ json_value 
++------------
++ aa
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING json);
++ json_value 
++------------
++ "aaa"
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING jsonb);
++ json_value 
++------------
++ "aaa"
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING json ERROR ON ERROR);
++ json_value 
++------------
++ "aaa"
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING jsonb ERROR ON ERROR);
++ json_value 
++------------
++ "aaa"
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"\"aaa\""', '$' RETURNING json);
++ json_value 
++------------
++ "\"aaa\""
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"\"aaa\""', '$' RETURNING jsonb);
++ json_value 
++------------
++ "\"aaa\""
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING int);
++ json_value 
++------------
++           
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING int ERROR ON ERROR);
++ERROR:  invalid input syntax for type integer: "aaa"
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING int DEFAULT 111 ON ERROR);
++ json_value 
++------------
++        111
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"123"', '$' RETURNING int) + 234;
++ ?column? 
++----------
++      357
++(1 row)
++
++SELECT JSON_VALUE(jsonb '"2017-02-20"', '$' RETURNING date) + 9;
++  ?column?  
++------------
++ 03-01-2017
++(1 row)
++
++-- Test NULL checks execution in domain types
++CREATE DOMAIN sqljsonb_int_not_null AS int NOT NULL;
++SELECT JSON_VALUE(jsonb '1', '$.a' RETURNING sqljsonb_int_not_null);
++ERROR:  domain sqljsonb_int_not_null does not allow null values
++SELECT JSON_VALUE(jsonb '1', '$.a' RETURNING sqljsonb_int_not_null NULL ON ERROR);
++ERROR:  domain sqljsonb_int_not_null does not allow null values
++SELECT JSON_VALUE(jsonb '1', '$.a' RETURNING sqljsonb_int_not_null DEFAULT NULL ON ERROR);
++ERROR:  domain sqljsonb_int_not_null does not allow null values
++SELECT JSON_VALUE(jsonb '[]', '$');
++ json_value 
++------------
++ 
++(1 row)
++
++SELECT JSON_VALUE(jsonb '[]', '$' ERROR ON ERROR);
++ERROR:  JSON path expression in JSON_VALUE should return singleton scalar item
++SELECT JSON_VALUE(jsonb '{}', '$');
++ json_value 
++------------
++ 
++(1 row)
++
++SELECT JSON_VALUE(jsonb '{}', '$' ERROR ON ERROR);
++ERROR:  JSON path expression in JSON_VALUE should return singleton scalar item
++SELECT JSON_VALUE(jsonb '1', '$.a');
++ json_value 
++------------
++ 
++(1 row)
++
++SELECT JSON_VALUE(jsonb '1', 'strict $.a' ERROR ON ERROR);
++ERROR:  jsonpath member accessor can only be applied to an object
++SELECT JSON_VALUE(jsonb '1', 'strict $.a' DEFAULT 'error' ON ERROR);
++ json_value 
++------------
++ error
++(1 row)
++
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' ERROR ON ERROR);
++ json_value 
++------------
++ 
++(1 row)
++
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' ERROR ON EMPTY ERROR ON ERROR);
++ERROR:  no SQL/JSON item
++SELECT JSON_VALUE(jsonb '1', 'strict $.a' DEFAULT 2 ON ERROR);
++ json_value 
++------------
++ 2
++(1 row)
++
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' DEFAULT 2 ON ERROR);
++ json_value 
++------------
++ 
++(1 row)
++
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' DEFAULT '2' ON ERROR);
++ json_value 
++------------
++ 
++(1 row)
++
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' NULL ON EMPTY DEFAULT '2' ON ERROR);
++ json_value 
++------------
++ 
++(1 row)
++
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' DEFAULT '2' ON EMPTY DEFAULT '3' ON ERROR);
++ json_value 
++------------
++ 2
++(1 row)
++
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' ERROR ON EMPTY DEFAULT '3' ON ERROR);
++ json_value 
++------------
++ 3
++(1 row)
++
++SELECT JSON_VALUE(jsonb '[1,2]', '$[*]' ERROR ON ERROR);
++ERROR:  JSON path expression in JSON_VALUE should return singleton scalar item
++SELECT JSON_VALUE(jsonb '[1,2]', '$[*]' DEFAULT '0' ON ERROR);
++ json_value 
++------------
++ 0
++(1 row)
++
++SELECT JSON_VALUE(jsonb '[" "]', '$[*]' RETURNING int ERROR ON ERROR);
++ERROR:  invalid input syntax for type integer: " "
++SELECT JSON_VALUE(jsonb '[" "]', '$[*]' RETURNING int DEFAULT 2 + 3 ON ERROR);
++ json_value 
++------------
++          5
++(1 row)
++
++SELECT JSON_VALUE(jsonb '["1"]', '$[*]' RETURNING int DEFAULT 2 + 3 ON ERROR);
++ json_value 
++------------
++          1
++(1 row)
++
++SELECT
++	x,
++	JSON_VALUE(
++		jsonb '{"a": 1, "b": 2}',
++		'$.* ? (@ > $x)' PASSING x AS x
++		RETURNING int
++		DEFAULT -1 ON EMPTY
++		DEFAULT -2 ON ERROR
++	) y
++FROM
++	generate_series(0, 2) x;
++ x | y  
++---+----
++ 0 | -2
++ 1 |  2
++ 2 | -1
++(3 rows)
++
++SELECT JSON_VALUE(jsonb 'null', '$a' PASSING point ' (1, 2 )' AS a);
++ json_value 
++------------
++ (1,2)
++(1 row)
++
++SELECT JSON_VALUE(jsonb 'null', '$a' PASSING point ' (1, 2 )' AS a RETURNING point);
++ json_value 
++------------
++ (1,2)
++(1 row)
++
++-- Test timestamptz passing and output
++SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts);
++          json_value          
++------------------------------
++ Tue Feb 20 18:34:56 2018 PST
++(1 row)
++
++SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING timestamptz);
++          json_value          
++------------------------------
++ Tue Feb 20 18:34:56 2018 PST
++(1 row)
++
++SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING timestamp);
++        json_value        
++--------------------------
++ Tue Feb 20 18:34:56 2018
++(1 row)
++
++SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING json);
++         json_value          
++-----------------------------
++ "2018-02-21T02:34:56+00:00"
++(1 row)
++
++SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING jsonb);
++         json_value          
++-----------------------------
++ "2018-02-21T02:34:56+00:00"
++(1 row)
++
++-- JSON_QUERY
++SELECT
++	JSON_QUERY(js, '$'),
++	JSON_QUERY(js, '$' WITHOUT WRAPPER),
++	JSON_QUERY(js, '$' WITH CONDITIONAL WRAPPER),
++	JSON_QUERY(js, '$' WITH UNCONDITIONAL ARRAY WRAPPER),
++	JSON_QUERY(js, '$' WITH ARRAY WRAPPER)
++FROM
++	(VALUES
++		(jsonb 'null'),
++		('12.3'),
++		('true'),
++		('"aaa"'),
++		('[1, null, "2"]'),
++		('{"a": 1, "b": [2]}')
++	) foo(js);
++     json_query     |     json_query     |     json_query     |      json_query      |      json_query      
++--------------------+--------------------+--------------------+----------------------+----------------------
++ null               | null               | [null]             | [null]               | [null]
++ 12.3               | 12.3               | [12.3]             | [12.3]               | [12.3]
++ true               | true               | [true]             | [true]               | [true]
++ "aaa"              | "aaa"              | ["aaa"]            | ["aaa"]              | ["aaa"]
++ [1, null, "2"]     | [1, null, "2"]     | [1, null, "2"]     | [[1, null, "2"]]     | [[1, null, "2"]]
++ {"a": 1, "b": [2]} | {"a": 1, "b": [2]} | {"a": 1, "b": [2]} | [{"a": 1, "b": [2]}] | [{"a": 1, "b": [2]}]
++(6 rows)
++
++SELECT
++	JSON_QUERY(js, 'strict $[*]') AS "unspec",
++	JSON_QUERY(js, 'strict $[*]' WITHOUT WRAPPER) AS "without",
++	JSON_QUERY(js, 'strict $[*]' WITH CONDITIONAL WRAPPER) AS "with cond",
++	JSON_QUERY(js, 'strict $[*]' WITH UNCONDITIONAL ARRAY WRAPPER) AS "with uncond",
++	JSON_QUERY(js, 'strict $[*]' WITH ARRAY WRAPPER) AS "with"
++FROM
++	(VALUES
++		(jsonb '1'),
++		('[]'),
++		('[null]'),
++		('[12.3]'),
++		('[true]'),
++		('["aaa"]'),
++		('[[1, 2, 3]]'),
++		('[{"a": 1, "b": [2]}]'),
++		('[1, "2", null, [3]]')
++	) foo(js);
++       unspec       |      without       |      with cond      |     with uncond      |         with         
++--------------------+--------------------+---------------------+----------------------+----------------------
++                    |                    |                     |                      | 
++                    |                    |                     |                      | 
++ null               | null               | [null]              | [null]               | [null]
++ 12.3               | 12.3               | [12.3]              | [12.3]               | [12.3]
++ true               | true               | [true]              | [true]               | [true]
++ "aaa"              | "aaa"              | ["aaa"]             | ["aaa"]              | ["aaa"]
++ [1, 2, 3]          | [1, 2, 3]          | [1, 2, 3]           | [[1, 2, 3]]          | [[1, 2, 3]]
++ {"a": 1, "b": [2]} | {"a": 1, "b": [2]} | {"a": 1, "b": [2]}  | [{"a": 1, "b": [2]}] | [{"a": 1, "b": [2]}]
++                    |                    | [1, "2", null, [3]] | [1, "2", null, [3]]  | [1, "2", null, [3]]
++(9 rows)
++
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text);
++ json_query 
++------------
++ "aaa"
++(1 row)
++
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text KEEP QUOTES);
++ json_query 
++------------
++ "aaa"
++(1 row)
++
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text KEEP QUOTES ON SCALAR STRING);
++ json_query 
++------------
++ "aaa"
++(1 row)
++
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text OMIT QUOTES);
++ json_query 
++------------
++ aaa
++(1 row)
++
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text OMIT QUOTES ON SCALAR STRING);
++ json_query 
++------------
++ aaa
++(1 row)
++
++SELECT JSON_QUERY(jsonb '"aaa"', '$' OMIT QUOTES ERROR ON ERROR);
++ERROR:  invalid input syntax for type json
++DETAIL:  Token "aaa" is invalid.
++CONTEXT:  JSON data, line 1: aaa
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING json OMIT QUOTES ERROR ON ERROR);
++ERROR:  invalid input syntax for type json
++DETAIL:  Token "aaa" is invalid.
++CONTEXT:  JSON data, line 1: aaa
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING bytea FORMAT JSON OMIT QUOTES ERROR ON ERROR);
++ json_query 
++------------
++ \x616161
++(1 row)
++
++-- QUOTES behavior should not be specified when WITH WRAPPER used:
++-- Should fail
++SELECT JSON_QUERY(jsonb '[1]', '$' WITH WRAPPER OMIT QUOTES);
++ERROR:  SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used
++LINE 1: SELECT JSON_QUERY(jsonb '[1]', '$' WITH WRAPPER OMIT QUOTES)...
++                                                        ^
++SELECT JSON_QUERY(jsonb '[1]', '$' WITH WRAPPER KEEP QUOTES);
++ERROR:  SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used
++LINE 1: SELECT JSON_QUERY(jsonb '[1]', '$' WITH WRAPPER KEEP QUOTES)...
++                                                        ^
++SELECT JSON_QUERY(jsonb '[1]', '$' WITH CONDITIONAL WRAPPER KEEP QUOTES);
++ERROR:  SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used
++LINE 1: ...N_QUERY(jsonb '[1]', '$' WITH CONDITIONAL WRAPPER KEEP QUOTE...
++                                                             ^
++SELECT JSON_QUERY(jsonb '[1]', '$' WITH CONDITIONAL WRAPPER OMIT QUOTES);
++ERROR:  SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used
++LINE 1: ...N_QUERY(jsonb '[1]', '$' WITH CONDITIONAL WRAPPER OMIT QUOTE...
++                                                             ^
++-- Should succeed
++SELECT JSON_QUERY(jsonb '[1]', '$' WITHOUT WRAPPER OMIT QUOTES);
++ json_query 
++------------
++ [1]
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1]', '$' WITHOUT WRAPPER KEEP QUOTES);
++ json_query 
++------------
++ [1]
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]');
++ json_query 
++------------
++ 
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]' NULL ON EMPTY);
++ json_query 
++------------
++ 
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]' EMPTY ON EMPTY);
++ json_query 
++------------
++ []
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]' EMPTY ARRAY ON EMPTY);
++ json_query 
++------------
++ []
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]' EMPTY OBJECT ON EMPTY);
++ json_query 
++------------
++ {}
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY);
++ json_query 
++------------
++ 
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]' DEFAULT '"empty"' ON EMPTY);
++ json_query 
++------------
++ "empty"
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY NULL ON ERROR);
++ json_query 
++------------
++ 
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY EMPTY ARRAY ON ERROR);
++ json_query 
++------------
++ []
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY EMPTY OBJECT ON ERROR);
++ json_query 
++------------
++ {}
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY ERROR ON ERROR);
++ERROR:  no SQL/JSON item
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON ERROR);
++ json_query 
++------------
++ 
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' ERROR ON ERROR);
++ERROR:  JSON path expression in JSON_QUERY should return singleton item without wrapper
++HINT:  use WITH WRAPPER clause to wrap SQL/JSON item sequence into array
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' DEFAULT '"empty"' ON ERROR);
++ json_query 
++------------
++ "empty"
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING json);
++ json_query 
++------------
++ [1, 2]
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING json FORMAT JSON);
++ json_query 
++------------
++ [1, 2]
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING jsonb);
++ json_query 
++------------
++ [1, 2]
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING jsonb FORMAT JSON);
++ json_query 
++------------
++ [1, 2]
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING text);
++ json_query 
++------------
++ [1, 2]
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING char(10));
++ json_query 
++------------
++ [1, 2]    
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING char(3));
++ json_query 
++------------
++ [1,
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING text FORMAT JSON);
++ json_query 
++------------
++ [1, 2]
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING bytea);
++   json_query   
++----------------
++ \x5b312c20325d
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING bytea FORMAT JSON);
++   json_query   
++----------------
++ \x5b312c20325d
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING bytea EMPTY OBJECT ON ERROR);
++ json_query 
++------------
++ \x7b7d
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING bytea FORMAT JSON EMPTY OBJECT ON ERROR);
++ json_query 
++------------
++ \x7b7d
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING json EMPTY OBJECT ON ERROR);
++ json_query 
++------------
++ {}
++(1 row)
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING jsonb EMPTY OBJECT ON ERROR);
++ json_query 
++------------
++ {}
++(1 row)
++
++SELECT
++	x, y,
++	JSON_QUERY(
++		jsonb '[1,2,3,4,5,null]',
++		'$[*] ? (@ >= $x && @ <= $y)'
++		PASSING x AS x, y AS y
++		WITH CONDITIONAL WRAPPER
++		EMPTY ARRAY ON EMPTY
++	) list
++FROM
++	generate_series(0, 4) x,
++	generate_series(0, 4) y;
++ x | y |     list     
++---+---+--------------
++ 0 | 0 | []
++ 0 | 1 | [1]
++ 0 | 2 | [1, 2]
++ 0 | 3 | [1, 2, 3]
++ 0 | 4 | [1, 2, 3, 4]
++ 1 | 0 | []
++ 1 | 1 | [1]
++ 1 | 2 | [1, 2]
++ 1 | 3 | [1, 2, 3]
++ 1 | 4 | [1, 2, 3, 4]
++ 2 | 0 | []
++ 2 | 1 | []
++ 2 | 2 | [2]
++ 2 | 3 | [2, 3]
++ 2 | 4 | [2, 3, 4]
++ 3 | 0 | []
++ 3 | 1 | []
++ 3 | 2 | []
++ 3 | 3 | [3]
++ 3 | 4 | [3, 4]
++ 4 | 0 | []
++ 4 | 1 | []
++ 4 | 2 | []
++ 4 | 3 | []
++ 4 | 4 | [4]
++(25 rows)
++
++-- Extension: record types returning
++CREATE TYPE sqljsonb_rec AS (a int, t text, js json, jb jsonb, jsa json[]);
++CREATE TYPE sqljsonb_reca AS (reca sqljsonb_rec[]);
++SELECT JSON_QUERY(jsonb '[{"a": 1, "b": "foo", "t": "aaa", "js": [1, "2", {}], "jb": {"x": [1, "2", {}]}},  {"a": 2}]', '$[0]' RETURNING sqljsonb_rec);
++                     json_query                      
++-----------------------------------------------------
++ (1,aaa,"[1, ""2"", {}]","{""x"": [1, ""2"", {}]}",)
++(1 row)
++
++SELECT * FROM unnest((JSON_QUERY(jsonb '{"jsa":  [{"a": 1, "b": ["foo"]}, {"a": 2, "c": {}}, 123]}', '$' RETURNING sqljsonb_rec)).jsa);
++         unnest         
++------------------------
++ {"a": 1, "b": ["foo"]}
++ {"a": 2, "c": {}}
++ 123
++(3 rows)
++
++SELECT * FROM unnest((JSON_QUERY(jsonb '{"reca": [{"a": 1, "t": ["foo", []]}, {"a": 2, "jb": [{}, true]}]}', '$' RETURNING sqljsonb_reca)).reca);
++ a |      t      | js |     jb     | jsa 
++---+-------------+----+------------+-----
++ 1 | ["foo", []] |    |            | 
++ 2 |             |    | [{}, true] | 
++(2 rows)
++
++-- Extension: array types returning
++SELECT JSON_QUERY(jsonb '[1,2,null,"3"]', '$[*]' RETURNING int[] WITH WRAPPER);
++  json_query  
++--------------
++ {1,2,NULL,3}
++(1 row)
++
++SELECT * FROM unnest(JSON_QUERY(jsonb '[{"a": 1, "t": ["foo", []]}, {"a": 2, "jb": [{}, true]}]', '$' RETURNING sqljsonb_rec[]));
++ a |      t      | js |     jb     | jsa 
++---+-------------+----+------------+-----
++ 1 | ["foo", []] |    |            | 
++ 2 |             |    | [{}, true] | 
++(2 rows)
++
++-- Extension: domain types returning
++SELECT JSON_QUERY(jsonb '{"a": 1}', '$.a' RETURNING sqljsonb_int_not_null);
++ json_query 
++------------
++          1
++(1 row)
++
++SELECT JSON_QUERY(jsonb '{"a": 1}', '$.b' RETURNING sqljsonb_int_not_null);
++ERROR:  domain sqljsonb_int_not_null does not allow null values
++-- Test timestamptz passing and output
++SELECT JSON_QUERY(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts);
++         json_query          
++-----------------------------
++ "2018-02-21T02:34:56+00:00"
++(1 row)
++
++SELECT JSON_QUERY(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING json);
++         json_query          
++-----------------------------
++ "2018-02-21T02:34:56+00:00"
++(1 row)
++
++SELECT JSON_QUERY(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING jsonb);
++         json_query          
++-----------------------------
++ "2018-02-21T02:34:56+00:00"
++(1 row)
++
++-- Test constraints
++CREATE TABLE test_jsonb_constraints (
++	js text,
++	i int,
++	x jsonb DEFAULT JSON_QUERY(jsonb '[1,2]', '$[*]' WITH WRAPPER)
++	CONSTRAINT test_jsonb_constraint1
++		CHECK (js IS JSON)
++	CONSTRAINT test_jsonb_constraint2
++		CHECK (JSON_EXISTS(js::jsonb, '$.a' PASSING i + 5 AS int, i::text AS txt, array[1,2,3] as arr))
++	CONSTRAINT test_jsonb_constraint3
++		CHECK (JSON_VALUE(js::jsonb, '$.a' RETURNING int DEFAULT ('12' || i)::int ON EMPTY ERROR ON ERROR) > i)
++	CONSTRAINT test_jsonb_constraint4
++		CHECK (JSON_QUERY(js::jsonb, '$.a' WITH CONDITIONAL WRAPPER EMPTY OBJECT ON ERROR) < jsonb '[10]')
++	CONSTRAINT test_jsonb_constraint5
++		CHECK (JSON_QUERY(js::jsonb, '$.a' RETURNING char(5) OMIT QUOTES EMPTY ARRAY ON EMPTY) >  'a' COLLATE "C")
++	CONSTRAINT test_jsonb_constraint6
++		CHECK (JSON_EXISTS(js::jsonb, 'strict $.a' RETURNING int TRUE ON ERROR) < 2)
++);
++\d test_jsonb_constraints
++                                          Table "public.test_jsonb_constraints"
++ Column |  Type   | Collation | Nullable |                                    Default                                     
++--------+---------+-----------+----------+--------------------------------------------------------------------------------
++ js     | text    |           |          | 
++ i      | integer |           |          | 
++ x      | jsonb   |           |          | JSON_QUERY('[1, 2]'::jsonb, '$[*]' RETURNING jsonb WITH UNCONDITIONAL WRAPPER)
++Check constraints:
++    "test_jsonb_constraint1" CHECK (js IS JSON)
++    "test_jsonb_constraint2" CHECK (JSON_EXISTS(js::jsonb, '$."a"' PASSING i + 5 AS int, i::text AS txt, ARRAY[1, 2, 3] AS arr))
++    "test_jsonb_constraint3" CHECK (JSON_VALUE(js::jsonb, '$."a"' RETURNING integer DEFAULT ('12'::text || i)::integer ON EMPTY ERROR ON ERROR) > i)
++    "test_jsonb_constraint4" CHECK (JSON_QUERY(js::jsonb, '$."a"' RETURNING jsonb WITH CONDITIONAL WRAPPER EMPTY OBJECT ON ERROR) < '[10]'::jsonb)
++    "test_jsonb_constraint5" CHECK (JSON_QUERY(js::jsonb, '$."a"' RETURNING character(5) OMIT QUOTES EMPTY ARRAY ON EMPTY) > ('a'::bpchar COLLATE "C"))
++    "test_jsonb_constraint6" CHECK (JSON_EXISTS(js::jsonb, 'strict $."a"' RETURNING integer TRUE ON ERROR) < 2)
++
++SELECT check_clause
++FROM information_schema.check_constraints
++WHERE constraint_name LIKE 'test_jsonb_constraint%';
++                                                       check_clause                                                       
++--------------------------------------------------------------------------------------------------------------------------
++ ((js IS JSON))
++ (JSON_EXISTS((js)::jsonb, '$."a"' PASSING (i + 5) AS int, (i)::text AS txt, ARRAY[1, 2, 3] AS arr))
++ ((JSON_VALUE((js)::jsonb, '$."a"' RETURNING integer DEFAULT (('12'::text || i))::integer ON EMPTY ERROR ON ERROR) > i))
++ ((JSON_QUERY((js)::jsonb, '$."a"' RETURNING jsonb WITH CONDITIONAL WRAPPER EMPTY OBJECT ON ERROR) < '[10]'::jsonb))
++ ((JSON_QUERY((js)::jsonb, '$."a"' RETURNING character(5) OMIT QUOTES EMPTY ARRAY ON EMPTY) > ('a'::bpchar COLLATE "C")))
++ ((JSON_EXISTS((js)::jsonb, 'strict $."a"' RETURNING integer TRUE ON ERROR) < 2))
++(6 rows)
++
++SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'test_jsonb_constraints'::regclass;
++                                  pg_get_expr                                   
++--------------------------------------------------------------------------------
++ JSON_QUERY('[1, 2]'::jsonb, '$[*]' RETURNING jsonb WITH UNCONDITIONAL WRAPPER)
++(1 row)
++
++INSERT INTO test_jsonb_constraints VALUES ('', 1);
++ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint1"
++DETAIL:  Failing row contains (, 1, [1, 2]).
++INSERT INTO test_jsonb_constraints VALUES ('1', 1);
++ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint2"
++DETAIL:  Failing row contains (1, 1, [1, 2]).
++INSERT INTO test_jsonb_constraints VALUES ('[]');
++ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint2"
++DETAIL:  Failing row contains ([], null, [1, 2]).
++INSERT INTO test_jsonb_constraints VALUES ('{"b": 1}', 1);
++ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint2"
++DETAIL:  Failing row contains ({"b": 1}, 1, [1, 2]).
++INSERT INTO test_jsonb_constraints VALUES ('{"a": 1}', 1);
++ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint3"
++DETAIL:  Failing row contains ({"a": 1}, 1, [1, 2]).
++INSERT INTO test_jsonb_constraints VALUES ('{"a": 7}', 1);
++ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint5"
++DETAIL:  Failing row contains ({"a": 7}, 1, [1, 2]).
++INSERT INTO test_jsonb_constraints VALUES ('{"a": 10}', 1);
++ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint4"
++DETAIL:  Failing row contains ({"a": 10}, 1, [1, 2]).
++DROP TABLE test_jsonb_constraints;
++-- Test mutabilily od query functions
++CREATE TABLE test_jsonb_mutability(js jsonb);
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a[0]'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime()'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@ < $.datetime())'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime() < $.datetime())'));
++ERROR:  functions in index expression must be marked IMMUTABLE
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime() < $.datetime("HH:MI TZH"))'));
++ERROR:  functions in index expression must be marked IMMUTABLE
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime("HH:MI TZH") < $.datetime("HH:MI TZH"))'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime("HH:MI") < $.datetime("YY-MM-DD HH:MI"))'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime("HH:MI TZH") < $.datetime("YY-MM-DD HH:MI"))'));
++ERROR:  functions in index expression must be marked IMMUTABLE
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime("HH:MI TZH") < $x' PASSING '12:34'::timetz AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime("HH:MI TZH") < $y' PASSING '12:34'::timetz AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime() < $x' PASSING '12:34'::timetz AS x));
++ERROR:  functions in index expression must be marked IMMUTABLE
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime() < $x' PASSING '1234'::int AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime() ? (@ == $x)' PASSING '12:34'::time AS x));
++ERROR:  functions in index expression must be marked IMMUTABLE
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime("YY-MM-DD") ? (@ == $x)' PASSING '2020-07-14'::date AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$[1, $.a ? (@.datetime() == $x)]' PASSING '12:34'::time AS x));
++ERROR:  functions in index expression must be marked IMMUTABLE
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$[1, 0 to $.a ? (@.datetime() == $x)]' PASSING '12:34'::time AS x));
++ERROR:  functions in index expression must be marked IMMUTABLE
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$[1, $.a ? (@.datetime("HH:MI") == $x)]' PASSING '12:34'::time AS x));
++DROP TABLE test_jsonb_mutability;
+diff --git a/src/test/regress/parallel_schedule b/src/test/regress/parallel_schedule
+index 58fab1de1a06..5030d19c03ef 100644
+--- a/src/test/regress/parallel_schedule
++++ b/src/test/regress/parallel_schedule
+@@ -111,7 +111,7 @@ test: select_views portals_p2 foreign_key cluster dependency guc bitmapops combo
+ # ----------
+ # Another group of parallel tests (JSON related)
+ # ----------
+-test: json jsonb json_encoding jsonpath jsonpath_encoding jsonb_jsonpath sqljson
++test: json jsonb json_encoding jsonpath jsonpath_encoding jsonb_jsonpath sqljson json_sqljson jsonb_sqljson
+ 
+ # ----------
+ # Another group of parallel tests
+diff --git a/src/test/regress/sql/json_sqljson.sql b/src/test/regress/sql/json_sqljson.sql
+new file mode 100644
+index 000000000000..4f30fa46b910
+--- /dev/null
++++ b/src/test/regress/sql/json_sqljson.sql
+@@ -0,0 +1,11 @@
++-- JSON_EXISTS
++
++SELECT JSON_EXISTS(NULL FORMAT JSON, '$');
++
++-- JSON_VALUE
++
++SELECT JSON_VALUE(NULL FORMAT JSON, '$');
++
++-- JSON_QUERY
++
++SELECT JSON_QUERY(NULL FORMAT JSON, '$');
+diff --git a/src/test/regress/sql/jsonb_sqljson.sql b/src/test/regress/sql/jsonb_sqljson.sql
+new file mode 100644
+index 000000000000..00a067a06a42
+--- /dev/null
++++ b/src/test/regress/sql/jsonb_sqljson.sql
+@@ -0,0 +1,317 @@
++-- JSON_EXISTS
++
++SELECT JSON_EXISTS(NULL::jsonb, '$');
++
++SELECT JSON_EXISTS(jsonb '[]', '$');
++SELECT JSON_EXISTS(JSON_OBJECT(RETURNING jsonb), '$');
++
++SELECT JSON_EXISTS(jsonb '1', '$');
++SELECT JSON_EXISTS(jsonb 'null', '$');
++SELECT JSON_EXISTS(jsonb '[]', '$');
++
++SELECT JSON_EXISTS(jsonb '1', '$.a');
++SELECT JSON_EXISTS(jsonb '1', 'strict $.a');
++SELECT JSON_EXISTS(jsonb '1', 'strict $.a' ERROR ON ERROR);
++SELECT JSON_EXISTS(jsonb 'null', '$.a');
++SELECT JSON_EXISTS(jsonb '[]', '$.a');
++SELECT JSON_EXISTS(jsonb '[1, "aaa", {"a": 1}]', 'strict $.a');
++SELECT JSON_EXISTS(jsonb '[1, "aaa", {"a": 1}]', 'lax $.a');
++SELECT JSON_EXISTS(jsonb '{}', '$.a');
++SELECT JSON_EXISTS(jsonb '{"b": 1, "a": 2}', '$.a');
++
++SELECT JSON_EXISTS(jsonb '1', '$.a.b');
++SELECT JSON_EXISTS(jsonb '{"a": {"b": 1}}', '$.a.b');
++SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.a.b');
++
++SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x)' PASSING 1 AS x);
++SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x)' PASSING '1' AS x);
++SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x && @ < $y)' PASSING 0 AS x, 2 AS y);
++SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x && @ < $y)' PASSING 0 AS x, 1 AS y);
++
++-- extension: boolean expressions
++SELECT JSON_EXISTS(jsonb '1', '$ > 2');
++SELECT JSON_EXISTS(jsonb '1', '$.a > 2' ERROR ON ERROR);
++
++-- extension: RETURNING clause
++SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING bool);
++SELECT JSON_EXISTS(jsonb '1', '$[1]' RETURNING bool);
++SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING int);
++SELECT JSON_EXISTS(jsonb '1', '$[1]' RETURNING int);
++SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING text);
++SELECT JSON_EXISTS(jsonb '1', '$[1]' RETURNING text);
++SELECT JSON_EXISTS(jsonb '1', 'strict $[1]' RETURNING text FALSE ON ERROR);
++SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING jsonb);
++SELECT JSON_EXISTS(jsonb '1', '$[0]' RETURNING float4);
++
++
++-- JSON_VALUE
++
++SELECT JSON_VALUE(NULL::jsonb, '$');
++
++SELECT JSON_VALUE(jsonb 'null', '$');
++SELECT JSON_VALUE(jsonb 'null', '$' RETURNING int);
++
++SELECT JSON_VALUE(jsonb 'true', '$');
++SELECT JSON_VALUE(jsonb 'true', '$' RETURNING bool);
++
++SELECT JSON_VALUE(jsonb '123', '$');
++SELECT JSON_VALUE(jsonb '123', '$' RETURNING int) + 234;
++SELECT JSON_VALUE(jsonb '123', '$' RETURNING text);
++/* jsonb bytea ??? */
++SELECT JSON_VALUE(jsonb '123', '$' RETURNING bytea ERROR ON ERROR);
++
++SELECT JSON_VALUE(jsonb '1.23', '$');
++SELECT JSON_VALUE(jsonb '1.23', '$' RETURNING int);
++SELECT JSON_VALUE(jsonb '"1.23"', '$' RETURNING numeric);
++SELECT JSON_VALUE(jsonb '"1.23"', '$' RETURNING int ERROR ON ERROR);
++
++SELECT JSON_VALUE(jsonb '"aaa"', '$');
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING text);
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING char(5));
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING char(2));
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING json);
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING jsonb);
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING json ERROR ON ERROR);
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING jsonb ERROR ON ERROR);
++SELECT JSON_VALUE(jsonb '"\"aaa\""', '$' RETURNING json);
++SELECT JSON_VALUE(jsonb '"\"aaa\""', '$' RETURNING jsonb);
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING int);
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING int ERROR ON ERROR);
++SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING int DEFAULT 111 ON ERROR);
++SELECT JSON_VALUE(jsonb '"123"', '$' RETURNING int) + 234;
++
++SELECT JSON_VALUE(jsonb '"2017-02-20"', '$' RETURNING date) + 9;
++
++-- Test NULL checks execution in domain types
++CREATE DOMAIN sqljsonb_int_not_null AS int NOT NULL;
++SELECT JSON_VALUE(jsonb '1', '$.a' RETURNING sqljsonb_int_not_null);
++SELECT JSON_VALUE(jsonb '1', '$.a' RETURNING sqljsonb_int_not_null NULL ON ERROR);
++SELECT JSON_VALUE(jsonb '1', '$.a' RETURNING sqljsonb_int_not_null DEFAULT NULL ON ERROR);
++
++SELECT JSON_VALUE(jsonb '[]', '$');
++SELECT JSON_VALUE(jsonb '[]', '$' ERROR ON ERROR);
++SELECT JSON_VALUE(jsonb '{}', '$');
++SELECT JSON_VALUE(jsonb '{}', '$' ERROR ON ERROR);
++
++SELECT JSON_VALUE(jsonb '1', '$.a');
++SELECT JSON_VALUE(jsonb '1', 'strict $.a' ERROR ON ERROR);
++SELECT JSON_VALUE(jsonb '1', 'strict $.a' DEFAULT 'error' ON ERROR);
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' ERROR ON ERROR);
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' ERROR ON EMPTY ERROR ON ERROR);
++SELECT JSON_VALUE(jsonb '1', 'strict $.a' DEFAULT 2 ON ERROR);
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' DEFAULT 2 ON ERROR);
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' DEFAULT '2' ON ERROR);
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' NULL ON EMPTY DEFAULT '2' ON ERROR);
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' DEFAULT '2' ON EMPTY DEFAULT '3' ON ERROR);
++SELECT JSON_VALUE(jsonb '1', 'lax $.a' ERROR ON EMPTY DEFAULT '3' ON ERROR);
++
++SELECT JSON_VALUE(jsonb '[1,2]', '$[*]' ERROR ON ERROR);
++SELECT JSON_VALUE(jsonb '[1,2]', '$[*]' DEFAULT '0' ON ERROR);
++SELECT JSON_VALUE(jsonb '[" "]', '$[*]' RETURNING int ERROR ON ERROR);
++SELECT JSON_VALUE(jsonb '[" "]', '$[*]' RETURNING int DEFAULT 2 + 3 ON ERROR);
++SELECT JSON_VALUE(jsonb '["1"]', '$[*]' RETURNING int DEFAULT 2 + 3 ON ERROR);
++
++SELECT
++	x,
++	JSON_VALUE(
++		jsonb '{"a": 1, "b": 2}',
++		'$.* ? (@ > $x)' PASSING x AS x
++		RETURNING int
++		DEFAULT -1 ON EMPTY
++		DEFAULT -2 ON ERROR
++	) y
++FROM
++	generate_series(0, 2) x;
++
++SELECT JSON_VALUE(jsonb 'null', '$a' PASSING point ' (1, 2 )' AS a);
++SELECT JSON_VALUE(jsonb 'null', '$a' PASSING point ' (1, 2 )' AS a RETURNING point);
++
++-- Test timestamptz passing and output
++SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts);
++SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING timestamptz);
++SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING timestamp);
++SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING json);
++SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING jsonb);
++
++-- JSON_QUERY
++
++SELECT
++	JSON_QUERY(js, '$'),
++	JSON_QUERY(js, '$' WITHOUT WRAPPER),
++	JSON_QUERY(js, '$' WITH CONDITIONAL WRAPPER),
++	JSON_QUERY(js, '$' WITH UNCONDITIONAL ARRAY WRAPPER),
++	JSON_QUERY(js, '$' WITH ARRAY WRAPPER)
++FROM
++	(VALUES
++		(jsonb 'null'),
++		('12.3'),
++		('true'),
++		('"aaa"'),
++		('[1, null, "2"]'),
++		('{"a": 1, "b": [2]}')
++	) foo(js);
++
++SELECT
++	JSON_QUERY(js, 'strict $[*]') AS "unspec",
++	JSON_QUERY(js, 'strict $[*]' WITHOUT WRAPPER) AS "without",
++	JSON_QUERY(js, 'strict $[*]' WITH CONDITIONAL WRAPPER) AS "with cond",
++	JSON_QUERY(js, 'strict $[*]' WITH UNCONDITIONAL ARRAY WRAPPER) AS "with uncond",
++	JSON_QUERY(js, 'strict $[*]' WITH ARRAY WRAPPER) AS "with"
++FROM
++	(VALUES
++		(jsonb '1'),
++		('[]'),
++		('[null]'),
++		('[12.3]'),
++		('[true]'),
++		('["aaa"]'),
++		('[[1, 2, 3]]'),
++		('[{"a": 1, "b": [2]}]'),
++		('[1, "2", null, [3]]')
++	) foo(js);
++
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text);
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text KEEP QUOTES);
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text KEEP QUOTES ON SCALAR STRING);
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text OMIT QUOTES);
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text OMIT QUOTES ON SCALAR STRING);
++SELECT JSON_QUERY(jsonb '"aaa"', '$' OMIT QUOTES ERROR ON ERROR);
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING json OMIT QUOTES ERROR ON ERROR);
++SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING bytea FORMAT JSON OMIT QUOTES ERROR ON ERROR);
++
++-- QUOTES behavior should not be specified when WITH WRAPPER used:
++-- Should fail
++SELECT JSON_QUERY(jsonb '[1]', '$' WITH WRAPPER OMIT QUOTES);
++SELECT JSON_QUERY(jsonb '[1]', '$' WITH WRAPPER KEEP QUOTES);
++SELECT JSON_QUERY(jsonb '[1]', '$' WITH CONDITIONAL WRAPPER KEEP QUOTES);
++SELECT JSON_QUERY(jsonb '[1]', '$' WITH CONDITIONAL WRAPPER OMIT QUOTES);
++-- Should succeed
++SELECT JSON_QUERY(jsonb '[1]', '$' WITHOUT WRAPPER OMIT QUOTES);
++SELECT JSON_QUERY(jsonb '[1]', '$' WITHOUT WRAPPER KEEP QUOTES);
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]');
++SELECT JSON_QUERY(jsonb '[]', '$[*]' NULL ON EMPTY);
++SELECT JSON_QUERY(jsonb '[]', '$[*]' EMPTY ON EMPTY);
++SELECT JSON_QUERY(jsonb '[]', '$[*]' EMPTY ARRAY ON EMPTY);
++SELECT JSON_QUERY(jsonb '[]', '$[*]' EMPTY OBJECT ON EMPTY);
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY);
++SELECT JSON_QUERY(jsonb '[]', '$[*]' DEFAULT '"empty"' ON EMPTY);
++
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY NULL ON ERROR);
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY EMPTY ARRAY ON ERROR);
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY EMPTY OBJECT ON ERROR);
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY ERROR ON ERROR);
++SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON ERROR);
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' ERROR ON ERROR);
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' DEFAULT '"empty"' ON ERROR);
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING json);
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING json FORMAT JSON);
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING jsonb);
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING jsonb FORMAT JSON);
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING text);
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING char(10));
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING char(3));
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING text FORMAT JSON);
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING bytea);
++SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING bytea FORMAT JSON);
++
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING bytea EMPTY OBJECT ON ERROR);
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING bytea FORMAT JSON EMPTY OBJECT ON ERROR);
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING json EMPTY OBJECT ON ERROR);
++SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING jsonb EMPTY OBJECT ON ERROR);
++
++SELECT
++	x, y,
++	JSON_QUERY(
++		jsonb '[1,2,3,4,5,null]',
++		'$[*] ? (@ >= $x && @ <= $y)'
++		PASSING x AS x, y AS y
++		WITH CONDITIONAL WRAPPER
++		EMPTY ARRAY ON EMPTY
++	) list
++FROM
++	generate_series(0, 4) x,
++	generate_series(0, 4) y;
++
++-- Extension: record types returning
++CREATE TYPE sqljsonb_rec AS (a int, t text, js json, jb jsonb, jsa json[]);
++CREATE TYPE sqljsonb_reca AS (reca sqljsonb_rec[]);
++
++SELECT JSON_QUERY(jsonb '[{"a": 1, "b": "foo", "t": "aaa", "js": [1, "2", {}], "jb": {"x": [1, "2", {}]}},  {"a": 2}]', '$[0]' RETURNING sqljsonb_rec);
++SELECT * FROM unnest((JSON_QUERY(jsonb '{"jsa":  [{"a": 1, "b": ["foo"]}, {"a": 2, "c": {}}, 123]}', '$' RETURNING sqljsonb_rec)).jsa);
++SELECT * FROM unnest((JSON_QUERY(jsonb '{"reca": [{"a": 1, "t": ["foo", []]}, {"a": 2, "jb": [{}, true]}]}', '$' RETURNING sqljsonb_reca)).reca);
++
++-- Extension: array types returning
++SELECT JSON_QUERY(jsonb '[1,2,null,"3"]', '$[*]' RETURNING int[] WITH WRAPPER);
++SELECT * FROM unnest(JSON_QUERY(jsonb '[{"a": 1, "t": ["foo", []]}, {"a": 2, "jb": [{}, true]}]', '$' RETURNING sqljsonb_rec[]));
++
++-- Extension: domain types returning
++SELECT JSON_QUERY(jsonb '{"a": 1}', '$.a' RETURNING sqljsonb_int_not_null);
++SELECT JSON_QUERY(jsonb '{"a": 1}', '$.b' RETURNING sqljsonb_int_not_null);
++
++-- Test timestamptz passing and output
++SELECT JSON_QUERY(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts);
++SELECT JSON_QUERY(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING json);
++SELECT JSON_QUERY(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING jsonb);
++
++-- Test constraints
++
++CREATE TABLE test_jsonb_constraints (
++	js text,
++	i int,
++	x jsonb DEFAULT JSON_QUERY(jsonb '[1,2]', '$[*]' WITH WRAPPER)
++	CONSTRAINT test_jsonb_constraint1
++		CHECK (js IS JSON)
++	CONSTRAINT test_jsonb_constraint2
++		CHECK (JSON_EXISTS(js::jsonb, '$.a' PASSING i + 5 AS int, i::text AS txt, array[1,2,3] as arr))
++	CONSTRAINT test_jsonb_constraint3
++		CHECK (JSON_VALUE(js::jsonb, '$.a' RETURNING int DEFAULT ('12' || i)::int ON EMPTY ERROR ON ERROR) > i)
++	CONSTRAINT test_jsonb_constraint4
++		CHECK (JSON_QUERY(js::jsonb, '$.a' WITH CONDITIONAL WRAPPER EMPTY OBJECT ON ERROR) < jsonb '[10]')
++	CONSTRAINT test_jsonb_constraint5
++		CHECK (JSON_QUERY(js::jsonb, '$.a' RETURNING char(5) OMIT QUOTES EMPTY ARRAY ON EMPTY) >  'a' COLLATE "C")
++	CONSTRAINT test_jsonb_constraint6
++		CHECK (JSON_EXISTS(js::jsonb, 'strict $.a' RETURNING int TRUE ON ERROR) < 2)
++);
++
++\d test_jsonb_constraints
++
++SELECT check_clause
++FROM information_schema.check_constraints
++WHERE constraint_name LIKE 'test_jsonb_constraint%';
++
++SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'test_jsonb_constraints'::regclass;
++
++INSERT INTO test_jsonb_constraints VALUES ('', 1);
++INSERT INTO test_jsonb_constraints VALUES ('1', 1);
++INSERT INTO test_jsonb_constraints VALUES ('[]');
++INSERT INTO test_jsonb_constraints VALUES ('{"b": 1}', 1);
++INSERT INTO test_jsonb_constraints VALUES ('{"a": 1}', 1);
++INSERT INTO test_jsonb_constraints VALUES ('{"a": 7}', 1);
++INSERT INTO test_jsonb_constraints VALUES ('{"a": 10}', 1);
++
++DROP TABLE test_jsonb_constraints;
++
++-- Test mutabilily od query functions
++CREATE TABLE test_jsonb_mutability(js jsonb);
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a[0]'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime()'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@ < $.datetime())'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime() < $.datetime())'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime() < $.datetime("HH:MI TZH"))'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime("HH:MI TZH") < $.datetime("HH:MI TZH"))'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime("HH:MI") < $.datetime("YY-MM-DD HH:MI"))'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime("HH:MI TZH") < $.datetime("YY-MM-DD HH:MI"))'));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime("HH:MI TZH") < $x' PASSING '12:34'::timetz AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime("HH:MI TZH") < $y' PASSING '12:34'::timetz AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime() < $x' PASSING '12:34'::timetz AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime() < $x' PASSING '1234'::int AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime() ? (@ == $x)' PASSING '12:34'::time AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime("YY-MM-DD") ? (@ == $x)' PASSING '2020-07-14'::date AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$[1, $.a ? (@.datetime() == $x)]' PASSING '12:34'::time AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$[1, 0 to $.a ? (@.datetime() == $x)]' PASSING '12:34'::time AS x));
++CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$[1, $.a ? (@.datetime("HH:MI") == $x)]' PASSING '12:34'::time AS x));
++DROP TABLE test_jsonb_mutability;

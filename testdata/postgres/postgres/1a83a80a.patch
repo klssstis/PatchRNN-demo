@@ -1,0 +1,248 @@
+From 1a83a80a2fe5b559f85ed4830acb92d5124b7a9a Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 11 Mar 2019 19:13:46 -0400
+Subject: [PATCH] Allow fractional input values for integer GUCs, and improve
+ rounding logic.
+
+Historically guc.c has just refused examples like set work_mem = '30.1GB',
+but it seems more useful for it to take that and round off the value to
+some reasonable approximation of what the user said.  Just rounding to
+the parameter's native unit would work, but it would lead to rather
+silly-looking settings, such as 31562138kB for this example.  Instead
+let's round to the nearest multiple of the next smaller unit (if any),
+producing 30822MB.
+
+Also, do the units conversion math in floating point and round to integer
+(if needed) only at the end.  This produces saner results for inputs that
+aren't exact multiples of the parameter's native unit, and removes another
+difference in the behavior for integer vs. float parameters.
+
+In passing, document the ability to use hex or octal input where it
+ought to be documented.
+
+Discussion: https://postgr.es/m/1798.1552165479@sss.pgh.pa.us
+---
+ doc/src/sgml/config.sgml                 | 18 ++++-
+ src/backend/utils/misc/guc.c             | 83 +++++++++++++++---------
+ src/test/regress/expected/reloptions.out |  5 +-
+ src/test/regress/sql/reloptions.sql      |  2 +-
+ 4 files changed, 74 insertions(+), 34 deletions(-)
+
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index fe1735722a6f..d383de251285 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -51,14 +51,21 @@
+        In general, enclose the value in single quotes, doubling any single
+        quotes within the value.  Quotes can usually be omitted if the value
+        is a simple number or identifier, however.
++       (Values that match a SQL keyword require quoting in some contexts.)
+       </para>
+      </listitem>
+ 
+      <listitem>
+       <para>
+        <emphasis>Numeric (integer and floating point):</emphasis>
+-       A decimal point is permitted only for floating-point parameters.
+-       Do not use thousands separators.  Quotes are not required.
++       Numeric parameters can be specified in the customary integer and
++       floating-point formats; fractional values are rounded to the nearest
++       integer if the parameter is of integer type.  Integer parameters
++       additionally accept hexadecimal input (beginning
++       with <literal>0x</literal>) and octal input (beginning
++       with <literal>0</literal>), but these formats cannot have a fraction.
++       Do not use thousands separators.
++       Quotes are not required, except for hexadecimal input.
+       </para>
+      </listitem>
+ 
+@@ -99,6 +106,13 @@
+          </para>
+         </listitem>
+        </itemizedlist>
++
++       If a fractional value is specified with a unit, it will be rounded
++       to a multiple of the next smaller unit if there is one.
++       For example, <literal>30.1 GB</literal> will be converted
++       to <literal>30822 MB</literal> not <literal>32319628902 B</literal>.
++       If the parameter is of integer type, a final rounding to integer
++       occurs after any units conversion.
+       </para>
+      </listitem>
+ 
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index fe6c6f8a05a5..cdb6a6121f5f 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -5995,7 +5995,19 @@ convert_to_base_unit(double value, const char *unit,
+ 		if (base_unit == table[i].base_unit &&
+ 			strcmp(unitstr, table[i].unit) == 0)
+ 		{
+-			*base_value = value * table[i].multiplier;
++			double		cvalue = value * table[i].multiplier;
++
++			/*
++			 * If the user gave a fractional value such as "30.1GB", round it
++			 * off to the nearest multiple of the next smaller unit, if there
++			 * is one.
++			 */
++			if (*table[i + 1].unit &&
++				base_unit == table[i + 1].base_unit)
++				cvalue = rint(cvalue / table[i + 1].multiplier) *
++					table[i + 1].multiplier;
++
++			*base_value = cvalue;
+ 			return true;
+ 		}
+ 	}
+@@ -6141,8 +6153,10 @@ get_config_unit_name(int flags)
+ 
+ /*
+  * Try to parse value as an integer.  The accepted formats are the
+- * usual decimal, octal, or hexadecimal formats, optionally followed by
+- * a unit name if "flags" indicates a unit is allowed.
++ * usual decimal, octal, or hexadecimal formats, as well as floating-point
++ * formats (which will be rounded to integer after any units conversion).
++ * Optionally, the value can be followed by a unit name if "flags" indicates
++ * a unit is allowed.
+  *
+  * If the string parses okay, return true, else false.
+  * If okay and result is not NULL, return the value in *result.
+@@ -6152,7 +6166,11 @@ get_config_unit_name(int flags)
+ bool
+ parse_int(const char *value, int *result, int flags, const char **hintmsg)
+ {
+-	int64		val;
++	/*
++	 * We assume here that double is wide enough to represent any integer
++	 * value with adequate precision.
++	 */
++	double		val;
+ 	char	   *endptr;
+ 
+ 	/* To suppress compiler warnings, always set output params */
+@@ -6161,35 +6179,42 @@ parse_int(const char *value, int *result, int flags, const char **hintmsg)
+ 	if (hintmsg)
+ 		*hintmsg = NULL;
+ 
+-	/* We assume here that int64 is at least as wide as long */
++	/*
++	 * Try to parse as an integer (allowing octal or hex input).  If the
++	 * conversion stops at a decimal point or 'e', or overflows, re-parse as
++	 * float.  This should work fine as long as we have no unit names starting
++	 * with 'e'.  If we ever do, the test could be extended to check for a
++	 * sign or digit after 'e', but for now that's unnecessary.
++	 */
+ 	errno = 0;
+ 	val = strtol(value, &endptr, 0);
+-
+-	if (endptr == value)
+-		return false;			/* no HINT for integer syntax error */
+-
+-	if (errno == ERANGE || val != (int64) ((int32) val))
++	if (*endptr == '.' || *endptr == 'e' || *endptr == 'E' ||
++		errno == ERANGE)
+ 	{
+-		if (hintmsg)
+-			*hintmsg = gettext_noop("Value exceeds integer range.");
+-		return false;
++		errno = 0;
++		val = strtod(value, &endptr);
+ 	}
+ 
+-	/* allow whitespace between integer and unit */
++	if (endptr == value || errno == ERANGE)
++		return false;			/* no HINT for these cases */
++
++	/* reject NaN (infinities will fail range check below) */
++	if (isnan(val))
++		return false;			/* treat same as syntax error; no HINT */
++
++	/* allow whitespace between number and unit */
+ 	while (isspace((unsigned char) *endptr))
+ 		endptr++;
+ 
+ 	/* Handle possible unit */
+ 	if (*endptr != '\0')
+ 	{
+-		double		cval;
+-
+ 		if ((flags & GUC_UNIT) == 0)
+ 			return false;		/* this setting does not accept a unit */
+ 
+-		if (!convert_to_base_unit((double) val,
++		if (!convert_to_base_unit(val,
+ 								  endptr, (flags & GUC_UNIT),
+-								  &cval))
++								  &val))
+ 		{
+ 			/* invalid unit, or garbage after the unit; set hint and fail. */
+ 			if (hintmsg)
+@@ -6201,16 +6226,16 @@ parse_int(const char *value, int *result, int flags, const char **hintmsg)
+ 			}
+ 			return false;
+ 		}
++	}
+ 
+-		/* Round to int, then check for overflow due to units conversion */
+-		cval = rint(cval);
+-		if (cval > INT_MAX || cval < INT_MIN)
+-		{
+-			if (hintmsg)
+-				*hintmsg = gettext_noop("Value exceeds integer range.");
+-			return false;
+-		}
+-		val = (int64) cval;
++	/* Round to int, then check for overflow */
++	val = rint(val);
++
++	if (val > INT_MAX || val < INT_MIN)
++	{
++		if (hintmsg)
++			*hintmsg = gettext_noop("Value exceeds integer range.");
++		return false;
+ 	}
+ 
+ 	if (result)
+@@ -6218,10 +6243,10 @@ parse_int(const char *value, int *result, int flags, const char **hintmsg)
+ 	return true;
+ }
+ 
+-
+-
+ /*
+  * Try to parse value as a floating point number in the usual format.
++ * Optionally, the value can be followed by a unit name if "flags" indicates
++ * a unit is allowed.
+  *
+  * If the string parses okay, return true, else false.
+  * If okay and result is not NULL, return the value in *result.
+diff --git a/src/test/regress/expected/reloptions.out b/src/test/regress/expected/reloptions.out
+index f90c267c87e9..5266490127d8 100644
+--- a/src/test/regress/expected/reloptions.out
++++ b/src/test/regress/expected/reloptions.out
+@@ -26,8 +26,9 @@ ERROR:  unrecognized parameter "not_existing_option"
+ CREATE TABLE reloptions_test2(i INT) WITH (not_existing_namespace.fillfactor=2);
+ ERROR:  unrecognized parameter namespace "not_existing_namespace"
+ -- Fail while setting improper values
+-CREATE TABLE reloptions_test2(i INT) WITH (fillfactor=30.5);
+-ERROR:  invalid value for integer option "fillfactor": 30.5
++CREATE TABLE reloptions_test2(i INT) WITH (fillfactor=-30.1);
++ERROR:  value -30.1 out of bounds for option "fillfactor"
++DETAIL:  Valid values are between "10" and "100".
+ CREATE TABLE reloptions_test2(i INT) WITH (fillfactor='string');
+ ERROR:  invalid value for integer option "fillfactor": string
+ CREATE TABLE reloptions_test2(i INT) WITH (fillfactor=true);
+diff --git a/src/test/regress/sql/reloptions.sql b/src/test/regress/sql/reloptions.sql
+index 44fcd8c41451..855185156d0e 100644
+--- a/src/test/regress/sql/reloptions.sql
++++ b/src/test/regress/sql/reloptions.sql
+@@ -15,7 +15,7 @@ CREATE TABLE reloptions_test2(i INT) WITH (not_existing_option=2);
+ CREATE TABLE reloptions_test2(i INT) WITH (not_existing_namespace.fillfactor=2);
+ 
+ -- Fail while setting improper values
+-CREATE TABLE reloptions_test2(i INT) WITH (fillfactor=30.5);
++CREATE TABLE reloptions_test2(i INT) WITH (fillfactor=-30.1);
+ CREATE TABLE reloptions_test2(i INT) WITH (fillfactor='string');
+ CREATE TABLE reloptions_test2(i INT) WITH (fillfactor=true);
+ CREATE TABLE reloptions_test2(i INT) WITH (autovacuum_enabled=12);

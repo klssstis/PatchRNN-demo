@@ -1,0 +1,644 @@
+From 1c53c4dec3985512f7f2f53c9d76a5295cd0a2dd Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 15 Jan 2019 12:07:10 -0500
+Subject: [PATCH] Finish reverting "recheck_on_update" patch.
+
+This reverts commit c203d6cf8 and some follow-on fixes, completing the
+task begun in commit 5d28c9bd7.  If that feature is ever resurrected,
+the code will look quite a bit different from this, so it seems best
+to start from a clean slate.
+
+The v11 branch is not touched; in that branch, the recheck_on_update
+storage option remains present, but nonfunctional and undocumented.
+
+Discussion: https://postgr.es/m/20190114223409.3tcvejfhlvbucrv5@alap3.anarazel.de
+---
+ src/backend/access/common/reloptions.c |  45 +---------
+ src/backend/access/heap/heapam.c       | 109 ++---------------------
+ src/backend/catalog/index.c            |   5 +-
+ src/backend/utils/cache/relcache.c     | 118 ++-----------------------
+ src/bin/psql/tab-complete.c            |   4 +-
+ src/include/access/reloptions.h        |   2 -
+ src/include/utils/rel.h                |  12 +--
+ src/include/utils/relcache.h           |   3 +-
+ 8 files changed, 21 insertions(+), 277 deletions(-)
+
+diff --git a/src/backend/access/common/reloptions.c b/src/backend/access/common/reloptions.c
+index f5efe94b7b98..cdf1f4af62df 100644
+--- a/src/backend/access/common/reloptions.c
++++ b/src/backend/access/common/reloptions.c
+@@ -129,15 +129,6 @@ static relopt_bool boolRelOpts[] =
+ 		},
+ 		true
+ 	},
+-	{
+-		{
+-			"recheck_on_update",
+-			"Recheck functional index expression for changed value after update",
+-			RELOPT_KIND_INDEX,
+-			ShareUpdateExclusiveLock	/* since only applies to later UPDATEs */
+-		},
+-		true
+-	},
+ 	{
+ 		{
+ 			"security_barrier",
+@@ -1343,7 +1334,7 @@ fillRelOptions(void *rdopts, Size basesize,
+ 				break;
+ 			}
+ 		}
+-		if (validate && !found && options[i].gen->kinds != RELOPT_KIND_INDEX)
++		if (validate && !found)
+ 			elog(ERROR, "reloption \"%s\" not found in parse table",
+ 				 options[i].gen->name);
+ 	}
+@@ -1501,40 +1492,6 @@ index_reloptions(amoptions_function amoptions, Datum reloptions, bool validate)
+ 	return amoptions(reloptions, validate);
+ }
+ 
+-/*
+- * Parse generic options for all indexes.
+- *
+- *	reloptions	options as text[] datum
+- *	validate	error flag
+- */
+-bytea *
+-index_generic_reloptions(Datum reloptions, bool validate)
+-{
+-	int			numoptions;
+-	GenericIndexOpts *idxopts;
+-	relopt_value *options;
+-	static const relopt_parse_elt tab[] = {
+-		{"recheck_on_update", RELOPT_TYPE_BOOL, offsetof(GenericIndexOpts, recheck_on_update)}
+-	};
+-
+-	options = parseRelOptions(reloptions, validate,
+-							  RELOPT_KIND_INDEX,
+-							  &numoptions);
+-
+-	/* if none set, we're done */
+-	if (numoptions == 0)
+-		return NULL;
+-
+-	idxopts = allocateReloptStruct(sizeof(GenericIndexOpts), options, numoptions);
+-
+-	fillRelOptions((void *) idxopts, sizeof(GenericIndexOpts), options, numoptions,
+-				   validate, tab, lengthof(tab));
+-
+-	pfree(options);
+-
+-	return (bytea *) idxopts;
+-}
+-
+ /*
+  * Option parser for attribute reloptions
+  */
+diff --git a/src/backend/access/heap/heapam.c b/src/backend/access/heap/heapam.c
+index 3a184f2eccbe..f7b08ffdd13c 100644
+--- a/src/backend/access/heap/heapam.c
++++ b/src/backend/access/heap/heapam.c
+@@ -57,7 +57,6 @@
+ #include "access/xlogutils.h"
+ #include "catalog/catalog.h"
+ #include "catalog/namespace.h"
+-#include "catalog/index.h"
+ #include "miscadmin.h"
+ #include "pgstat.h"
+ #include "port/atomics.h"
+@@ -76,9 +75,7 @@
+ #include "utils/snapmgr.h"
+ #include "utils/syscache.h"
+ #include "utils/tqual.h"
+-#include "utils/memutils.h"
+-#include "nodes/execnodes.h"
+-#include "executor/executor.h"
++
+ 
+ /* GUC variable */
+ bool		synchronize_seqscans = true;
+@@ -130,7 +127,6 @@ static bool ConditionalMultiXactIdWait(MultiXactId multi, MultiXactStatus status
+ static XLogRecPtr log_heap_new_cid(Relation relation, HeapTuple tup);
+ static HeapTuple ExtractReplicaIdentity(Relation rel, HeapTuple tup, bool key_modified,
+ 					   bool *copy);
+-static bool ProjIndexIsUnchanged(Relation relation, HeapTuple oldtup, HeapTuple newtup);
+ 
+ 
+ /*
+@@ -3511,7 +3507,6 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
+ 	HTSU_Result result;
+ 	TransactionId xid = GetCurrentTransactionId();
+ 	Bitmapset  *hot_attrs;
+-	Bitmapset  *proj_idx_attrs;
+ 	Bitmapset  *key_attrs;
+ 	Bitmapset  *id_attrs;
+ 	Bitmapset  *interesting_attrs;
+@@ -3575,11 +3570,12 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
+ 	 * Note that we get copies of each bitmap, so we need not worry about
+ 	 * relcache flush happening midway through.
+ 	 */
+-	hot_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_HOT);
+-	proj_idx_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_PROJ);
++	hot_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_ALL);
+ 	key_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_KEY);
+ 	id_attrs = RelationGetIndexAttrBitmap(relation,
+ 										  INDEX_ATTR_BITMAP_IDENTITY_KEY);
++
++
+ 	block = ItemPointerGetBlockNumber(otid);
+ 	buffer = ReadBuffer(relation, block);
+ 	page = BufferGetPage(buffer);
+@@ -3599,7 +3595,6 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
+ 	if (!PageIsFull(page))
+ 	{
+ 		interesting_attrs = bms_add_members(interesting_attrs, hot_attrs);
+-		interesting_attrs = bms_add_members(interesting_attrs, proj_idx_attrs);
+ 		hot_attrs_checked = true;
+ 	}
+ 	interesting_attrs = bms_add_members(interesting_attrs, key_attrs);
+@@ -3883,7 +3878,6 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
+ 		if (vmbuffer != InvalidBuffer)
+ 			ReleaseBuffer(vmbuffer);
+ 		bms_free(hot_attrs);
+-		bms_free(proj_idx_attrs);
+ 		bms_free(key_attrs);
+ 		bms_free(id_attrs);
+ 		bms_free(modified_attrs);
+@@ -4191,18 +4185,11 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
+ 		/*
+ 		 * Since the new tuple is going into the same page, we might be able
+ 		 * to do a HOT update.  Check if any of the index columns have been
+-		 * changed, or if we have projection functional indexes, check whether
+-		 * the old and the new values are the same.   If the page was already
+-		 * full, we may have skipped checking for index columns. If so, HOT
+-		 * update is possible.
++		 * changed. If the page was already full, we may have skipped checking
++		 * for index columns. If so, HOT update is possible.
+ 		 */
+-		if (hot_attrs_checked
+-			&& !bms_overlap(modified_attrs, hot_attrs)
+-			&& (!bms_overlap(modified_attrs, proj_idx_attrs)
+-				|| ProjIndexIsUnchanged(relation, &oldtup, newtup)))
+-		{
++		if (hot_attrs_checked && !bms_overlap(modified_attrs, hot_attrs))
+ 			use_hot_update = true;
+-		}
+ 	}
+ 	else
+ 	{
+@@ -4364,7 +4351,6 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
+ 		heap_freetuple(old_key_tuple);
+ 
+ 	bms_free(hot_attrs);
+-	bms_free(proj_idx_attrs);
+ 	bms_free(key_attrs);
+ 	bms_free(id_attrs);
+ 	bms_free(modified_attrs);
+@@ -4450,87 +4436,6 @@ heap_tuple_attr_equals(TupleDesc tupdesc, int attrnum,
+ 	}
+ }
+ 
+-/*
+- * Check whether the value is unchanged after update of a projection
+- * functional index. Compare the new and old values of the indexed
+- * expression to see if we are able to use a HOT update or not.
+- */
+-static bool
+-ProjIndexIsUnchanged(Relation relation, HeapTuple oldtup, HeapTuple newtup)
+-{
+-	ListCell   *l;
+-	List	   *indexoidlist = RelationGetIndexList(relation);
+-	EState	   *estate = CreateExecutorState();
+-	ExprContext *econtext = GetPerTupleExprContext(estate);
+-	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(relation),
+-													&TTSOpsHeapTuple);
+-	bool		equals = true;
+-	Datum		old_values[INDEX_MAX_KEYS];
+-	bool		old_isnull[INDEX_MAX_KEYS];
+-	Datum		new_values[INDEX_MAX_KEYS];
+-	bool		new_isnull[INDEX_MAX_KEYS];
+-	int			indexno = 0;
+-
+-	econtext->ecxt_scantuple = slot;
+-
+-	foreach(l, indexoidlist)
+-	{
+-		if (bms_is_member(indexno, relation->rd_projidx))
+-		{
+-			Oid			indexOid = lfirst_oid(l);
+-			Relation	indexDesc = index_open(indexOid, AccessShareLock);
+-			IndexInfo  *indexInfo = BuildIndexInfo(indexDesc);
+-			int			i;
+-
+-			ResetExprContext(econtext);
+-			ExecStoreHeapTuple(oldtup, slot, false);
+-			FormIndexDatum(indexInfo,
+-						   slot,
+-						   estate,
+-						   old_values,
+-						   old_isnull);
+-
+-			ExecStoreHeapTuple(newtup, slot, false);
+-			FormIndexDatum(indexInfo,
+-						   slot,
+-						   estate,
+-						   new_values,
+-						   new_isnull);
+-
+-			for (i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
+-			{
+-				if (old_isnull[i] != new_isnull[i])
+-				{
+-					equals = false;
+-					break;
+-				}
+-				else if (!old_isnull[i])
+-				{
+-					Form_pg_attribute att = TupleDescAttr(RelationGetDescr(indexDesc), i);
+-
+-					if (!datumIsEqual(old_values[i], new_values[i], att->attbyval, att->attlen))
+-					{
+-						equals = false;
+-						break;
+-					}
+-				}
+-			}
+-			index_close(indexDesc, AccessShareLock);
+-
+-			if (!equals)
+-			{
+-				break;
+-			}
+-		}
+-		indexno += 1;
+-	}
+-	ExecDropSingleTupleTableSlot(slot);
+-	FreeExecutorState(estate);
+-
+-	return equals;
+-}
+-
+-
+ /*
+  * Check which columns are being updated.
+  *
+diff --git a/src/backend/catalog/index.c b/src/backend/catalog/index.c
+index 761218f0574b..8701e3a791cf 100644
+--- a/src/backend/catalog/index.c
++++ b/src/backend/catalog/index.c
+@@ -27,7 +27,6 @@
+ #include "access/heapam.h"
+ #include "access/multixact.h"
+ #include "access/relscan.h"
+-#include "access/reloptions.h"
+ #include "access/sysattr.h"
+ #include "access/transam.h"
+ #include "access/visibilitymap.h"
+@@ -355,7 +354,7 @@ ConstructTupleDescriptor(Relation heapRelation,
+ 			/* Simple index column */
+ 			const FormData_pg_attribute *from;
+ 
+-			Assert(atnum > 0); /* should've been caught above */
++			Assert(atnum > 0);	/* should've been caught above */
+ 
+ 			if (atnum > natts)	/* safety check */
+ 				elog(ERROR, "invalid column number %d", atnum);
+@@ -3903,7 +3902,7 @@ reindex_relation(Oid relid, int flags, int options)
+ 
+ 	/* Ensure rd_indexattr is valid; see comments for RelationSetIndexList */
+ 	if (is_pg_class)
+-		(void) RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_HOT);
++		(void) RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_ALL);
+ 
+ 	PG_TRY();
+ 	{
+diff --git a/src/backend/utils/cache/relcache.c b/src/backend/utils/cache/relcache.c
+index df30bff6c999..e3b1473e6c99 100644
+--- a/src/backend/utils/cache/relcache.c
++++ b/src/backend/utils/cache/relcache.c
+@@ -71,11 +71,9 @@
+ #include "miscadmin.h"
+ #include "nodes/nodeFuncs.h"
+ #include "optimizer/clauses.h"
+-#include "optimizer/cost.h"
+ #include "optimizer/prep.h"
+ #include "optimizer/var.h"
+ #include "partitioning/partbounds.h"
+-#include "pgstat.h"
+ #include "rewrite/rewriteDefine.h"
+ #include "rewrite/rowsecurity.h"
+ #include "storage/lmgr.h"
+@@ -2266,11 +2264,9 @@ RelationDestroyRelation(Relation relation, bool remember_tupdesc)
+ 	list_free_deep(relation->rd_fkeylist);
+ 	list_free(relation->rd_indexlist);
+ 	bms_free(relation->rd_indexattr);
+-	bms_free(relation->rd_projindexattr);
+ 	bms_free(relation->rd_keyattr);
+ 	bms_free(relation->rd_pkattr);
+ 	bms_free(relation->rd_idattr);
+-	bms_free(relation->rd_projidx);
+ 	if (relation->rd_pubactions)
+ 		pfree(relation->rd_pubactions);
+ 	if (relation->rd_options)
+@@ -4401,7 +4397,7 @@ RelationGetStatExtList(Relation relation)
+ 
+ 	while (HeapTupleIsValid(htup = systable_getnext(indscan)))
+ 	{
+-		Oid oid = ((Form_pg_statistic_ext) GETSTRUCT(htup))->oid;
++		Oid			oid = ((Form_pg_statistic_ext) GETSTRUCT(htup))->oid;
+ 
+ 		result = insert_ordered_oid(result, oid);
+ 	}
+@@ -4675,77 +4671,6 @@ RelationGetIndexPredicate(Relation relation)
+ 	return result;
+ }
+ 
+-#define HEURISTIC_MAX_HOT_RECHECK_EXPR_COST 1000
+-
+-/*
+- * Check if functional index is projection: index expression returns some subset
+- * of its argument values. During HOT update check we handle projection indexes
+- * differently: instead of checking if any of attributes used in indexed
+- * expression were updated, we calculate and compare values of index expression
+- * for old and new tuple values.
+- *
+- * Decision made by this function is based on two sources:
+- * 1. Calculated cost of index expression: if greater than some heuristic limit
+-	  then extra comparison of index expression values is expected to be too
+-	  expensive, so we don't attempt it by default.
+- * 2. "recheck_on_update" index option explicitly set by user, which overrides 1)
+- */
+-static bool
+-IsProjectionFunctionalIndex(Relation index, IndexInfo *ii)
+-{
+-	bool		is_projection = false;
+-
+-#ifdef NOT_USED
+-	if (ii->ii_Expressions)
+-	{
+-		HeapTuple	tuple;
+-		Datum		reloptions;
+-		bool		isnull;
+-		QualCost	index_expr_cost;
+-
+-		/* by default functional index is considered as non-injective */
+-		is_projection = true;
+-
+-		cost_qual_eval(&index_expr_cost, ii->ii_Expressions, NULL);
+-
+-		/*
+-		 * If index expression is too expensive, then disable projection
+-		 * optimization, because extra evaluation of index expression is
+-		 * expected to be more expensive than index update.  Currently the
+-		 * projection optimization has to calculate index expression twice
+-		 * when the value of index expression has not changed and three times
+-		 * when values differ because the expression is recalculated when
+-		 * inserting a new index entry for the changed value.
+-		 */
+-		if ((index_expr_cost.startup + index_expr_cost.per_tuple) >
+-			HEURISTIC_MAX_HOT_RECHECK_EXPR_COST)
+-			is_projection = false;
+-
+-		tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(RelationGetRelid(index)));
+-		if (!HeapTupleIsValid(tuple))
+-			elog(ERROR, "cache lookup failed for relation %u", RelationGetRelid(index));
+-
+-		reloptions = SysCacheGetAttr(RELOID, tuple,
+-									 Anum_pg_class_reloptions, &isnull);
+-		if (!isnull)
+-		{
+-			GenericIndexOpts *idxopts;
+-
+-			idxopts = (GenericIndexOpts *) index_generic_reloptions(reloptions, false);
+-
+-			if (idxopts != NULL)
+-			{
+-				is_projection = idxopts->recheck_on_update;
+-				pfree(idxopts);
+-			}
+-		}
+-		ReleaseSysCache(tuple);
+-	}
+-#endif
+-
+-	return is_projection;
+-}
+-
+ /*
+  * RelationGetIndexAttrBitmap -- get a bitmap of index attribute numbers
+  *
+@@ -4773,29 +4698,24 @@ IsProjectionFunctionalIndex(Relation index, IndexInfo *ii)
+ Bitmapset *
+ RelationGetIndexAttrBitmap(Relation relation, IndexAttrBitmapKind attrKind)
+ {
+-	Bitmapset  *indexattrs;		/* columns used in non-projection indexes */
+-	Bitmapset  *projindexattrs; /* columns used in projection indexes */
++	Bitmapset  *indexattrs;		/* indexed columns */
+ 	Bitmapset  *uindexattrs;	/* columns in unique indexes */
+ 	Bitmapset  *pkindexattrs;	/* columns in the primary index */
+ 	Bitmapset  *idindexattrs;	/* columns in the replica identity */
+-	Bitmapset  *projindexes;	/* projection indexes */
+ 	List	   *indexoidlist;
+ 	List	   *newindexoidlist;
+ 	Oid			relpkindex;
+ 	Oid			relreplindex;
+ 	ListCell   *l;
+ 	MemoryContext oldcxt;
+-	int			indexno;
+ 
+ 	/* Quick exit if we already computed the result. */
+ 	if (relation->rd_indexattr != NULL)
+ 	{
+ 		switch (attrKind)
+ 		{
+-			case INDEX_ATTR_BITMAP_HOT:
++			case INDEX_ATTR_BITMAP_ALL:
+ 				return bms_copy(relation->rd_indexattr);
+-			case INDEX_ATTR_BITMAP_PROJ:
+-				return bms_copy(relation->rd_projindexattr);
+ 			case INDEX_ATTR_BITMAP_KEY:
+ 				return bms_copy(relation->rd_keyattr);
+ 			case INDEX_ATTR_BITMAP_PRIMARY_KEY:
+@@ -4842,12 +4762,9 @@ RelationGetIndexAttrBitmap(Relation relation, IndexAttrBitmapKind attrKind)
+ 	 * won't be returned at all by RelationGetIndexList.
+ 	 */
+ 	indexattrs = NULL;
+-	projindexattrs = NULL;
+ 	uindexattrs = NULL;
+ 	pkindexattrs = NULL;
+ 	idindexattrs = NULL;
+-	projindexes = NULL;
+-	indexno = 0;
+ 	foreach(l, indexoidlist)
+ 	{
+ 		Oid			indexOid = lfirst_oid(l);
+@@ -4906,22 +4823,13 @@ RelationGetIndexAttrBitmap(Relation relation, IndexAttrBitmapKind attrKind)
+ 			}
+ 		}
+ 
+-		/* Collect attributes used in expressions, too */
+-		if (IsProjectionFunctionalIndex(indexDesc, indexInfo))
+-		{
+-			projindexes = bms_add_member(projindexes, indexno);
+-			pull_varattnos((Node *) indexInfo->ii_Expressions, 1, &projindexattrs);
+-		}
+-		else
+-		{
+-			/* Collect all attributes used in expressions, too */
+-			pull_varattnos((Node *) indexInfo->ii_Expressions, 1, &indexattrs);
+-		}
++		/* Collect all attributes used in expressions, too */
++		pull_varattnos((Node *) indexInfo->ii_Expressions, 1, &indexattrs);
++
+ 		/* Collect all attributes in the index predicate, too */
+ 		pull_varattnos((Node *) indexInfo->ii_Predicate, 1, &indexattrs);
+ 
+ 		index_close(indexDesc, AccessShareLock);
+-		indexno += 1;
+ 	}
+ 
+ 	/*
+@@ -4948,8 +4856,6 @@ RelationGetIndexAttrBitmap(Relation relation, IndexAttrBitmapKind attrKind)
+ 		bms_free(pkindexattrs);
+ 		bms_free(idindexattrs);
+ 		bms_free(indexattrs);
+-		bms_free(projindexattrs);
+-		bms_free(projindexes);
+ 
+ 		goto restart;
+ 	}
+@@ -4957,16 +4863,12 @@ RelationGetIndexAttrBitmap(Relation relation, IndexAttrBitmapKind attrKind)
+ 	/* Don't leak the old values of these bitmaps, if any */
+ 	bms_free(relation->rd_indexattr);
+ 	relation->rd_indexattr = NULL;
+-	bms_free(relation->rd_projindexattr);
+-	relation->rd_projindexattr = NULL;
+ 	bms_free(relation->rd_keyattr);
+ 	relation->rd_keyattr = NULL;
+ 	bms_free(relation->rd_pkattr);
+ 	relation->rd_pkattr = NULL;
+ 	bms_free(relation->rd_idattr);
+ 	relation->rd_idattr = NULL;
+-	bms_free(relation->rd_projidx);
+-	relation->rd_projidx = NULL;
+ 
+ 	/*
+ 	 * Now save copies of the bitmaps in the relcache entry.  We intentionally
+@@ -4980,17 +4882,13 @@ RelationGetIndexAttrBitmap(Relation relation, IndexAttrBitmapKind attrKind)
+ 	relation->rd_pkattr = bms_copy(pkindexattrs);
+ 	relation->rd_idattr = bms_copy(idindexattrs);
+ 	relation->rd_indexattr = bms_copy(indexattrs);
+-	relation->rd_projindexattr = bms_copy(projindexattrs);
+-	relation->rd_projidx = bms_copy(projindexes);
+ 	MemoryContextSwitchTo(oldcxt);
+ 
+ 	/* We return our original working copy for caller to play with */
+ 	switch (attrKind)
+ 	{
+-		case INDEX_ATTR_BITMAP_HOT:
++		case INDEX_ATTR_BITMAP_ALL:
+ 			return indexattrs;
+-		case INDEX_ATTR_BITMAP_PROJ:
+-			return projindexattrs;
+ 		case INDEX_ATTR_BITMAP_KEY:
+ 			return uindexattrs;
+ 		case INDEX_ATTR_BITMAP_PRIMARY_KEY:
+@@ -5619,11 +5517,9 @@ load_relcache_init_file(bool shared)
+ 		rel->rd_pkindex = InvalidOid;
+ 		rel->rd_replidindex = InvalidOid;
+ 		rel->rd_indexattr = NULL;
+-		rel->rd_projindexattr = NULL;
+ 		rel->rd_keyattr = NULL;
+ 		rel->rd_pkattr = NULL;
+ 		rel->rd_idattr = NULL;
+-		rel->rd_projidx = NULL;
+ 		rel->rd_pubactions = NULL;
+ 		rel->rd_statvalid = false;
+ 		rel->rd_statlist = NIL;
+diff --git a/src/bin/psql/tab-complete.c b/src/bin/psql/tab-complete.c
+index bca788c7a331..292b1f483a96 100644
+--- a/src/bin/psql/tab-complete.c
++++ b/src/bin/psql/tab-complete.c
+@@ -1623,14 +1623,14 @@ psql_completion(const char *text, int start, int end)
+ 		COMPLETE_WITH("(");
+ 	/* ALTER INDEX <foo> SET|RESET ( */
+ 	else if (Matches("ALTER", "INDEX", MatchAny, "RESET", "("))
+-		COMPLETE_WITH("fillfactor", "recheck_on_update",
++		COMPLETE_WITH("fillfactor",
+ 					  "vacuum_cleanup_index_scale_factor",	/* BTREE */
+ 					  "fastupdate", "gin_pending_list_limit",	/* GIN */
+ 					  "buffering",	/* GiST */
+ 					  "pages_per_range", "autosummarize"	/* BRIN */
+ 			);
+ 	else if (Matches("ALTER", "INDEX", MatchAny, "SET", "("))
+-		COMPLETE_WITH("fillfactor =", "recheck_on_update =",
++		COMPLETE_WITH("fillfactor =",
+ 					  "vacuum_cleanup_index_scale_factor =",	/* BTREE */
+ 					  "fastupdate =", "gin_pending_list_limit =",	/* GIN */
+ 					  "buffering =",	/* GiST */
+diff --git a/src/include/access/reloptions.h b/src/include/access/reloptions.h
+index 96b457fbe489..7ade18ea46b4 100644
+--- a/src/include/access/reloptions.h
++++ b/src/include/access/reloptions.h
+@@ -51,7 +51,6 @@ typedef enum relopt_kind
+ 	RELOPT_KIND_PARTITIONED = (1 << 11),
+ 	/* if you add a new kind, make sure you update "last_default" too */
+ 	RELOPT_KIND_LAST_DEFAULT = RELOPT_KIND_PARTITIONED,
+-	RELOPT_KIND_INDEX = RELOPT_KIND_BTREE | RELOPT_KIND_HASH | RELOPT_KIND_GIN | RELOPT_KIND_SPGIST,
+ 	/* some compilers treat enums as signed ints, so we can't use 1 << 31 */
+ 	RELOPT_KIND_MAX = (1 << 30)
+ } relopt_kind;
+@@ -277,7 +276,6 @@ extern bytea *heap_reloptions(char relkind, Datum reloptions, bool validate);
+ extern bytea *view_reloptions(Datum reloptions, bool validate);
+ extern bytea *index_reloptions(amoptions_function amoptions, Datum reloptions,
+ 				 bool validate);
+-extern bytea *index_generic_reloptions(Datum reloptions, bool validate);
+ extern bytea *attribute_reloptions(Datum reloptions, bool validate);
+ extern bytea *tablespace_reloptions(Datum reloptions, bool validate);
+ extern LOCKMODE AlterTableGetRelOptionsLockLevel(List *defList);
+diff --git a/src/include/utils/rel.h b/src/include/utils/rel.h
+index bc20950cc8ac..ff0a3ea45cde 100644
+--- a/src/include/utils/rel.h
++++ b/src/include/utils/rel.h
+@@ -110,12 +110,10 @@ typedef struct RelationData
+ 	List	   *rd_statlist;	/* list of OIDs of extended stats */
+ 
+ 	/* data managed by RelationGetIndexAttrBitmap: */
+-	Bitmapset  *rd_indexattr;	/* columns used in non-projection indexes */
+-	Bitmapset  *rd_projindexattr;	/* columns used in projection indexes */
++	Bitmapset  *rd_indexattr;	/* identifies columns used in indexes */
+ 	Bitmapset  *rd_keyattr;		/* cols that can be ref'd by foreign keys */
+ 	Bitmapset  *rd_pkattr;		/* cols included in primary key */
+ 	Bitmapset  *rd_idattr;		/* included in replica identity index */
+-	Bitmapset  *rd_projidx;		/* Oids of projection indexes */
+ 
+ 	PublicationActions *rd_pubactions;	/* publication actions */
+ 
+@@ -217,14 +215,6 @@ typedef struct ForeignKeyCacheInfo
+ 	Oid			conpfeqop[INDEX_MAX_KEYS];	/* PK = FK operator OIDs */
+ } ForeignKeyCacheInfo;
+ 
+-/*
+- * Options common for all indexes
+- */
+-typedef struct GenericIndexOpts
+-{
+-	int32		vl_len_;
+-	bool		recheck_on_update;
+-} GenericIndexOpts;
+ 
+ /*
+  * StdRdOptions
+diff --git a/src/include/utils/relcache.h b/src/include/utils/relcache.h
+index 3135d06c18f6..a80e335374db 100644
+--- a/src/include/utils/relcache.h
++++ b/src/include/utils/relcache.h
+@@ -52,8 +52,7 @@ extern List *RelationGetIndexPredicate(Relation relation);
+ 
+ typedef enum IndexAttrBitmapKind
+ {
+-	INDEX_ATTR_BITMAP_HOT,
+-	INDEX_ATTR_BITMAP_PROJ,
++	INDEX_ATTR_BITMAP_ALL,
+ 	INDEX_ATTR_BITMAP_KEY,
+ 	INDEX_ATTR_BITMAP_PRIMARY_KEY,
+ 	INDEX_ATTR_BITMAP_IDENTITY_KEY

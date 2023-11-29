@@ -1,0 +1,95 @@
+From 1a990b207b86967cc323c00adda21fef3b2cd63e Mon Sep 17 00:00:00 2001
+From: Peter Geoghegan <pg@bowt.ie>
+Date: Wed, 28 Nov 2018 14:42:54 -0800
+Subject: [PATCH] Have BufFileSize() ereport() on FileSize() failure.
+
+Move the responsibility for checking for and reporting a failure from
+the only current BufFileSize() caller, logtape.c, to BufFileSize()
+itself.  Code within buffile.c is generally responsible for interfacing
+with fd.c to report irrecoverable failures.  This seems like a
+convention that's worth sticking to.
+
+Reorganizing things this way makes it easy to make the error message
+raised in the event of BufFileSize() failure descriptive of the
+underlying problem.  We're now clear on the distinction between
+temporary file name and BufFile name, and can show errno, confident that
+its value actually relates to the error being reported.  In passing, an
+existing, similar buffile.c ereport() + errcode_for_file_access() site
+is changed to follow the same conventions.
+
+The API of the function BufFileSize() is changed by this commit, despite
+already being in a stable release (Postgres 11).  This seems acceptable,
+since the BufFileSize() ABI was changed by commit aa551830421, which
+hasn't made it into a point release yet.  Besides, it's difficult to
+imagine a third party BufFileSize() caller not just raising an error
+anyway, since BufFile state should be considered corrupt when
+BufFileSize() fails.
+
+Per complaint from Tom Lane.
+
+Discussion: https://postgr.es/m/26974.1540826748@sss.pgh.pa.us
+Backpatch: 11-, where shared BufFiles were introduced.
+---
+ src/backend/storage/file/buffile.c | 15 +++++++++++----
+ src/backend/utils/sort/logtape.c   |  4 ----
+ 2 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/storage/file/buffile.c b/src/backend/storage/file/buffile.c
+index d3722616bba5..5d4dcb102fca 100644
+--- a/src/backend/storage/file/buffile.c
++++ b/src/backend/storage/file/buffile.c
+@@ -304,7 +304,8 @@ BufFileOpenShared(SharedFileSet *fileset, const char *name)
+ 	if (nfiles == 0)
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not open BufFile \"%s\"", name)));
++				 errmsg("could not open temporary file \"%s\" from BufFile \"%s\": %m",
++						segment_name, name)));
+ 
+ 	file = makeBufFileCommon(nfiles);
+ 	file->files = files;
+@@ -763,20 +764,26 @@ BufFileTellBlock(BufFile *file)
+ #endif
+ 
+ /*
+- * Return the current file size.
++ * Return the current shared BufFile size.
+  *
+  * Counts any holes left behind by BufFileAppend as part of the size.
+- * Returns -1 on error.
++ * ereport()s on failure.
+  */
+ int64
+ BufFileSize(BufFile *file)
+ {
+ 	int64		lastFileSize;
+ 
++	Assert(file->fileset != NULL);
++
+ 	/* Get the size of the last physical file. */
+ 	lastFileSize = FileSize(file->files[file->numFiles - 1]);
+ 	if (lastFileSize < 0)
+-		return -1;
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not determine size of temporary file \"%s\" from BufFile \"%s\": %m",
++						FilePathName(file->files[file->numFiles - 1]),
++						file->name)));
+ 
+ 	return ((file->numFiles - 1) * (int64) MAX_PHYSICAL_FILESIZE) +
+ 		lastFileSize;
+diff --git a/src/backend/utils/sort/logtape.c b/src/backend/utils/sort/logtape.c
+index 269523d5f6af..2358c6fe523f 100644
+--- a/src/backend/utils/sort/logtape.c
++++ b/src/backend/utils/sort/logtape.c
+@@ -433,10 +433,6 @@ ltsConcatWorkerTapes(LogicalTapeSet *lts, TapeShare *shared,
+ 		pg_itoa(i, filename);
+ 		file = BufFileOpenShared(fileset, filename);
+ 		filesize = BufFileSize(file);
+-		if (filesize < 0)
+-			ereport(ERROR,
+-					(errcode_for_file_access(),
+-					 errmsg("could not determine size of temporary file \"%s\"", filename)));
+ 
+ 		/*
+ 		 * Stash first BufFile, and concatenate subsequent BufFiles to that.
