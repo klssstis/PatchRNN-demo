@@ -1,0 +1,453 @@
+From 0823d061b0b7f1e20fbfd48bef3c2e093493dbd4 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Thu, 29 Sep 2022 15:05:40 +0900
+Subject: [PATCH] Introduce SYSTEM_USER
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+SYSTEM_USER is a reserved keyword of the SQL specification that,
+roughly described, is aimed at reporting some information about the
+system user who has connected to the database server.  It may include
+implementation-specific information about the means by the user
+connected, like an authentication method.
+
+This commit implements SYSTEM_USER as of auth_method:identity, where
+"auth_method" is a keyword about the authentication method used to log
+into the server (like peer, md5, scram-sha-256, gss, etc.) and
+"identity" is the authentication identity as introduced by 9afffcb (peer
+sets authn to the OS user name, gss to the user principal, etc.).  This
+format has been suggested by Tom Lane.
+
+Note that thanks to d951052, SYSTEM_USER is available to parallel
+workers.
+
+Bump catalog version.
+
+Author: Bertrand Drouvot
+Reviewed-by: Jacob Champion, Joe Conway, Álvaro Herrera, Michael Paquier
+Discussion: https://postgr.es/m/7e692b8c-0b11-45db-1cad-3afc5b57409f@amazon.com
+---
+ doc/src/sgml/func.sgml                    | 19 +++++++++
+ src/backend/access/transam/parallel.c     |  8 ++++
+ src/backend/parser/gram.y                 | 11 ++++-
+ src/backend/utils/adt/ruleutils.c         |  4 ++
+ src/backend/utils/init/miscinit.c         | 50 +++++++++++++++++++++++
+ src/backend/utils/init/postinit.c         |  4 ++
+ src/include/catalog/catversion.h          |  2 +-
+ src/include/catalog/pg_proc.dat           |  3 ++
+ src/include/miscadmin.h                   |  3 ++
+ src/include/parser/kwlist.h               |  1 +
+ src/test/authentication/t/001_password.pl | 42 +++++++++++++++++++
+ src/test/kerberos/t/001_auth.pl           | 28 ++++++++++++-
+ src/test/regress/expected/create_view.out |  6 ++-
+ src/test/regress/sql/create_view.sql      |  3 +-
+ 14 files changed, 177 insertions(+), 7 deletions(-)
+
+diff --git a/doc/src/sgml/func.sgml b/doc/src/sgml/func.sgml
+index 546213fa931b..e82077292c6d 100644
+--- a/doc/src/sgml/func.sgml
++++ b/doc/src/sgml/func.sgml
+@@ -22623,6 +22623,25 @@ SELECT * FROM pg_ls_dir('.') WITH ORDINALITY AS t(ls,n);
+        </para></entry>
+       </row>
+ 
++      <row>
++       <entry role="func_table_entry"><para role="func_signature">
++        <indexterm>
++         <primary>system_user</primary>
++        </indexterm>
++        <function>system_user</function>
++        <returnvalue>text</returnvalue>
++       </para>
++       <para>
++        Returns the authentication method and the identity (if any) that the
++        user presented during the authentication cycle before they were
++        assigned a database role. It is represented as
++        <literal>auth_method:identity</literal> or
++        <literal>NULL</literal> if the user has not been authenticated (for
++        example if <link linkend="auth-trust">Trust authentication</link> has
++        been used).
++       </para></entry>
++      </row>
++
+       <row>
+        <entry role="func_table_entry"><para role="func_signature">
+         <indexterm>
+diff --git a/src/backend/access/transam/parallel.c b/src/backend/access/transam/parallel.c
+index 8cba8882239a..ee0985c7eddb 100644
+--- a/src/backend/access/transam/parallel.c
++++ b/src/backend/access/transam/parallel.c
+@@ -1496,6 +1496,14 @@ ParallelWorkerMain(Datum main_arg)
+ 										 false);
+ 	RestoreClientConnectionInfo(clientconninfospace);
+ 
++	/*
++	 * Initialize SystemUser now that MyClientConnectionInfo is restored.
++	 * Also ensure that auth_method is actually valid, aka authn_id is not NULL.
++	 */
++	if (MyClientConnectionInfo.authn_id)
++		InitializeSystemUser(MyClientConnectionInfo.authn_id,
++							 hba_authname(MyClientConnectionInfo.auth_method));
++
+ 	/* Attach to the leader's serializable transaction, if SERIALIZABLE. */
+ 	AttachSerializableXact(fps->serializable_xact_handle);
+ 
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 0d8d2928509c..94d5142a4a06 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -743,7 +743,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
+ 	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SQL_P STABLE STANDALONE_P
+ 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRIP_P
+-	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P
++	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
+ 
+ 	TABLE TABLES TABLESAMPLE TABLESPACE TEMP TEMPLATE TEMPORARY TEXT_P THEN
+ 	TIES TIME TIMESTAMP TO TRAILING TRANSACTION TRANSFORM
+@@ -15239,6 +15239,13 @@ func_expr_common_subexpr:
+ 				{
+ 					$$ = makeSQLValueFunction(SVFOP_SESSION_USER, -1, @1);
+ 				}
++			| SYSTEM_USER
++				{
++					$$ = (Node *) makeFuncCall(SystemFuncName("system_user"),
++											   NIL,
++											   COERCE_SQL_SYNTAX,
++											   @1);
++				}
+ 			| USER
+ 				{
+ 					$$ = makeSQLValueFunction(SVFOP_USER, -1, @1);
+@@ -17120,6 +17127,7 @@ reserved_keyword:
+ 			| SESSION_USER
+ 			| SOME
+ 			| SYMMETRIC
++			| SYSTEM_USER
+ 			| TABLE
+ 			| THEN
+ 			| TO
+@@ -17500,6 +17508,7 @@ bare_label_keyword:
+ 			| SYMMETRIC
+ 			| SYSID
+ 			| SYSTEM_P
++			| SYSTEM_USER
+ 			| TABLE
+ 			| TABLES
+ 			| TABLESAMPLE
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index 2b7b1b0c0f69..c4184035374b 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -10317,6 +10317,10 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
+ 			appendStringInfoChar(buf, ')');
+ 			return true;
+ 
++		case F_SYSTEM_USER:
++			appendStringInfoString(buf, "SYSTEM_USER");
++			return true;
++
+ 		case F_XMLEXISTS:
+ 			/* XMLEXISTS ... extra parens because args are c_expr */
+ 			appendStringInfoString(buf, "XMLEXISTS((");
+diff --git a/src/backend/utils/init/miscinit.c b/src/backend/utils/init/miscinit.c
+index 4d341d3f7f1d..dfdcd3d78eb2 100644
+--- a/src/backend/utils/init/miscinit.c
++++ b/src/backend/utils/init/miscinit.c
+@@ -477,6 +477,7 @@ static Oid	AuthenticatedUserId = InvalidOid;
+ static Oid	SessionUserId = InvalidOid;
+ static Oid	OuterUserId = InvalidOid;
+ static Oid	CurrentUserId = InvalidOid;
++static const char *SystemUser = NULL;
+ 
+ /* We also have to remember the superuser state of some of these levels */
+ static bool AuthenticatedUserIsSuperuser = false;
+@@ -548,6 +549,16 @@ SetSessionUserId(Oid userid, bool is_superuser)
+ 	CurrentUserId = userid;
+ }
+ 
++/*
++ * Return the system user representing the authenticated identity.
++ * It is defined in InitializeSystemUser() as auth_method:authn_id.
++ */
++const char *
++GetSystemUser(void)
++{
++	return SystemUser;
++}
++
+ /*
+  * GetAuthenticatedUserId - get the authenticated user ID
+  */
+@@ -818,6 +829,45 @@ InitializeSessionUserIdStandalone(void)
+ 	SetSessionUserId(BOOTSTRAP_SUPERUSERID, true);
+ }
+ 
++/*
++ * Initialize the system user.
++ *
++ * This is built as auth_method:authn_id.
++ */
++void
++InitializeSystemUser(const char *authn_id, const char *auth_method)
++{
++	char	   *system_user;
++
++	/* call only once */
++	Assert(SystemUser == NULL);
++
++	/*
++	 * InitializeSystemUser should be called only when authn_id is not NULL,
++	 * meaning that auth_method is valid.
++	 */
++	Assert(authn_id != NULL);
++
++	system_user = psprintf("%s:%s", auth_method, authn_id);
++
++	/* Store SystemUser in long-lived storage */
++	SystemUser = MemoryContextStrdup(TopMemoryContext, system_user);
++	pfree(system_user);
++}
++
++/*
++ * SQL-function SYSTEM_USER
++ */
++Datum
++system_user(PG_FUNCTION_ARGS)
++{
++	const char *sysuser = GetSystemUser();
++
++	if (sysuser)
++		PG_RETURN_DATUM(CStringGetTextDatum(sysuser));
++	else
++		PG_RETURN_NULL();
++}
+ 
+ /*
+  * Change session auth ID while running
+diff --git a/src/backend/utils/init/postinit.c b/src/backend/utils/init/postinit.c
+index 4a207a739178..31b7e1de5df8 100644
+--- a/src/backend/utils/init/postinit.c
++++ b/src/backend/utils/init/postinit.c
+@@ -904,6 +904,10 @@ InitPostgres(const char *in_dbname, Oid dboid,
+ 		Assert(MyProcPort != NULL);
+ 		PerformAuthentication(MyProcPort);
+ 		InitializeSessionUserId(username, useroid);
++		/* ensure that auth_method is actually valid, aka authn_id is not NULL */
++		if (MyClientConnectionInfo.authn_id)
++			InitializeSystemUser(MyClientConnectionInfo.authn_id,
++								 hba_authname(MyClientConnectionInfo.auth_method));
+ 		am_superuser = superuser();
+ 	}
+ 
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 95e7c249ed8c..c1af6eaf5ff6 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -57,6 +57,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202209261
++#define CATALOG_VERSION_NO	202209291
+ 
+ #endif
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index a07e737a337e..68bb032d3ea5 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -1508,6 +1508,9 @@
+ { oid => '746', descr => 'session user name',
+   proname => 'session_user', provolatile => 's', prorettype => 'name',
+   proargtypes => '', prosrc => 'session_user' },
++{ oid => '9977', descr => 'system user name',
++  proname => 'system_user', provolatile => 's', prorettype => 'text',
++  proargtypes => '', prosrc => 'system_user' },
+ 
+ { oid => '744',
+   proname => 'array_eq', prorettype => 'bool',
+diff --git a/src/include/miscadmin.h b/src/include/miscadmin.h
+index ee48e392ed79..e7ebea4ff444 100644
+--- a/src/include/miscadmin.h
++++ b/src/include/miscadmin.h
+@@ -357,6 +357,9 @@ extern void InitializeSessionUserIdStandalone(void);
+ extern void SetSessionAuthorization(Oid userid, bool is_superuser);
+ extern Oid	GetCurrentRoleId(void);
+ extern void SetCurrentRoleId(Oid roleid, bool is_superuser);
++extern void InitializeSystemUser(const char *authn_id,
++								 const char *auth_method);
++extern const char *GetSystemUser(void);
+ 
+ /* in utils/misc/superuser.c */
+ extern bool superuser(void);	/* current user is superuser */
+diff --git a/src/include/parser/kwlist.h b/src/include/parser/kwlist.h
+index 9a7cc0c6bd1d..ccc927851cb9 100644
+--- a/src/include/parser/kwlist.h
++++ b/src/include/parser/kwlist.h
+@@ -409,6 +409,7 @@ PG_KEYWORD("support", SUPPORT, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("symmetric", SYMMETRIC, RESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("sysid", SYSID, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("system", SYSTEM_P, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("system_user", SYSTEM_USER, RESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("table", TABLE, RESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("tables", TABLES, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("tablesample", TABLESAMPLE, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
+diff --git a/src/test/authentication/t/001_password.pl b/src/test/authentication/t/001_password.pl
+index 3e3079c824a1..58e4176e80df 100644
+--- a/src/test/authentication/t/001_password.pl
++++ b/src/test/authentication/t/001_password.pl
+@@ -72,6 +72,11 @@ sub test_role
+ $node->safe_psql('postgres',
+ 	"SET password_encryption='md5'; CREATE ROLE md5_role LOGIN PASSWORD 'pass';"
+ );
++# Set up a table for tests of SYSTEM_USER.
++$node->safe_psql(
++	'postgres',
++	"CREATE TABLE sysuser_data (n) AS SELECT NULL FROM generate_series(1, 10);
++	 GRANT ALL ON sysuser_data TO md5_role;");
+ $ENV{"PGPASSWORD"} = 'pass';
+ 
+ # For "trust" method, all users should be able to connect. These users are not
+@@ -82,6 +87,24 @@ sub test_role
+ test_role($node, 'md5_role', 'trust', 0,
+ 	log_unlike => [qr/connection authenticated:/]);
+ 
++# SYSTEM_USER is null when not authenticated.
++my $res = $node->safe_psql('postgres', "SELECT SYSTEM_USER IS NULL;");
++is($res, 't', "users with trust authentication use SYSTEM_USER = NULL");
++
++# Test SYSTEM_USER with parallel workers when not authenticated.
++$res = $node->safe_psql(
++	'postgres', qq(
++        SET min_parallel_table_scan_size TO 0;
++        SET parallel_setup_cost TO 0;
++        SET parallel_tuple_cost TO 0;
++        SET max_parallel_workers_per_gather TO 2;
++
++        SELECT bool_and(SYSTEM_USER IS NOT DISTINCT FROM n) FROM sysuser_data;),
++	connstr => "user=md5_role");
++is($res, 't',
++	"users with trust authentication use SYSTEM_USER = NULL in parallel workers"
++);
++
+ # For plain "password" method, all users should also be able to connect.
+ reset_pg_hba($node, 'password');
+ test_role($node, 'scram_role', 'password', 0,
+@@ -120,6 +143,25 @@ sub test_role
+ 	log_like =>
+ 	  [qr/connection authenticated: identity="md5_role" method=md5/]);
+ 
++# Test SYSTEM_USER <> NULL with parallel workers.
++$node->safe_psql(
++	'postgres',
++	"TRUNCATE sysuser_data;
++INSERT INTO sysuser_data SELECT 'md5:md5_role' FROM generate_series(1, 10);",
++	connstr => "user=md5_role");
++$res = $node->safe_psql(
++	'postgres', qq(
++        SET min_parallel_table_scan_size TO 0;
++        SET parallel_setup_cost TO 0;
++        SET parallel_tuple_cost TO 0;
++        SET max_parallel_workers_per_gather TO 2;
++
++        SELECT bool_and(SYSTEM_USER IS NOT DISTINCT FROM n) FROM sysuser_data;),
++	connstr => "user=md5_role");
++is($res, 't',
++	"users with md5 authentication use SYSTEM_USER = md5:role in parallel workers"
++);
++
+ # Tests for channel binding without SSL.
+ # Using the password authentication method; channel binding can't work
+ reset_pg_hba($node, 'password');
+diff --git a/src/test/kerberos/t/001_auth.pl b/src/test/kerberos/t/001_auth.pl
+index 47169a1d1eb4..a2bc8a5351e2 100644
+--- a/src/test/kerberos/t/001_auth.pl
++++ b/src/test/kerberos/t/001_auth.pl
+@@ -4,8 +4,8 @@
+ # Sets up a KDC and then runs a variety of tests to make sure that the
+ # GSSAPI/Kerberos authentication and encryption are working properly,
+ # that the options in pg_hba.conf and pg_ident.conf are handled correctly,
+-# and that the server-side pg_stat_gssapi view reports what we expect to
+-# see for each test.
++# that the server-side pg_stat_gssapi view reports what we expect to
++# see for each test and that SYSTEM_USER returns what we expect to see.
+ #
+ # Since this requires setting up a full KDC, it doesn't make much sense
+ # to have multiple test scripts (since they'd have to also create their
+@@ -180,6 +180,13 @@ END
+ 
+ $node->safe_psql('postgres', 'CREATE USER test1;');
+ 
++# Set up a table for SYSTEM_USER parallel worker testing.
++$node->safe_psql('postgres',
++	"CREATE TABLE ids (id) AS SELECT 'gss:test1\@$realm' FROM generate_series(1, 10);"
++);
++
++$node->safe_psql('postgres', 'GRANT SELECT ON ids TO public;');
++
+ note "running tests";
+ 
+ # Test connection success or failure, and if success, that query returns true.
+@@ -311,6 +318,23 @@ sub test_query
+ 	'gssencmode=require',
+ 	'sending 100K lines works');
+ 
++# Test that SYSTEM_USER works.
++test_query($node, 'test1', 'SELECT SYSTEM_USER;',
++	qr/^gss:test1\@$realm$/s, 'gssencmode=require', 'testing system_user');
++
++# Test that SYSTEM_USER works with parallel workers.
++test_query(
++	$node,
++	'test1', qq(
++	SET min_parallel_table_scan_size TO 0;
++	SET parallel_setup_cost TO 0;
++	SET parallel_tuple_cost TO 0;
++	SET max_parallel_workers_per_gather TO 2;
++	SELECT bool_and(SYSTEM_USER = id) FROM ids;),
++	qr/^t$/s,
++	'gssencmode=require',
++	'testing system_user with parallel workers');
++
+ unlink($node->data_dir . '/pg_hba.conf');
+ $node->append_conf('pg_hba.conf',
+ 	qq{hostgssenc all all $hostaddr/32 gss map=mymap});
+diff --git a/src/test/regress/expected/create_view.out b/src/test/regress/expected/create_view.out
+index a828b1f6de6e..bf4ff30d86f9 100644
+--- a/src/test/regress/expected/create_view.out
++++ b/src/test/regress/expected/create_view.out
+@@ -1940,7 +1940,8 @@ select
+   trim(trailing ' foo ') as rt,
+   trim(E'\\000'::bytea from E'\\000Tom\\000'::bytea) as btb,
+   trim(leading E'\\000'::bytea from E'\\000Tom\\000'::bytea) as ltb,
+-  trim(trailing E'\\000'::bytea from E'\\000Tom\\000'::bytea) as rtb;
++  trim(trailing E'\\000'::bytea from E'\\000Tom\\000'::bytea) as rtb,
++  SYSTEM_USER as su;
+ select pg_get_viewdef('tt201v', true);
+                                         pg_get_viewdef                                         
+ -----------------------------------------------------------------------------------------------
+@@ -1961,7 +1962,8 @@ select pg_get_viewdef('tt201v', true);
+      TRIM(TRAILING FROM ' foo '::text) AS rt,                                                 +
+      TRIM(BOTH '\x00'::bytea FROM '\x00546f6d00'::bytea) AS btb,                              +
+      TRIM(LEADING '\x00'::bytea FROM '\x00546f6d00'::bytea) AS ltb,                           +
+-     TRIM(TRAILING '\x00'::bytea FROM '\x00546f6d00'::bytea) AS rtb;
++     TRIM(TRAILING '\x00'::bytea FROM '\x00546f6d00'::bytea) AS rtb,                          +
++     SYSTEM_USER AS su;
+ (1 row)
+ 
+ -- corner cases with empty join conditions
+diff --git a/src/test/regress/sql/create_view.sql b/src/test/regress/sql/create_view.sql
+index 44a6775f9077..913b4ee46015 100644
+--- a/src/test/regress/sql/create_view.sql
++++ b/src/test/regress/sql/create_view.sql
+@@ -721,7 +721,8 @@ select
+   trim(trailing ' foo ') as rt,
+   trim(E'\\000'::bytea from E'\\000Tom\\000'::bytea) as btb,
+   trim(leading E'\\000'::bytea from E'\\000Tom\\000'::bytea) as ltb,
+-  trim(trailing E'\\000'::bytea from E'\\000Tom\\000'::bytea) as rtb;
++  trim(trailing E'\\000'::bytea from E'\\000Tom\\000'::bytea) as rtb,
++  SYSTEM_USER as su;
+ select pg_get_viewdef('tt201v', true);
+ 
+ -- corner cases with empty join conditions

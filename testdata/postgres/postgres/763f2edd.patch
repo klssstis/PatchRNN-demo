@@ -1,0 +1,784 @@
+From 763f2edd92095b1ca2f4476da073a28505c13820 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Thu, 15 Nov 2018 14:26:14 -0800
+Subject: [PATCH] Rejigger materializing and fetching a HeapTuple from a slot.
+
+Previously materializing a slot always returned a HeapTuple. As
+current work aims to reduce the reliance on HeapTuples (so other
+storage systems can work efficiently), that needs to change. Thus
+split the tasks of materializing a slot (i.e. making it independent
+from the underlying storage / other memory contexts) from fetching a
+HeapTuple from the slot.  For brevity, allow to fetch a HeapTuple from
+a slot and materializing the slot at the same time, controlled by a
+parameter.
+
+For now some callers of ExecFetchSlotHeapTuple, with materialize =
+true, expect that changes to the heap tuple will be reflected in the
+underlying slot.  Those places will be adapted in due course, so while
+not pretty, that's OK for now.
+
+Also rename ExecFetchSlotTuple to ExecFetchSlotHeapTupleDatum and
+ExecFetchSlotTupleDatum to ExecFetchSlotHeapTupleDatum, as it's likely
+that future storage methods will need similar methods. There already
+is ExecFetchSlotMinimalTuple, so the new names make the naming scheme
+more coherent.
+
+Author: Ashutosh Bapat and Andres Freund, with changes by Amit Khandekar
+Discussion: https://postgr.es/m/20181105210039.hh4vvi4vwoq5ba2q@alap3.anarazel.de
+---
+ contrib/postgres_fdw/postgres_fdw.c    |  5 +-
+ src/backend/commands/copy.c            |  4 +-
+ src/backend/commands/createas.c        |  2 +-
+ src/backend/commands/matview.c         |  5 +-
+ src/backend/commands/trigger.c         | 46 +++++++++-----
+ src/backend/executor/execMain.c        |  2 +-
+ src/backend/executor/execReplication.c |  4 +-
+ src/backend/executor/execSRF.c         |  2 +-
+ src/backend/executor/execTuples.c      | 85 +++++++++++++++-----------
+ src/backend/executor/functions.c       |  2 +-
+ src/backend/executor/nodeForeignscan.c |  2 +-
+ src/backend/executor/nodeHash.c        | 24 ++++++--
+ src/backend/executor/nodeHashjoin.c    | 17 +++++-
+ src/backend/executor/nodeModifyTable.c | 26 ++++----
+ src/backend/executor/tqueue.c          |  6 +-
+ src/include/executor/tuptable.h        |  9 +--
+ 16 files changed, 154 insertions(+), 87 deletions(-)
+
+diff --git a/contrib/postgres_fdw/postgres_fdw.c b/contrib/postgres_fdw/postgres_fdw.c
+index fd20aa96aa9b..6f9c6e193fcc 100644
+--- a/contrib/postgres_fdw/postgres_fdw.c
++++ b/contrib/postgres_fdw/postgres_fdw.c
+@@ -3947,11 +3947,12 @@ apply_returning_filter(PgFdwDirectModifyState *dmstate,
+ 	ExecStoreVirtualTuple(resultSlot);
+ 
+ 	/*
+-	 * If we have any system columns to return, install them.
++	 * If we have any system columns to return, materialize a heap tuple in the
++	 * slot from column values set above and install system columns in that tuple.
+ 	 */
+ 	if (dmstate->hasSystemCols)
+ 	{
+-		HeapTuple	resultTup = ExecMaterializeSlot(resultSlot);
++		HeapTuple	resultTup = ExecFetchSlotHeapTuple(resultSlot, true, NULL);
+ 
+ 		/* ctid */
+ 		if (dmstate->ctidAttno)
+diff --git a/src/backend/commands/copy.c b/src/backend/commands/copy.c
+index b58a74f4e3db..a9471c5ef6a1 100644
+--- a/src/backend/commands/copy.c
++++ b/src/backend/commands/copy.c
+@@ -2899,7 +2899,7 @@ CopyFrom(CopyState cstate)
+ 			if (slot == NULL)	/* "do nothing" */
+ 				skip_tuple = true;
+ 			else				/* trigger might have changed tuple */
+-				tuple = ExecMaterializeSlot(slot);
++				tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 		}
+ 
+ 		if (!skip_tuple)
+@@ -2975,7 +2975,7 @@ CopyFrom(CopyState cstate)
+ 							continue;	/* next tuple please */
+ 
+ 						/* FDW might have changed tuple */
+-						tuple = ExecMaterializeSlot(slot);
++						tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 
+ 						/*
+ 						 * AFTER ROW Triggers might reference the tableoid
+diff --git a/src/backend/commands/createas.c b/src/backend/commands/createas.c
+index d5cb62da15bd..d8002e5b776d 100644
+--- a/src/backend/commands/createas.c
++++ b/src/backend/commands/createas.c
+@@ -589,7 +589,7 @@ intorel_receive(TupleTableSlot *slot, DestReceiver *self)
+ 	 * get the heap tuple out of the tuple table slot, making sure we have a
+ 	 * writable copy
+ 	 */
+-	tuple = ExecMaterializeSlot(slot);
++	tuple = ExecCopySlotTuple(slot);
+ 
+ 	/*
+ 	 * force assignment of new OID (see comments in ExecInsert)
+diff --git a/src/backend/commands/matview.c b/src/backend/commands/matview.c
+index e1eb7c374b83..9957c7074de0 100644
+--- a/src/backend/commands/matview.c
++++ b/src/backend/commands/matview.c
+@@ -484,7 +484,7 @@ transientrel_receive(TupleTableSlot *slot, DestReceiver *self)
+ 	 * get the heap tuple out of the tuple table slot, making sure we have a
+ 	 * writable copy
+ 	 */
+-	tuple = ExecMaterializeSlot(slot);
++	tuple = ExecCopySlotTuple(slot);
+ 
+ 	heap_insert(myState->transientrel,
+ 				tuple,
+@@ -494,6 +494,9 @@ transientrel_receive(TupleTableSlot *slot, DestReceiver *self)
+ 
+ 	/* We know this is a newly created relation, so there are no indexes */
+ 
++	/* Free the copied tuple. */
++	heap_freetuple(tuple);
++
+ 	return true;
+ }
+ 
+diff --git a/src/backend/commands/trigger.c b/src/backend/commands/trigger.c
+index ccb5706c1628..d6f33ecbd043 100644
+--- a/src/backend/commands/trigger.c
++++ b/src/backend/commands/trigger.c
+@@ -2517,7 +2517,8 @@ ExecBRInsertTriggers(EState *estate, ResultRelInfo *relinfo,
+ 					 TupleTableSlot *slot)
+ {
+ 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
+-	HeapTuple	slottuple = ExecMaterializeSlot(slot);
++	bool		should_free;
++	HeapTuple	slottuple = ExecFetchSlotHeapTuple(slot, true, &should_free);
+ 	HeapTuple	newtuple = slottuple;
+ 	HeapTuple	oldtuple;
+ 	TriggerData LocTriggerData;
+@@ -2556,7 +2557,11 @@ ExecBRInsertTriggers(EState *estate, ResultRelInfo *relinfo,
+ 		if (oldtuple != newtuple && oldtuple != slottuple)
+ 			heap_freetuple(oldtuple);
+ 		if (newtuple == NULL)
++		{
++			if (should_free)
++				heap_freetuple(slottuple);
+ 			return NULL;		/* "do nothing" */
++		}
+ 	}
+ 
+ 	if (newtuple != slottuple)
+@@ -2575,6 +2580,9 @@ ExecBRInsertTriggers(EState *estate, ResultRelInfo *relinfo,
+ 		ExecStoreHeapTuple(newtuple, newslot, false);
+ 		slot = newslot;
+ 	}
++
++	if (should_free)
++		heap_freetuple(slottuple);
+ 	return slot;
+ }
+ 
+@@ -2598,7 +2606,8 @@ ExecIRInsertTriggers(EState *estate, ResultRelInfo *relinfo,
+ 					 TupleTableSlot *slot)
+ {
+ 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
+-	HeapTuple	slottuple = ExecMaterializeSlot(slot);
++	bool		should_free;
++	HeapTuple	slottuple = ExecFetchSlotHeapTuple(slot, true, &should_free);
+ 	HeapTuple	newtuple = slottuple;
+ 	HeapTuple	oldtuple;
+ 	TriggerData LocTriggerData;
+@@ -2637,7 +2646,11 @@ ExecIRInsertTriggers(EState *estate, ResultRelInfo *relinfo,
+ 		if (oldtuple != newtuple && oldtuple != slottuple)
+ 			heap_freetuple(oldtuple);
+ 		if (newtuple == NULL)
++		{
++			if (should_free)
++				heap_freetuple(slottuple);
+ 			return NULL;		/* "do nothing" */
++		}
+ 	}
+ 
+ 	if (newtuple != slottuple)
+@@ -2656,6 +2669,9 @@ ExecIRInsertTriggers(EState *estate, ResultRelInfo *relinfo,
+ 		ExecStoreHeapTuple(newtuple, newslot, false);
+ 		slot = newslot;
+ 	}
++
++	if (should_free)
++		heap_freetuple(slottuple);
+ 	return slot;
+ }
+ 
+@@ -2976,7 +2992,7 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
+ 					 TupleTableSlot *slot)
+ {
+ 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
+-	HeapTuple	slottuple = ExecMaterializeSlot(slot);
++	HeapTuple	slottuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 	HeapTuple	newtuple = slottuple;
+ 	TriggerData LocTriggerData;
+ 	HeapTuple	trigtuple;
+@@ -3018,7 +3034,7 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
+ 	if (newSlot != NULL)
+ 	{
+ 		slot = ExecFilterJunk(relinfo->ri_junkFilter, newSlot);
+-		slottuple = ExecMaterializeSlot(slot);
++		slottuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 		newtuple = slottuple;
+ 	}
+ 
+@@ -3132,7 +3148,7 @@ ExecIRUpdateTriggers(EState *estate, ResultRelInfo *relinfo,
+ 					 HeapTuple trigtuple, TupleTableSlot *slot)
+ {
+ 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
+-	HeapTuple	slottuple = ExecMaterializeSlot(slot);
++	HeapTuple	slottuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 	HeapTuple	newtuple = slottuple;
+ 	TriggerData LocTriggerData;
+ 	HeapTuple	oldtuple;
+@@ -4262,22 +4278,22 @@ AfterTriggerExecute(AfterTriggerEvent event,
+ 		case AFTER_TRIGGER_FDW_REUSE:
+ 
+ 			/*
+-			 * Using ExecMaterializeSlot() rather than ExecFetchSlotTuple()
+-			 * ensures that tg_trigtuple does not reference tuplestore memory.
+-			 * (It is formally possible for the trigger function to queue
+-			 * trigger events that add to the same tuplestore, which can push
+-			 * other tuples out of memory.)  The distinction is academic,
+-			 * because we start with a minimal tuple that ExecFetchSlotTuple()
+-			 * must materialize anyway.
++			 * Materialize tuple in the slot so that tg_trigtuple does not
++			 * reference tuplestore memory.  (It is formally possible for the
++			 * trigger function to queue trigger events that add to the same
++			 * tuplestore, which can push other tuples out of memory.)  The
++			 * distinction is academic, because we start with a minimal tuple
++			 * that is stored as a heap tuple, constructed in different memory
++			 * context, in the slot anyway.
+ 			 */
+-			LocTriggerData.tg_trigtuple =
+-				ExecMaterializeSlot(trig_tuple_slot1);
++			LocTriggerData.tg_trigtuple = ExecFetchSlotHeapTuple(trig_tuple_slot1,
++																	true, NULL);
+ 			LocTriggerData.tg_trigtuplebuf = InvalidBuffer;
+ 
+ 			LocTriggerData.tg_newtuple =
+ 				((evtshared->ats_event & TRIGGER_EVENT_OPMASK) ==
+ 				 TRIGGER_EVENT_UPDATE) ?
+-				ExecMaterializeSlot(trig_tuple_slot2) : NULL;
++				ExecFetchSlotHeapTuple(trig_tuple_slot2, true, NULL) : NULL;
+ 			LocTriggerData.tg_newtuplebuf = InvalidBuffer;
+ 
+ 			break;
+diff --git a/src/backend/executor/execMain.c b/src/backend/executor/execMain.c
+index ba156f8c5fcf..d10e533fd166 100644
+--- a/src/backend/executor/execMain.c
++++ b/src/backend/executor/execMain.c
+@@ -2549,7 +2549,7 @@ EvalPlanQual(EState *estate, EPQState *epqstate,
+ 	 * is to guard against early re-use of the EPQ query.
+ 	 */
+ 	if (!TupIsNull(slot))
+-		(void) ExecMaterializeSlot(slot);
++		ExecMaterializeSlot(slot);
+ 
+ 	/*
+ 	 * Clear out the test tuple.  This is needed in case the EPQ query is
+diff --git a/src/backend/executor/execReplication.c b/src/backend/executor/execReplication.c
+index 25ba93e03c38..071ba8762d4f 100644
+--- a/src/backend/executor/execReplication.c
++++ b/src/backend/executor/execReplication.c
+@@ -418,7 +418,7 @@ ExecSimpleRelationInsert(EState *estate, TupleTableSlot *slot)
+ 			ExecPartitionCheck(resultRelInfo, slot, estate, true);
+ 
+ 		/* Materialize slot into a tuple that we can scribble upon. */
+-		tuple = ExecMaterializeSlot(slot);
++		tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 
+ 		/* OK, store the tuple and create index entries for it */
+ 		simple_heap_insert(rel, tuple);
+@@ -485,7 +485,7 @@ ExecSimpleRelationUpdate(EState *estate, EPQState *epqstate,
+ 			ExecPartitionCheck(resultRelInfo, slot, estate, true);
+ 
+ 		/* Materialize slot into a tuple that we can scribble upon. */
+-		tuple = ExecMaterializeSlot(slot);
++		tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 
+ 		/* OK, update the tuple and index entries for it */
+ 		simple_heap_update(rel, &searchslot->tts_tuple->t_self,
+diff --git a/src/backend/executor/execSRF.c b/src/backend/executor/execSRF.c
+index b97b8d797ec2..3bffb0ea71f3 100644
+--- a/src/backend/executor/execSRF.c
++++ b/src/backend/executor/execSRF.c
+@@ -521,7 +521,7 @@ ExecMakeFunctionResultSet(SetExprState *fcache,
+ 			{
+ 				/* We must return the whole tuple as a Datum. */
+ 				*isNull = false;
+-				return ExecFetchSlotTupleDatum(fcache->funcResultSlot);
++				return ExecFetchSlotHeapTupleDatum(fcache->funcResultSlot);
+ 			}
+ 			else
+ 			{
+diff --git a/src/backend/executor/execTuples.c b/src/backend/executor/execTuples.c
+index 9f0d9daa8293..391db672d1d6 100644
+--- a/src/backend/executor/execTuples.c
++++ b/src/backend/executor/execTuples.c
+@@ -676,23 +676,27 @@ ExecCopySlotMinimalTuple(TupleTableSlot *slot)
+ 								   slot->tts_isnull);
+ }
+ 
+-/* --------------------------------
+- *		ExecFetchSlotTuple
+- *			Fetch the slot's regular physical tuple.
+- *
+- *		If the slot contains a virtual tuple, we convert it to physical
+- *		form.  The slot retains ownership of the physical tuple.
+- *		If it contains a minimal tuple we convert to regular form and store
+- *		that in addition to the minimal tuple (not instead of, because
+- *		callers may hold pointers to Datums within the minimal tuple).
+- *
+- * The main difference between this and ExecMaterializeSlot() is that this
+- * does not guarantee that the contained tuple is local storage.
+- * Hence, the result must be treated as read-only.
+- * --------------------------------
++/*
++ * ExecFetchSlotHeapTuple - fetch HeapTuple representing the slot's content
++ *
++ * The returned HeapTuple represents the slot's content as closely as
++ * possible.
++ *
++ * If materialize is true, the contents of the slots will be made independent
++ * from the underlying storage (i.e. all buffer pins are release, memory is
++ * allocated in the slot's context).
++ *
++ * If shouldFree is not-NULL it'll be set to true if the returned tuple has
++ * been allocated in the calling memory context, and must be freed by the
++ * caller (via explicit pfree() or a memory context reset).
++ *
++ * NB: If materialize is true, modifications of the returned tuple are
++ * allowed. But it depends on the type of the slot whether such modifications
++ * will also affect the slot's contents. While that is not the nicest
++ * behaviour, all such modifcations are in the process of being removed.
+  */
+ HeapTuple
+-ExecFetchSlotTuple(TupleTableSlot *slot)
++ExecFetchSlotHeapTuple(TupleTableSlot *slot, bool materialize, bool *shouldFree)
+ {
+ 	/*
+ 	 * sanity checks
+@@ -700,6 +704,10 @@ ExecFetchSlotTuple(TupleTableSlot *slot)
+ 	Assert(slot != NULL);
+ 	Assert(!TTS_EMPTY(slot));
+ 
++	/* will be used in the near future */
++	if (shouldFree)
++		*shouldFree = false;
++
+ 	/*
+ 	 * If we have a regular physical tuple then just return it.
+ 	 */
+@@ -722,7 +730,9 @@ ExecFetchSlotTuple(TupleTableSlot *slot)
+ 	/*
+ 	 * Otherwise materialize the slot...
+ 	 */
+-	return ExecMaterializeSlot(slot);
++	ExecMaterializeSlot(slot);
++
++	return slot->tts_tuple;
+ }
+ 
+ /* --------------------------------
+@@ -739,7 +749,7 @@ ExecFetchSlotTuple(TupleTableSlot *slot)
+  * --------------------------------
+  */
+ MinimalTuple
+-ExecFetchSlotMinimalTuple(TupleTableSlot *slot)
++ExecFetchSlotMinimalTuple(TupleTableSlot *slot, bool *shouldFree)
+ {
+ 	MemoryContext oldContext;
+ 
+@@ -749,6 +759,9 @@ ExecFetchSlotMinimalTuple(TupleTableSlot *slot)
+ 	Assert(slot != NULL);
+ 	Assert(!TTS_EMPTY(slot));
+ 
++	/* will be used in the near future */
++	if (shouldFree)
++		*shouldFree = false;
+ 
+ 	/*
+ 	 * If we have a minimal physical tuple (local or not) then just return it.
+@@ -779,40 +792,44 @@ ExecFetchSlotMinimalTuple(TupleTableSlot *slot)
+ }
+ 
+ /* --------------------------------
+- *		ExecFetchSlotTupleDatum
++ *		ExecFetchSlotHeapTupleDatum
+  *			Fetch the slot's tuple as a composite-type Datum.
+  *
+  *		The result is always freshly palloc'd in the caller's memory context.
+  * --------------------------------
+  */
+ Datum
+-ExecFetchSlotTupleDatum(TupleTableSlot *slot)
++ExecFetchSlotHeapTupleDatum(TupleTableSlot *slot)
+ {
+ 	HeapTuple	tup;
+ 	TupleDesc	tupdesc;
++	bool		shouldFree;
++	Datum		ret;
+ 
+ 	/* Fetch slot's contents in regular-physical-tuple form */
+-	tup = ExecFetchSlotTuple(slot);
++	tup = ExecFetchSlotHeapTuple(slot, false, &shouldFree);
+ 	tupdesc = slot->tts_tupleDescriptor;
+ 
+ 	/* Convert to Datum form */
+-	return heap_copy_tuple_as_datum(tup, tupdesc);
++	ret = heap_copy_tuple_as_datum(tup, tupdesc);
++
++	if (shouldFree)
++		pfree(tup);
++
++	return ret;
+ }
+ 
+-/* --------------------------------
+- *		ExecMaterializeSlot
+- *			Force a slot into the "materialized" state.
++/* ExecMaterializeSlot - force a slot into the "materialized" state.
+  *
+- *		This causes the slot's tuple to be a local copy not dependent on
+- *		any external storage.  A pointer to the contained tuple is returned.
++ * This causes the slot's tuple to be a local copy not dependent on any
++ * external storage (i.e. pointing into a Buffer, or having allocations in
++ * another memory context).
+  *
+- *		A typical use for this operation is to prepare a computed tuple
+- *		for being stored on disk.  The original data may or may not be
+- *		virtual, but in any case we need a private copy for heap_insert
+- *		to scribble on.
+- * --------------------------------
++ * A typical use for this operation is to prepare a computed tuple for being
++ * stored on disk.  The original data may or may not be virtual, but in any
++ * case we need a private copy for heap_insert to scribble on.
+  */
+-HeapTuple
++void
+ ExecMaterializeSlot(TupleTableSlot *slot)
+ {
+ 	MemoryContext oldContext;
+@@ -828,7 +845,7 @@ ExecMaterializeSlot(TupleTableSlot *slot)
+ 	 * nothing to do.
+ 	 */
+ 	if (slot->tts_tuple && TTS_SHOULDFREE(slot))
+-		return slot->tts_tuple;
++		return;
+ 
+ 	/*
+ 	 * Otherwise, copy or build a physical tuple, and store it into the slot.
+@@ -868,8 +885,6 @@ ExecMaterializeSlot(TupleTableSlot *slot)
+ 	 */
+ 	if (!TTS_SHOULDFREEMIN(slot))
+ 		slot->tts_mintuple = NULL;
+-
+-	return slot->tts_tuple;
+ }
+ 
+ /* --------------------------------
+diff --git a/src/backend/executor/functions.c b/src/backend/executor/functions.c
+index 23545896d4dd..f4dd5732198b 100644
+--- a/src/backend/executor/functions.c
++++ b/src/backend/executor/functions.c
+@@ -969,7 +969,7 @@ postquel_get_single_result(TupleTableSlot *slot,
+ 	{
+ 		/* We must return the whole tuple as a Datum. */
+ 		fcinfo->isnull = false;
+-		value = ExecFetchSlotTupleDatum(slot);
++		value = ExecFetchSlotHeapTupleDatum(slot);
+ 	}
+ 	else
+ 	{
+diff --git a/src/backend/executor/nodeForeignscan.c b/src/backend/executor/nodeForeignscan.c
+index 5d2cd0ed7175..f7eef32f6fef 100644
+--- a/src/backend/executor/nodeForeignscan.c
++++ b/src/backend/executor/nodeForeignscan.c
+@@ -62,7 +62,7 @@ ForeignNext(ForeignScanState *node)
+ 	 */
+ 	if (plan->fsSystemCol && !TupIsNull(slot))
+ 	{
+-		HeapTuple	tup = ExecMaterializeSlot(slot);
++		HeapTuple	tup = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 
+ 		tup->t_tableOid = RelationGetRelid(node->ss.ss_currentRelation);
+ 	}
+diff --git a/src/backend/executor/nodeHash.c b/src/backend/executor/nodeHash.c
+index a9f812d66b8e..5a9f1ea3c550 100644
+--- a/src/backend/executor/nodeHash.c
++++ b/src/backend/executor/nodeHash.c
+@@ -1590,7 +1590,8 @@ ExecHashTableInsert(HashJoinTable hashtable,
+ 					TupleTableSlot *slot,
+ 					uint32 hashvalue)
+ {
+-	MinimalTuple tuple = ExecFetchSlotMinimalTuple(slot);
++	bool		shouldFree;
++	MinimalTuple tuple = ExecFetchSlotMinimalTuple(slot, &shouldFree);
+ 	int			bucketno;
+ 	int			batchno;
+ 
+@@ -1664,6 +1665,9 @@ ExecHashTableInsert(HashJoinTable hashtable,
+ 							  hashvalue,
+ 							  &hashtable->innerBatchFile[batchno]);
+ 	}
++
++	if (shouldFree)
++		heap_free_minimal_tuple(tuple);
+ }
+ 
+ /*
+@@ -1675,7 +1679,8 @@ ExecParallelHashTableInsert(HashJoinTable hashtable,
+ 							TupleTableSlot *slot,
+ 							uint32 hashvalue)
+ {
+-	MinimalTuple tuple = ExecFetchSlotMinimalTuple(slot);
++	bool		shouldFree;
++	MinimalTuple tuple = ExecFetchSlotMinimalTuple(slot, &shouldFree);
+ 	dsa_pointer shared;
+ 	int			bucketno;
+ 	int			batchno;
+@@ -1723,6 +1728,9 @@ ExecParallelHashTableInsert(HashJoinTable hashtable,
+ 					 tuple);
+ 	}
+ 	++hashtable->batches[batchno].ntuples;
++
++	if (shouldFree)
++		heap_free_minimal_tuple(tuple);
+ }
+ 
+ /*
+@@ -1736,7 +1744,8 @@ ExecParallelHashTableInsertCurrentBatch(HashJoinTable hashtable,
+ 										TupleTableSlot *slot,
+ 										uint32 hashvalue)
+ {
+-	MinimalTuple tuple = ExecFetchSlotMinimalTuple(slot);
++	bool		shouldFree;
++	MinimalTuple tuple = ExecFetchSlotMinimalTuple(slot, &shouldFree);
+ 	HashJoinTuple hashTuple;
+ 	dsa_pointer shared;
+ 	int			batchno;
+@@ -1752,6 +1761,9 @@ ExecParallelHashTableInsertCurrentBatch(HashJoinTable hashtable,
+ 	HeapTupleHeaderClearMatch(HJTUPLE_MINTUPLE(hashTuple));
+ 	ExecParallelHashPushTuple(&hashtable->buckets.shared[bucketno],
+ 							  hashTuple, shared);
++
++	if (shouldFree)
++		heap_free_minimal_tuple(tuple);
+ }
+ 
+ /*
+@@ -2391,7 +2403,8 @@ ExecHashSkewTableInsert(HashJoinTable hashtable,
+ 						uint32 hashvalue,
+ 						int bucketNumber)
+ {
+-	MinimalTuple tuple = ExecFetchSlotMinimalTuple(slot);
++	bool		shouldFree;
++	MinimalTuple tuple = ExecFetchSlotMinimalTuple(slot, &shouldFree);
+ 	HashJoinTuple hashTuple;
+ 	int			hashTupleSize;
+ 
+@@ -2419,6 +2432,9 @@ ExecHashSkewTableInsert(HashJoinTable hashtable,
+ 	/* Check we are not over the total spaceAllowed, either */
+ 	if (hashtable->spaceUsed > hashtable->spaceAllowed)
+ 		ExecHashIncreaseNumBatches(hashtable);
++
++	if (shouldFree)
++		heap_free_minimal_tuple(tuple);
+ }
+ 
+ /*
+diff --git a/src/backend/executor/nodeHashjoin.c b/src/backend/executor/nodeHashjoin.c
+index 08a8bb3426c6..d6a6ef770dd2 100644
+--- a/src/backend/executor/nodeHashjoin.c
++++ b/src/backend/executor/nodeHashjoin.c
+@@ -389,16 +389,22 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
+ 				if (batchno != hashtable->curbatch &&
+ 					node->hj_CurSkewBucketNo == INVALID_SKEW_BUCKET_NO)
+ 				{
++					bool		shouldFree;
++					MinimalTuple mintuple = ExecFetchSlotMinimalTuple(outerTupleSlot,
++																	  &shouldFree);
++
+ 					/*
+ 					 * Need to postpone this outer tuple to a later batch.
+ 					 * Save it in the corresponding outer-batch file.
+ 					 */
+ 					Assert(parallel_state == NULL);
+ 					Assert(batchno > hashtable->curbatch);
+-					ExecHashJoinSaveTuple(ExecFetchSlotMinimalTuple(outerTupleSlot),
+-										  hashvalue,
++					ExecHashJoinSaveTuple(mintuple, hashvalue,
+ 										  &hashtable->outerBatchFile[batchno]);
+ 
++					if (shouldFree)
++						heap_free_minimal_tuple(mintuple);
++
+ 					/* Loop around, staying in HJ_NEED_NEW_OUTER state */
+ 					continue;
+ 				}
+@@ -1404,11 +1410,16 @@ ExecParallelHashJoinPartitionOuter(HashJoinState *hjstate)
+ 		{
+ 			int			batchno;
+ 			int			bucketno;
++			bool		shouldFree;
++			MinimalTuple mintup = ExecFetchSlotMinimalTuple(slot, &shouldFree);
+ 
+ 			ExecHashGetBucketAndBatch(hashtable, hashvalue, &bucketno,
+ 									  &batchno);
+ 			sts_puttuple(hashtable->batches[batchno].outer_tuples,
+-						 &hashvalue, ExecFetchSlotMinimalTuple(slot));
++						 &hashvalue, mintup);
++
++			if (shouldFree)
++				heap_free_minimal_tuple(mintup);
+ 		}
+ 		CHECK_FOR_INTERRUPTS();
+ 	}
+diff --git a/src/backend/executor/nodeModifyTable.c b/src/backend/executor/nodeModifyTable.c
+index 6ef694d5a4a6..a3ca336f2acd 100644
+--- a/src/backend/executor/nodeModifyTable.c
++++ b/src/backend/executor/nodeModifyTable.c
+@@ -175,7 +175,7 @@ ExecProcessReturning(ResultRelInfo *resultRelInfo,
+ 		 * initialize t_tableOid before evaluating them.
+ 		 */
+ 		Assert(!TupIsNull(econtext->ecxt_scantuple));
+-		tuple = ExecMaterializeSlot(econtext->ecxt_scantuple);
++		tuple = ExecFetchSlotHeapTuple(econtext->ecxt_scantuple, true, NULL);
+ 		tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+ 	}
+ 	econtext->ecxt_outertuple = planSlot;
+@@ -274,7 +274,7 @@ ExecInsert(ModifyTableState *mtstate,
+ 	 * get the heap tuple out of the tuple table slot, making sure we have a
+ 	 * writable copy
+ 	 */
+-	tuple = ExecMaterializeSlot(slot);
++	tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 
+ 	/*
+ 	 * get information on the (current) result relation
+@@ -315,7 +315,7 @@ ExecInsert(ModifyTableState *mtstate,
+ 			return NULL;
+ 
+ 		/* trigger might have changed tuple */
+-		tuple = ExecMaterializeSlot(slot);
++		tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 	}
+ 
+ 	/* INSTEAD OF ROW INSERT Triggers */
+@@ -328,7 +328,7 @@ ExecInsert(ModifyTableState *mtstate,
+ 			return NULL;
+ 
+ 		/* trigger might have changed tuple */
+-		tuple = ExecMaterializeSlot(slot);
++		tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 
+ 		newId = InvalidOid;
+ 	}
+@@ -346,7 +346,7 @@ ExecInsert(ModifyTableState *mtstate,
+ 			return NULL;
+ 
+ 		/* FDW might have changed tuple */
+-		tuple = ExecMaterializeSlot(slot);
++		tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 
+ 		/*
+ 		 * AFTER ROW Triggers or RETURNING expressions might reference the
+@@ -695,7 +695,7 @@ ExecDelete(ModifyTableState *mtstate,
+ 		 */
+ 		if (TTS_EMPTY(slot))
+ 			ExecStoreAllNullTuple(slot);
+-		tuple = ExecMaterializeSlot(slot);
++		tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 		tuple->t_tableOid = RelationGetRelid(resultRelationDesc);
+ 	}
+ 	else
+@@ -953,7 +953,7 @@ ExecUpdate(ModifyTableState *mtstate,
+ 	 * get the heap tuple out of the tuple table slot, making sure we have a
+ 	 * writable copy
+ 	 */
+-	tuple = ExecMaterializeSlot(slot);
++	tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 
+ 	/*
+ 	 * get information on the (current) result relation
+@@ -972,7 +972,7 @@ ExecUpdate(ModifyTableState *mtstate,
+ 			return NULL;
+ 
+ 		/* trigger might have changed tuple */
+-		tuple = ExecMaterializeSlot(slot);
++		tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 	}
+ 
+ 	/* INSTEAD OF ROW UPDATE Triggers */
+@@ -986,7 +986,7 @@ ExecUpdate(ModifyTableState *mtstate,
+ 			return NULL;
+ 
+ 		/* trigger might have changed tuple */
+-		tuple = ExecMaterializeSlot(slot);
++		tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 	}
+ 	else if (resultRelInfo->ri_FdwRoutine)
+ 	{
+@@ -1002,7 +1002,7 @@ ExecUpdate(ModifyTableState *mtstate,
+ 			return NULL;
+ 
+ 		/* FDW might have changed tuple */
+-		tuple = ExecMaterializeSlot(slot);
++		tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 
+ 		/*
+ 		 * AFTER ROW Triggers or RETURNING expressions might reference the
+@@ -1129,7 +1129,7 @@ lreplace:;
+ 				else
+ 				{
+ 					slot = ExecFilterJunk(resultRelInfo->ri_junkFilter, epqslot);
+-					tuple = ExecMaterializeSlot(slot);
++					tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 					goto lreplace;
+ 				}
+ 			}
+@@ -1268,7 +1268,7 @@ lreplace:;
+ 					{
+ 						*tupleid = hufd.ctid;
+ 						slot = ExecFilterJunk(resultRelInfo->ri_junkFilter, epqslot);
+-						tuple = ExecMaterializeSlot(slot);
++						tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 						goto lreplace;
+ 					}
+ 				}
+@@ -1739,7 +1739,7 @@ ExecPrepareTupleRouting(ModifyTableState *mtstate,
+ 	estate->es_result_relation_info = partrel;
+ 
+ 	/* Get the heap tuple out of the given slot. */
+-	tuple = ExecMaterializeSlot(slot);
++	tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+ 
+ 	/*
+ 	 * If we're capturing transition tuples, we might need to convert from the
+diff --git a/src/backend/executor/tqueue.c b/src/backend/executor/tqueue.c
+index ecdbe7f79f61..e47ef491928e 100644
+--- a/src/backend/executor/tqueue.c
++++ b/src/backend/executor/tqueue.c
+@@ -56,11 +56,15 @@ tqueueReceiveSlot(TupleTableSlot *slot, DestReceiver *self)
+ 	TQueueDestReceiver *tqueue = (TQueueDestReceiver *) self;
+ 	HeapTuple	tuple;
+ 	shm_mq_result result;
++	bool		should_free;
+ 
+ 	/* Send the tuple itself. */
+-	tuple = ExecMaterializeSlot(slot);
++	tuple = ExecFetchSlotHeapTuple(slot, true, &should_free);
+ 	result = shm_mq_send(tqueue->queue, tuple->t_len, tuple->t_data, false);
+ 
++	if (should_free)
++		heap_freetuple(tuple);
++
+ 	/* Check for failure. */
+ 	if (result == SHM_MQ_DETACHED)
+ 		return false;
+diff --git a/src/include/executor/tuptable.h b/src/include/executor/tuptable.h
+index b41b400ef186..8bfa73c30ea2 100644
+--- a/src/include/executor/tuptable.h
++++ b/src/include/executor/tuptable.h
+@@ -185,10 +185,11 @@ extern TupleTableSlot *ExecStoreVirtualTuple(TupleTableSlot *slot);
+ extern TupleTableSlot *ExecStoreAllNullTuple(TupleTableSlot *slot);
+ extern HeapTuple ExecCopySlotTuple(TupleTableSlot *slot);
+ extern MinimalTuple ExecCopySlotMinimalTuple(TupleTableSlot *slot);
+-extern HeapTuple ExecFetchSlotTuple(TupleTableSlot *slot);
+-extern MinimalTuple ExecFetchSlotMinimalTuple(TupleTableSlot *slot);
+-extern Datum ExecFetchSlotTupleDatum(TupleTableSlot *slot);
+-extern HeapTuple ExecMaterializeSlot(TupleTableSlot *slot);
++extern HeapTuple ExecFetchSlotHeapTuple(TupleTableSlot *slot, bool materialize, bool *shoulFree);
++extern MinimalTuple ExecFetchSlotMinimalTuple(TupleTableSlot *slot,
++						  bool *shouldFree);
++extern Datum ExecFetchSlotHeapTupleDatum(TupleTableSlot *slot);
++extern void ExecMaterializeSlot(TupleTableSlot *slot);
+ extern TupleTableSlot *ExecCopySlot(TupleTableSlot *dstslot,
+ 			 TupleTableSlot *srcslot);
+ extern void slot_getmissingattrs(TupleTableSlot *slot, int startAttNum,

@@ -1,0 +1,155 @@
+From 701c881f782b93ee29587112390bd3bfe035e78d Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 21 Dec 2022 17:51:50 -0500
+Subject: [PATCH] Fix contrib/seg to be more wary of long input numbers.
+
+seg stores the number of significant digits in an input number
+in a "char" field.  If char is signed, and the input is more than
+127 digits long, the count can read out as negative causing
+seg_out() to print garbage (or, if you're really unlucky,
+even crash).
+
+To fix, clamp the digit count to be not more than FLT_DIG.
+(In theory this loses some information about what the original
+input was, but it doesn't seem like useful information; it would
+not survive dump/restore in any case.)
+
+Also, in case there are stored values of the seg type containing
+bad data, add a clamp in seg_out's restore() subroutine.
+
+Per bug #17725 from Robins Tharakan.  It's been like this
+forever, so back-patch to all supported branches.
+
+Discussion: https://postgr.es/m/17725-0a09313b67fbe86e@postgresql.org
+---
+ contrib/seg/expected/seg.out |  7 +++++++
+ contrib/seg/seg.c            |  8 ++++++--
+ contrib/seg/segparse.y       | 22 +++++++++++++++++-----
+ contrib/seg/sql/seg.sql      |  3 +++
+ 4 files changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/contrib/seg/expected/seg.out b/contrib/seg/expected/seg.out
+index e617dd7e2996..2320464dd471 100644
+--- a/contrib/seg/expected/seg.out
++++ b/contrib/seg/expected/seg.out
+@@ -256,6 +256,13 @@ SELECT '12.34567890123456'::seg AS seg;
+  12.3457
+ (1 row)
+ 
++-- Same, with a very long input
++SELECT '12.3456789012345600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::seg AS seg;
++   seg   
++---------
++ 12.3457
++(1 row)
++
+ -- Numbers with certainty indicators
+ SELECT '~6.5'::seg AS seg;
+  seg  
+diff --git a/contrib/seg/seg.c b/contrib/seg/seg.c
+index e964560053d1..a7effc1b190c 100644
+--- a/contrib/seg/seg.c
++++ b/contrib/seg/seg.c
+@@ -928,9 +928,13 @@ restore(char *result, float val, int n)
+ 
+ 	/*
+ 	 * Put a cap on the number of significant digits to avoid garbage in the
+-	 * output and ensure we don't overrun the result buffer.
++	 * output and ensure we don't overrun the result buffer.  (n should not be
++	 * negative, but check to protect ourselves against corrupted data.)
+ 	 */
+-	n = Min(n, FLT_DIG);
++	if (n <= 0)
++		n = FLT_DIG;
++	else
++		n = Min(n, FLT_DIG);
+ 
+ 	/* remember the sign */
+ 	sign = (val < 0 ? 1 : 0);
+diff --git a/contrib/seg/segparse.y b/contrib/seg/segparse.y
+index 1d2adbbec893..0156c3e02748 100644
+--- a/contrib/seg/segparse.y
++++ b/contrib/seg/segparse.y
+@@ -3,6 +3,7 @@
+ 
+ #include "postgres.h"
+ 
++#include <float.h>
+ #include <math.h>
+ 
+ #include "fmgr.h"
+@@ -20,6 +21,8 @@
+ 
+ static float seg_atof(const char *value);
+ 
++static int sig_digits(const char *value);
++
+ static char strbuf[25] = {
+ 	'0', '0', '0', '0', '0',
+ 	'0', '0', '0', '0', '0',
+@@ -62,9 +65,9 @@ range: boundary PLUMIN deviation
+ 		result->lower = $1.val - $3.val;
+ 		result->upper = $1.val + $3.val;
+ 		sprintf(strbuf, "%g", result->lower);
+-		result->l_sigd = Max(Min(6, significant_digits(strbuf)), Max($1.sigd, $3.sigd));
++		result->l_sigd = Max(sig_digits(strbuf), Max($1.sigd, $3.sigd));
+ 		sprintf(strbuf, "%g", result->upper);
+-		result->u_sigd = Max(Min(6, significant_digits(strbuf)), Max($1.sigd, $3.sigd));
++		result->u_sigd = Max(sig_digits(strbuf), Max($1.sigd, $3.sigd));
+ 		result->l_ext = '\0';
+ 		result->u_ext = '\0';
+ 	}
+@@ -121,7 +124,7 @@ boundary: SEGFLOAT
+ 		float		val = seg_atof($1);
+ 
+ 		$$.ext = '\0';
+-		$$.sigd = significant_digits($1);
++		$$.sigd = sig_digits($1);
+ 		$$.val = val;
+ 	}
+ 	| EXTENSION SEGFLOAT
+@@ -130,7 +133,7 @@ boundary: SEGFLOAT
+ 		float		val = seg_atof($2);
+ 
+ 		$$.ext = $1[0];
+-		$$.sigd = significant_digits($2);
++		$$.sigd = sig_digits($2);
+ 		$$.val = val;
+ 	}
+ 	;
+@@ -141,7 +144,7 @@ deviation: SEGFLOAT
+ 		float		val = seg_atof($1);
+ 
+ 		$$.ext = '\0';
+-		$$.sigd = significant_digits($1);
++		$$.sigd = sig_digits($1);
+ 		$$.val = val;
+ 	}
+ 	;
+@@ -157,3 +160,12 @@ seg_atof(const char *value)
+ 	datum = DirectFunctionCall1(float4in, CStringGetDatum(value));
+ 	return DatumGetFloat4(datum);
+ }
++
++static int
++sig_digits(const char *value)
++{
++	int			n = significant_digits(value);
++
++	/* Clamp, to ensure value will fit in sigd fields */
++	return Min(n, FLT_DIG);
++}
+diff --git a/contrib/seg/sql/seg.sql b/contrib/seg/sql/seg.sql
+index 6fe33e90e4e5..a027d4de97ed 100644
+--- a/contrib/seg/sql/seg.sql
++++ b/contrib/seg/sql/seg.sql
+@@ -60,6 +60,9 @@ SELECT '3.400e5'::seg AS seg;
+ -- Digits truncated
+ SELECT '12.34567890123456'::seg AS seg;
+ 
++-- Same, with a very long input
++SELECT '12.3456789012345600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::seg AS seg;
++
+ -- Numbers with certainty indicators
+ SELECT '~6.5'::seg AS seg;
+ SELECT '<6.5'::seg AS seg;

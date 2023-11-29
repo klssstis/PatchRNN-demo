@@ -1,0 +1,3696 @@
+From 818fd4a67d610991757b610755e3065fb99d80a5 Mon Sep 17 00:00:00 2001
+From: Heikki Linnakangas <heikki.linnakangas@iki.fi>
+Date: Tue, 7 Mar 2017 14:25:40 +0200
+Subject: [PATCH] Support SCRAM-SHA-256 authentication (RFC 5802 and 7677).
+
+This introduces a new generic SASL authentication method, similar to the
+GSS and SSPI methods. The server first tells the client which SASL
+authentication mechanism to use, and then the mechanism-specific SASL
+messages are exchanged in AuthenticationSASLcontinue and PasswordMessage
+messages. Only SCRAM-SHA-256 is supported at the moment, but this allows
+adding more SASL mechanisms in the future, without changing the overall
+protocol.
+
+Support for channel binding, aka SCRAM-SHA-256-PLUS is left for later.
+
+The SASLPrep algorithm, for pre-processing the password, is not yet
+implemented. That could cause trouble, if you use a password with
+non-ASCII characters, and a client library that does implement SASLprep.
+That will hopefully be added later.
+
+Authorization identities, as specified in the SCRAM-SHA-256 specification,
+are ignored. SET SESSION AUTHORIZATION provides more or less the same
+functionality, anyway.
+
+If a user doesn't exist, perform a "mock" authentication, by constructing
+an authentic-looking challenge on the fly. The challenge is derived from
+a new system-wide random value, "mock authentication nonce", which is
+created at initdb, and stored in the control file. We go through these
+motions, in order to not give away the information on whether the user
+exists, to unauthenticated users.
+
+Bumps PG_CONTROL_VERSION, because of the new field in control file.
+
+Patch by Michael Paquier and Heikki Linnakangas, reviewed at different
+stages by Robert Haas, Stephen Frost, David Steele, Aleksander Alekseev,
+and many others.
+
+Discussion: https://www.postgresql.org/message-id/CAB7nPqRbR3GmFYdedCAhzukfKrgBLTLtMvENOmPrVWREsZkF8g%40mail.gmail.com
+Discussion: https://www.postgresql.org/message-id/CAB7nPqSMXU35g%3DW9X74HVeQp0uvgJxvYOuA4A-A3M%2B0wfEBv-w%40mail.gmail.com
+Discussion: https://www.postgresql.org/message-id/55192AFE.6080106@iki.fi
+---
+ contrib/pgcrypto/.gitignore                   |    4 -
+ contrib/pgcrypto/Makefile                     |   11 +-
+ doc/src/sgml/catalogs.sgml                    |   25 +-
+ doc/src/sgml/client-auth.sgml                 |   59 +-
+ doc/src/sgml/config.sgml                      |    7 +-
+ doc/src/sgml/protocol.sgml                    |  147 ++-
+ doc/src/sgml/ref/create_role.sgml             |   17 +-
+ src/backend/access/transam/xlog.c             |   24 +
+ src/backend/commands/user.c                   |   14 +-
+ src/backend/libpq/Makefile                    |    2 +-
+ src/backend/libpq/auth-scram.c                | 1032 +++++++++++++++++
+ src/backend/libpq/auth.c                      |  136 +++
+ src/backend/libpq/crypt.c                     |   27 +-
+ src/backend/libpq/hba.c                       |    3 +
+ src/backend/libpq/pg_hba.conf.sample          |    8 +-
+ src/backend/utils/misc/guc.c                  |    1 +
+ src/backend/utils/misc/postgresql.conf.sample |    2 +-
+ src/bin/initdb/initdb.c                       |   21 +-
+ src/bin/pg_controldata/pg_controldata.c       |   12 +-
+ src/common/Makefile                           |    6 +-
+ src/common/base64.c                           |  199 ++++
+ src/common/scram-common.c                     |  196 ++++
+ src/include/access/xlog.h                     |    1 +
+ src/include/catalog/pg_control.h              |   11 +-
+ src/include/common/base64.h                   |   19 +
+ src/include/common/scram-common.h             |   62 +
+ src/include/libpq/crypt.h                     |    3 +-
+ src/include/libpq/hba.h                       |    1 +
+ src/include/libpq/pqcomm.h                    |    2 +
+ src/include/libpq/scram.h                     |   35 +
+ src/interfaces/libpq/.gitignore               |    5 +
+ src/interfaces/libpq/Makefile                 |   20 +-
+ src/interfaces/libpq/fe-auth-scram.c          |  640 ++++++++++
+ src/interfaces/libpq/fe-auth.c                |  112 ++
+ src/interfaces/libpq/fe-auth.h                |    8 +
+ src/interfaces/libpq/fe-connect.c             |   52 +
+ src/interfaces/libpq/libpq-int.h              |    7 +-
+ src/tools/msvc/Mkvcbuild.pm                   |   12 +-
+ 38 files changed, 2866 insertions(+), 77 deletions(-)
+ create mode 100644 src/backend/libpq/auth-scram.c
+ create mode 100644 src/common/base64.c
+ create mode 100644 src/common/scram-common.c
+ create mode 100644 src/include/common/base64.h
+ create mode 100644 src/include/common/scram-common.h
+ create mode 100644 src/include/libpq/scram.h
+ create mode 100644 src/interfaces/libpq/fe-auth-scram.c
+
+diff --git a/contrib/pgcrypto/.gitignore b/contrib/pgcrypto/.gitignore
+index 30619bfbbf91..5dcb3ff97235 100644
+--- a/contrib/pgcrypto/.gitignore
++++ b/contrib/pgcrypto/.gitignore
+@@ -1,7 +1,3 @@
+-# Source file copied from src/common
+-/sha2.c
+-/sha2_openssl.c
+-
+ # Generated subdirectories
+ /log/
+ /results/
+diff --git a/contrib/pgcrypto/Makefile b/contrib/pgcrypto/Makefile
+index 14e74f899cd4..573bc6df79ad 100644
+--- a/contrib/pgcrypto/Makefile
++++ b/contrib/pgcrypto/Makefile
+@@ -1,10 +1,10 @@
+ # contrib/pgcrypto/Makefile
+ 
+-INT_SRCS = md5.c sha1.c sha2.c internal.c internal-sha2.c blf.c rijndael.c \
++INT_SRCS = md5.c sha1.c internal.c internal-sha2.c blf.c rijndael.c \
+ 		pgp-mpi-internal.c imath.c
+ INT_TESTS = sha2
+ 
+-OSSL_SRCS = openssl.c pgp-mpi-openssl.c sha2_openssl.c
++OSSL_SRCS = openssl.c pgp-mpi-openssl.c
+ OSSL_TESTS = sha2 des 3des cast5
+ 
+ ZLIB_TST = pgp-compression
+@@ -59,13 +59,6 @@ SHLIB_LINK += $(filter -leay32, $(LIBS))
+ SHLIB_LINK += -lws2_32
+ endif
+ 
+-# Compiling pgcrypto with those two raw files is necessary as long
+-# as none of their routines are used by the backend code.  Note doing
+-# so can either result in library loading failures or linking resolution
+-# failures at compilation depending on the environment used.
+-sha2.c sha2_openssl.c: % : $(top_srcdir)/src/common/%
+-	rm -f $@ && $(LN_S) $< .
+-
+ rijndael.o: rijndael.tbl
+ 
+ rijndael.tbl:
+diff --git a/doc/src/sgml/catalogs.sgml b/doc/src/sgml/catalogs.sgml
+index 41e3e1b547dd..28cdabe6fe31 100644
+--- a/doc/src/sgml/catalogs.sgml
++++ b/doc/src/sgml/catalogs.sgml
+@@ -1334,14 +1334,8 @@
+       <entry><structfield>rolpassword</structfield></entry>
+       <entry><type>text</type></entry>
+       <entry>
+-       Password (possibly encrypted); null if none.  If the password
+-       is encrypted, this column will begin with the string <literal>md5</>
+-       followed by a 32-character hexadecimal MD5 hash.  The MD5 hash
+-       will be of the user's password concatenated to their user name.
+-       For example, if user <literal>joe</> has password <literal>xyzzy</>,
+-       <productname>PostgreSQL</> will store the md5 hash of
+-       <literal>xyzzyjoe</>.  A password that does not follow that
+-       format is assumed to be unencrypted.
++       Password (possibly encrypted); null if none. The format depends
++       on the form of encryption used.
+       </entry>
+      </row>
+ 
+@@ -1355,6 +1349,21 @@
+    </tgroup>
+   </table>
+ 
++  <para>
++   For an MD5 encrypted password, <structfield>rolpassword</structfield>
++   column will begin with the string <literal>md5</> followed by a
++   32-character hexadecimal MD5 hash. The MD5 hash will be of the user's
++   password concatenated to their user name. For example, if user
++   <literal>joe</> has password <literal>xyzzy</>, <productname>PostgreSQL</>
++   will store the md5 hash of <literal>xyzzyjoe</>.  If the password is
++   encrypted with SCRAM-SHA-256, it consists of 5 fields separated by colons.
++   The first field is the constant <literal>scram-sha-256</literal>, to
++   identify the password as a SCRAM-SHA-256 verifier. The second field is a
++   salt, Base64-encoded, and the third field is the number of iterations used
++   to generate the password.  The fourth field and fifth field are the stored
++   key and server key, respectively, in hexadecimal format. A password that
++   does not follow either of those formats is assumed to be unencrypted.
++  </para>
+  </sect1>
+ 
+ 
+diff --git a/doc/src/sgml/client-auth.sgml b/doc/src/sgml/client-auth.sgml
+index 231fc40fc306..bbd52a5418d9 100644
+--- a/doc/src/sgml/client-auth.sgml
++++ b/doc/src/sgml/client-auth.sgml
+@@ -422,6 +422,17 @@ hostnossl  <replaceable>database</replaceable>  <replaceable>user</replaceable>
+         </listitem>
+        </varlistentry>
+ 
++       <varlistentry>
++        <term><literal>scram</></term>
++        <listitem>
++         <para>
++          Perform SCRAM-SHA-256 authentication to verify the user's
++          password.
++          See <xref linkend="auth-password"> for details.
++         </para>
++        </listitem>
++       </varlistentry>
++
+        <varlistentry>
+         <term><literal>password</></term>
+         <listitem>
+@@ -673,13 +684,19 @@ host    postgres        all             192.168.93.0/24         ident
+ # "postgres" if the user's password is correctly supplied.
+ #
+ # TYPE  DATABASE        USER            ADDRESS                 METHOD
+-host    postgres        all             192.168.12.10/32        md5
++host    postgres        all             192.168.12.10/32        scram
+ 
+ # Allow any user from hosts in the example.com domain to connect to
+ # any database if the user's password is correctly supplied.
+ #
++# Most users use SCRAM authentication, but some users use older clients
++# that don't support SCRAM authentication, and need to be able to log
++# in using MD5 authentication. Such users are put in the @md5users
++# group, everyone else must use SCRAM.
++#
+ # TYPE  DATABASE        USER            ADDRESS                 METHOD
+-host    all             all             .example.com            md5
++host    all             @md5users       .example.com            md5
++host    all             all             .example.com            scram
+ 
+ # In the absence of preceding "host" lines, these two lines will
+ # reject all connections from 192.168.54.1 (since that entry will be
+@@ -907,21 +924,37 @@ omicron         bryanh                  guest1
+    </indexterm>
+ 
+    <para>
+-    The password-based authentication methods are <literal>md5</>
+-    and <literal>password</>. These methods operate
++    The password-based authentication methods are <literal>scram</>
++    <literal>md5</> and <literal>password</>. These methods operate
+     similarly except for the way that the password is sent across the
+-    connection, namely MD5-hashed and clear-text respectively.
++    connection.
++   </para>
++
++   <para>
++    Plain <literal>password</> sends the password in clear-text, and is
++    therefore vulnerable to password <quote>sniffing</> attacks. It should
++    always be avoided if possible. If the connection is protected by SSL
++    encryption then <literal>password</> can be used safely, though.
++    (Though SSL certificate authentication might be a better choice if one
++    is depending on using SSL).
++   </para>
++
++
++   <para>
++    <literal>scram</> performs SCRAM-SHA-256 authentication, as described
++    in <ulink url="https://tools.ietf.org/html/rfc5802">RFC5802</ulink>. It
++    is a challenge-response scheme, that prevents password sniffing on
++    untrusted connections. It is more secure than the <literal>md5</>
++    method, but might not be supported by older clients.
+    </para>
+ 
+    <para>
+-    If you are at all concerned about password
+-    <quote>sniffing</> attacks then <literal>md5</> is preferred.
+-    Plain <literal>password</> should always be avoided if possible.
+-    However, <literal>md5</> cannot be used with the <xref
+-    linkend="guc-db-user-namespace"> feature.  If the connection is
+-    protected by SSL encryption then <literal>password</> can be used
+-    safely (though SSL certificate authentication might be a better
+-    choice if one is depending on using SSL).
++    In <literal>md5</>, the client sends a hash of a random challenge,
++    generated by the server, and the password. It prevents password sniffing,
++    but is less secure than <literal>scram</>, and provides no protection
++    if an attacker manages to steal the password hash from the server.
++    <literal>md5</> cannot be used with the <xref
++    linkend="guc-db-user-namespace"> feature.  
+    </para>
+ 
+    <para>
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index cd82c04b051c..1881236726a8 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -1193,9 +1193,10 @@ include_dir 'conf.d'
+         password is to be encrypted. The default value is <literal>md5</>, which
+         stores the password as an MD5 hash. Setting this to <literal>plain</> stores
+         it in plaintext. <literal>on</> and <literal>off</> are also accepted, as
+-        aliases for <literal>md5</> and <literal>plain</>, respectively.
+-       </para>
+-
++        aliases for <literal>md5</> and <literal>plain</>, respectively.  Setting
++        this parameter to <literal>scram</> will encrypt the password with
++        SCRAM-SHA-256.
++       </para>       
+       </listitem>
+      </varlistentry>
+ 
+diff --git a/doc/src/sgml/protocol.sgml b/doc/src/sgml/protocol.sgml
+index 589b881ef2c9..3d6e8eed4341 100644
+--- a/doc/src/sgml/protocol.sgml
++++ b/doc/src/sgml/protocol.sgml
+@@ -228,11 +228,11 @@
+     The server then sends an appropriate authentication request message,
+     to which the frontend must reply with an appropriate authentication
+     response message (such as a password).
+-    For all authentication methods except GSSAPI and SSPI, there is at most
+-    one request and one response. In some methods, no response
++    For all authentication methods except GSSAPI, SSPI and SASL, there is at
++    most one request and one response. In some methods, no response
+     at all is needed from the frontend, and so no authentication request
+-    occurs. For GSSAPI and SSPI, multiple exchanges of packets may be needed
+-    to complete the authentication.
++    occurs. For GSSAPI, SSPI and SASL, multiple exchanges of packets may be
++    needed to complete the authentication.
+    </para>
+ 
+    <para>
+@@ -366,6 +366,35 @@
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry>
++      <term>AuthenticationSASL</term>
++      <listitem>
++       <para>
++        The frontend must now initiate a SASL negotiation, using the SASL
++        mechanism specified in the message. The frontend will send a
++        PasswordMessage with the first part of the SASL data stream in
++        response to this. If further messages are needed, the server will
++        respond with AuthenticationSASLContinue.
++       </para>
++      </listitem>
++
++     </varlistentry>
++     <varlistentry>
++      <term>AuthenticationSASLContinue</term>
++      <listitem>
++       <para>
++        This message contains the response data from the previous step
++        of SASL negotiation (AuthenticationSASL, or a previous
++        AuthenticationSASLContinue). If the SASL data in this message
++        indicates more data is needed to complete the authentication,
++        the frontend must send that data as another PasswordMessage. If
++        SASL authentication is completed by this message, the server
++        will next send AuthenticationOk to indicate successful authentication
++        or ErrorResponse to indicate failure.
++       </para>
++      </listitem>
++     </varlistentry>
++
+     </variablelist>
+    </para>
+ 
+@@ -2782,6 +2811,114 @@ AuthenticationGSSContinue (B)
+ </listitem>
+ </varlistentry>
+ 
++<varlistentry>
++<term>
++AuthenticationSASL (B)
++</term>
++<listitem>
++<para>
++
++<variablelist>
++<varlistentry>
++<term>
++        Byte1('R')
++</term>
++<listitem>
++<para>
++                Identifies the message as an authentication request.
++</para>
++</listitem>
++</varlistentry>
++<varlistentry>
++<term>
++        Int32
++</term>
++<listitem>
++<para>
++                Length of message contents in bytes, including self.
++</para>
++</listitem>
++</varlistentry>
++<varlistentry>
++<term>
++        Int32(10)
++</term>
++<listitem>
++<para>
++                Specifies that SASL authentication is started.
++</para>
++</listitem>
++</varlistentry>
++<varlistentry>
++<term>
++        String
++</term>
++<listitem>
++<para>
++                Name of a SASL authentication mechanism.
++</para>
++</listitem>
++</varlistentry>
++</variablelist>
++
++</para>
++</listitem>
++</varlistentry>
++
++<varlistentry>
++<term>
++AuthenticationSASLContinue (B)
++</term>
++<listitem>
++<para>
++
++<variablelist>
++<varlistentry>
++<term>
++        Byte1('R')
++</term>
++<listitem>
++<para>
++                Identifies the message as an authentication request.
++</para>
++</listitem>
++</varlistentry>
++<varlistentry>
++<term>
++        Int32
++</term>
++<listitem>
++<para>
++                Length of message contents in bytes, including self.
++</para>
++</listitem>
++</varlistentry>
++<varlistentry>
++<term>
++        Int32(11)
++</term>
++<listitem>
++<para>
++                Specifies that this message contains SASL-mechanism specific
++                data.
++</para>
++</listitem>
++</varlistentry>
++<varlistentry>
++<term>
++        Byte<replaceable>n</replaceable>
++</term>
++<listitem>
++<para>
++                SASL data, specific to the SASL mechanism being used.
++</para>
++</listitem>
++</varlistentry>
++</variablelist>
++
++</para>
++</listitem>
++</varlistentry>
+ 
+ <varlistentry>
+ <term>
+@@ -4544,7 +4681,7 @@ PasswordMessage (F)
+ <listitem>
+ <para>
+                 Identifies the message as a password response. Note that
+-                this is also used for GSSAPI and SSPI response messages
++                this is also used for GSSAPI, SSPI and SASL response messages
+                 (which is really a design error, since the contained data
+                 is not a null-terminated string in that case, but can be
+                 arbitrary binary data).
+diff --git a/doc/src/sgml/ref/create_role.sgml b/doc/src/sgml/ref/create_role.sgml
+index 2ae576ede696..99d1c8336c40 100644
+--- a/doc/src/sgml/ref/create_role.sgml
++++ b/doc/src/sgml/ref/create_role.sgml
+@@ -231,12 +231,17 @@ CREATE ROLE <replaceable class="PARAMETER">name</replaceable> [ [ WITH ] <replac
+         encrypted in the system catalogs.  (If neither is specified,
+         the default behavior is determined by the configuration
+         parameter <xref linkend="guc-password-encryption">.)  If the
+-        presented password string is already in MD5-encrypted format,
+-        then it is stored encrypted as-is, regardless of whether
+-        <literal>ENCRYPTED</> or <literal>UNENCRYPTED</> is specified
+-        (since the system cannot decrypt the specified encrypted
+-        password string).  This allows reloading of encrypted
+-        passwords during dump/restore.
++        presented password string is already in MD5-encrypted or
++        SCRAM-encrypted format, then it is stored encrypted as-is,
++        regardless of whether <literal>ENCRYPTED</> or <literal>UNENCRYPTED</>
++        is specified (since the system cannot decrypt the specified encrypted
++        password string).  This allows reloading of encrypted passwords
++        during dump/restore.
++       </para>
++
++       <para>
++        Note that older clients might lack support for the SCRAM
++        authentication mechanism.
+        </para>
+       </listitem>
+      </varlistentry>
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 897358342dbc..744360c76965 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -65,6 +65,7 @@
+ #include "storage/reinit.h"
+ #include "storage/smgr.h"
+ #include "storage/spin.h"
++#include "utils/backend_random.h"
+ #include "utils/builtins.h"
+ #include "utils/guc.h"
+ #include "utils/memutils.h"
+@@ -4664,6 +4665,16 @@ GetSystemIdentifier(void)
+ 	return ControlFile->system_identifier;
+ }
+ 
++/*
++ * Returns the random nonce from control file.
++ */
++char *
++GetMockAuthenticationNonce(void)
++{
++	Assert(ControlFile != NULL);
++	return ControlFile->mock_authentication_nonce;
++}
++
+ /*
+  * Are checksums enabled for data pages?
+  */
+@@ -4914,6 +4925,7 @@ BootStrapXLOG(void)
+ 	char	   *recptr;
+ 	bool		use_existent;
+ 	uint64		sysidentifier;
++	char		mock_auth_nonce[MOCK_AUTH_NONCE_LEN];
+ 	struct timeval tv;
+ 	pg_crc32c	crc;
+ 
+@@ -4934,6 +4946,17 @@ BootStrapXLOG(void)
+ 	sysidentifier |= ((uint64) tv.tv_usec) << 12;
+ 	sysidentifier |= getpid() & 0xFFF;
+ 
++	/*
++	 * Generate a random nonce. This is used for authentication requests
++	 * that will fail because the user does not exist. The nonce is used to
++	 * create a genuine-looking password challenge for the non-existent user,
++	 * in lieu of an actual stored password.
++	 */
++	if (!pg_backend_random(mock_auth_nonce, MOCK_AUTH_NONCE_LEN))
++		ereport(PANIC,
++			(errcode(ERRCODE_INTERNAL_ERROR),
++			 errmsg("could not generation secret authorization token")));
++
+ 	/* First timeline ID is always 1 */
+ 	ThisTimeLineID = 1;
+ 
+@@ -5040,6 +5063,7 @@ BootStrapXLOG(void)
+ 	memset(ControlFile, 0, sizeof(ControlFileData));
+ 	/* Initialize pg_control status fields */
+ 	ControlFile->system_identifier = sysidentifier;
++	memcpy(ControlFile->mock_authentication_nonce, mock_auth_nonce, MOCK_AUTH_NONCE_LEN);
+ 	ControlFile->state = DB_SHUTDOWNED;
+ 	ControlFile->time = checkPoint.time;
+ 	ControlFile->checkPoint = checkPoint.redo;
+diff --git a/src/backend/commands/user.c b/src/backend/commands/user.c
+index 994c093250be..14b977914429 100644
+--- a/src/backend/commands/user.c
++++ b/src/backend/commands/user.c
+@@ -139,7 +139,12 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
+ 						 parser_errposition(pstate, defel->location)));
+ 			dpassword = defel;
+ 			if (strcmp(defel->defname, "encryptedPassword") == 0)
+-				password_type = PASSWORD_TYPE_MD5;
++			{
++				if (Password_encryption == PASSWORD_TYPE_SCRAM)
++					password_type = PASSWORD_TYPE_SCRAM;
++				else
++					password_type = PASSWORD_TYPE_MD5;
++			}
+ 			else if (strcmp(defel->defname, "unencryptedPassword") == 0)
+ 				password_type = PASSWORD_TYPE_PLAINTEXT;
+ 		}
+@@ -542,7 +547,12 @@ AlterRole(AlterRoleStmt *stmt)
+ 						 errmsg("conflicting or redundant options")));
+ 			dpassword = defel;
+ 			if (strcmp(defel->defname, "encryptedPassword") == 0)
+-				password_type = PASSWORD_TYPE_MD5;
++			{
++				if (Password_encryption == PASSWORD_TYPE_SCRAM)
++					password_type = PASSWORD_TYPE_SCRAM;
++				else
++					password_type = PASSWORD_TYPE_MD5;
++			}
+ 			else if (strcmp(defel->defname, "unencryptedPassword") == 0)
+ 				password_type = PASSWORD_TYPE_PLAINTEXT;
+ 		}
+diff --git a/src/backend/libpq/Makefile b/src/backend/libpq/Makefile
+index 1bdd8adde246..7fa2b027433d 100644
+--- a/src/backend/libpq/Makefile
++++ b/src/backend/libpq/Makefile
+@@ -15,7 +15,7 @@ include $(top_builddir)/src/Makefile.global
+ # be-fsstubs is here for historical reasons, probably belongs elsewhere
+ 
+ OBJS = be-fsstubs.o be-secure.o auth.o crypt.o hba.o ifaddr.o pqcomm.o \
+-       pqformat.o pqmq.o pqsignal.o
++       pqformat.o pqmq.o pqsignal.o auth-scram.o
+ 
+ ifeq ($(with_openssl),yes)
+ OBJS += be-secure-openssl.o
+diff --git a/src/backend/libpq/auth-scram.c b/src/backend/libpq/auth-scram.c
+new file mode 100644
+index 000000000000..cc4e84403f9a
+--- /dev/null
++++ b/src/backend/libpq/auth-scram.c
+@@ -0,0 +1,1032 @@
++/*-------------------------------------------------------------------------
++ *
++ * auth-scram.c
++ *	  Server-side implementation of the SASL SCRAM-SHA-256 mechanism.
++ *
++ * See the following RFCs for more details:
++ * - RFC 5802: https://tools.ietf.org/html/rfc5802
++ * - RFC 7677: https://tools.ietf.org/html/rfc7677
++ *
++ * Here are some differences:
++ *
++ * - Username from the authentication exchange is not used. The client
++ *	 should send an empty string as the username.
++ * - Password is not processed with the SASLprep algorithm.
++ * - Channel binding is not supported yet.
++ *
++ * The password stored in pg_authid consists of the salt, iteration count,
++ * StoredKey and ServerKey.
++ *
++ * On error handling:
++ *
++ * Don't reveal user information to an unauthenticated client.  We don't
++ * want an attacker to be able to probe whether a particular username is
++ * valid.  In SCRAM, the server has to read the salt and iteration count
++ * from the user's password verifier, and send it to the client.  To avoid
++ * revealing whether a user exists, when the client tries to authenticate
++ * with a username that doesn't exist, or doesn't have a valid SCRAM
++ * verifier in pg_authid, we create a fake salt and iteration count
++ * on-the-fly, and proceed with the authentication with that.  In the end,
++ * we'll reject the attempt, as if an incorrect password was given.  When
++ * we are performing a "mock" authentication, the 'doomed' flag in
++ * scram_state is set.
++ *
++ * In the error messages, avoid printing strings from the client, unless
++ * you check that they are pure ASCII.  We don't want an unauthenticated
++ * attacker to be able to spam the logs with characters that are not valid
++ * to the encoding being used, whatever that is.  We cannot avoid that in
++ * general, after logging in, but let's do what we can here.
++ *
++ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * src/backend/libpq/auth-scram.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include <unistd.h>
++
++#include "access/xlog.h"
++#include "catalog/pg_authid.h"
++#include "catalog/pg_control.h"
++#include "common/base64.h"
++#include "common/scram-common.h"
++#include "common/sha2.h"
++#include "libpq/auth.h"
++#include "libpq/crypt.h"
++#include "libpq/scram.h"
++#include "miscadmin.h"
++#include "utils/backend_random.h"
++#include "utils/builtins.h"
++#include "utils/timestamp.h"
++
++/*
++ * Status data for a SCRAM authentication exchange.  This should be kept
++ * internal to this file.
++ */
++typedef enum
++{
++	SCRAM_AUTH_INIT,
++	SCRAM_AUTH_SALT_SENT,
++	SCRAM_AUTH_FINISHED
++} scram_state_enum;
++
++typedef struct
++{
++	scram_state_enum state;
++
++	const char *username;		/* username from startup packet */
++
++	char	   *salt;			/* base64-encoded */
++	int			iterations;
++	uint8		StoredKey[SCRAM_KEY_LEN];
++	uint8		ServerKey[SCRAM_KEY_LEN];
++
++	/* Fields of the first message from client */
++	char	   *client_first_message_bare;
++	char	   *client_username;
++	char	   *client_nonce;
++
++	/* Fields from the last message from client */
++	char	   *client_final_message_without_proof;
++	char	   *client_final_nonce;
++	char		ClientProof[SCRAM_KEY_LEN];
++
++	/* Fields generated in the server */
++	char	   *server_first_message;
++	char	   *server_nonce;
++
++	/*
++	 * If something goes wrong during the authentication, or we are performing
++	 * a "mock" authentication (see comments at top of file), the 'doomed'
++	 * flag is set.  A reason for the failure, for the server log, is put in
++	 * 'logdetail'.
++	 */
++	bool		doomed;
++	char	   *logdetail;
++} scram_state;
++
++static void read_client_first_message(scram_state *state, char *input);
++static void read_client_final_message(scram_state *state, char *input);
++static char *build_server_first_message(scram_state *state);
++static char *build_server_final_message(scram_state *state);
++static bool verify_client_proof(scram_state *state);
++static bool verify_final_nonce(scram_state *state);
++static bool parse_scram_verifier(const char *verifier, char **salt,
++					 int *iterations, uint8 *stored_key, uint8 *server_key);
++static void mock_scram_verifier(const char *username, char **salt, int *iterations,
++					uint8 *stored_key, uint8 *server_key);
++static bool is_scram_printable(char *p);
++static char *sanitize_char(char c);
++static char *scram_MockSalt(const char *username);
++
++/*
++ * pg_be_scram_init
++ *
++ * Initialize a new SCRAM authentication exchange status tracker.  This
++ * needs to be called before doing any exchange.  It will be filled later
++ * after the beginning of the exchange with verifier data.
++ *
++ * 'username' is the provided by the client.  'shadow_pass' is the role's
++ * password verifier, from pg_authid.rolpassword.  If 'doomed' is true, the
++ * authentication must fail, as if an incorrect password was given.
++ * 'shadow_pass' may be NULL, when 'doomed' is set.
++ */
++void *
++pg_be_scram_init(const char *username, const char *shadow_pass, bool doomed)
++{
++	scram_state *state;
++	int			password_type;
++
++	state = (scram_state *) palloc0(sizeof(scram_state));
++	state->state = SCRAM_AUTH_INIT;
++	state->username = username;
++
++	/*
++	 * Perform sanity checks on the provided password after catalog lookup.
++	 * The authentication is bound to fail if the lookup itself failed or if
++	 * the password stored is MD5-encrypted.  Authentication is possible for
++	 * users with a valid plain password though.
++	 */
++
++	if (shadow_pass == NULL || doomed)
++		password_type = -1;
++	else
++		password_type = get_password_type(shadow_pass);
++
++	if (password_type == PASSWORD_TYPE_SCRAM)
++	{
++		if (!parse_scram_verifier(shadow_pass, &state->salt, &state->iterations,
++								  state->StoredKey, state->ServerKey))
++		{
++			/*
++			 * The password looked like a SCRAM verifier, but could not be
++			 * parsed.
++			 */
++			elog(LOG, "invalid SCRAM verifier for user \"%s\"", username);
++			doomed = true;
++		}
++	}
++	else if (password_type == PASSWORD_TYPE_PLAINTEXT)
++	{
++		char	   *verifier;
++
++		/*
++		 * The password provided is in plain format, in which case a fresh
++		 * SCRAM verifier can be generated and used for the rest of the
++		 * processing.
++		 */
++		verifier = scram_build_verifier(username, shadow_pass, 0);
++
++		(void) parse_scram_verifier(verifier, &state->salt, &state->iterations,
++									state->StoredKey, state->ServerKey);
++		pfree(verifier);
++	}
++	else
++		doomed = true;
++
++	if (doomed)
++	{
++		/*
++		 * We don't have a valid SCRAM verifier, nor could we generate one, or
++		 * the caller requested us to perform a dummy authentication.
++		 *
++		 * The authentication is bound to fail, but to avoid revealing
++		 * information to the attacker, go through the motions with a fake
++		 * SCRAM verifier, and fail as if the password was incorrect.
++		 */
++		state->logdetail = psprintf(_("User \"%s\" does not have a valid SCRAM verifier."),
++									state->username);
++		mock_scram_verifier(username, &state->salt, &state->iterations,
++							state->StoredKey, state->ServerKey);
++	}
++	state->doomed = doomed;
++
++	return state;
++}
++
++/*
++ * Continue a SCRAM authentication exchange.
++ *
++ * The next message to send to client is saved in "output", for a length
++ * of "outputlen".  In the case of an error, optionally store a palloc'd
++ * string at *logdetail that will be sent to the postmaster log (but not
++ * the client).
++ */
++int
++pg_be_scram_exchange(void *opaq, char *input, int inputlen,
++					 char **output, int *outputlen, char **logdetail)
++{
++	scram_state *state = (scram_state *) opaq;
++	int			result;
++
++	*output = NULL;
++
++	/*
++	 * Check that the input length agrees with the string length of the input.
++	 * We can ignore inputlen after this.
++	 */
++	if (inputlen == 0)
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 (errmsg("malformed SCRAM message (empty message)"))));
++	if (inputlen != strlen(input))
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 (errmsg("malformed SCRAM message (length mismatch)"))));
++
++	switch (state->state)
++	{
++		case SCRAM_AUTH_INIT:
++
++			/*
++			 * Initialization phase.  Receive the first message from client
++			 * and be sure that it parsed correctly.  Then send the challenge
++			 * to the client.
++			 */
++			read_client_first_message(state, input);
++
++			/* prepare message to send challenge */
++			*output = build_server_first_message(state);
++
++			state->state = SCRAM_AUTH_SALT_SENT;
++			result = SASL_EXCHANGE_CONTINUE;
++			break;
++
++		case SCRAM_AUTH_SALT_SENT:
++
++			/*
++			 * Final phase for the server.  Receive the response to the
++			 * challenge previously sent, verify, and let the client know that
++			 * everything went well (or not).
++			 */
++			read_client_final_message(state, input);
++
++			if (!verify_final_nonce(state))
++				ereport(ERROR,
++						(errcode(ERRCODE_PROTOCOL_VIOLATION),
++					   (errmsg("invalid SCRAM response (nonce mismatch)"))));
++
++			/*
++			 * Now check the final nonce and the client proof.
++			 *
++			 * If we performed a "mock" authentication that we knew would fail
++			 * from the get go, this is where we fail.
++			 *
++			 * NB: the order of these checks is intentional.  We calculate the
++			 * client proof even in a mock authentication, even though it's
++			 * bound to fail, to thwart timing attacks to determine if a role
++			 * with the given name exists or not.
++			 */
++			if (!verify_client_proof(state) || state->doomed)
++			{
++				/*
++				 * Signal invalid-proof, although the real reason might also
++				 * be e.g. that the password has expired, or the user doesn't
++				 * exist.  "e=other-error" might be more correct, but
++				 * "e=invalid-proof" is more likely to give a nice error
++				 * message to the user.
++				 */
++				*output = psprintf("e=invalid-proof");
++				result = SASL_EXCHANGE_FAILURE;
++				break;
++			}
++
++			/* Build final message for client */
++			*output = build_server_final_message(state);
++
++			/* Success! */
++			result = SASL_EXCHANGE_SUCCESS;
++			state->state = SCRAM_AUTH_FINISHED;
++			break;
++
++		default:
++			elog(ERROR, "invalid SCRAM exchange state");
++			result = SASL_EXCHANGE_FAILURE;
++	}
++
++	if (result == SASL_EXCHANGE_FAILURE && state->logdetail && logdetail)
++		*logdetail = state->logdetail;
++
++	if (*output)
++		*outputlen = strlen(*output);
++
++	return result;
++}
++
++/*
++ * Construct a verifier string for SCRAM, stored in pg_authid.rolpassword.
++ *
++ * If iterations is 0, default number of iterations is used.  The result is
++ * palloc'd, so caller is responsible for freeing it.
++ */
++char *
++scram_build_verifier(const char *username, const char *password,
++					 int iterations)
++{
++	uint8		keybuf[SCRAM_KEY_LEN + 1];
++	char		storedkey_hex[SCRAM_KEY_LEN * 2 + 1];
++	char		serverkey_hex[SCRAM_KEY_LEN * 2 + 1];
++	char		salt[SCRAM_SALT_LEN];
++	char	   *encoded_salt;
++	int			encoded_len;
++
++	if (iterations <= 0)
++		iterations = SCRAM_ITERATIONS_DEFAULT;
++
++	if (!pg_backend_random(salt, SCRAM_SALT_LEN))
++	{
++		ereport(LOG,
++				(errcode(ERRCODE_INTERNAL_ERROR),
++				 errmsg("could not generate random salt")));
++		return NULL;
++	}
++
++	encoded_salt = palloc(pg_b64_enc_len(SCRAM_SALT_LEN) + 1);
++	encoded_len = pg_b64_encode(salt, SCRAM_SALT_LEN, encoded_salt);
++	encoded_salt[encoded_len] = '\0';
++
++	/* Calculate StoredKey, and encode it in hex */
++	scram_ClientOrServerKey(password, salt, SCRAM_SALT_LEN,
++							iterations, SCRAM_CLIENT_KEY_NAME, keybuf);
++	scram_H(keybuf, SCRAM_KEY_LEN, keybuf);		/* StoredKey */
++	(void) hex_encode((const char *) keybuf, SCRAM_KEY_LEN, storedkey_hex);
++	storedkey_hex[SCRAM_KEY_LEN * 2] = '\0';
++
++	/* And same for ServerKey */
++	scram_ClientOrServerKey(password, salt, SCRAM_SALT_LEN, iterations,
++							SCRAM_SERVER_KEY_NAME, keybuf);
++	(void) hex_encode((const char *) keybuf, SCRAM_KEY_LEN, serverkey_hex);
++	serverkey_hex[SCRAM_KEY_LEN * 2] = '\0';
++
++	return psprintf("scram-sha-256:%s:%d:%s:%s", encoded_salt, iterations, storedkey_hex, serverkey_hex);
++}
++
++
++/*
++ * Check if given verifier can be used for SCRAM authentication.
++ *
++ * Returns true if it is a SCRAM verifier, and false otherwise.
++ */
++bool
++is_scram_verifier(const char *verifier)
++{
++	char	   *salt = NULL;
++	int			iterations;
++	uint8		stored_key[SCRAM_KEY_LEN];
++	uint8		server_key[SCRAM_KEY_LEN];
++	bool		result;
++
++	result = parse_scram_verifier(verifier, &salt, &iterations, stored_key, server_key);
++	if (salt)
++		pfree(salt);
++
++	return result;
++}
++
++
++/*
++ * Parse and validate format of given SCRAM verifier.
++ *
++ * Returns true if the SCRAM verifier has been parsed, and false otherwise.
++ */
++static bool
++parse_scram_verifier(const char *verifier, char **salt, int *iterations,
++					 uint8 *stored_key, uint8 *server_key)
++{
++	char	   *v;
++	char	   *p;
++
++	/*
++	 * The verifier is of form:
++	 *
++	 * scram-sha-256:<salt>:<iterations>:<storedkey>:<serverkey>
++	 */
++	if (strncmp(verifier, "scram-sha-256:", strlen("scram-sha-256:")) != 0)
++		return false;
++
++	v = pstrdup(verifier + strlen("scram-sha-256:"));
++
++	/* salt */
++	if ((p = strtok(v, ":")) == NULL)
++		goto invalid_verifier;
++	*salt = pstrdup(p);
++
++	/* iterations */
++	if ((p = strtok(NULL, ":")) == NULL)
++		goto invalid_verifier;
++	errno = 0;
++	*iterations = strtol(p, &p, SCRAM_ITERATION_LEN);
++	if (*p || errno != 0)
++		goto invalid_verifier;
++
++	/* storedkey */
++	if ((p = strtok(NULL, ":")) == NULL)
++		goto invalid_verifier;
++	if (strlen(p) != SCRAM_KEY_LEN * 2)
++		goto invalid_verifier;
++
++	hex_decode(p, SCRAM_KEY_LEN * 2, (char *) stored_key);
++
++	/* serverkey */
++	if ((p = strtok(NULL, ":")) == NULL)
++		goto invalid_verifier;
++	if (strlen(p) != SCRAM_KEY_LEN * 2)
++		goto invalid_verifier;
++	hex_decode(p, SCRAM_KEY_LEN * 2, (char *) server_key);
++
++	pfree(v);
++	return true;
++
++invalid_verifier:
++	pfree(v);
++	return false;
++}
++
++static void
++mock_scram_verifier(const char *username, char **salt, int *iterations,
++					uint8 *stored_key, uint8 *server_key)
++{
++	char	   *raw_salt;
++	char	   *encoded_salt;
++	int			encoded_len;
++
++	/* Generate deterministic salt */
++	raw_salt = scram_MockSalt(username);
++
++	encoded_salt = (char *) palloc(pg_b64_enc_len(SCRAM_SALT_LEN) + 1);
++	encoded_len = pg_b64_encode(raw_salt, SCRAM_SALT_LEN, encoded_salt);
++	encoded_salt[encoded_len] = '\0';
++
++	*salt = encoded_salt;
++	*iterations = SCRAM_ITERATIONS_DEFAULT;
++
++	/* StoredKey and ServerKey are not used in a doomed authentication */
++	memset(stored_key, 0, SCRAM_KEY_LEN);
++	memset(server_key, 0, SCRAM_KEY_LEN);
++}
++
++/*
++ * Read the value in a given SASL exchange message for given attribute.
++ */
++static char *
++read_attr_value(char **input, char attr)
++{
++	char	   *begin = *input;
++	char	   *end;
++
++	if (*begin != attr)
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++		(errmsg("malformed SCRAM message (attribute '%c' expected, %s found)",
++				attr, sanitize_char(*begin)))));
++	begin++;
++
++	if (*begin != '=')
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++		 (errmsg("malformed SCRAM message (expected = in attr %c)", attr))));
++	begin++;
++
++	end = begin;
++	while (*end && *end != ',')
++		end++;
++
++	if (*end)
++	{
++		*end = '\0';
++		*input = end + 1;
++	}
++	else
++		*input = end;
++
++	return begin;
++}
++
++static bool
++is_scram_printable(char *p)
++{
++	/*------
++	 * Printable characters, as defined by SCRAM spec: (RFC 5802)
++	 *
++	 *	printable		= %x21-2B / %x2D-7E
++	 *					  ;; Printable ASCII except ",".
++	 *					  ;; Note that any "printable" is also
++	 *					  ;; a valid "value".
++	 *------
++	 */
++	for (; *p; p++)
++	{
++		if (*p < 0x21 || *p > 0x7E || *p == 0x2C /* comma */ )
++			return false;
++	}
++	return true;
++}
++
++/*
++ * Convert an arbitrary byte to printable form.  For error messages.
++ *
++ * If it's a printable ASCII character, print it as a single character.
++ * otherwise, print it in hex.
++ *
++ * The returned pointer points to a static buffer.
++ */
++static char *
++sanitize_char(char c)
++{
++	static char buf[5];
++
++	if (c >= 0x21 && c <= 0x7E)
++		snprintf(buf, sizeof(buf), "'%c'", c);
++	else
++		snprintf(buf, sizeof(buf), "0x%02x", c);
++	return buf;
++}
++
++/*
++ * Read the next attribute and value in a SASL exchange message.
++ *
++ * Returns NULL if there is attribute.
++ */
++static char *
++read_any_attr(char **input, char *attr_p)
++{
++	char	   *begin = *input;
++	char	   *end;
++	char		attr = *begin;
++
++	/*------
++	 * attr-val		   = ALPHA "=" value
++	 *					 ;; Generic syntax of any attribute sent
++	 *					 ;; by server or client
++	 *------
++	 */
++	if (!((attr >= 'A' && attr <= 'Z') ||
++		  (attr >= 'a' && attr <= 'z')))
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 (errmsg("malformed SCRAM message (attribute expected, invalid char %s found)",
++						 sanitize_char(attr)))));
++	if (attr_p)
++		*attr_p = attr;
++	begin++;
++
++	if (*begin != '=')
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++		 (errmsg("malformed SCRAM message (expected = in attr %c)", attr))));
++	begin++;
++
++	end = begin;
++	while (*end && *end != ',')
++		end++;
++
++	if (*end)
++	{
++		*end = '\0';
++		*input = end + 1;
++	}
++	else
++		*input = end;
++
++	return begin;
++}
++
++/*
++ * Read and parse the first message from client in the context of a SASL
++ * authentication exchange message.
++ *
++ * At this stage, any errors will be reported directly with ereport(ERROR).
++ */
++static void
++read_client_first_message(scram_state *state, char *input)
++{
++	input = pstrdup(input);
++
++	/*------
++	 * The syntax for the client-first-message is: (RFC 5802)
++	 *
++	 * saslname		   = 1*(value-safe-char / "=2C" / "=3D")
++	 *					 ;; Conforms to <value>.
++	 *
++	 * authzid		   = "a=" saslname
++	 *					 ;; Protocol specific.
++	 *
++	 * cb-name		   = 1*(ALPHA / DIGIT / "." / "-")
++	 *					  ;; See RFC 5056, Section 7.
++	 *					  ;; E.g., "tls-server-end-point" or
++	 *					  ;; "tls-unique".
++	 *
++	 * gs2-cbind-flag  = ("p=" cb-name) / "n" / "y"
++	 *					 ;; "n" -> client doesn't support channel binding.
++	 *					 ;; "y" -> client does support channel binding
++	 *					 ;;		   but thinks the server does not.
++	 *					 ;; "p" -> client requires channel binding.
++	 *					 ;; The selected channel binding follows "p=".
++	 *
++	 * gs2-header	   = gs2-cbind-flag "," [ authzid ] ","
++	 *					 ;; GS2 header for SCRAM
++	 *					 ;; (the actual GS2 header includes an optional
++	 *					 ;; flag to indicate that the GSS mechanism is not
++	 *					 ;; "standard", but since SCRAM is "standard", we
++	 *					 ;; don't include that flag).
++	 *
++	 * username		   = "n=" saslname
++	 *					 ;; Usernames are prepared using SASLprep.
++	 *
++	 * reserved-mext  = "m=" 1*(value-char)
++	 *					 ;; Reserved for signaling mandatory extensions.
++	 *					 ;; The exact syntax will be defined in
++	 *					 ;; the future.
++	 *
++	 * nonce		   = "r=" c-nonce [s-nonce]
++	 *					 ;; Second part provided by server.
++	 *
++	 * c-nonce		   = printable
++	 *
++	 * client-first-message-bare =
++	 *					 [reserved-mext ","]
++	 *					 username "," nonce ["," extensions]
++	 *
++	 * client-first-message =
++	 *					 gs2-header client-first-message-bare
++	 *
++	 * For example:
++	 * n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL
++	 *
++	 * The "n,," in the beginning means that the client doesn't support
++	 * channel binding, and no authzid is given.  "n=user" is the username.
++	 * However, in PostgreSQL the username is sent in the startup packet, and
++	 * the username in the SCRAM exchange is ignored.  libpq always sends it
++	 * as an empty string.  The last part, "r=fyko+d2lbbFgONRv9qkxdawL" is
++	 * the client nonce.
++	 *------
++	 */
++
++	/* read gs2-cbind-flag */
++	switch (*input)
++	{
++		case 'n':
++			/* Client does not support channel binding */
++			input++;
++			break;
++		case 'y':
++			/* Client supports channel binding, but we're not doing it today */
++			input++;
++			break;
++		case 'p':
++
++			/*
++			 * Client requires channel binding.  We don't support it.
++			 *
++			 * RFC 5802 specifies a particular error code,
++			 * e=server-does-support-channel-binding, for this.  But it can
++			 * only be sent in the server-final message, and we don't want to
++			 * go through the motions of the authentication, knowing it will
++			 * fail, just to send that error message.
++			 */
++			ereport(ERROR,
++					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++					 errmsg("client requires SCRAM channel binding, but it is not supported")));
++		default:
++			ereport(ERROR,
++					(errcode(ERRCODE_PROTOCOL_VIOLATION),
++					 (errmsg("malformed SCRAM message (unexpected channel-binding flag %s)",
++							 sanitize_char(*input)))));
++	}
++	if (*input != ',')
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 errmsg("malformed SCRAM message (comma expected, got %s)",
++						sanitize_char(*input))));
++	input++;
++
++	/*
++	 * Forbid optional authzid (authorization identity).  We don't support it.
++	 */
++	if (*input == 'a')
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("client uses authorization identity, but it is not supported")));
++	if (*input != ',')
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 errmsg("malformed SCRAM message (unexpected attribute %s in client-first-message)",
++						sanitize_char(*input))));
++	input++;
++
++	state->client_first_message_bare = pstrdup(input);
++
++	/*
++	 * Any mandatory extensions would go here.  We don't support any.
++	 *
++	 * RFC 5802 specifies error code "e=extensions-not-supported" for this,
++	 * but it can only be sent in the server-final message.  We prefer to fail
++	 * immediately (which the RFC also allows).
++	 */
++	if (*input == 'm')
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("client requires mandatory SCRAM extension")));
++
++	/*
++	 * Read username.  Note: this is ignored.  We use the username from the
++	 * startup message instead, still it is kept around if provided as it
++	 * proves to be useful for debugging purposes.
++	 */
++	state->client_username = read_attr_value(&input, 'n');
++
++	/* read nonce and check that it is made of only printable characters */
++	state->client_nonce = read_attr_value(&input, 'r');
++	if (!is_scram_printable(state->client_nonce))
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 errmsg("non-printable characters in SCRAM nonce")));
++
++	/*
++	 * There can be any number of optional extensions after this.  We don't
++	 * support any extensions, so ignore them.
++	 */
++	while (*input != '\0')
++		read_any_attr(&input, NULL);
++
++	/* success! */
++}
++
++/*
++ * Verify the final nonce contained in the last message received from
++ * client in an exchange.
++ */
++static bool
++verify_final_nonce(scram_state *state)
++{
++	int			client_nonce_len = strlen(state->client_nonce);
++	int			server_nonce_len = strlen(state->server_nonce);
++	int			final_nonce_len = strlen(state->client_final_nonce);
++
++	if (final_nonce_len != client_nonce_len + server_nonce_len)
++		return false;
++	if (memcmp(state->client_final_nonce, state->client_nonce, client_nonce_len) != 0)
++		return false;
++	if (memcmp(state->client_final_nonce + client_nonce_len, state->server_nonce, server_nonce_len) != 0)
++		return false;
++
++	return true;
++}
++
++/*
++ * Verify the client proof contained in the last message received from
++ * client in an exchange.
++ */
++static bool
++verify_client_proof(scram_state *state)
++{
++	uint8		ClientSignature[SCRAM_KEY_LEN];
++	uint8		ClientKey[SCRAM_KEY_LEN];
++	uint8		client_StoredKey[SCRAM_KEY_LEN];
++	scram_HMAC_ctx ctx;
++	int			i;
++
++	/* calculate ClientSignature */
++	scram_HMAC_init(&ctx, state->StoredKey, SCRAM_KEY_LEN);
++	scram_HMAC_update(&ctx,
++					  state->client_first_message_bare,
++					  strlen(state->client_first_message_bare));
++	scram_HMAC_update(&ctx, ",", 1);
++	scram_HMAC_update(&ctx,
++					  state->server_first_message,
++					  strlen(state->server_first_message));
++	scram_HMAC_update(&ctx, ",", 1);
++	scram_HMAC_update(&ctx,
++					  state->client_final_message_without_proof,
++					  strlen(state->client_final_message_without_proof));
++	scram_HMAC_final(ClientSignature, &ctx);
++
++	/* Extract the ClientKey that the client calculated from the proof */
++	for (i = 0; i < SCRAM_KEY_LEN; i++)
++		ClientKey[i] = state->ClientProof[i] ^ ClientSignature[i];
++
++	/* Hash it one more time, and compare with StoredKey */
++	scram_H(ClientKey, SCRAM_KEY_LEN, client_StoredKey);
++
++	if (memcmp(client_StoredKey, state->StoredKey, SCRAM_KEY_LEN) != 0)
++		return false;
++
++	return true;
++}
++
++/*
++ * Build the first server-side message sent to the client in a SASL
++ * communication exchange.
++ */
++static char *
++build_server_first_message(scram_state *state)
++{
++	/*------
++	 * The syntax for the server-first-message is: (RFC 5802)
++	 *
++	 * server-first-message =
++	 *					 [reserved-mext ","] nonce "," salt ","
++	 *					 iteration-count ["," extensions]
++	 *
++	 * nonce		   = "r=" c-nonce [s-nonce]
++	 *					 ;; Second part provided by server.
++	 *
++	 * c-nonce		   = printable
++	 *
++	 * s-nonce		   = printable
++	 *
++	 * salt			   = "s=" base64
++	 *
++	 * iteration-count = "i=" posit-number
++	 *					 ;; A positive number.
++	 *
++	 * Example:
++	 *
++	 * r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096
++	 *------
++	 */
++
++	/*
++	 * Per the spec, the nonce may consist of any printable ASCII characters.
++	 * For convenience, however, we don't use the whole range available,
++	 * rather, we generate some random bytes, and base64 encode them.
++	 */
++	char		raw_nonce[SCRAM_RAW_NONCE_LEN];
++	int			encoded_len;
++
++	if (!pg_backend_random(raw_nonce, SCRAM_RAW_NONCE_LEN))
++		ereport(COMMERROR,
++				(errcode(ERRCODE_INTERNAL_ERROR),
++				 errmsg("could not generate random nonce")));
++
++	state->server_nonce = palloc(pg_b64_enc_len(SCRAM_RAW_NONCE_LEN) + 1);
++	encoded_len = pg_b64_encode(raw_nonce, SCRAM_RAW_NONCE_LEN, state->server_nonce);
++	state->server_nonce[encoded_len] = '\0';
++
++	state->server_first_message =
++		psprintf("r=%s%s,s=%s,i=%u",
++				 state->client_nonce, state->server_nonce,
++				 state->salt, state->iterations);
++
++	return state->server_first_message;
++}
++
++
++/*
++ * Read and parse the final message received from client.
++ */
++static void
++read_client_final_message(scram_state *state, char *input)
++{
++	char		attr;
++	char	   *channel_binding;
++	char	   *value;
++	char	   *begin,
++			   *proof;
++	char	   *p;
++	char	   *client_proof;
++
++	begin = p = pstrdup(input);
++
++	/*------
++	 * The syntax for the server-first-message is: (RFC 5802)
++	 *
++	 * gs2-header	   = gs2-cbind-flag "," [ authzid ] ","
++	 *					 ;; GS2 header for SCRAM
++	 *					 ;; (the actual GS2 header includes an optional
++	 *					 ;; flag to indicate that the GSS mechanism is not
++	 *					 ;; "standard", but since SCRAM is "standard", we
++	 *					 ;; don't include that flag).
++	 *
++	 * cbind-input	 = gs2-header [ cbind-data ]
++	 *					 ;; cbind-data MUST be present for
++	 *					 ;; gs2-cbind-flag of "p" and MUST be absent
++	 *					 ;; for "y" or "n".
++	 *
++	 * channel-binding = "c=" base64
++	 *					 ;; base64 encoding of cbind-input.
++	 *
++	 * proof		   = "p=" base64
++	 *
++	 * client-final-message-without-proof =
++	 *					 channel-binding "," nonce [","
++	 *					 extensions]
++	 *
++	 * client-final-message =
++	 *					 client-final-message-without-proof "," proof
++	 *------
++	 */
++
++	/*
++	 * Read channel-binding.  We don't support channel binding, so it's
++	 * expected to always be "biws", which is "n,,", base64-encoded.
++	 */
++	channel_binding = read_attr_value(&p, 'c');
++	if (strcmp(channel_binding, "biws") != 0)
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 (errmsg("unexpected SCRAM channel-binding attribute in client-final-message"))));
++	state->client_final_nonce = read_attr_value(&p, 'r');
++
++	/* ignore optional extensions */
++	do
++	{
++		proof = p - 1;
++		value = read_any_attr(&p, &attr);
++	} while (attr != 'p');
++
++	client_proof = palloc(pg_b64_dec_len(strlen(value)));
++	if (pg_b64_decode(value, strlen(value), client_proof) != SCRAM_KEY_LEN)
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 (errmsg("malformed SCRAM message (malformed proof in client-final-message"))));
++	memcpy(state->ClientProof, client_proof, SCRAM_KEY_LEN);
++	pfree(client_proof);
++
++	if (*p != '\0')
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 (errmsg("malformed SCRAM message (garbage at end of client-final-message)"))));
++
++	state->client_final_message_without_proof = palloc(proof - begin + 1);
++	memcpy(state->client_final_message_without_proof, input, proof - begin);
++	state->client_final_message_without_proof[proof - begin] = '\0';
++}
++
++/*
++ * Build the final server-side message of an exchange.
++ */
++static char *
++build_server_final_message(scram_state *state)
++{
++	uint8		ServerSignature[SCRAM_KEY_LEN];
++	char	   *server_signature_base64;
++	int			siglen;
++	scram_HMAC_ctx ctx;
++
++	/* calculate ServerSignature */
++	scram_HMAC_init(&ctx, state->ServerKey, SCRAM_KEY_LEN);
++	scram_HMAC_update(&ctx,
++					  state->client_first_message_bare,
++					  strlen(state->client_first_message_bare));
++	scram_HMAC_update(&ctx, ",", 1);
++	scram_HMAC_update(&ctx,
++					  state->server_first_message,
++					  strlen(state->server_first_message));
++	scram_HMAC_update(&ctx, ",", 1);
++	scram_HMAC_update(&ctx,
++					  state->client_final_message_without_proof,
++					  strlen(state->client_final_message_without_proof));
++	scram_HMAC_final(ServerSignature, &ctx);
++
++	server_signature_base64 = palloc(pg_b64_enc_len(SCRAM_KEY_LEN) + 1);
++	siglen = pg_b64_encode((const char *) ServerSignature,
++						   SCRAM_KEY_LEN, server_signature_base64);
++	server_signature_base64[siglen] = '\0';
++
++	/*------
++	 * The syntax for the server-final-message is: (RFC 5802)
++	 *
++	 * verifier		   = "v=" base64
++	 *					 ;; base-64 encoded ServerSignature.
++	 *
++	 * server-final-message = (server-error / verifier)
++	 *					 ["," extensions]
++	 *
++	 *------
++	 */
++	return psprintf("v=%s", server_signature_base64);
++}
++
++
++/*
++ * Determinisitcally generate salt for mock authentication, using a SHA256
++ * hash based on the username and a cluster-level secret key.  Returns a
++ * pointer to a static buffer of size SCRAM_SALT_LEN.
++ */
++static char *
++scram_MockSalt(const char *username)
++{
++	pg_sha256_ctx ctx;
++	static uint8 sha_digest[PG_SHA256_DIGEST_LENGTH];
++	char	   *mock_auth_nonce = GetMockAuthenticationNonce();
++
++	/*
++	 * Generate salt using a SHA256 hash of the username and the cluster's
++	 * mock authentication nonce.  (This works as long as the salt length is
++	 * not larger the SHA256 digest length. If the salt is smaller, the caller
++	 * will just ignore the extra data))
++	 */
++	StaticAssertStmt(PG_SHA256_DIGEST_LENGTH >= SCRAM_SALT_LEN,
++					 "salt length greater than SHA256 digest length");
++
++	pg_sha256_init(&ctx);
++	pg_sha256_update(&ctx, (uint8 *) username, strlen(username));
++	pg_sha256_update(&ctx, (uint8 *) mock_auth_nonce, MOCK_AUTH_NONCE_LEN);
++	pg_sha256_final(&ctx, sha_digest);
++
++	return (char *) sha_digest;
++}
+diff --git a/src/backend/libpq/auth.c b/src/backend/libpq/auth.c
+index 824e40837b48..ebf10bbbaefe 100644
+--- a/src/backend/libpq/auth.c
++++ b/src/backend/libpq/auth.c
+@@ -30,10 +30,12 @@
+ #include "libpq/crypt.h"
+ #include "libpq/libpq.h"
+ #include "libpq/pqformat.h"
++#include "libpq/scram.h"
+ #include "miscadmin.h"
+ #include "replication/walsender.h"
+ #include "storage/ipc.h"
+ #include "utils/backend_random.h"
++#include "utils/timestamp.h"
+ 
+ 
+ /*----------------------------------------------------------------
+@@ -197,6 +199,12 @@ static int pg_SSPI_make_upn(char *accountname,
+ static int	CheckRADIUSAuth(Port *port);
+ 
+ 
++/*----------------------------------------------------------------
++ * SASL authentication
++ *----------------------------------------------------------------
++ */
++static int	CheckSASLAuth(Port *port, char **logdetail);
++
+ /*
+  * Maximum accepted size of GSS and SSPI authentication tokens.
+  *
+@@ -212,6 +220,13 @@ static int	CheckRADIUSAuth(Port *port);
+  */
+ #define PG_MAX_AUTH_TOKEN_LENGTH	65535
+ 
++/*
++ * Maximum accepted size of SASL messages.
++ *
++ * The messages that the server or libpq generate are much smaller than this,
++ * but have some headroom.
++ */
++#define PG_MAX_SASL_MESSAGE_LENGTH	1024
+ 
+ /*----------------------------------------------------------------
+  * Global authentication functions
+@@ -275,6 +290,7 @@ auth_failed(Port *port, int status, char *logdetail)
+ 			break;
+ 		case uaPassword:
+ 		case uaMD5:
++		case uaSASL:
+ 			errstr = gettext_noop("password authentication failed for user \"%s\"");
+ 			/* We use it to indicate if a .pgpass password failed. */
+ 			errcode_return = ERRCODE_INVALID_PASSWORD;
+@@ -542,6 +558,10 @@ ClientAuthentication(Port *port)
+ 			status = CheckPasswordAuth(port, &logdetail);
+ 			break;
+ 
++		case uaSASL:
++			status = CheckSASLAuth(port, &logdetail);
++			break;
++
+ 		case uaPAM:
+ #ifdef USE_PAM
+ 			status = CheckPAMAuth(port, port->user_name, "");
+@@ -762,6 +782,122 @@ CheckPasswordAuth(Port *port, char **logdetail)
+ 	return result;
+ }
+ 
++/*----------------------------------------------------------------
++ * SASL authentication system
++ *----------------------------------------------------------------
++ */
++static int
++CheckSASLAuth(Port *port, char **logdetail)
++{
++	int			mtype;
++	StringInfoData buf;
++	void	   *scram_opaq;
++	char	   *output = NULL;
++	int			outputlen = 0;
++	int			result;
++	char	   *shadow_pass;
++	bool		doomed = false;
++
++	/*
++	 * SASL auth is not supported for protocol versions before 3, because it
++	 * relies on the overall message length word to determine the SASL payload
++	 * size in AuthenticationSASLContinue and PasswordMessage messages.  (We
++	 * used to have a hard rule that protocol messages must be parsable
++	 * without relying on the length word, but we hardly care about older
++	 * protocol version anymore.)
++	 */
++	if (PG_PROTOCOL_MAJOR(FrontendProtocol) < 3)
++		ereport(FATAL,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("SASL authentication is not supported in protocol version 2")));
++
++	/*
++	 * Send first the authentication request to user.
++	 */
++	sendAuthRequest(port, AUTH_REQ_SASL, SCRAM_SHA256_NAME,
++					strlen(SCRAM_SHA256_NAME) + 1);
++
++	/*
++	 * If the user doesn't exist, or doesn't have a valid password, or it's
++	 * expired, we still go through the motions of SASL authentication, but
++	 * tell the authentication method that the authentication is "doomed".
++	 * That is, it's going to fail, no matter what.
++	 *
++	 * This is because we don't want to reveal to an attacker what usernames
++	 * are valid, nor which users have a valid password.
++	 */
++	if (get_role_password(port->user_name, &shadow_pass, logdetail) != STATUS_OK)
++		doomed = true;
++
++	/* Initialize the status tracker for message exchanges */
++	scram_opaq = pg_be_scram_init(port->user_name, shadow_pass, doomed);
++
++	/*
++	 * Loop through SASL message exchange.  This exchange can consist of
++	 * multiple messages sent in both directions.  First message is always
++	 * from the client.  All messages from client to server are password
++	 * packets (type 'p').
++	 */
++	do
++	{
++		pq_startmsgread();
++		mtype = pq_getbyte();
++		if (mtype != 'p')
++		{
++			/* Only log error if client didn't disconnect. */
++			if (mtype != EOF)
++			{
++				ereport(COMMERROR,
++						(errcode(ERRCODE_PROTOCOL_VIOLATION),
++						 errmsg("expected SASL response, got message type %d",
++								mtype)));
++				return STATUS_ERROR;
++			}
++			else
++				return STATUS_EOF;
++		}
++
++		/* Get the actual SASL message */
++		initStringInfo(&buf);
++		if (pq_getmessage(&buf, PG_MAX_SASL_MESSAGE_LENGTH))
++		{
++			/* EOF - pq_getmessage already logged error */
++			pfree(buf.data);
++			return STATUS_ERROR;
++		}
++
++		elog(DEBUG4, "Processing received SASL token of length %d", buf.len);
++
++		/*
++		 * we pass 'logdetail' as NULL when doing a mock authentication,
++		 * because we should already have a better error message in that case
++		 */
++		result = pg_be_scram_exchange(scram_opaq, buf.data, buf.len,
++									  &output, &outputlen,
++									  doomed ? NULL : logdetail);
++
++		/* input buffer no longer used */
++		pfree(buf.data);
++
++		if (outputlen > 0)
++		{
++			/*
++			 * Negotiation generated data to be sent to the client.
++			 */
++			elog(DEBUG4, "sending SASL response token of length %u", outputlen);
++
++			sendAuthRequest(port, AUTH_REQ_SASL_CONT, output, outputlen);
++		}
++	} while (result == SASL_EXCHANGE_CONTINUE);
++
++	/* Oops, Something bad happened */
++	if (result != SASL_EXCHANGE_SUCCESS)
++	{
++		return STATUS_ERROR;
++	}
++
++	return STATUS_OK;
++}
+ 
+ 
+ /*----------------------------------------------------------------
+diff --git a/src/backend/libpq/crypt.c b/src/backend/libpq/crypt.c
+index e7dd212355dd..bd3e936d38cf 100644
+--- a/src/backend/libpq/crypt.c
++++ b/src/backend/libpq/crypt.c
+@@ -21,6 +21,7 @@
+ #include "catalog/pg_authid.h"
+ #include "common/md5.h"
+ #include "libpq/crypt.h"
++#include "libpq/scram.h"
+ #include "miscadmin.h"
+ #include "utils/builtins.h"
+ #include "utils/syscache.h"
+@@ -111,6 +112,8 @@ get_password_type(const char *shadow_pass)
+ {
+ 	if (strncmp(shadow_pass, "md5", 3) == 0 && strlen(shadow_pass) == MD5_PASSWD_LEN)
+ 		return PASSWORD_TYPE_MD5;
++	if (strncmp(shadow_pass, "scram-sha-256:", strlen("scram-sha-256:")) == 0)
++		return PASSWORD_TYPE_SCRAM;
+ 	return PASSWORD_TYPE_PLAINTEXT;
+ }
+ 
+@@ -150,7 +153,29 @@ encrypt_password(PasswordType target_type, const char *role,
+ 						elog(ERROR, "password encryption failed");
+ 					return encrypted_password;
+ 
++				case PASSWORD_TYPE_SCRAM:
++
++					/*
++					 * cannot convert a SCRAM verifier to an MD5 hash, so fall
++					 * through to save the SCRAM verifier instead.
++					 */
++				case PASSWORD_TYPE_MD5:
++					return pstrdup(password);
++			}
++
++		case PASSWORD_TYPE_SCRAM:
++			switch (guessed_type)
++			{
++				case PASSWORD_TYPE_PLAINTEXT:
++					return scram_build_verifier(role, password, 0);
++
+ 				case PASSWORD_TYPE_MD5:
++
++					/*
++					 * cannot convert an MD5 hash to a SCRAM verifier, so fall
++					 * through to save the MD5 hash instead.
++					 */
++				case PASSWORD_TYPE_SCRAM:
+ 					return pstrdup(password);
+ 			}
+ 	}
+@@ -160,7 +185,7 @@ encrypt_password(PasswordType target_type, const char *role,
+ 	 * handle every combination of source and target password types.
+ 	 */
+ 	elog(ERROR, "cannot encrypt password to requested type");
+-	return NULL;		/* keep compiler quiet */
++	return NULL;				/* keep compiler quiet */
+ }
+ 
+ /*
+diff --git a/src/backend/libpq/hba.c b/src/backend/libpq/hba.c
+index 323bfa858d71..3817d249c445 100644
+--- a/src/backend/libpq/hba.c
++++ b/src/backend/libpq/hba.c
+@@ -125,6 +125,7 @@ static const char *const UserAuthName[] =
+ 	"ident",
+ 	"password",
+ 	"md5",
++	"scram",
+ 	"gss",
+ 	"sspi",
+ 	"pam",
+@@ -1323,6 +1324,8 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
+ 		}
+ 		parsedline->auth_method = uaMD5;
+ 	}
++	else if (strcmp(token->string, "scram") == 0)
++		parsedline->auth_method = uaSASL;
+ 	else if (strcmp(token->string, "pam") == 0)
+ #ifdef USE_PAM
+ 		parsedline->auth_method = uaPAM;
+diff --git a/src/backend/libpq/pg_hba.conf.sample b/src/backend/libpq/pg_hba.conf.sample
+index e0fbfcb02609..73f7973ea227 100644
+--- a/src/backend/libpq/pg_hba.conf.sample
++++ b/src/backend/libpq/pg_hba.conf.sample
+@@ -42,10 +42,10 @@
+ # or "samenet" to match any address in any subnet that the server is
+ # directly connected to.
+ #
+-# METHOD can be "trust", "reject", "md5", "password", "gss", "sspi",
+-# "ident", "peer", "pam", "ldap", "radius" or "cert".  Note that
+-# "password" sends passwords in clear text; "md5" is preferred since
+-# it sends encrypted passwords.
++# METHOD can be "trust", "reject", "md5", "password", "scram", "gss",
++# "sspi", "ident", "peer", "pam", "ldap", "radius" or "cert".  Note that
++# "password" sends passwords in clear text; "md5" or "scram" are preferred
++# since they send encrypted passwords.
+ #
+ # OPTIONS are a set of options for the authentication in the format
+ # NAME=VALUE.  The available options depend on the different
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index 0707f666311b..f8b073d8a972 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -409,6 +409,7 @@ static const struct config_enum_entry force_parallel_mode_options[] = {
+ static const struct config_enum_entry password_encryption_options[] = {
+ 	{"plain", PASSWORD_TYPE_PLAINTEXT, false},
+ 	{"md5", PASSWORD_TYPE_MD5, false},
++	{"scram", PASSWORD_TYPE_SCRAM, false},
+ 	{"off", PASSWORD_TYPE_PLAINTEXT, false},
+ 	{"on", PASSWORD_TYPE_MD5, false},
+ 	{"true", PASSWORD_TYPE_MD5, true},
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index 157d775853af..891b16e483bb 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -84,7 +84,7 @@
+ #ssl_key_file = 'server.key'
+ #ssl_ca_file = ''
+ #ssl_crl_file = ''
+-#password_encryption = md5		# md5 or plain
++#password_encryption = md5		# md5, scram or plain
+ #db_user_namespace = off
+ #row_security = on
+ 
+diff --git a/src/bin/initdb/initdb.c b/src/bin/initdb/initdb.c
+index 1ed0d205041e..4968fc783e89 100644
+--- a/src/bin/initdb/initdb.c
++++ b/src/bin/initdb/initdb.c
+@@ -75,7 +75,7 @@
+ extern const char *select_default_timezone(const char *share_path);
+ 
+ static const char *const auth_methods_host[] = {
+-	"trust", "reject", "md5", "password", "ident", "radius",
++	"trust", "reject", "md5", "password", "scram", "ident", "radius",
+ #ifdef ENABLE_GSS
+ 	"gss",
+ #endif
+@@ -97,7 +97,7 @@ static const char *const auth_methods_host[] = {
+ 	NULL
+ };
+ static const char *const auth_methods_local[] = {
+-	"trust", "reject", "md5", "password", "peer", "radius",
++	"trust", "reject", "md5", "scram", "password", "peer", "radius",
+ #ifdef USE_PAM
+ 	"pam", "pam ",
+ #endif
+@@ -1128,6 +1128,14 @@ setup_config(void)
+ 							  "#update_process_title = off");
+ #endif
+ 
++	if (strcmp(authmethodlocal, "scram") == 0 ||
++		strcmp(authmethodhost, "scram") == 0)
++	{
++		conflines = replace_token(conflines,
++								  "#password_encryption = md5",
++								  "password_encryption = scram");
++	}
++
+ 	snprintf(path, sizeof(path), "%s/postgresql.conf", pg_data);
+ 
+ 	writefile(path, conflines);
+@@ -2307,14 +2315,17 @@ static void
+ check_need_password(const char *authmethodlocal, const char *authmethodhost)
+ {
+ 	if ((strcmp(authmethodlocal, "md5") == 0 ||
+-		 strcmp(authmethodlocal, "password") == 0) &&
++		 strcmp(authmethodlocal, "password") == 0 ||
++		 strcmp(authmethodlocal, "scram") == 0) &&
+ 		(strcmp(authmethodhost, "md5") == 0 ||
+-		 strcmp(authmethodhost, "password") == 0) &&
++		 strcmp(authmethodhost, "password") == 0 ||
++		 strcmp(authmethodlocal, "scram") == 0) &&
+ 		!(pwprompt || pwfilename))
+ 	{
+ 		fprintf(stderr, _("%s: must specify a password for the superuser to enable %s authentication\n"), progname,
+ 				(strcmp(authmethodlocal, "md5") == 0 ||
+-				 strcmp(authmethodlocal, "password") == 0)
++				 strcmp(authmethodlocal, "password") == 0 ||
++				 strcmp(authmethodlocal, "scram") == 0)
+ 				? authmethodlocal
+ 				: authmethodhost);
+ 		exit(1);
+diff --git a/src/bin/pg_controldata/pg_controldata.c b/src/bin/pg_controldata/pg_controldata.c
+index f47171d29d9c..2ea893179abf 100644
+--- a/src/bin/pg_controldata/pg_controldata.c
++++ b/src/bin/pg_controldata/pg_controldata.c
+@@ -92,11 +92,13 @@ main(int argc, char *argv[])
+ 	char		pgctime_str[128];
+ 	char		ckpttime_str[128];
+ 	char		sysident_str[32];
++	char		mock_auth_nonce_str[MOCK_AUTH_NONCE_LEN * 2 + 1];
+ 	const char *strftime_fmt = "%c";
+ 	const char *progname;
+ 	XLogSegNo	segno;
+ 	char		xlogfilename[MAXFNAMELEN];
+ 	int			c;
++	int			i;
+ 
+ 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_controldata"));
+ 
+@@ -186,11 +188,15 @@ main(int argc, char *argv[])
+ 	XLogFileName(xlogfilename, ControlFile->checkPointCopy.ThisTimeLineID, segno);
+ 
+ 	/*
+-	 * Format system_identifier separately to keep platform-dependent format
+-	 * code out of the translatable message string.
++	 * Format system_identifier and mock_authentication_nonce separately to
++	 * keep platform-dependent format code out of the translatable message
++	 * string.
+ 	 */
+ 	snprintf(sysident_str, sizeof(sysident_str), UINT64_FORMAT,
+ 			 ControlFile->system_identifier);
++	for (i = 0; i < MOCK_AUTH_NONCE_LEN; i++)
++		snprintf(&mock_auth_nonce_str[i * 2], 3, "%02x",
++				 (unsigned char) ControlFile->mock_authentication_nonce[i]);
+ 
+ 	printf(_("pg_control version number:            %u\n"),
+ 		   ControlFile->pg_control_version);
+@@ -302,5 +308,7 @@ main(int argc, char *argv[])
+ 		   (ControlFile->float8ByVal ? _("by value") : _("by reference")));
+ 	printf(_("Data page checksum version:           %u\n"),
+ 		   ControlFile->data_checksum_version);
++	printf(_("Mock authentication nonce:            %s\n"),
++		   mock_auth_nonce_str);
+ 	return 0;
+ }
+diff --git a/src/common/Makefile b/src/common/Makefile
+index 5ddfff8b440f..971ddd5ea72d 100644
+--- a/src/common/Makefile
++++ b/src/common/Makefile
+@@ -40,9 +40,9 @@ override CPPFLAGS += -DVAL_LDFLAGS_EX="\"$(LDFLAGS_EX)\""
+ override CPPFLAGS += -DVAL_LDFLAGS_SL="\"$(LDFLAGS_SL)\""
+ override CPPFLAGS += -DVAL_LIBS="\"$(LIBS)\""
+ 
+-OBJS_COMMON = config_info.o controldata_utils.o exec.o ip.o keywords.o \
+-	md5.o pg_lzcompress.o pgfnames.o psprintf.o relpath.o rmtree.o \
+-	string.o username.o wait_error.o
++OBJS_COMMON = base64.o config_info.o controldata_utils.o exec.o ip.o \
++	keywords.o md5.o pg_lzcompress.o pgfnames.o psprintf.o relpath.o \
++	rmtree.o scram-common.o string.o username.o wait_error.o
+ 
+ ifeq ($(with_openssl),yes)
+ OBJS_COMMON += sha2_openssl.o
+diff --git a/src/common/base64.c b/src/common/base64.c
+new file mode 100644
+index 000000000000..96406b191d21
+--- /dev/null
++++ b/src/common/base64.c
+@@ -0,0 +1,199 @@
++/*-------------------------------------------------------------------------
++ *
++ * base64.c
++ *	  Encoding and decoding routines for base64 without whitespace.
++ *
++ * Copyright (c) 2001-2016, PostgreSQL Global Development Group
++ *
++ *
++ * IDENTIFICATION
++ *	  src/common/base64.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#ifndef FRONTEND
++#include "postgres.h"
++#else
++#include "postgres_fe.h"
++#endif
++
++#include "common/base64.h"
++
++/*
++ * BASE64
++ */
++
++static const char _base64[] =
++"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++static const int8 b64lookup[128] = {
++	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 62, -1, -1, -1, 63,
++	52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1, -1,
++	-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
++	15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, -1,
++	-1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
++	41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, -1, -1, -1, -1, -1,
++};
++
++/*
++ * pg_b64_encode
++ *
++ * Encode into base64 the given string.  Returns the length of the encoded
++ * string.
++ */
++int
++pg_b64_encode(const char *src, int len, char *dst)
++{
++	char	   *p;
++	const char *s,
++			   *end = src + len;
++	int			pos = 2;
++	uint32		buf = 0;
++
++	s = src;
++	p = dst;
++
++	while (s < end)
++	{
++		buf |= (unsigned char) *s << (pos << 3);
++		pos--;
++		s++;
++
++		/* write it out */
++		if (pos < 0)
++		{
++			*p++ = _base64[(buf >> 18) & 0x3f];
++			*p++ = _base64[(buf >> 12) & 0x3f];
++			*p++ = _base64[(buf >> 6) & 0x3f];
++			*p++ = _base64[buf & 0x3f];
++
++			pos = 2;
++			buf = 0;
++		}
++	}
++	if (pos != 2)
++	{
++		*p++ = _base64[(buf >> 18) & 0x3f];
++		*p++ = _base64[(buf >> 12) & 0x3f];
++		*p++ = (pos == 0) ? _base64[(buf >> 6) & 0x3f] : '=';
++		*p++ = '=';
++	}
++
++	return p - dst;
++}
++
++/*
++ * pg_b64_decode
++ *
++ * Decode the given base64 string.  Returns the length of the decoded
++ * string on success, and -1 in the event of an error.
++ */
++int
++pg_b64_decode(const char *src, int len, char *dst)
++{
++	const char *srcend = src + len,
++			   *s = src;
++	char	   *p = dst;
++	char		c;
++	int			b = 0;
++	uint32		buf = 0;
++	int			pos = 0,
++				end = 0;
++
++	while (s < srcend)
++	{
++		c = *s++;
++
++		/* Leave if a whitespace is found */
++		if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
++			return -1;
++
++		if (c == '=')
++		{
++			/* end sequence */
++			if (!end)
++			{
++				if (pos == 2)
++					end = 1;
++				else if (pos == 3)
++					end = 2;
++				else
++				{
++					/*
++					 * Unexpected "=" character found while decoding base64
++					 * sequence.
++					 */
++					return -1;
++				}
++			}
++			b = 0;
++		}
++		else
++		{
++			b = -1;
++			if (c > 0 && c < 127)
++				b = b64lookup[(unsigned char) c];
++			if (b < 0)
++			{
++				/* invalid symbol found */
++				return -1;
++			}
++		}
++		/* add it to buffer */
++		buf = (buf << 6) + b;
++		pos++;
++		if (pos == 4)
++		{
++			*p++ = (buf >> 16) & 255;
++			if (end == 0 || end > 1)
++				*p++ = (buf >> 8) & 255;
++			if (end == 0 || end > 2)
++				*p++ = buf & 255;
++			buf = 0;
++			pos = 0;
++		}
++	}
++
++	if (pos != 0)
++	{
++		/*
++		 * base64 end sequence is invalid.  Input data is missing padding, is
++		 * truncated or is otherwise corrupted.
++		 */
++		return -1;
++	}
++
++	return p - dst;
++}
++
++/*
++ * pg_b64_enc_len
++ *
++ * Returns to caller the length of the string if it were encoded with
++ * base64 based on the length provided by caller.  This is useful to
++ * estimate how large a buffer allocation needs to be done before doing
++ * the actual encoding.
++ */
++int
++pg_b64_enc_len(int srclen)
++{
++	/* 3 bytes will be converted to 4 */
++	return (srclen + 2) * 4 / 3;
++}
++
++/*
++ * pg_b64_dec_len
++ *
++ * Returns to caller the length of the string if it were to be decoded
++ * with base64, based on the length given by caller.  This is useful to
++ * estimate how large a buffer allocation needs to be done before doing
++ * the actual decoding.
++ */
++int
++pg_b64_dec_len(int srclen)
++{
++	return (srclen * 3) >> 2;
++}
+diff --git a/src/common/scram-common.c b/src/common/scram-common.c
+new file mode 100644
+index 000000000000..4a1c3809cfea
+--- /dev/null
++++ b/src/common/scram-common.c
+@@ -0,0 +1,196 @@
++/*-------------------------------------------------------------------------
++ * scram-common.c
++ *		Shared frontend/backend code for SCRAM authentication
++ *
++ * This contains the common low-level functions needed in both frontend and
++ * backend, for implement the Salted Challenge Response Authentication
++ * Mechanism (SCRAM), per IETF's RFC 5802.
++ *
++ * Portions Copyright (c) 2016, PostgreSQL Global Development Group
++ *
++ * IDENTIFICATION
++ *	  src/common/scram-common.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef FRONTEND
++#include "postgres.h"
++#include "utils/memutils.h"
++#else
++#include "postgres_fe.h"
++#endif
++
++#include "common/scram-common.h"
++
++#define HMAC_IPAD 0x36
++#define HMAC_OPAD 0x5C
++
++/*
++ * Calculate HMAC per RFC2104.
++ *
++ * The hash function used is SHA-256.
++ */
++void
++scram_HMAC_init(scram_HMAC_ctx *ctx, const uint8 *key, int keylen)
++{
++	uint8		k_ipad[SHA256_HMAC_B];
++	int			i;
++	uint8		keybuf[SCRAM_KEY_LEN];
++
++	/*
++	 * If the key is longer than the block size (64 bytes for SHA-256), pass
++	 * it through SHA-256 once to shrink it down.
++	 */
++	if (keylen > SHA256_HMAC_B)
++	{
++		pg_sha256_ctx sha256_ctx;
++
++		pg_sha256_init(&sha256_ctx);
++		pg_sha256_update(&sha256_ctx, key, keylen);
++		pg_sha256_final(&sha256_ctx, keybuf);
++		key = keybuf;
++		keylen = SCRAM_KEY_LEN;
++	}
++
++	memset(k_ipad, HMAC_IPAD, SHA256_HMAC_B);
++	memset(ctx->k_opad, HMAC_OPAD, SHA256_HMAC_B);
++
++	for (i = 0; i < keylen; i++)
++	{
++		k_ipad[i] ^= key[i];
++		ctx->k_opad[i] ^= key[i];
++	}
++
++	/* tmp = H(K XOR ipad, text) */
++	pg_sha256_init(&ctx->sha256ctx);
++	pg_sha256_update(&ctx->sha256ctx, k_ipad, SHA256_HMAC_B);
++}
++
++/*
++ * Update HMAC calculation
++ * The hash function used is SHA-256.
++ */
++void
++scram_HMAC_update(scram_HMAC_ctx *ctx, const char *str, int slen)
++{
++	pg_sha256_update(&ctx->sha256ctx, (const uint8 *) str, slen);
++}
++
++/*
++ * Finalize HMAC calculation.
++ * The hash function used is SHA-256.
++ */
++void
++scram_HMAC_final(uint8 *result, scram_HMAC_ctx *ctx)
++{
++	uint8		h[SCRAM_KEY_LEN];
++
++	pg_sha256_final(&ctx->sha256ctx, h);
++
++	/* H(K XOR opad, tmp) */
++	pg_sha256_init(&ctx->sha256ctx);
++	pg_sha256_update(&ctx->sha256ctx, ctx->k_opad, SHA256_HMAC_B);
++	pg_sha256_update(&ctx->sha256ctx, h, SCRAM_KEY_LEN);
++	pg_sha256_final(&ctx->sha256ctx, result);
++}
++
++/*
++ * Iterate hash calculation of HMAC entry using given salt.
++ * scram_Hi() is essentially PBKDF2 (see RFC2898) with HMAC() as the
++ * pseudorandom function.
++ */
++static void
++scram_Hi(const char *str, const char *salt, int saltlen, int iterations, uint8 *result)
++{
++	int			str_len = strlen(str);
++	uint32		one = htonl(1);
++	int			i,
++				j;
++	uint8		Ui[SCRAM_KEY_LEN];
++	uint8		Ui_prev[SCRAM_KEY_LEN];
++	scram_HMAC_ctx hmac_ctx;
++
++	/* First iteration */
++	scram_HMAC_init(&hmac_ctx, (uint8 *) str, str_len);
++	scram_HMAC_update(&hmac_ctx, salt, saltlen);
++	scram_HMAC_update(&hmac_ctx, (char *) &one, sizeof(uint32));
++	scram_HMAC_final(Ui_prev, &hmac_ctx);
++	memcpy(result, Ui_prev, SCRAM_KEY_LEN);
++
++	/* Subsequent iterations */
++	for (i = 2; i <= iterations; i++)
++	{
++		scram_HMAC_init(&hmac_ctx, (uint8 *) str, str_len);
++		scram_HMAC_update(&hmac_ctx, (const char *) Ui_prev, SCRAM_KEY_LEN);
++		scram_HMAC_final(Ui, &hmac_ctx);
++		for (j = 0; j < SCRAM_KEY_LEN; j++)
++			result[j] ^= Ui[j];
++		memcpy(Ui_prev, Ui, SCRAM_KEY_LEN);
++	}
++}
++
++
++/*
++ * Calculate SHA-256 hash for a NULL-terminated string. (The NULL terminator is
++ * not included in the hash).
++ */
++void
++scram_H(const uint8 *input, int len, uint8 *result)
++{
++	pg_sha256_ctx ctx;
++
++	pg_sha256_init(&ctx);
++	pg_sha256_update(&ctx, input, len);
++	pg_sha256_final(&ctx, result);
++}
++
++/*
++ * Normalize a password for SCRAM authentication.
++ */
++static void
++scram_Normalize(const char *password, char *result)
++{
++	/*
++	 * XXX: Here SASLprep should be applied on password. However, per RFC5802,
++	 * it is required that the password is encoded in UTF-8, something that is
++	 * not guaranteed in this protocol. We may want to revisit this
++	 * normalization function once encoding functions are available as well in
++	 * the frontend in order to be able to encode properly this string, and
++	 * then apply SASLprep on it.
++	 */
++	memcpy(result, password, strlen(password) + 1);
++}
++
++/*
++ * Encrypt password for SCRAM authentication. This basically applies the
++ * normalization of the password and a hash calculation using the salt
++ * value given by caller.
++ */
++static void
++scram_SaltedPassword(const char *password, const char *salt, int saltlen, int iterations,
++					 uint8 *result)
++{
++	char	   *pwbuf;
++
++	pwbuf = (char *) malloc(strlen(password) + 1);
++	scram_Normalize(password, pwbuf);
++	scram_Hi(pwbuf, salt, saltlen, iterations, result);
++	free(pwbuf);
++}
++
++/*
++ * Calculate ClientKey or ServerKey.
++ */
++void
++scram_ClientOrServerKey(const char *password,
++						const char *salt, int saltlen, int iterations,
++						const char *keystr, uint8 *result)
++{
++	uint8		keybuf[SCRAM_KEY_LEN];
++	scram_HMAC_ctx ctx;
++
++	scram_SaltedPassword(password, salt, saltlen, iterations, keybuf);
++	scram_HMAC_init(&ctx, keybuf, SCRAM_KEY_LEN);
++	scram_HMAC_update(&ctx, keystr, strlen(keystr));
++	scram_HMAC_final(result, &ctx);
++}
+diff --git a/src/include/access/xlog.h b/src/include/access/xlog.h
+index 9f036c72d89d..104ee7dd5ed9 100644
+--- a/src/include/access/xlog.h
++++ b/src/include/access/xlog.h
+@@ -256,6 +256,7 @@ extern char *XLogFileNameP(TimeLineID tli, XLogSegNo segno);
+ 
+ extern void UpdateControlFile(void);
+ extern uint64 GetSystemIdentifier(void);
++extern char *GetMockAuthenticationNonce(void);
+ extern bool DataChecksumsEnabled(void);
+ extern XLogRecPtr GetFakeLSNForUnloggedRel(void);
+ extern Size XLOGShmemSize(void);
+diff --git a/src/include/catalog/pg_control.h b/src/include/catalog/pg_control.h
+index e4194b9de1f7..3a25cc84b2aa 100644
+--- a/src/include/catalog/pg_control.h
++++ b/src/include/catalog/pg_control.h
+@@ -20,8 +20,10 @@
+ #include "port/pg_crc32c.h"
+ 
+ 
++#define MOCK_AUTH_NONCE_LEN		32
++
+ /* Version identifier for this pg_control format */
+-#define PG_CONTROL_VERSION	1001
++#define PG_CONTROL_VERSION	1002
+ 
+ /*
+  * Body of CheckPoint XLOG records.  This is declared here because we keep
+@@ -222,6 +224,13 @@ typedef struct ControlFileData
+ 	/* Are data pages protected by checksums? Zero if no checksum version */
+ 	uint32		data_checksum_version;
+ 
++	/*
++	 * Random nonce, used in authentication requests that need to proceed
++	 * based on values that are cluster-unique, like a SASL exchange that
++	 * failed at an early stage.
++	 */
++	char		mock_authentication_nonce[MOCK_AUTH_NONCE_LEN];
++
+ 	/* CRC of all above ... MUST BE LAST! */
+ 	pg_crc32c	crc;
+ } ControlFileData;
+diff --git a/src/include/common/base64.h b/src/include/common/base64.h
+new file mode 100644
+index 000000000000..47c28c3b62f8
+--- /dev/null
++++ b/src/include/common/base64.h
+@@ -0,0 +1,19 @@
++/*
++ * base64.h
++ *	  Encoding and decoding routines for base64 without whitespace
++ *	  support.
++ *
++ * Portions Copyright (c) 2001-2016, PostgreSQL Global Development Group
++ *
++ * src/include/common/base64.h
++ */
++#ifndef BASE64_H
++#define BASE64_H
++
++/* base 64 */
++extern int	pg_b64_encode(const char *src, int len, char *dst);
++extern int	pg_b64_decode(const char *src, int len, char *dst);
++extern int	pg_b64_enc_len(int srclen);
++extern int	pg_b64_dec_len(int srclen);
++
++#endif   /* BASE64_H */
+diff --git a/src/include/common/scram-common.h b/src/include/common/scram-common.h
+new file mode 100644
+index 000000000000..14bb05383214
+--- /dev/null
++++ b/src/include/common/scram-common.h
+@@ -0,0 +1,62 @@
++/*-------------------------------------------------------------------------
++ *
++ * scram-common.h
++ *		Declarations for helper functions used for SCRAM authentication
++ *
++ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * src/include/common/relpath.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef SCRAM_COMMON_H
++#define SCRAM_COMMON_H
++
++#include "common/sha2.h"
++
++/* Length of SCRAM keys (client and server) */
++#define SCRAM_KEY_LEN				PG_SHA256_DIGEST_LENGTH
++
++/* length of HMAC */
++#define SHA256_HMAC_B				PG_SHA256_BLOCK_LENGTH
++
++/*
++ * Size of random nonce generated in the authentication exchange.  This
++ * is in "raw" number of bytes, the actual nonces sent over the wire are
++ * encoded using only ASCII-printable characters.
++ */
++#define SCRAM_RAW_NONCE_LEN			10
++
++/* length of salt when generating new verifiers */
++#define SCRAM_SALT_LEN				10
++
++/* number of bytes used when sending iteration number during exchange */
++#define SCRAM_ITERATION_LEN			10
++
++/* default number of iterations when generating verifier */
++#define SCRAM_ITERATIONS_DEFAULT	4096
++
++/* Base name of keys used for proof generation */
++#define SCRAM_SERVER_KEY_NAME "Server Key"
++#define SCRAM_CLIENT_KEY_NAME "Client Key"
++
++/*
++ * Context data for HMAC used in SCRAM authentication.
++ */
++typedef struct
++{
++	pg_sha256_ctx sha256ctx;
++	uint8		k_opad[SHA256_HMAC_B];
++} scram_HMAC_ctx;
++
++extern void scram_HMAC_init(scram_HMAC_ctx *ctx, const uint8 *key, int keylen);
++extern void scram_HMAC_update(scram_HMAC_ctx *ctx, const char *str, int slen);
++extern void scram_HMAC_final(uint8 *result, scram_HMAC_ctx *ctx);
++
++extern void scram_H(const uint8 *str, int len, uint8 *result);
++extern void scram_ClientOrServerKey(const char *password, const char *salt,
++						int saltlen, int iterations,
++						const char *keystr, uint8 *result);
++
++#endif   /* SCRAM_COMMON_H */
+diff --git a/src/include/libpq/crypt.h b/src/include/libpq/crypt.h
+index f94bc6339bf2..0502d6a0e5bc 100644
+--- a/src/include/libpq/crypt.h
++++ b/src/include/libpq/crypt.h
+@@ -24,7 +24,8 @@
+ typedef enum PasswordType
+ {
+ 	PASSWORD_TYPE_PLAINTEXT = 0,
+-	PASSWORD_TYPE_MD5
++	PASSWORD_TYPE_MD5,
++	PASSWORD_TYPE_SCRAM
+ } PasswordType;
+ 
+ extern PasswordType get_password_type(const char *shadow_pass);
+diff --git a/src/include/libpq/hba.h b/src/include/libpq/hba.h
+index 748a07285412..8f55edb16aa3 100644
+--- a/src/include/libpq/hba.h
++++ b/src/include/libpq/hba.h
+@@ -30,6 +30,7 @@ typedef enum UserAuth
+ 	uaIdent,
+ 	uaPassword,
+ 	uaMD5,
++	uaSASL,
+ 	uaGSS,
+ 	uaSSPI,
+ 	uaPAM,
+diff --git a/src/include/libpq/pqcomm.h b/src/include/libpq/pqcomm.h
+index de9ccc63b137..5441aaa93ac1 100644
+--- a/src/include/libpq/pqcomm.h
++++ b/src/include/libpq/pqcomm.h
+@@ -172,6 +172,8 @@ extern bool Db_user_namespace;
+ #define AUTH_REQ_GSS		7	/* GSSAPI without wrap() */
+ #define AUTH_REQ_GSS_CONT	8	/* Continue GSS exchanges */
+ #define AUTH_REQ_SSPI		9	/* SSPI negotiate without wrap() */
++#define AUTH_REQ_SASL	   10	/* SASL */
++#define AUTH_REQ_SASL_CONT 11	/* continue SASL exchange */
+ 
+ typedef uint32 AuthRequest;
+ 
+diff --git a/src/include/libpq/scram.h b/src/include/libpq/scram.h
+new file mode 100644
+index 000000000000..563462fb1cc5
+--- /dev/null
++++ b/src/include/libpq/scram.h
+@@ -0,0 +1,35 @@
++/*-------------------------------------------------------------------------
++ *
++ * scram.h
++ *	  Interface to libpq/scram.c
++ *
++ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * src/include/libpq/scram.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef PG_SCRAM_H
++#define PG_SCRAM_H
++
++/* Name of SCRAM-SHA-256 per IANA */
++#define SCRAM_SHA256_NAME "SCRAM-SHA-256"
++
++/* Status codes for message exchange */
++#define SASL_EXCHANGE_CONTINUE		0
++#define SASL_EXCHANGE_SUCCESS		1
++#define SASL_EXCHANGE_FAILURE		2
++
++/* Routines dedicated to authentication */
++extern void *pg_be_scram_init(const char *username, const char *shadow_pass, bool doomed);
++extern int pg_be_scram_exchange(void *opaq, char *input, int inputlen,
++					 char **output, int *outputlen, char **logdetail);
++
++/* Routines to handle and check SCRAM-SHA-256 verifier */
++extern char *scram_build_verifier(const char *username,
++					 const char *password,
++					 int iterations);
++extern bool is_scram_verifier(const char *verifier);
++
++#endif   /* PG_SCRAM_H */
+diff --git a/src/interfaces/libpq/.gitignore b/src/interfaces/libpq/.gitignore
+index cb96af717665..2224ada73136 100644
+--- a/src/interfaces/libpq/.gitignore
++++ b/src/interfaces/libpq/.gitignore
+@@ -1,4 +1,5 @@
+ /exports.list
++/base64.c
+ /chklocale.c
+ /crypt.c
+ /getaddrinfo.c
+@@ -7,8 +8,12 @@
+ /inet_net_ntop.c
+ /noblock.c
+ /open.c
++/pg_strong_random.c
+ /pgstrcasecmp.c
+ /pqsignal.c
++/scram-common.c
++/sha2.c
++/sha2_openssl.c
+ /snprintf.c
+ /strerror.c
+ /strlcpy.c
+diff --git a/src/interfaces/libpq/Makefile b/src/interfaces/libpq/Makefile
+index 4b1e552d1678..792232db495a 100644
+--- a/src/interfaces/libpq/Makefile
++++ b/src/interfaces/libpq/Makefile
+@@ -31,7 +31,7 @@ LIBS := $(LIBS:-lpgport=)
+ 
+ # We can't use Makefile variables here because the MSVC build system scrapes
+ # OBJS from this file.
+-OBJS=	fe-auth.o fe-connect.o fe-exec.o fe-misc.o fe-print.o fe-lobj.o \
++OBJS=	fe-auth.o fe-auth-scram.o fe-connect.o fe-exec.o fe-misc.o fe-print.o fe-lobj.o \
+ 	fe-protocol2.o fe-protocol3.o pqexpbuffer.o fe-secure.o \
+ 	libpq-events.o
+ # libpgport C files we always use
+@@ -39,13 +39,22 @@ OBJS += chklocale.o inet_net_ntop.o noblock.o pgstrcasecmp.o pqsignal.o \
+ 	thread.o
+ # libpgport C files that are needed if identified by configure
+ OBJS += $(filter crypt.o getaddrinfo.o getpeereid.o inet_aton.o open.o system.o snprintf.o strerror.o strlcpy.o win32error.o win32setlocale.o, $(LIBOBJS))
++
++ifeq ($(enable_strong_random), yes)
++OBJS += pg_strong_random.o
++else
++OBJS += erand48.o
++endif
++
+ # src/backend/utils/mb
+ OBJS += encnames.o wchar.o
+ # src/common
+-OBJS += ip.o md5.o
++OBJS += base64.o ip.o md5.o scram-common.o
+ 
+ ifeq ($(with_openssl),yes)
+-OBJS += fe-secure-openssl.o
++OBJS += fe-secure-openssl.o sha2_openssl.o
++else
++OBJS += sha2.o
+ endif
+ 
+ ifeq ($(PORTNAME), cygwin)
+@@ -93,7 +102,7 @@ backend_src = $(top_srcdir)/src/backend
+ # For some libpgport modules, this only happens if configure decides
+ # the module is needed (see filter hack in OBJS, above).
+ 
+-chklocale.c crypt.c getaddrinfo.c getpeereid.c inet_aton.c inet_net_ntop.c noblock.c open.c system.c pgsleep.c pgstrcasecmp.c pqsignal.c snprintf.c strerror.c strlcpy.c thread.c win32error.c win32setlocale.c: % : $(top_srcdir)/src/port/%
++chklocale.c crypt.c erand48.c getaddrinfo.c getpeereid.c inet_aton.c inet_net_ntop.c noblock.c open.c system.c pgsleep.c pg_strong_random.c pgstrcasecmp.c pqsignal.c snprintf.c strerror.c strlcpy.c thread.c win32error.c win32setlocale.c: % : $(top_srcdir)/src/port/%
+ 	rm -f $@ && $(LN_S) $< .
+ 
+ ip.c md5.c: % : $(top_srcdir)/src/common/%
+@@ -102,6 +111,9 @@ ip.c md5.c: % : $(top_srcdir)/src/common/%
+ encnames.c wchar.c: % : $(backend_src)/utils/mb/%
+ 	rm -f $@ && $(LN_S) $< .
+ 
++base64.c scram-common.c sha2.c sha2_openssl.c: % : $(top_srcdir)/src/common/%
++	rm -f $@ && $(LN_S) $< .
++
+ 
+ distprep: libpq-dist.rc
+ 
+diff --git a/src/interfaces/libpq/fe-auth-scram.c b/src/interfaces/libpq/fe-auth-scram.c
+new file mode 100644
+index 000000000000..14331f8d6189
+--- /dev/null
++++ b/src/interfaces/libpq/fe-auth-scram.c
+@@ -0,0 +1,640 @@
++/*-------------------------------------------------------------------------
++ *
++ * fe-auth-scram.c
++ *	   The front-end (client) implementation of SCRAM authentication.
++ *
++ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *	  src/interfaces/libpq/fe-auth-scram.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres_fe.h"
++
++#include "common/base64.h"
++#include "common/scram-common.h"
++#include "fe-auth.h"
++
++/* These are needed for getpid(), in the fallback implementation */
++#ifndef HAVE_STRONG_RANDOM
++#include <sys/types.h>
++#include <unistd.h>
++#endif
++
++/*
++ * Status of exchange messages used for SCRAM authentication via the
++ * SASL protocol.
++ */
++typedef enum
++{
++	FE_SCRAM_INIT,
++	FE_SCRAM_NONCE_SENT,
++	FE_SCRAM_PROOF_SENT,
++	FE_SCRAM_FINISHED
++} fe_scram_state_enum;
++
++typedef struct
++{
++	fe_scram_state_enum state;
++
++	/* These are supplied by the user */
++	const char *username;
++	const char *password;
++
++	/* We construct these */
++	char	   *client_nonce;
++	char	   *client_first_message_bare;
++	char	   *client_final_message_without_proof;
++
++	/* These come from the server-first message */
++	char	   *server_first_message;
++	char	   *salt;
++	int			saltlen;
++	int			iterations;
++	char	   *nonce;
++
++	/* These come from the server-final message */
++	char	   *server_final_message;
++	char		ServerProof[SCRAM_KEY_LEN];
++} fe_scram_state;
++
++static bool read_server_first_message(fe_scram_state *state, char *input,
++						  PQExpBuffer errormessage);
++static bool read_server_final_message(fe_scram_state *state, char *input,
++						  PQExpBuffer errormessage);
++static char *build_client_first_message(fe_scram_state *state,
++						   PQExpBuffer errormessage);
++static char *build_client_final_message(fe_scram_state *state,
++						   PQExpBuffer errormessage);
++static bool verify_server_proof(fe_scram_state *state);
++static void calculate_client_proof(fe_scram_state *state,
++					   const char *client_final_message_without_proof,
++					   uint8 *result);
++static bool pg_frontend_random(char *dst, int len);
++
++/*
++ * Initialize SCRAM exchange status.
++ */
++void *
++pg_fe_scram_init(const char *username, const char *password)
++{
++	fe_scram_state *state;
++
++	state = (fe_scram_state *) malloc(sizeof(fe_scram_state));
++	if (!state)
++		return NULL;
++	memset(state, 0, sizeof(fe_scram_state));
++	state->state = FE_SCRAM_INIT;
++	state->username = username;
++	state->password = password;
++
++	return state;
++}
++
++/*
++ * Free SCRAM exchange status
++ */
++void
++pg_fe_scram_free(void *opaq)
++{
++	fe_scram_state *state = (fe_scram_state *) opaq;
++
++	/* client messages */
++	if (state->client_nonce)
++		free(state->client_nonce);
++	if (state->client_first_message_bare)
++		free(state->client_first_message_bare);
++	if (state->client_final_message_without_proof)
++		free(state->client_final_message_without_proof);
++
++	/* first message from server */
++	if (state->server_first_message)
++		free(state->server_first_message);
++	if (state->salt)
++		free(state->salt);
++	if (state->nonce)
++		free(state->nonce);
++
++	/* final message from server */
++	if (state->server_final_message)
++		free(state->server_final_message);
++
++	free(state);
++}
++
++/*
++ * Exchange a SCRAM message with backend.
++ */
++void
++pg_fe_scram_exchange(void *opaq, char *input, int inputlen,
++					 char **output, int *outputlen,
++					 bool *done, bool *success, PQExpBuffer errorMessage)
++{
++	fe_scram_state *state = (fe_scram_state *) opaq;
++
++	*done = false;
++	*success = false;
++	*output = NULL;
++	*outputlen = 0;
++
++	/*
++	 * Check that the input length agrees with the string length of the input.
++	 * We can ignore inputlen after this.
++	 */
++	if (state->state != FE_SCRAM_INIT)
++	{
++		if (inputlen == 0)
++		{
++			printfPQExpBuffer(errorMessage,
++				 libpq_gettext("malformed SCRAM message (empty message)\n"));
++			goto error;
++		}
++		if (inputlen != strlen(input))
++		{
++			printfPQExpBuffer(errorMessage,
++			   libpq_gettext("malformed SCRAM message (length mismatch)\n"));
++			goto error;
++		}
++	}
++
++	switch (state->state)
++	{
++		case FE_SCRAM_INIT:
++			/* Begin the SCRAM handshake, by sending client nonce */
++			*output = build_client_first_message(state, errorMessage);
++			if (*output == NULL)
++				goto error;
++
++			*outputlen = strlen(*output);
++			*done = false;
++			state->state = FE_SCRAM_NONCE_SENT;
++			break;
++
++		case FE_SCRAM_NONCE_SENT:
++			/* Receive salt and server nonce, send response. */
++			if (!read_server_first_message(state, input, errorMessage))
++				goto error;
++
++			*output = build_client_final_message(state, errorMessage);
++			if (*output == NULL)
++				goto error;
++
++			*outputlen = strlen(*output);
++			*done = false;
++			state->state = FE_SCRAM_PROOF_SENT;
++			break;
++
++		case FE_SCRAM_PROOF_SENT:
++			/* Receive server proof */
++			if (!read_server_final_message(state, input, errorMessage))
++				goto error;
++
++			/*
++			 * Verify server proof, to make sure we're talking to the genuine
++			 * server.  XXX: A fake server could simply not require
++			 * authentication, though.  There is currently no option in libpq
++			 * to reject a connection, if SCRAM authentication did not happen.
++			 */
++			if (verify_server_proof(state))
++				*success = true;
++			else
++			{
++				*success = false;
++				printfPQExpBuffer(errorMessage,
++								  libpq_gettext("invalid server proof\n"));
++			}
++			*done = true;
++			state->state = FE_SCRAM_FINISHED;
++			break;
++
++		default:
++			/* shouldn't happen */
++			printfPQExpBuffer(errorMessage,
++							libpq_gettext("invalid SCRAM exchange state\n"));
++			goto error;
++	}
++	return;
++
++error:
++	*done = true;
++	*success = false;
++	return;
++}
++
++/*
++ * Read value for an attribute part of a SASL message.
++ */
++static char *
++read_attr_value(char **input, char attr, PQExpBuffer errorMessage)
++{
++	char	   *begin = *input;
++	char	   *end;
++
++	if (*begin != attr)
++	{
++		printfPQExpBuffer(errorMessage,
++					libpq_gettext("malformed SCRAM message (%c expected)\n"),
++						  attr);
++		return NULL;
++	}
++	begin++;
++
++	if (*begin != '=')
++	{
++		printfPQExpBuffer(errorMessage,
++		libpq_gettext("malformed SCRAM message (expected = in attr '%c')\n"),
++						  attr);
++		return NULL;
++	}
++	begin++;
++
++	end = begin;
++	while (*end && *end != ',')
++		end++;
++
++	if (*end)
++	{
++		*end = '\0';
++		*input = end + 1;
++	}
++	else
++		*input = end;
++
++	return begin;
++}
++
++/*
++ * Build the first exchange message sent by the client.
++ */
++static char *
++build_client_first_message(fe_scram_state *state, PQExpBuffer errormessage)
++{
++	char		raw_nonce[SCRAM_RAW_NONCE_LEN + 1];
++	char	   *buf;
++	char		buflen;
++	int			encoded_len;
++
++	/*
++	 * Generate a "raw" nonce.  This is converted to ASCII-printable form by
++	 * base64-encoding it.
++	 */
++	if (!pg_frontend_random(raw_nonce, SCRAM_RAW_NONCE_LEN))
++	{
++		printfPQExpBuffer(errormessage,
++						  libpq_gettext("failed to generate nonce\n"));
++		return NULL;
++	}
++
++	state->client_nonce = malloc(pg_b64_enc_len(SCRAM_RAW_NONCE_LEN) + 1);
++	if (state->client_nonce == NULL)
++	{
++		printfPQExpBuffer(errormessage,
++						  libpq_gettext("out of memory\n"));
++		return NULL;
++	}
++	encoded_len = pg_b64_encode(raw_nonce, SCRAM_RAW_NONCE_LEN, state->client_nonce);
++	state->client_nonce[encoded_len] = '\0';
++
++	/*
++	 * Generate message.  The username is left empty as the backend uses the
++	 * value provided by the startup packet.  Also, as this username is not
++	 * prepared with SASLprep, the message parsing would fail if it includes
++	 * '=' or ',' characters.
++	 */
++	buflen = 8 + strlen(state->client_nonce) + 1;
++	buf = malloc(buflen);
++	if (buf == NULL)
++	{
++		printfPQExpBuffer(errormessage,
++						  libpq_gettext("out of memory\n"));
++		return NULL;
++	}
++	snprintf(buf, buflen, "n,,n=,r=%s", state->client_nonce);
++
++	state->client_first_message_bare = strdup(buf + 3);
++	if (!state->client_first_message_bare)
++	{
++		free(buf);
++		printfPQExpBuffer(errormessage,
++						  libpq_gettext("out of memory\n"));
++		return NULL;
++	}
++
++	return buf;
++}
++
++/*
++ * Build the final exchange message sent from the client.
++ */
++static char *
++build_client_final_message(fe_scram_state *state, PQExpBuffer errormessage)
++{
++	PQExpBufferData buf;
++	uint8		client_proof[SCRAM_KEY_LEN];
++	char	   *result;
++
++	initPQExpBuffer(&buf);
++
++	/*
++	 * Construct client-final-message-without-proof.  We need to remember it
++	 * for verifying the server proof in the final step of authentication.
++	 */
++	appendPQExpBuffer(&buf, "c=biws,r=%s", state->nonce);
++	if (PQExpBufferDataBroken(buf))
++		goto oom_error;
++
++	state->client_final_message_without_proof = strdup(buf.data);
++	if (state->client_final_message_without_proof == NULL)
++		goto oom_error;
++
++	/* Append proof to it, to form client-final-message. */
++	calculate_client_proof(state,
++						   state->client_final_message_without_proof,
++						   client_proof);
++
++	appendPQExpBuffer(&buf, ",p=");
++	if (!enlargePQExpBuffer(&buf, pg_b64_enc_len(SCRAM_KEY_LEN)))
++		goto oom_error;
++	buf.len += pg_b64_encode((char *) client_proof,
++							 SCRAM_KEY_LEN,
++							 buf.data + buf.len);
++	buf.data[buf.len] = '\0';
++
++	result = strdup(buf.data);
++	if (result == NULL)
++		goto oom_error;
++
++	termPQExpBuffer(&buf);
++	return result;
++
++oom_error:
++	termPQExpBuffer(&buf);
++	printfPQExpBuffer(errormessage,
++					  libpq_gettext("out of memory\n"));
++	return NULL;
++}
++
++/*
++ * Read the first exchange message coming from the server.
++ */
++static bool
++read_server_first_message(fe_scram_state *state, char *input,
++						  PQExpBuffer errormessage)
++{
++	char	   *iterations_str;
++	char	   *endptr;
++	char	   *encoded_salt;
++	char	   *nonce;
++
++	state->server_first_message = strdup(input);
++	if (state->server_first_message == NULL)
++	{
++		printfPQExpBuffer(errormessage,
++						  libpq_gettext("out of memory\n"));
++		return false;
++	}
++
++	/* parse the message */
++	nonce = read_attr_value(&input, 'r', errormessage);
++	if (nonce == NULL)
++	{
++		/* read_attr_value() has generated an error string */
++		return false;
++	}
++
++	/* Verify immediately that the server used our part of the nonce */
++	if (strncmp(nonce, state->client_nonce, strlen(state->client_nonce)) != 0)
++	{
++		printfPQExpBuffer(errormessage,
++				 libpq_gettext("invalid SCRAM response (nonce mismatch)\n"));
++		return false;
++	}
++
++	state->nonce = strdup(nonce);
++	if (state->nonce == NULL)
++	{
++		printfPQExpBuffer(errormessage,
++						  libpq_gettext("out of memory\n"));
++		return false;
++	}
++
++	encoded_salt = read_attr_value(&input, 's', errormessage);
++	if (encoded_salt == NULL)
++	{
++		/* read_attr_value() has generated an error string */
++		return false;
++	}
++	state->salt = malloc(pg_b64_dec_len(strlen(encoded_salt)));
++	if (state->salt == NULL)
++	{
++		printfPQExpBuffer(errormessage,
++						  libpq_gettext("out of memory\n"));
++		return false;
++	}
++	state->saltlen = pg_b64_decode(encoded_salt,
++								   strlen(encoded_salt),
++								   state->salt);
++
++	iterations_str = read_attr_value(&input, 'i', errormessage);
++	if (iterations_str == NULL)
++	{
++		/* read_attr_value() has generated an error string */
++		return false;
++	}
++	state->iterations = strtol(iterations_str, &endptr, SCRAM_ITERATION_LEN);
++	if (*endptr != '\0' || state->iterations < 1)
++	{
++		printfPQExpBuffer(errormessage,
++		libpq_gettext("malformed SCRAM message (invalid iteration count)\n"));
++		return false;
++	}
++
++	if (*input != '\0')
++		printfPQExpBuffer(errormessage,
++						  libpq_gettext("malformed SCRAM message (garbage at end of server-first-message)\n"));
++
++	return true;
++}
++
++/*
++ * Read the final exchange message coming from the server.
++ */
++static bool
++read_server_final_message(fe_scram_state *state,
++						  char *input,
++						  PQExpBuffer errormessage)
++{
++	char	   *encoded_server_proof;
++	int			server_proof_len;
++
++	state->server_final_message = strdup(input);
++	if (!state->server_final_message)
++	{
++		printfPQExpBuffer(errormessage,
++						  libpq_gettext("out of memory\n"));
++		return false;
++	}
++
++	/* Check for error result. */
++	if (*input == 'e')
++	{
++		char	   *errmsg = read_attr_value(&input, 'e', errormessage);
++
++		printfPQExpBuffer(errormessage,
++		  libpq_gettext("error received from server in SASL exchange: %s\n"),
++						  errmsg);
++		return false;
++	}
++
++	/* Parse the message. */
++	encoded_server_proof = read_attr_value(&input, 'v', errormessage);
++	if (encoded_server_proof == NULL)
++	{
++		/* read_attr_value() has generated an error message */
++		return false;
++	}
++
++	if (*input != '\0')
++		printfPQExpBuffer(errormessage,
++						  libpq_gettext("malformed SCRAM message (garbage at end of server-final-message)\n"));
++
++	server_proof_len = pg_b64_decode(encoded_server_proof,
++									 strlen(encoded_server_proof),
++									 state->ServerProof);
++	if (server_proof_len != SCRAM_KEY_LEN)
++	{
++		printfPQExpBuffer(errormessage,
++		  libpq_gettext("malformed SCRAM message (invalid server proof)\n"));
++		return false;
++	}
++
++	return true;
++}
++
++/*
++ * Calculate the client proof, part of the final exchange message sent
++ * by the client.
++ */
++static void
++calculate_client_proof(fe_scram_state *state,
++					   const char *client_final_message_without_proof,
++					   uint8 *result)
++{
++	uint8		StoredKey[SCRAM_KEY_LEN];
++	uint8		ClientKey[SCRAM_KEY_LEN];
++	uint8		ClientSignature[SCRAM_KEY_LEN];
++	int			i;
++	scram_HMAC_ctx ctx;
++
++	scram_ClientOrServerKey(state->password, state->salt, state->saltlen,
++						state->iterations, SCRAM_CLIENT_KEY_NAME, ClientKey);
++	scram_H(ClientKey, SCRAM_KEY_LEN, StoredKey);
++
++	scram_HMAC_init(&ctx, StoredKey, SCRAM_KEY_LEN);
++	scram_HMAC_update(&ctx,
++					  state->client_first_message_bare,
++					  strlen(state->client_first_message_bare));
++	scram_HMAC_update(&ctx, ",", 1);
++	scram_HMAC_update(&ctx,
++					  state->server_first_message,
++					  strlen(state->server_first_message));
++	scram_HMAC_update(&ctx, ",", 1);
++	scram_HMAC_update(&ctx,
++					  client_final_message_without_proof,
++					  strlen(client_final_message_without_proof));
++	scram_HMAC_final(ClientSignature, &ctx);
++
++	for (i = 0; i < SCRAM_KEY_LEN; i++)
++		result[i] = ClientKey[i] ^ ClientSignature[i];
++}
++
++/*
++ * Validate the server proof, received as part of the final exchange message
++ * received from the server.
++ */
++static bool
++verify_server_proof(fe_scram_state *state)
++{
++	uint8		ServerSignature[SCRAM_KEY_LEN];
++	uint8		ServerKey[SCRAM_KEY_LEN];
++	scram_HMAC_ctx ctx;
++
++	scram_ClientOrServerKey(state->password, state->salt, state->saltlen,
++							state->iterations, SCRAM_SERVER_KEY_NAME,
++							ServerKey);
++
++	/* calculate ServerSignature */
++	scram_HMAC_init(&ctx, ServerKey, SCRAM_KEY_LEN);
++	scram_HMAC_update(&ctx,
++					  state->client_first_message_bare,
++					  strlen(state->client_first_message_bare));
++	scram_HMAC_update(&ctx, ",", 1);
++	scram_HMAC_update(&ctx,
++					  state->server_first_message,
++					  strlen(state->server_first_message));
++	scram_HMAC_update(&ctx, ",", 1);
++	scram_HMAC_update(&ctx,
++					  state->client_final_message_without_proof,
++					  strlen(state->client_final_message_without_proof));
++	scram_HMAC_final(ServerSignature, &ctx);
++
++	if (memcmp(ServerSignature, state->ServerProof, SCRAM_KEY_LEN) != 0)
++		return false;
++
++	return true;
++}
++
++/*
++ * Random number generator.
++ */
++static bool
++pg_frontend_random(char *dst, int len)
++{
++#ifdef HAVE_STRONG_RANDOM
++	return pg_strong_random(dst, len);
++#else
++	int			i;
++	char	   *end = dst + len;
++
++	static unsigned short seed[3];
++	static int	mypid = 0;
++
++	pglock_thread();
++
++	if (mypid != getpid())
++	{
++		struct timeval now;
++
++		gettimeofday(&now, NULL);
++
++		seed[0] = now.tv_sec ^ getpid();
++		seed[1] = (unsigned short) (now.tv_usec);
++		seed[2] = (unsigned short) (now.tv_usec >> 16);
++	}
++
++	for (i = 0; dst < end; i++)
++	{
++		uint32		r;
++		int			j;
++
++		/*
++		 * pg_jrand48 returns a 32-bit integer.  Fill the next 4 bytes from
++		 * it.
++		 */
++		r = (uint32) pg_jrand48(seed);
++
++		for (j = 0; j < 4 && dst < end; j++)
++		{
++			*(dst++) = (char) (r & 0xFF);
++			r >>= 8;
++		}
++	}
++
++	pgunlock_thread();
++
++	return true;
++#endif
++}
+diff --git a/src/interfaces/libpq/fe-auth.c b/src/interfaces/libpq/fe-auth.c
+index b47a16e3d019..c69260b52264 100644
+--- a/src/interfaces/libpq/fe-auth.c
++++ b/src/interfaces/libpq/fe-auth.c
+@@ -40,6 +40,7 @@
+ 
+ #include "common/md5.h"
+ #include "libpq-fe.h"
++#include "libpq/scram.h"
+ #include "fe-auth.h"
+ 
+ 
+@@ -432,6 +433,87 @@ pg_SSPI_startup(PGconn *conn, int use_negotiate)
+ }
+ #endif   /* ENABLE_SSPI */
+ 
++/*
++ * Initialize SASL authentication exchange.
++ */
++static bool
++pg_SASL_init(PGconn *conn, const char *auth_mechanism)
++{
++	/*
++	 * Check the authentication mechanism (only SCRAM-SHA-256 is supported at
++	 * the moment.)
++	 */
++	if (strcmp(auth_mechanism, SCRAM_SHA256_NAME) == 0)
++	{
++		char	   *password = conn->connhost[conn->whichhost].password;
++
++		if (password == NULL)
++			password = conn->pgpass;
++		conn->password_needed = true;
++		if (password == NULL || password == '\0')
++		{
++			printfPQExpBuffer(&conn->errorMessage,
++							  PQnoPasswordSupplied);
++			return STATUS_ERROR;
++		}
++
++		conn->sasl_state = pg_fe_scram_init(conn->pguser, password);
++		if (!conn->sasl_state)
++		{
++			printfPQExpBuffer(&conn->errorMessage,
++							  libpq_gettext("out of memory\n"));
++			return STATUS_ERROR;
++		}
++
++		return STATUS_OK;
++	}
++	else
++	{
++		printfPQExpBuffer(&conn->errorMessage,
++		   libpq_gettext("SASL authentication mechanism %s not supported\n"),
++						  (char *) conn->auth_req_inbuf);
++		return STATUS_ERROR;
++	}
++}
++
++/*
++ * Exchange a message for SASL communication protocol with the backend.
++ * This should be used after calling pg_SASL_init to set up the status of
++ * the protocol.
++ */
++static int
++pg_SASL_exchange(PGconn *conn)
++{
++	char	   *output;
++	int			outputlen;
++	bool		done;
++	bool		success;
++	int			res;
++
++	pg_fe_scram_exchange(conn->sasl_state,
++						 conn->auth_req_inbuf, conn->auth_req_inlen,
++						 &output, &outputlen,
++						 &done, &success, &conn->errorMessage);
++	if (outputlen != 0)
++	{
++		/*
++		 * Send the SASL response to the server. We don't care if it's the
++		 * first or subsequent packet, just send the same kind of password
++		 * packet.
++		 */
++		res = pqPacketSend(conn, 'p', output, outputlen);
++		free(output);
++
++		if (res != STATUS_OK)
++			return STATUS_ERROR;
++	}
++
++	if (done && !success)
++		return STATUS_ERROR;
++
++	return STATUS_OK;
++}
++
+ /*
+  * Respond to AUTH_REQ_SCM_CREDS challenge.
+  *
+@@ -707,6 +789,36 @@ pg_fe_sendauth(AuthRequest areq, PGconn *conn)
+ 				break;
+ 			}
+ 
++		case AUTH_REQ_SASL:
++
++			/*
++			 * The request contains the name (as assigned by IANA) of the
++			 * authentication mechanism.
++			 */
++			if (pg_SASL_init(conn, conn->auth_req_inbuf) != STATUS_OK)
++			{
++				/* pg_SASL_init already set the error message */
++				return STATUS_ERROR;
++			}
++			/* fall through */
++
++		case AUTH_REQ_SASL_CONT:
++			if (conn->sasl_state == NULL)
++			{
++				printfPQExpBuffer(&conn->errorMessage,
++								  "fe_sendauth: invalid authentication request from server: AUTH_REQ_SASL_CONT without AUTH_REQ_SASL\n");
++				return STATUS_ERROR;
++			}
++			if (pg_SASL_exchange(conn) != STATUS_OK)
++			{
++				/* Use error message, if set already */
++				if (conn->errorMessage.len == 0)
++					printfPQExpBuffer(&conn->errorMessage,
++							  "fe_sendauth: error in SASL authentication\n");
++				return STATUS_ERROR;
++			}
++			break;
++
+ 		case AUTH_REQ_SCM_CREDS:
+ 			if (pg_local_sendauth(conn) != STATUS_OK)
+ 				return STATUS_ERROR;
+diff --git a/src/interfaces/libpq/fe-auth.h b/src/interfaces/libpq/fe-auth.h
+index 0aa6a2876832..204790cea466 100644
+--- a/src/interfaces/libpq/fe-auth.h
++++ b/src/interfaces/libpq/fe-auth.h
+@@ -18,7 +18,15 @@
+ #include "libpq-int.h"
+ 
+ 
++/* Prototypes for functions in fe-auth.c */
+ extern int	pg_fe_sendauth(AuthRequest areq, PGconn *conn);
+ extern char *pg_fe_getauthname(PQExpBuffer errorMessage);
+ 
++/* Prototypes for functions in fe-auth-scram.c */
++extern void *pg_fe_scram_init(const char *username, const char *password);
++extern void pg_fe_scram_free(void *opaq);
++extern void pg_fe_scram_exchange(void *opaq, char *input, int inputlen,
++					 char **output, int *outputlen,
++					 bool *done, bool *success, PQExpBuffer errorMessage);
++
+ #endif   /* FE_AUTH_H */
+diff --git a/src/interfaces/libpq/fe-connect.c b/src/interfaces/libpq/fe-connect.c
+index 685f355ab36e..c1814f5fe435 100644
+--- a/src/interfaces/libpq/fe-connect.c
++++ b/src/interfaces/libpq/fe-connect.c
+@@ -2720,6 +2720,49 @@ PQconnectPoll(PGconn *conn)
+ 					}
+ 				}
+ #endif
++				/* Get additional payload for SASL, if any */
++				if ((areq == AUTH_REQ_SASL ||
++					 areq == AUTH_REQ_SASL_CONT) &&
++					msgLength > 4)
++				{
++					int			llen = msgLength - 4;
++
++					/*
++					 * We can be called repeatedly for the same buffer. Avoid
++					 * re-allocating the buffer in this case - just re-use the
++					 * old buffer.
++					 */
++					if (llen != conn->auth_req_inlen)
++					{
++						if (conn->auth_req_inbuf)
++						{
++							free(conn->auth_req_inbuf);
++							conn->auth_req_inbuf = NULL;
++						}
++
++						conn->auth_req_inlen = llen;
++						conn->auth_req_inbuf = malloc(llen + 1);
++						if (!conn->auth_req_inbuf)
++						{
++							printfPQExpBuffer(&conn->errorMessage,
++											  libpq_gettext("out of memory allocating SASL buffer (%d)"),
++											  llen);
++							goto error_return;
++						}
++					}
++
++					if (pqGetnchar(conn->auth_req_inbuf, llen, conn))
++					{
++						/* We'll come back when there is more data. */
++						return PGRES_POLLING_READING;
++					}
++
++					/*
++					 * For safety and convenience, always ensure the in-buffer
++					 * is NULL-terminated.
++					 */
++					conn->auth_req_inbuf[llen] = '\0';
++				}
+ 
+ 				/*
+ 				 * OK, we successfully read the message; mark data consumed
+@@ -3506,6 +3549,15 @@ closePGconn(PGconn *conn)
+ 		conn->sspictx = NULL;
+ 	}
+ #endif
++	if (conn->sasl_state)
++	{
++		/*
++		 * XXX: if support for more authentication mechanisms is added, this
++		 * needs to call the right 'free' function.
++		 */
++		pg_fe_scram_free(conn->sasl_state);
++		conn->sasl_state = NULL;
++	}
+ }
+ 
+ /*
+diff --git a/src/interfaces/libpq/libpq-int.h b/src/interfaces/libpq/libpq-int.h
+index 24242da221e3..360956d6eb3f 100644
+--- a/src/interfaces/libpq/libpq-int.h
++++ b/src/interfaces/libpq/libpq-int.h
+@@ -453,7 +453,12 @@ struct pg_conn
+ 	PGresult   *result;			/* result being constructed */
+ 	PGresult   *next_result;	/* next result (used in single-row mode) */
+ 
+-	/* Assorted state for SSL, GSS, etc */
++	/* Buffer to hold incoming authentication request data */
++	char	   *auth_req_inbuf;
++	int			auth_req_inlen;
++
++	/* Assorted state for SASL, SSL, GSS, etc */
++	void	   *sasl_state;
+ 
+ #ifdef USE_SSL
+ 	bool		allow_ssl_try;	/* Allowed to try SSL negotiation */
+diff --git a/src/tools/msvc/Mkvcbuild.pm b/src/tools/msvc/Mkvcbuild.pm
+index 282471176714..12f73f344cfb 100644
+--- a/src/tools/msvc/Mkvcbuild.pm
++++ b/src/tools/msvc/Mkvcbuild.pm
+@@ -110,9 +110,9 @@ sub mkvcbuild
+ 	}
+ 
+ 	our @pgcommonallfiles = qw(
+-	  config_info.c controldata_utils.c exec.c ip.c keywords.c
++	  base64.c config_info.c controldata_utils.c exec.c ip.c keywords.c
+ 	  md5.c pg_lzcompress.c pgfnames.c psprintf.c relpath.c rmtree.c
+-	  string.c username.c wait_error.c);
++	  scram-common.c string.c username.c wait_error.c);
+ 
+ 	if ($solution->{options}->{openssl})
+ 	{
+@@ -233,10 +233,16 @@ sub mkvcbuild
+ 	$libpq->AddReference($libpgport);
+ 
+    # The OBJS scraper doesn't know about ifdefs, so remove fe-secure-openssl.c
+-   # if building without OpenSSL
++   # and sha2_openssl.c if building without OpenSSL, and remove sha2.c if
++   # building with OpenSSL.
+ 	if (!$solution->{options}->{openssl})
+ 	{
+ 		$libpq->RemoveFile('src/interfaces/libpq/fe-secure-openssl.c');
++		$libpq->RemoveFile('src/common/sha2_openssl.c');
++	}
++	else
++	{
++		$libpq->RemoveFile('src/common/sha2.c');
+ 	}
+ 
+ 	my $libpqwalreceiver =

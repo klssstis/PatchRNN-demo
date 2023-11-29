@@ -1,0 +1,120 @@
+From 641f3dffcdf1c7378cfb94c98b6642793181d6db Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 11 Mar 2022 13:47:26 -0500
+Subject: [PATCH] Restore the previous semantics of get_constraint_index().
+
+Commit 8b069ef5d changed this function to look at pg_constraint.conindid
+rather than searching pg_depend.  That was a good performance improvement,
+but it failed to preserve the exact semantics.  The old code would only
+return an index that was "owned by" (internally dependent on) the
+specified constraint, whereas the new code will also return indexes that
+are just referenced by foreign key constraints.  This confuses ALTER
+TABLE, which was implicitly expecting the previous semantics, into
+failing with errors like
+    ERROR:  relation 146621 has multiple clustered indexes
+or
+    ERROR:  "pk_attbl" is not an index for table "atref"
+
+We can fix this without reverting the performance improvement by adding
+a contype check in get_constraint_index().  Another way could be to
+make ALTER TABLE check it, but I'm worried that extension code could
+also have subtle dependencies on the old semantics.
+
+Tom Lane and Japin Li, per bug #17409 from Holly Roberts.
+Back-patch to v14 where the error crept in.
+
+Discussion: https://postgr.es/m/17409-52871dda8b5741cb@postgresql.org
+---
+ src/backend/utils/cache/lsyscache.c       | 16 +++++++++++++---
+ src/test/regress/expected/alter_table.out | 14 ++++++++++++++
+ src/test/regress/sql/alter_table.sql      | 18 ++++++++++++++++++
+ 3 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/utils/cache/lsyscache.c b/src/backend/utils/cache/lsyscache.c
+index feef99986346..1b7e11b93e01 100644
+--- a/src/backend/utils/cache/lsyscache.c
++++ b/src/backend/utils/cache/lsyscache.c
+@@ -1126,8 +1126,13 @@ get_constraint_name(Oid conoid)
+  *		Given the OID of a unique, primary-key, or exclusion constraint,
+  *		return the OID of the underlying index.
+  *
+- * Return InvalidOid if the index couldn't be found; this suggests the
+- * given OID is bogus, but we leave it to caller to decide what to do.
++ * Returns InvalidOid if the constraint could not be found or is of
++ * the wrong type.
++ *
++ * The intent of this function is to return the index "owned" by the
++ * specified constraint.  Therefore we must check contype, since some
++ * pg_constraint entries (e.g. for foreign-key constraints) store the
++ * OID of an index that is referenced but not owned by the constraint.
+  */
+ Oid
+ get_constraint_index(Oid conoid)
+@@ -1140,7 +1145,12 @@ get_constraint_index(Oid conoid)
+ 		Form_pg_constraint contup = (Form_pg_constraint) GETSTRUCT(tp);
+ 		Oid			result;
+ 
+-		result = contup->conindid;
++		if (contup->contype == CONSTRAINT_UNIQUE ||
++			contup->contype == CONSTRAINT_PRIMARY ||
++			contup->contype == CONSTRAINT_EXCLUSION)
++			result = contup->conindid;
++		else
++			result = InvalidOid;
+ 		ReleaseSysCache(tp);
+ 		return result;
+ 	}
+diff --git a/src/test/regress/expected/alter_table.out b/src/test/regress/expected/alter_table.out
+index 16e047566341..aabc564e2c8e 100644
+--- a/src/test/regress/expected/alter_table.out
++++ b/src/test/regress/expected/alter_table.out
+@@ -4502,6 +4502,20 @@ create trigger xtrig
+ update bar1 set a = a + 1;
+ INFO:  a=1, b=1
+ /* End test case for bug #16242 */
++/* Test case for bug #17409 */
++create table attbl (p1 int constraint pk_attbl primary key);
++create table atref (c1 int references attbl(p1));
++cluster attbl using pk_attbl;
++alter table attbl alter column p1 set data type bigint;
++alter table atref alter column c1 set data type bigint;
++drop table attbl, atref;
++create table attbl (p1 int constraint pk_attbl primary key);
++alter table attbl replica identity using index pk_attbl;
++create table atref (c1 int references attbl(p1));
++alter table attbl alter column p1 set data type bigint;
++alter table atref alter column c1 set data type bigint;
++drop table attbl, atref;
++/* End test case for bug #17409 */
+ -- Test that ALTER TABLE rewrite preserves a clustered index
+ -- for normal indexes and indexes on constraints.
+ create table alttype_cluster (a int);
+diff --git a/src/test/regress/sql/alter_table.sql b/src/test/regress/sql/alter_table.sql
+index ac894c0602c6..cce1cb1dd3c1 100644
+--- a/src/test/regress/sql/alter_table.sql
++++ b/src/test/regress/sql/alter_table.sql
+@@ -2958,6 +2958,24 @@ update bar1 set a = a + 1;
+ 
+ /* End test case for bug #16242 */
+ 
++/* Test case for bug #17409 */
++
++create table attbl (p1 int constraint pk_attbl primary key);
++create table atref (c1 int references attbl(p1));
++cluster attbl using pk_attbl;
++alter table attbl alter column p1 set data type bigint;
++alter table atref alter column c1 set data type bigint;
++drop table attbl, atref;
++
++create table attbl (p1 int constraint pk_attbl primary key);
++alter table attbl replica identity using index pk_attbl;
++create table atref (c1 int references attbl(p1));
++alter table attbl alter column p1 set data type bigint;
++alter table atref alter column c1 set data type bigint;
++drop table attbl, atref;
++
++/* End test case for bug #17409 */
++
+ -- Test that ALTER TABLE rewrite preserves a clustered index
+ -- for normal indexes and indexes on constraints.
+ create table alttype_cluster (a int);

@@ -1,0 +1,159 @@
+From 0662eb6219f1f4bafc1916a0bf2813cdc58e5eca Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 9 Aug 2019 13:20:28 -0400
+Subject: [PATCH] Fix SIGSEGV in pruning for ScalarArrayOp with constant-null
+ array.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Not much to be said here: commit 9fdb675fc should have checked
+constisnull, didn't.
+
+Per report from Piotr Włodarczyk.  Back-patch to v11 where
+bug was introduced.
+
+Discussion: https://postgr.es/m/CAP-dhMr+vRpwizEYjUjsiZ1vwqpohTm+3Pbdt6Pr7FEgPq9R0Q@mail.gmail.com
+---
+ src/backend/partitioning/partprune.c          |  7 +-
+ src/test/regress/expected/partition_prune.out | 66 +++++++++++++++++++
+ src/test/regress/sql/partition_prune.sql      | 10 +++
+ 3 files changed, 82 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/partitioning/partprune.c b/src/backend/partitioning/partprune.c
+index 2ed1e44c1816..2ee47b8c8a92 100644
+--- a/src/backend/partitioning/partprune.c
++++ b/src/backend/partitioning/partprune.c
+@@ -2059,7 +2059,7 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
+ 			 * nodes, one for each array element (excepting nulls).
+ 			 */
+ 			Const	   *arr = (Const *) rightop;
+-			ArrayType  *arrval = DatumGetArrayTypeP(arr->constvalue);
++			ArrayType  *arrval;
+ 			int16		elemlen;
+ 			bool		elembyval;
+ 			char		elemalign;
+@@ -2068,6 +2068,11 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
+ 			int			num_elems,
+ 						i;
+ 
++			/* If the array itself is null, the saop returns null */
++			if (arr->constisnull)
++				return PARTCLAUSE_MATCH_CONTRADICT;
++
++			arrval = DatumGetArrayTypeP(arr->constvalue);
+ 			get_typlenbyvalalign(ARR_ELEMTYPE(arrval),
+ 								 &elemlen, &elembyval, &elemalign);
+ 			deconstruct_array(arrval,
+diff --git a/src/test/regress/expected/partition_prune.out b/src/test/regress/expected/partition_prune.out
+index 6ccc91d390c7..82b68e793d3f 100644
+--- a/src/test/regress/expected/partition_prune.out
++++ b/src/test/regress/expected/partition_prune.out
+@@ -1186,6 +1186,58 @@ explain (costs off) select * from coercepart where a !~ all ('{ab,bc}');
+          Filter: ((a)::text !~ ALL ('{ab,bc}'::text[]))
+ (7 rows)
+ 
++explain (costs off) select * from coercepart where a = any ('{ab,bc}');
++                      QUERY PLAN                       
++-------------------------------------------------------
++ Append
++   ->  Seq Scan on coercepart_ab
++         Filter: ((a)::text = ANY ('{ab,bc}'::text[]))
++   ->  Seq Scan on coercepart_bc
++         Filter: ((a)::text = ANY ('{ab,bc}'::text[]))
++(5 rows)
++
++explain (costs off) select * from coercepart where a = any ('{ab,null}');
++                    QUERY PLAN                     
++---------------------------------------------------
++ Seq Scan on coercepart_ab
++   Filter: ((a)::text = ANY ('{ab,NULL}'::text[]))
++(2 rows)
++
++explain (costs off) select * from coercepart where a = any (null::text[]);
++        QUERY PLAN        
++--------------------------
++ Result
++   One-Time Filter: false
++(2 rows)
++
++explain (costs off) select * from coercepart where a = all ('{ab}');
++                  QUERY PLAN                  
++----------------------------------------------
++ Seq Scan on coercepart_ab
++   Filter: ((a)::text = ALL ('{ab}'::text[]))
++(2 rows)
++
++explain (costs off) select * from coercepart where a = all ('{ab,bc}');
++        QUERY PLAN        
++--------------------------
++ Result
++   One-Time Filter: false
++(2 rows)
++
++explain (costs off) select * from coercepart where a = all ('{ab,null}');
++        QUERY PLAN        
++--------------------------
++ Result
++   One-Time Filter: false
++(2 rows)
++
++explain (costs off) select * from coercepart where a = all (null::text[]);
++        QUERY PLAN        
++--------------------------
++ Result
++   One-Time Filter: false
++(2 rows)
++
+ drop table coercepart;
+ CREATE TABLE part (a INT, b INT) PARTITION BY LIST (a);
+ CREATE TABLE part_p1 PARTITION OF part FOR VALUES IN (-2,-1,0,1,2);
+@@ -3157,6 +3209,20 @@ select * from stable_qual_pruning
+          Filter: (a = ANY ('{"Tue Feb 01 00:00:00 2000 PST","Fri Jan 01 00:00:00 2010 PST"}'::timestamp with time zone[]))
+ (4 rows)
+ 
++explain (analyze, costs off, summary off, timing off)
++select * from stable_qual_pruning
++  where a = any(null::timestamptz[]);
++                           QUERY PLAN                           
++----------------------------------------------------------------
++ Append (actual rows=0 loops=1)
++   ->  Seq Scan on stable_qual_pruning1 (actual rows=0 loops=1)
++         Filter: (a = ANY (NULL::timestamp with time zone[]))
++   ->  Seq Scan on stable_qual_pruning2 (actual rows=0 loops=1)
++         Filter: (a = ANY (NULL::timestamp with time zone[]))
++   ->  Seq Scan on stable_qual_pruning3 (actual rows=0 loops=1)
++         Filter: (a = ANY (NULL::timestamp with time zone[]))
++(7 rows)
++
+ drop table stable_qual_pruning;
+ --
+ -- Check that pruning with composite range partitioning works correctly when
+diff --git a/src/test/regress/sql/partition_prune.sql b/src/test/regress/sql/partition_prune.sql
+index a26c2f0e72bc..446af3b2c171 100644
+--- a/src/test/regress/sql/partition_prune.sql
++++ b/src/test/regress/sql/partition_prune.sql
+@@ -184,6 +184,13 @@ explain (costs off) select * from coercepart where a ~ any ('{ab}');
+ explain (costs off) select * from coercepart where a !~ all ('{ab}');
+ explain (costs off) select * from coercepart where a ~ any ('{ab,bc}');
+ explain (costs off) select * from coercepart where a !~ all ('{ab,bc}');
++explain (costs off) select * from coercepart where a = any ('{ab,bc}');
++explain (costs off) select * from coercepart where a = any ('{ab,null}');
++explain (costs off) select * from coercepart where a = any (null::text[]);
++explain (costs off) select * from coercepart where a = all ('{ab}');
++explain (costs off) select * from coercepart where a = all ('{ab,bc}');
++explain (costs off) select * from coercepart where a = all ('{ab,null}');
++explain (costs off) select * from coercepart where a = all (null::text[]);
+ 
+ drop table coercepart;
+ 
+@@ -803,6 +810,9 @@ select * from stable_qual_pruning
+ explain (analyze, costs off, summary off, timing off)
+ select * from stable_qual_pruning
+   where a = any(array['2000-02-01', '2010-01-01']::timestamptz[]);
++explain (analyze, costs off, summary off, timing off)
++select * from stable_qual_pruning
++  where a = any(null::timestamptz[]);
+ 
+ drop table stable_qual_pruning;
+ 

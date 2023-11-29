@@ -1,0 +1,725 @@
+From 811b6e36a9e21a4d9eb78410976c88ce601cea0c Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Wed, 18 Jul 2018 08:01:23 +0900
+Subject: [PATCH] Rework error messages around file handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Some error messages related to file handling are using the code path
+context to define their state.  For example, 2PC-related errors are
+referring to "two-phase status files", or "relation mapping file" is
+used for catalog-to-filenode mapping, however those prove to be
+difficult to translate, and are not more helpful than just referring to
+the path of the file being worked on.  So simplify all those error
+messages by just referring to files with their path used.  In some
+cases, like the manipulation of WAL segments, the context is actually
+helpful so those are kept.
+
+Calls to the system function read() have also been rather inconsistent
+with their error handling sometimes not reporting the number of bytes
+read, and some other code paths trying to use an errno which has not
+been set.  The in-core functions are using a more consistent pattern
+with this patch, which checks for both errno if set or if an
+inconsistent read is happening.
+
+So as to care about pluralization when reading an unexpected number of
+byte(s), "could not read: read %d of %zu" is used as error message, with
+%d field being the output result of read() and %zu the expected size.
+This simplifies the work of translators with less variations of the same
+message.
+
+Author: Michael Paquier
+Reviewed-by: Álvaro Herrera
+Discussion: https://postgr.es/m/20180520000522.GB1603@paquier.xyz
+---
+ src/backend/access/transam/twophase.c       | 40 ++++++------
+ src/backend/access/transam/xlog.c           | 40 ++++++++----
+ src/backend/replication/logical/origin.c    | 13 +++-
+ src/backend/replication/logical/snapbuild.c | 68 +++++++++++++++------
+ src/backend/replication/slot.c              | 26 +++++---
+ src/backend/replication/walsender.c         | 20 ++++--
+ src/backend/utils/cache/relmapper.c         | 28 ++++++---
+ src/bin/pg_basebackup/pg_receivewal.c       | 12 +++-
+ src/bin/pg_rewind/file_ops.c                | 14 ++++-
+ src/bin/pg_rewind/parsexlog.c               | 14 ++++-
+ src/bin/pg_waldump/pg_waldump.c             | 19 ++++--
+ src/common/controldata_utils.c              |  8 +--
+ 12 files changed, 207 insertions(+), 95 deletions(-)
+
+diff --git a/src/backend/access/transam/twophase.c b/src/backend/access/transam/twophase.c
+index e8d4e37fe307..0c99b3366417 100644
+--- a/src/backend/access/transam/twophase.c
++++ b/src/backend/access/transam/twophase.c
+@@ -1219,6 +1219,7 @@ ReadTwoPhaseFile(TransactionId xid, bool give_warnings)
+ 	uint32		crc_offset;
+ 	pg_crc32c	calc_crc,
+ 				file_crc;
++	int			r;
+ 
+ 	TwoPhaseFilePath(path, xid);
+ 
+@@ -1228,8 +1229,7 @@ ReadTwoPhaseFile(TransactionId xid, bool give_warnings)
+ 		if (give_warnings)
+ 			ereport(WARNING,
+ 					(errcode_for_file_access(),
+-					 errmsg("could not open two-phase state file \"%s\": %m",
+-							path)));
++					 errmsg("could not open file \"%s\": %m", path)));
+ 		return NULL;
+ 	}
+ 
+@@ -1249,8 +1249,7 @@ ReadTwoPhaseFile(TransactionId xid, bool give_warnings)
+ 			errno = save_errno;
+ 			ereport(WARNING,
+ 					(errcode_for_file_access(),
+-					 errmsg("could not stat two-phase state file \"%s\": %m",
+-							path)));
++					 errmsg("could not stat file \"%s\": %m", path)));
+ 		}
+ 		return NULL;
+ 	}
+@@ -1277,7 +1276,8 @@ ReadTwoPhaseFile(TransactionId xid, bool give_warnings)
+ 	buf = (char *) palloc(stat.st_size);
+ 
+ 	pgstat_report_wait_start(WAIT_EVENT_TWOPHASE_FILE_READ);
+-	if (read(fd, buf, stat.st_size) != stat.st_size)
++	r = read(fd, buf, stat.st_size);
++	if (r != stat.st_size)
+ 	{
+ 		int			save_errno = errno;
+ 
+@@ -1285,11 +1285,17 @@ ReadTwoPhaseFile(TransactionId xid, bool give_warnings)
+ 		CloseTransientFile(fd);
+ 		if (give_warnings)
+ 		{
+-			errno = save_errno;
+-			ereport(WARNING,
+-					(errcode_for_file_access(),
+-					 errmsg("could not read two-phase state file \"%s\": %m",
+-							path)));
++			if (r < 0)
++			{
++				errno = save_errno;
++				ereport(WARNING,
++						(errcode_for_file_access(),
++						 errmsg("could not read file \"%s\": %m", path)));
++			}
++			else
++				ereport(WARNING,
++						(errmsg("could not read file \"%s\": read %d of %zu",
++								path, r, stat.st_size)));
+ 		}
+ 		pfree(buf);
+ 		return NULL;
+@@ -1632,8 +1638,7 @@ RemoveTwoPhaseFile(TransactionId xid, bool giveWarning)
+ 		if (errno != ENOENT || giveWarning)
+ 			ereport(WARNING,
+ 					(errcode_for_file_access(),
+-					 errmsg("could not remove two-phase state file \"%s\": %m",
+-							path)));
++					 errmsg("could not remove file \"%s\": %m", path)));
+ }
+ 
+ /*
+@@ -1661,8 +1666,7 @@ RecreateTwoPhaseFile(TransactionId xid, void *content, int len)
+ 	if (fd < 0)
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not recreate two-phase state file \"%s\": %m",
+-						path)));
++				 errmsg("could not recreate file \"%s\": %m", path)));
+ 
+ 	/* Write content and CRC */
+ 	pgstat_report_wait_start(WAIT_EVENT_TWOPHASE_FILE_WRITE);
+@@ -1677,7 +1681,7 @@ RecreateTwoPhaseFile(TransactionId xid, void *content, int len)
+ 		errno = save_errno ? save_errno : ENOSPC;
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not write two-phase state file: %m")));
++				 errmsg("could not write file \"%s\": %m", path)));
+ 	}
+ 	if (write(fd, &statefile_crc, sizeof(pg_crc32c)) != sizeof(pg_crc32c))
+ 	{
+@@ -1690,7 +1694,7 @@ RecreateTwoPhaseFile(TransactionId xid, void *content, int len)
+ 		errno = save_errno ? save_errno : ENOSPC;
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not write two-phase state file: %m")));
++				 errmsg("could not write file \"%s\": %m", path)));
+ 	}
+ 	pgstat_report_wait_end();
+ 
+@@ -1707,14 +1711,14 @@ RecreateTwoPhaseFile(TransactionId xid, void *content, int len)
+ 		errno = save_errno;
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not fsync two-phase state file: %m")));
++				 errmsg("could not fsync file \"%s\": %m", path)));
+ 	}
+ 	pgstat_report_wait_end();
+ 
+ 	if (CloseTransientFile(fd) != 0)
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not close two-phase state file: %m")));
++				 errmsg("could not close file \"%s\": %m", path)));
+ }
+ 
+ /*
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 4049deb968e3..bebe6405de5e 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -3408,21 +3408,24 @@ XLogFileCopy(XLogSegNo destsegno, TimeLineID srcTLI, XLogSegNo srcsegno,
+ 
+ 		if (nread > 0)
+ 		{
++			int			r;
++
+ 			if (nread > sizeof(buffer))
+ 				nread = sizeof(buffer);
+ 			errno = 0;
+ 			pgstat_report_wait_start(WAIT_EVENT_WAL_COPY_READ);
+-			if (read(srcfd, buffer, nread) != nread)
++			r = read(srcfd, buffer, nread);
++			if (r != nread)
+ 			{
+-				if (errno != 0)
++				if (r < 0)
+ 					ereport(ERROR,
+ 							(errcode_for_file_access(),
+ 							 errmsg("could not read file \"%s\": %m",
+ 									path)));
+ 				else
+ 					ereport(ERROR,
+-							(errmsg("not enough data in file \"%s\"",
+-									path)));
++							(errmsg("could not read file \"%s\": read %d of %zu",
++									path, r, (Size) nread)));
+ 			}
+ 			pgstat_report_wait_end();
+ 		}
+@@ -4544,7 +4547,7 @@ ReadControlFile(void)
+ 	if (fd < 0)
+ 		ereport(PANIC,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not open control file \"%s\": %m",
++				 errmsg("could not open file \"%s\": %m",
+ 						XLOG_CONTROL_FILE)));
+ 
+ 	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_READ);
+@@ -4554,10 +4557,12 @@ ReadControlFile(void)
+ 		if (r < 0)
+ 			ereport(PANIC,
+ 					(errcode_for_file_access(),
+-					 errmsg("could not read from control file: %m")));
++					 errmsg("could not read file \"%s\": %m",
++							XLOG_CONTROL_FILE)));
+ 		else
+ 			ereport(PANIC,
+-					(errmsg("could not read from control file: read %d bytes, expected %d", r, (int) sizeof(ControlFileData))));
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							XLOG_CONTROL_FILE, r, sizeof(ControlFileData))));
+ 	}
+ 	pgstat_report_wait_end();
+ 
+@@ -11689,6 +11694,7 @@ XLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen,
+ 	int			emode = private->emode;
+ 	uint32		targetPageOff;
+ 	XLogSegNo	targetSegNo PG_USED_FOR_ASSERTS_ONLY;
++	int			r;
+ 
+ 	XLByteToSeg(targetPagePtr, targetSegNo, wal_segment_size);
+ 	targetPageOff = XLogSegmentOffset(targetPagePtr, wal_segment_size);
+@@ -11782,18 +11788,26 @@ XLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen,
+ 	}
+ 
+ 	pgstat_report_wait_start(WAIT_EVENT_WAL_READ);
+-	if (read(readFile, readBuf, XLOG_BLCKSZ) != XLOG_BLCKSZ)
++	r = read(readFile, readBuf, XLOG_BLCKSZ);
++	if (r != XLOG_BLCKSZ)
+ 	{
+ 		char		fname[MAXFNAMELEN];
+ 		int			save_errno = errno;
+ 
+ 		pgstat_report_wait_end();
+ 		XLogFileName(fname, curFileTLI, readSegNo, wal_segment_size);
+-		errno = save_errno;
+-		ereport(emode_for_corrupt_record(emode, targetPagePtr + reqLen),
+-				(errcode_for_file_access(),
+-				 errmsg("could not read from log segment %s, offset %u: %m",
+-						fname, readOff)));
++		if (r < 0)
++		{
++			errno = save_errno;
++			ereport(emode_for_corrupt_record(emode, targetPagePtr + reqLen),
++					(errcode_for_file_access(),
++					 errmsg("could not read from log segment %s, offset %u: %m",
++							fname, readOff)));
++		}
++		else
++			ereport(emode_for_corrupt_record(emode, targetPagePtr + reqLen),
++					(errmsg("could not read from log segment %s, offset %u: read %d of %zu",
++							fname, readOff, r, (Size) XLOG_BLCKSZ)));
+ 		goto next_record_is_invalid;
+ 	}
+ 	pgstat_report_wait_end();
+diff --git a/src/backend/replication/logical/origin.c b/src/backend/replication/logical/origin.c
+index 3d3f6dff1b07..841e24c03da3 100644
+--- a/src/backend/replication/logical/origin.c
++++ b/src/backend/replication/logical/origin.c
+@@ -712,9 +712,16 @@ StartupReplicationOrigin(void)
+ 	/* verify magic, that is written even if nothing was active */
+ 	readBytes = read(fd, &magic, sizeof(magic));
+ 	if (readBytes != sizeof(magic))
+-		ereport(PANIC,
+-				(errmsg("could not read file \"%s\": %m",
+-						path)));
++	{
++		if (readBytes < 0)
++			ereport(PANIC,
++					(errmsg("could not read file \"%s\": %m",
++							path)));
++		else
++			ereport(PANIC,
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							path, readBytes, sizeof(magic))));
++	}
+ 	COMP_CRC32C(crc, &magic, sizeof(magic));
+ 
+ 	if (magic != REPLICATION_STATE_MAGIC)
+diff --git a/src/backend/replication/logical/snapbuild.c b/src/backend/replication/logical/snapbuild.c
+index e975faeb8c9f..61bc9e8f147e 100644
+--- a/src/backend/replication/logical/snapbuild.c
++++ b/src/backend/replication/logical/snapbuild.c
+@@ -1726,11 +1726,18 @@ SnapBuildRestore(SnapBuild *builder, XLogRecPtr lsn)
+ 		int			save_errno = errno;
+ 
+ 		CloseTransientFile(fd);
+-		errno = save_errno;
+-		ereport(ERROR,
+-				(errcode_for_file_access(),
+-				 errmsg("could not read file \"%s\", read %d of %d: %m",
+-						path, readBytes, (int) SnapBuildOnDiskConstantSize)));
++
++		if (readBytes < 0)
++		{
++			errno = save_errno;
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("could not read file \"%s\": %m", path)));
++		}
++		else
++			ereport(ERROR,
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							path, readBytes, SnapBuildOnDiskConstantSize)));
+ 	}
+ 
+ 	if (ondisk.magic != SNAPBUILD_MAGIC)
+@@ -1757,11 +1764,18 @@ SnapBuildRestore(SnapBuild *builder, XLogRecPtr lsn)
+ 		int			save_errno = errno;
+ 
+ 		CloseTransientFile(fd);
+-		errno = save_errno;
+-		ereport(ERROR,
+-				(errcode_for_file_access(),
+-				 errmsg("could not read file \"%s\", read %d of %d: %m",
+-						path, readBytes, (int) sizeof(SnapBuild))));
++
++		if (readBytes < 0)
++		{
++			errno = save_errno;
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("could not read file \"%s\": %m", path)));
++		}
++		else
++			ereport(ERROR,
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							path, readBytes, sizeof(SnapBuild))));
+ 	}
+ 	COMP_CRC32C(checksum, &ondisk.builder, sizeof(SnapBuild));
+ 
+@@ -1777,11 +1791,18 @@ SnapBuildRestore(SnapBuild *builder, XLogRecPtr lsn)
+ 		int			save_errno = errno;
+ 
+ 		CloseTransientFile(fd);
+-		errno = save_errno;
+-		ereport(ERROR,
+-				(errcode_for_file_access(),
+-				 errmsg("could not read file \"%s\", read %d of %d: %m",
+-						path, readBytes, (int) sz)));
++
++		if (readBytes < 0)
++		{
++			errno = save_errno;
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("could not read file \"%s\": %m", path)));
++		}
++		else
++			ereport(ERROR,
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							path, readBytes, sz)));
+ 	}
+ 	COMP_CRC32C(checksum, ondisk.builder.was_running.was_xip, sz);
+ 
+@@ -1796,11 +1817,18 @@ SnapBuildRestore(SnapBuild *builder, XLogRecPtr lsn)
+ 		int			save_errno = errno;
+ 
+ 		CloseTransientFile(fd);
+-		errno = save_errno;
+-		ereport(ERROR,
+-				(errcode_for_file_access(),
+-				 errmsg("could not read file \"%s\", read %d of %d: %m",
+-						path, readBytes, (int) sz)));
++
++		if (readBytes < 0)
++		{
++			errno = save_errno;
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("could not read file \"%s\": %m", path)));
++		}
++		else
++			ereport(ERROR,
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							path, readBytes, sz)));
+ 	}
+ 	COMP_CRC32C(checksum, ondisk.builder.committed.xip, sz);
+ 
+diff --git a/src/backend/replication/slot.c b/src/backend/replication/slot.c
+index fb95b44ed824..afbaf8c80d80 100644
+--- a/src/backend/replication/slot.c
++++ b/src/backend/replication/slot.c
+@@ -1414,11 +1414,15 @@ RestoreSlotFromDisk(const char *name)
+ 
+ 		CloseTransientFile(fd);
+ 		errno = saved_errno;
+-		ereport(PANIC,
+-				(errcode_for_file_access(),
+-				 errmsg("could not read file \"%s\", read %d of %u: %m",
+-						path, readBytes,
+-						(uint32) ReplicationSlotOnDiskConstantSize)));
++		if (readBytes < 0)
++			ereport(PANIC,
++					(errcode_for_file_access(),
++					 errmsg("could not read file \"%s\": %m", path)));
++		else
++			ereport(PANIC,
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							path, readBytes,
++							ReplicationSlotOnDiskConstantSize)));
+ 	}
+ 
+ 	/* verify magic */
+@@ -1454,10 +1458,14 @@ RestoreSlotFromDisk(const char *name)
+ 
+ 		CloseTransientFile(fd);
+ 		errno = saved_errno;
+-		ereport(PANIC,
+-				(errcode_for_file_access(),
+-				 errmsg("could not read file \"%s\", read %d of %u: %m",
+-						path, readBytes, cp.length)));
++		if (readBytes < 0)
++			ereport(PANIC,
++					(errcode_for_file_access(),
++					 errmsg("could not read file \"%s\": %m", path)));
++		else
++			ereport(PANIC,
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							path, readBytes, (Size) cp.length)));
+ 	}
+ 
+ 	CloseTransientFile(fd);
+diff --git a/src/backend/replication/walsender.c b/src/backend/replication/walsender.c
+index 3a0106bc9337..e3df5495c33f 100644
+--- a/src/backend/replication/walsender.c
++++ b/src/backend/replication/walsender.c
+@@ -501,11 +501,16 @@ SendTimeLineHistory(TimeLineHistoryCmd *cmd)
+ 		pgstat_report_wait_start(WAIT_EVENT_WALSENDER_TIMELINE_HISTORY_READ);
+ 		nread = read(fd, rbuf, sizeof(rbuf));
+ 		pgstat_report_wait_end();
+-		if (nread <= 0)
++		if (nread < 0)
+ 			ereport(ERROR,
+ 					(errcode_for_file_access(),
+ 					 errmsg("could not read file \"%s\": %m",
+ 							path)));
++		else if (nread == 0)
++			ereport(ERROR,
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							path, nread, bytesleft)));
++
+ 		pq_sendbytes(&buf, rbuf, nread);
+ 		bytesleft -= nread;
+ 	}
+@@ -2425,13 +2430,20 @@ XLogRead(char *buf, XLogRecPtr startptr, Size count)
+ 		pgstat_report_wait_start(WAIT_EVENT_WAL_READ);
+ 		readbytes = read(sendFile, p, segbytes);
+ 		pgstat_report_wait_end();
+-		if (readbytes <= 0)
++		if (readbytes < 0)
+ 		{
+ 			ereport(ERROR,
+ 					(errcode_for_file_access(),
+-					 errmsg("could not read from log segment %s, offset %u, length %lu: %m",
++					 errmsg("could not read from log segment %s, offset %u, length %zu: %m",
++							XLogFileNameP(curFileTimeLine, sendSegNo),
++							sendOff, (Size) segbytes)));
++		}
++		else if (readbytes == 0)
++		{
++			ereport(ERROR,
++					(errmsg("could not read from log segment %s, offset %u: read %d of %zu",
+ 							XLogFileNameP(curFileTimeLine, sendSegNo),
+-							sendOff, (unsigned long) segbytes)));
++							sendOff, readbytes, (Size) segbytes)));
+ 		}
+ 
+ 		/* Update state for read */
+diff --git a/src/backend/utils/cache/relmapper.c b/src/backend/utils/cache/relmapper.c
+index 99d095f2df39..2d31f9f912a3 100644
+--- a/src/backend/utils/cache/relmapper.c
++++ b/src/backend/utils/cache/relmapper.c
+@@ -629,6 +629,7 @@ load_relmap_file(bool shared)
+ 	char		mapfilename[MAXPGPATH];
+ 	pg_crc32c	crc;
+ 	int			fd;
++	int			r;
+ 
+ 	if (shared)
+ 	{
+@@ -648,7 +649,7 @@ load_relmap_file(bool shared)
+ 	if (fd < 0)
+ 		ereport(FATAL,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not open relation mapping file \"%s\": %m",
++				 errmsg("could not open file \"%s\": %m",
+ 						mapfilename)));
+ 
+ 	/*
+@@ -659,11 +660,18 @@ load_relmap_file(bool shared)
+ 	 * are able to access any relation that's affected by the change.
+ 	 */
+ 	pgstat_report_wait_start(WAIT_EVENT_RELATION_MAP_READ);
+-	if (read(fd, map, sizeof(RelMapFile)) != sizeof(RelMapFile))
+-		ereport(FATAL,
+-				(errcode_for_file_access(),
+-				 errmsg("could not read relation mapping file \"%s\": %m",
+-						mapfilename)));
++	r = read(fd, map, sizeof(RelMapFile));
++	if (r != sizeof(RelMapFile))
++	{
++		if (r < 0)
++			ereport(FATAL,
++					(errcode_for_file_access(),
++					 errmsg("could not read file \"%s\": %m", mapfilename)));
++		else
++			ereport(FATAL,
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							mapfilename, r, sizeof(RelMapFile))));
++	}
+ 	pgstat_report_wait_end();
+ 
+ 	CloseTransientFile(fd);
+@@ -748,7 +756,7 @@ write_relmap_file(bool shared, RelMapFile *newmap,
+ 	if (fd < 0)
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not open relation mapping file \"%s\": %m",
++				 errmsg("could not open file \"%s\": %m",
+ 						mapfilename)));
+ 
+ 	if (write_wal)
+@@ -782,7 +790,7 @@ write_relmap_file(bool shared, RelMapFile *newmap,
+ 			errno = ENOSPC;
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not write to relation mapping file \"%s\": %m",
++				 errmsg("could not write file \"%s\": %m",
+ 						mapfilename)));
+ 	}
+ 	pgstat_report_wait_end();
+@@ -797,14 +805,14 @@ write_relmap_file(bool shared, RelMapFile *newmap,
+ 	if (pg_fsync(fd) != 0)
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not fsync relation mapping file \"%s\": %m",
++				 errmsg("could not fsync file \"%s\": %m",
+ 						mapfilename)));
+ 	pgstat_report_wait_end();
+ 
+ 	if (CloseTransientFile(fd))
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not close relation mapping file \"%s\": %m",
++				 errmsg("could not close file \"%s\": %m",
+ 						mapfilename)));
+ 
+ 	/*
+diff --git a/src/bin/pg_basebackup/pg_receivewal.c b/src/bin/pg_basebackup/pg_receivewal.c
+index ed9d7f6378a5..8be8d48a8ad3 100644
+--- a/src/bin/pg_basebackup/pg_receivewal.c
++++ b/src/bin/pg_basebackup/pg_receivewal.c
+@@ -284,6 +284,7 @@ FindStreamingStart(uint32 *tli)
+ 			char		buf[4];
+ 			int			bytes_out;
+ 			char		fullpath[MAXPGPATH * 2];
++			int			r;
+ 
+ 			snprintf(fullpath, sizeof(fullpath), "%s/%s", basedir, dirent->d_name);
+ 
+@@ -300,10 +301,15 @@ FindStreamingStart(uint32 *tli)
+ 						progname, fullpath, strerror(errno));
+ 				disconnect_and_exit(1);
+ 			}
+-			if (read(fd, (char *) buf, sizeof(buf)) != sizeof(buf))
++			r = read(fd, (char *) buf, sizeof(buf));
++			if (r != sizeof(buf))
+ 			{
+-				fprintf(stderr, _("%s: could not read compressed file \"%s\": %s\n"),
+-						progname, fullpath, strerror(errno));
++				if (r < 0)
++					fprintf(stderr, _("%s: could not read compressed file \"%s\": %s\n"),
++							progname, fullpath, strerror(errno));
++				else
++					fprintf(stderr, _("%s: could not read compressed file \"%s\": read %d of %zu\n"),
++							progname, fullpath, r, sizeof(buf));
+ 				disconnect_and_exit(1);
+ 			}
+ 
+diff --git a/src/bin/pg_rewind/file_ops.c b/src/bin/pg_rewind/file_ops.c
+index 94bcc13ae866..0bd110f9b003 100644
+--- a/src/bin/pg_rewind/file_ops.c
++++ b/src/bin/pg_rewind/file_ops.c
+@@ -289,6 +289,7 @@ slurpFile(const char *datadir, const char *path, size_t *filesize)
+ 	struct stat statbuf;
+ 	char		fullpath[MAXPGPATH];
+ 	int			len;
++	int			r;
+ 
+ 	snprintf(fullpath, sizeof(fullpath), "%s/%s", datadir, path);
+ 
+@@ -304,9 +305,16 @@ slurpFile(const char *datadir, const char *path, size_t *filesize)
+ 
+ 	buffer = pg_malloc(len + 1);
+ 
+-	if (read(fd, buffer, len) != len)
+-		pg_fatal("could not read file \"%s\": %s\n",
+-				 fullpath, strerror(errno));
++	r = read(fd, buffer, len);
++	if (r != len)
++	{
++		if (r < 0)
++			pg_fatal("could not read file \"%s\": %s\n",
++					 fullpath, strerror(errno));
++		else
++			pg_fatal("could not read file \"%s\": read %d of %zu\n",
++					 fullpath, r, (Size) len);
++	}
+ 	close(fd);
+ 
+ 	/* Zero-terminate the buffer. */
+diff --git a/src/bin/pg_rewind/parsexlog.c b/src/bin/pg_rewind/parsexlog.c
+index 1689279767f1..40028471bf6e 100644
+--- a/src/bin/pg_rewind/parsexlog.c
++++ b/src/bin/pg_rewind/parsexlog.c
+@@ -246,6 +246,7 @@ SimpleXLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr,
+ 	uint32		targetPageOff;
+ 	XLogRecPtr	targetSegEnd;
+ 	XLogSegNo	targetSegNo;
++	int			r;
+ 
+ 	XLByteToSeg(targetPagePtr, targetSegNo, WalSegSz);
+ 	XLogSegNoOffsetToRecPtr(targetSegNo + 1, 0, WalSegSz, targetSegEnd);
+@@ -309,10 +310,17 @@ SimpleXLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr,
+ 		return -1;
+ 	}
+ 
+-	if (read(xlogreadfd, readBuf, XLOG_BLCKSZ) != XLOG_BLCKSZ)
++
++	r = read(xlogreadfd, readBuf, XLOG_BLCKSZ);
++	if (r != XLOG_BLCKSZ)
+ 	{
+-		printf(_("could not read from file \"%s\": %s\n"), xlogfpath,
+-			   strerror(errno));
++		if (r < 0)
++			printf(_("could not read file \"%s\": %s\n"), xlogfpath,
++				   strerror(errno));
++		else
++			printf(_("could not read file \"%s\": read %d of %zu\n"),
++				   xlogfpath, r, (Size) XLOG_BLCKSZ);
++
+ 		return -1;
+ 	}
+ 
+diff --git a/src/bin/pg_waldump/pg_waldump.c b/src/bin/pg_waldump/pg_waldump.c
+index d41b831b1804..2a557b37e5de 100644
+--- a/src/bin/pg_waldump/pg_waldump.c
++++ b/src/bin/pg_waldump/pg_waldump.c
+@@ -210,8 +210,10 @@ search_directory(const char *directory, const char *fname)
+ 	if (fd >= 0)
+ 	{
+ 		char		buf[XLOG_BLCKSZ];
++		int			r;
+ 
+-		if (read(fd, buf, XLOG_BLCKSZ) == XLOG_BLCKSZ)
++		r = read(fd, buf, XLOG_BLCKSZ);
++		if (r == XLOG_BLCKSZ)
+ 		{
+ 			XLogLongPageHeader longhdr = (XLogLongPageHeader) buf;
+ 
+@@ -229,7 +231,8 @@ search_directory(const char *directory, const char *fname)
+ 				fatal_error("could not read file \"%s\": %s",
+ 							fname, strerror(errno));
+ 			else
+-				fatal_error("not enough data in file \"%s\"", fname);
++				fatal_error("could not read file \"%s\": read %d of %zu",
++							fname, r, (Size) XLOG_BLCKSZ);
+ 		}
+ 		close(fd);
+ 		return true;
+@@ -411,11 +414,17 @@ XLogDumpXLogRead(const char *directory, TimeLineID timeline_id,
+ 		{
+ 			int			err = errno;
+ 			char		fname[MAXPGPATH];
++			int			save_errno = errno;
+ 
+ 			XLogFileName(fname, timeline_id, sendSegNo, WalSegSz);
+-
+-			fatal_error("could not read from log file %s, offset %u, length %d: %s",
+-						fname, sendOff, segbytes, strerror(err));
++			errno = save_errno;
++
++			if (readbytes < 0)
++				fatal_error("could not read from log file %s, offset %u, length %d: %s",
++							fname, sendOff, segbytes, strerror(err));
++			else if (readbytes == 0)
++				fatal_error("could not read from log file %s, offset %u: read %d of %zu",
++							fname, sendOff, readbytes, (Size) segbytes);
+ 		}
+ 
+ 		/* Update state for read */
+diff --git a/src/common/controldata_utils.c b/src/common/controldata_utils.c
+index e83d60d43836..60197b244065 100644
+--- a/src/common/controldata_utils.c
++++ b/src/common/controldata_utils.c
+@@ -83,12 +83,12 @@ get_controlfile(const char *DataDir, const char *progname, bool *crc_ok_p)
+ 		else
+ #ifndef FRONTEND
+ 			ereport(ERROR,
+-					(errmsg("could not read file \"%s\": read %d of %d",
+-							ControlFilePath, r, (int) sizeof(ControlFileData))));
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							ControlFilePath, r, sizeof(ControlFileData))));
+ #else
+ 		{
+-			fprintf(stderr, _("%s: could not read file \"%s\": read %d of %d\n"),
+-					progname, ControlFilePath, r, (int) sizeof(ControlFileData));
++			fprintf(stderr, _("%s: could not read file \"%s\": read %d of %zu\n"),
++					progname, ControlFilePath, r, sizeof(ControlFileData));
+ 			exit(EXIT_FAILURE);
+ 		}
+ #endif

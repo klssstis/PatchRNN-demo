@@ -1,0 +1,1160 @@
+From 865fe4d5df560a6f5353da652018ff876978ad2d Mon Sep 17 00:00:00 2001
+From: Andrew Dunstan <andrew@dunslane.net>
+Date: Thu, 3 Mar 2022 13:00:49 -0500
+Subject: [PATCH] Common SQL/JSON clauses
+
+This introduces some of the building blocks used by the SQL/JSON
+constructor and query functions. Specifically, it provides node
+executor and grammar support for the FORMAT JSON [ENCODING foo]
+clause, and values decorated with it, and for the RETURNING clause.
+
+The following SQL/JSON patches will leverage these.
+
+Nikita Glukhov (who probably deserves an award for perseverance).
+
+Reviewers have included (in no particular order) Andres Freund, Alexander
+Korotkov, Pavel Stehule, Andrew Alsup. Erik Rijkers, Zihong Yu and
+Himanshu Upadhyaya.
+
+Discussion: https://postgr.es/m/cd0bb935-0158-78a7-08b5-904886deac4b@postgrespro.ru
+---
+ src/backend/executor/execExpr.c      |  22 ++++
+ src/backend/nodes/copyfuncs.c        |  55 ++++++++
+ src/backend/nodes/equalfuncs.c       |  39 ++++++
+ src/backend/nodes/makefuncs.c        |  54 ++++++++
+ src/backend/nodes/nodeFuncs.c        |  66 ++++++++++
+ src/backend/nodes/outfuncs.c         |  39 ++++++
+ src/backend/nodes/readfuncs.c        |  51 ++++++++
+ src/backend/optimizer/util/clauses.c |  23 ++++
+ src/backend/parser/gram.y            |  65 +++++++++-
+ src/backend/parser/parse_expr.c      | 181 +++++++++++++++++++++++++++
+ src/backend/utils/adt/ruleutils.c    |  56 +++++++++
+ src/backend/utils/misc/queryjumble.c |  26 ++++
+ src/include/nodes/makefuncs.h        |   5 +
+ src/include/nodes/nodes.h            |   4 +
+ src/include/nodes/parsenodes.h       |  13 ++
+ src/include/nodes/primnodes.h        |  59 +++++++++
+ src/include/parser/kwlist.h          |   2 +
+ 17 files changed, 758 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend/executor/execExpr.c b/src/backend/executor/execExpr.c
+index e0656bfe85be..d0b91e881db2 100644
+--- a/src/backend/executor/execExpr.c
++++ b/src/backend/executor/execExpr.c
+@@ -2428,6 +2428,28 @@ ExecInitExprRec(Expr *node, ExprState *state,
+ 				break;
+ 			}
+ 
++		case T_JsonValueExpr:
++			{
++				JsonValueExpr *jve = (JsonValueExpr *) node;
++
++				ExecInitExprRec(jve->raw_expr, state, resv, resnull);
++
++				if (jve->formatted_expr)
++				{
++					Datum	   *innermost_caseval = state->innermost_caseval;
++					bool	   *innermost_isnull = state->innermost_casenull;
++
++					state->innermost_caseval = resv;
++					state->innermost_casenull = resnull;
++
++					ExecInitExprRec(jve->formatted_expr, state, resv, resnull);
++
++					state->innermost_caseval = innermost_caseval;
++					state->innermost_casenull = innermost_isnull;
++				}
++				break;
++			}
++
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index d4f8455a2bdb..55c36b46a884 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -2298,6 +2298,52 @@ _copyOnConflictExpr(const OnConflictExpr *from)
+ 	return newnode;
+ }
+ 
++
++/*
++ * _copyJsonFormat
++ */
++static JsonFormat *
++_copyJsonFormat(const JsonFormat *from)
++{
++	JsonFormat *newnode = makeNode(JsonFormat);
++
++	COPY_SCALAR_FIELD(format_type);
++	COPY_SCALAR_FIELD(encoding);
++	COPY_LOCATION_FIELD(location);
++
++	return newnode;
++}
++
++/*
++ * _copyJsonReturning
++ */
++static JsonReturning *
++_copyJsonReturning(const JsonReturning *from)
++{
++	JsonReturning *newnode = makeNode(JsonReturning);
++
++	COPY_NODE_FIELD(format);
++	COPY_SCALAR_FIELD(typid);
++	COPY_SCALAR_FIELD(typmod);
++
++	return newnode;
++}
++
++/*
++ * _copyJsonValueExpr
++ */
++static JsonValueExpr *
++_copyJsonValueExpr(const JsonValueExpr *from)
++{
++	JsonValueExpr  *newnode = makeNode(JsonValueExpr);
++
++	COPY_NODE_FIELD(raw_expr);
++	COPY_NODE_FIELD(formatted_expr);
++	COPY_NODE_FIELD(format);
++
++	return newnode;
++}
++
+ /* ****************************************************************
+  *						pathnodes.h copy functions
+  *
+@@ -5350,6 +5396,15 @@ copyObjectImpl(const void *from)
+ 		case T_OnConflictExpr:
+ 			retval = _copyOnConflictExpr(from);
+ 			break;
++		case T_JsonFormat:
++			retval = _copyJsonFormat(from);
++			break;
++		case T_JsonReturning:
++			retval = _copyJsonReturning(from);
++			break;
++		case T_JsonValueExpr:
++			retval = _copyJsonValueExpr(from);
++			break;
+ 
+ 			/*
+ 			 * RELATION NODES
+diff --git a/src/backend/nodes/equalfuncs.c b/src/backend/nodes/equalfuncs.c
+index f1002afe7a0d..0ddebd066eb3 100644
+--- a/src/backend/nodes/equalfuncs.c
++++ b/src/backend/nodes/equalfuncs.c
+@@ -841,6 +841,36 @@ _equalOnConflictExpr(const OnConflictExpr *a, const OnConflictExpr *b)
+ 	return true;
+ }
+ 
++static bool
++_equalJsonFormat(const JsonFormat *a, const JsonFormat *b)
++{
++	COMPARE_SCALAR_FIELD(format_type);
++	COMPARE_SCALAR_FIELD(encoding);
++	COMPARE_LOCATION_FIELD(location);
++
++	return true;
++}
++
++static bool
++_equalJsonReturning(const JsonReturning *a, const JsonReturning *b)
++{
++	COMPARE_NODE_FIELD(format);
++	COMPARE_SCALAR_FIELD(typid);
++	COMPARE_SCALAR_FIELD(typmod);
++
++	return true;
++}
++
++static bool
++_equalJsonValueExpr(const JsonValueExpr *a, const JsonValueExpr *b)
++{
++	COMPARE_NODE_FIELD(raw_expr);
++	COMPARE_NODE_FIELD(formatted_expr);
++	COMPARE_NODE_FIELD(format);
++
++	return true;
++}
++
+ /*
+  * Stuff from pathnodes.h
+  */
+@@ -3358,6 +3388,15 @@ equal(const void *a, const void *b)
+ 		case T_JoinExpr:
+ 			retval = _equalJoinExpr(a, b);
+ 			break;
++		case T_JsonFormat:
++			retval = _equalJsonFormat(a, b);
++			break;
++		case T_JsonReturning:
++			retval = _equalJsonReturning(a, b);
++			break;
++		case T_JsonValueExpr:
++			retval = _equalJsonValueExpr(a, b);
++			break;
+ 
+ 			/*
+ 			 * RELATION NODES
+diff --git a/src/backend/nodes/makefuncs.c b/src/backend/nodes/makefuncs.c
+index c85d8fe97511..867a927e7a06 100644
+--- a/src/backend/nodes/makefuncs.c
++++ b/src/backend/nodes/makefuncs.c
+@@ -19,6 +19,7 @@
+ #include "catalog/pg_type.h"
+ #include "nodes/makefuncs.h"
+ #include "nodes/nodeFuncs.h"
++#include "utils/errcodes.h"
+ #include "utils/lsyscache.h"
+ 
+ 
+@@ -818,3 +819,56 @@ makeVacuumRelation(RangeVar *relation, Oid oid, List *va_cols)
+ 	v->va_cols = va_cols;
+ 	return v;
+ }
++
++/*
++ * makeJsonFormat -
++ *	  creates a JsonFormat node
++ */
++JsonFormat *
++makeJsonFormat(JsonFormatType type, JsonEncoding encoding, int location)
++{
++	JsonFormat *jf = makeNode(JsonFormat);
++
++	jf->format_type = type;
++	jf->encoding = encoding;
++	jf->location = location;
++
++	return jf;
++}
++
++/*
++ * makeJsonValueExpr -
++ *	  creates a JsonValueExpr node
++ */
++JsonValueExpr *
++makeJsonValueExpr(Expr *expr, JsonFormat *format)
++{
++	JsonValueExpr *jve = makeNode(JsonValueExpr);
++
++	jve->raw_expr = expr;
++	jve->formatted_expr = NULL;
++	jve->format = format;
++
++	return jve;
++}
++
++/*
++ * makeJsonEncoding -
++ *	  converts JSON encoding name to enum JsonEncoding
++ */
++JsonEncoding
++makeJsonEncoding(char *name)
++{
++	if (!pg_strcasecmp(name, "utf8"))
++		return JS_ENC_UTF8;
++	if (!pg_strcasecmp(name, "utf16"))
++		return JS_ENC_UTF16;
++	if (!pg_strcasecmp(name, "utf32"))
++		return JS_ENC_UTF32;
++
++	ereport(ERROR,
++			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++			 errmsg("unrecognized JSON encoding: %s", name)));
++
++	return JS_ENC_DEFAULT;
++}
+diff --git a/src/backend/nodes/nodeFuncs.c b/src/backend/nodes/nodeFuncs.c
+index ec25aae6e38a..0b242c76ecad 100644
+--- a/src/backend/nodes/nodeFuncs.c
++++ b/src/backend/nodes/nodeFuncs.c
+@@ -250,6 +250,13 @@ exprType(const Node *expr)
+ 		case T_PlaceHolderVar:
+ 			type = exprType((Node *) ((const PlaceHolderVar *) expr)->phexpr);
+ 			break;
++		case T_JsonValueExpr:
++			{
++				const JsonValueExpr *jve = (const JsonValueExpr *) expr;
++
++				type = exprType((Node *) (jve->formatted_expr ? jve->formatted_expr : jve->raw_expr));
++			}
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			type = InvalidOid;	/* keep compiler quiet */
+@@ -482,6 +489,8 @@ exprTypmod(const Node *expr)
+ 			return ((const SetToDefault *) expr)->typeMod;
+ 		case T_PlaceHolderVar:
+ 			return exprTypmod((Node *) ((const PlaceHolderVar *) expr)->phexpr);
++		case T_JsonValueExpr:
++			return exprTypmod((Node *) ((const JsonValueExpr *) expr)->formatted_expr);
+ 		default:
+ 			break;
+ 	}
+@@ -958,6 +967,9 @@ exprCollation(const Node *expr)
+ 		case T_PlaceHolderVar:
+ 			coll = exprCollation((Node *) ((const PlaceHolderVar *) expr)->phexpr);
+ 			break;
++		case T_JsonValueExpr:
++			coll = exprCollation((Node *) ((const JsonValueExpr *) expr)->formatted_expr);
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			coll = InvalidOid;	/* keep compiler quiet */
+@@ -1170,6 +1182,10 @@ exprSetCollation(Node *expr, Oid collation)
+ 			/* NextValueExpr's result is an integer type ... */
+ 			Assert(!OidIsValid(collation)); /* ... so never set a collation */
+ 			break;
++		case T_JsonValueExpr:
++			exprSetCollation((Node *) ((JsonValueExpr *) expr)->formatted_expr,
++							 collation);
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			break;
+@@ -1616,6 +1632,9 @@ exprLocation(const Node *expr)
+ 		case T_PartitionRangeDatum:
+ 			loc = ((const PartitionRangeDatum *) expr)->location;
+ 			break;
++		case T_JsonValueExpr:
++			loc = exprLocation((Node *) ((const JsonValueExpr *) expr)->raw_expr);
++			break;
+ 		default:
+ 			/* for any other node type it's just unknown... */
+ 			loc = -1;
+@@ -2350,6 +2369,16 @@ expression_tree_walker(Node *node,
+ 					return true;
+ 			}
+ 			break;
++		case T_JsonValueExpr:
++			{
++				JsonValueExpr *jve = (JsonValueExpr *) node;
++
++				if (walker(jve->raw_expr, context))
++					return true;
++				if (walker(jve->formatted_expr, context))
++					return true;
++			}
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+@@ -2680,6 +2709,7 @@ expression_tree_mutator(Node *node,
+ 		case T_RangeTblRef:
+ 		case T_SortGroupClause:
+ 		case T_CTESearchClause:
++		case T_JsonFormat:
+ 			return (Node *) copyObject(node);
+ 		case T_WithCheckOption:
+ 			{
+@@ -3311,6 +3341,28 @@ expression_tree_mutator(Node *node,
+ 				return (Node *) newnode;
+ 			}
+ 			break;
++		case T_JsonReturning:
++			{
++				JsonReturning *jr = (JsonReturning *) node;
++				JsonReturning *newnode;
++
++				FLATCOPY(newnode, jr, JsonReturning);
++				MUTATE(newnode->format, jr->format, JsonFormat *);
++
++				return (Node *) newnode;
++			}
++		case T_JsonValueExpr:
++			{
++				JsonValueExpr *jve = (JsonValueExpr *) node;
++				JsonValueExpr *newnode;
++
++				FLATCOPY(newnode, jve, JsonValueExpr);
++				MUTATE(newnode->raw_expr, jve->raw_expr, Expr *);
++				MUTATE(newnode->formatted_expr, jve->formatted_expr, Expr *);
++				MUTATE(newnode->format, jve->format, JsonFormat *);
++
++				return (Node *) newnode;
++			}
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+@@ -4019,6 +4071,20 @@ raw_expression_tree_walker(Node *node,
+ 		case T_CommonTableExpr:
+ 			/* search_clause and cycle_clause are not interesting here */
+ 			return walker(((CommonTableExpr *) node)->ctequery, context);
++		case T_JsonReturning:
++			return walker(((JsonReturning *) node)->format, context);
++		case T_JsonValueExpr:
++			{
++				JsonValueExpr *jve = (JsonValueExpr *) node;
++
++				if (walker(jve->raw_expr, context))
++					return true;
++				if (walker(jve->formatted_expr, context))
++					return true;
++				if (walker(jve->format, context))
++					return true;
++			}
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index 6bdad462c788..449d90c8f4f7 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -1751,6 +1751,36 @@ _outOnConflictExpr(StringInfo str, const OnConflictExpr *node)
+ 	WRITE_NODE_FIELD(exclRelTlist);
+ }
+ 
++static void
++_outJsonFormat(StringInfo str, const JsonFormat *node)
++{
++	WRITE_NODE_TYPE("JSONFORMAT");
++
++	WRITE_ENUM_FIELD(format_type, JsonFormatType);
++	WRITE_ENUM_FIELD(encoding, JsonEncoding);
++	WRITE_LOCATION_FIELD(location);
++}
++
++static void
++_outJsonReturning(StringInfo str, const JsonReturning *node)
++{
++	WRITE_NODE_TYPE("JSONRETURNING");
++
++	WRITE_NODE_FIELD(format);
++	WRITE_OID_FIELD(typid);
++	WRITE_INT_FIELD(typmod);
++}
++
++static void
++_outJsonValueExpr(StringInfo str, const JsonValueExpr *node)
++{
++	WRITE_NODE_TYPE("JSONVALUEEXPR");
++
++	WRITE_NODE_FIELD(raw_expr);
++	WRITE_NODE_FIELD(formatted_expr);
++	WRITE_NODE_FIELD(format);
++}
++
+ /*****************************************************************************
+  *
+  *	Stuff from pathnodes.h.
+@@ -4537,6 +4567,15 @@ outNode(StringInfo str, const void *obj)
+ 			case T_PartitionRangeDatum:
+ 				_outPartitionRangeDatum(str, obj);
+ 				break;
++			case T_JsonFormat:
++				_outJsonFormat(str, obj);
++				break;
++			case T_JsonReturning:
++				_outJsonReturning(str, obj);
++				break;
++			case T_JsonValueExpr:
++				_outJsonValueExpr(str, obj);
++				break;
+ 
+ 			default:
+ 
+diff --git a/src/backend/nodes/readfuncs.c b/src/backend/nodes/readfuncs.c
+index 3f68f7c18d99..6f398cdc15ba 100644
+--- a/src/backend/nodes/readfuncs.c
++++ b/src/backend/nodes/readfuncs.c
+@@ -1389,6 +1389,51 @@ _readOnConflictExpr(void)
+ 	READ_DONE();
+ }
+ 
++/*
++ * _readJsonFormat
++ */
++static JsonFormat *
++_readJsonFormat(void)
++{
++	READ_LOCALS(JsonFormat);
++
++	READ_ENUM_FIELD(format_type, JsonFormatType);
++	READ_ENUM_FIELD(encoding, JsonEncoding);
++	READ_LOCATION_FIELD(location);
++
++	READ_DONE();
++}
++
++/*
++ * _readJsonReturning
++ */
++static JsonReturning *
++_readJsonReturning(void)
++{
++	READ_LOCALS(JsonReturning);
++
++	READ_NODE_FIELD(format);
++	READ_OID_FIELD(typid);
++	READ_INT_FIELD(typmod);
++
++	READ_DONE();
++}
++
++/*
++ * _readJsonValueExpr
++ */
++static JsonValueExpr *
++_readJsonValueExpr(void)
++{
++	READ_LOCALS(JsonValueExpr);
++
++	READ_NODE_FIELD(raw_expr);
++	READ_NODE_FIELD(formatted_expr);
++	READ_NODE_FIELD(format);
++
++	READ_DONE();
++}
++
+ /*
+  *	Stuff from pathnodes.h.
+  *
+@@ -2974,6 +3019,12 @@ parseNodeString(void)
+ 		return_value = _readPartitionBoundSpec();
+ 	else if (MATCH("PARTITIONRANGEDATUM", 19))
+ 		return_value = _readPartitionRangeDatum();
++	else if (MATCH("JSONFORMAT", 10))
++		return_value = _readJsonFormat();
++	else if (MATCH("JSONRETURNING", 13))
++		return_value = _readJsonReturning();
++	else if (MATCH("JSONVALUEEXPR", 13))
++		return_value = _readJsonValueExpr();
+ 	else
+ 	{
+ 		elog(ERROR, "badly formatted node string \"%.32s\"...", token);
+diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
+index 413dcac0363a..b9cefe884792 100644
+--- a/src/backend/optimizer/util/clauses.c
++++ b/src/backend/optimizer/util/clauses.c
+@@ -3512,6 +3512,29 @@ eval_const_expressions_mutator(Node *node,
+ 					return ece_evaluate_expr((Node *) newcre);
+ 				return (Node *) newcre;
+ 			}
++		case T_JsonValueExpr:
++			{
++				JsonValueExpr *jve = (JsonValueExpr *) node;
++				Node	   *raw = eval_const_expressions_mutator((Node *) jve->raw_expr,
++																 context);
++
++				if (raw && IsA(raw, Const))
++				{
++					Node	   *formatted;
++					Node	   *save_case_val = context->case_val;
++
++					context->case_val = raw;
++
++					formatted = eval_const_expressions_mutator((Node *) jve->formatted_expr,
++																context);
++
++					context->case_val = save_case_val;
++
++					if (formatted && IsA(formatted, Const))
++						return formatted;
++				}
++				break;
++			}
+ 		default:
+ 			break;
+ 	}
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 0036c2f9e2d6..204b754ebaaf 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -635,6 +635,14 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ %type <defelt>		hash_partbound_elem
+ 
+ 
++%type <node>		json_format_clause_opt
++					json_representation
++					json_value_expr
++					json_output_clause_opt
++
++%type <ival>		json_encoding
++					json_encoding_clause_opt
++
+ /*
+  * Non-keyword token types.  These are hard-wired into the "flex" lexer.
+  * They must be listed first so that their numeric codes do not depend on
+@@ -686,7 +694,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	EXTENSION EXTERNAL EXTRACT
+ 
+ 	FALSE_P FAMILY FETCH FILTER FINALIZE FIRST_P FLOAT_P FOLLOWING FOR
+-	FORCE FOREIGN FORWARD FREEZE FROM FULL FUNCTION FUNCTIONS
++	FORCE FOREIGN FORMAT FORWARD FREEZE FROM FULL FUNCTION FUNCTIONS
+ 
+ 	GENERATED GLOBAL GRANT GRANTED GREATEST GROUP_P GROUPING GROUPS
+ 
+@@ -697,7 +705,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	INNER_P INOUT INPUT_P INSENSITIVE INSERT INSTEAD INT_P INTEGER
+ 	INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION
+ 
+-	JOIN
++	JOIN JSON
+ 
+ 	KEY
+ 
+@@ -781,6 +789,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 
+ /* Precedence: lowest to highest */
+ %nonassoc	SET				/* see relation_expr_opt_alias */
++%right		FORMAT
+ %left		UNION EXCEPT
+ %left		INTERSECT
+ %left		OR
+@@ -15235,6 +15244,54 @@ opt_asymmetric: ASYMMETRIC
+ 			| /*EMPTY*/
+ 		;
+ 
++/* SQL/JSON support */
++
++json_value_expr:
++			a_expr json_format_clause_opt
++			{
++				$$ = (Node *) makeJsonValueExpr((Expr *) $1, $2);
++			}
++		;
++
++json_format_clause_opt:
++			FORMAT json_representation
++				{
++					$$ = $2;
++					$$.location = @1;
++				}
++			| /* EMPTY */
++				{
++					$$ = (Node *) makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
++				}
++		;
++
++json_representation:
++			JSON json_encoding_clause_opt
++				{
++					$$ = (Node *) makeJsonFormat(JS_FORMAT_JSON, $2, @1);
++				}
++		/*	| other implementation defined JSON representation options (BSON, AVRO etc) */
++		;
++
++json_encoding_clause_opt:
++			ENCODING json_encoding					{ $$ = $2; }
++			| /* EMPTY */							{ $$ = JS_ENC_DEFAULT; }
++		;
++
++json_encoding:
++			name									{ $$ = makeJsonEncoding($1); }
++		;
++
++json_output_clause_opt:
++			RETURNING Typename json_format_clause_opt
++				{
++					JsonOutput *n = makeNode(JsonOutput);
++					n->typeName = $2;
++					n->returning.format = $3;
++					$$ = (Node *) n;
++				}
++			| /* EMPTY */							{ $$ = NULL; }
++		;
+ 
+ /*****************************************************************************
+  *
+@@ -15776,6 +15833,7 @@ unreserved_keyword:
+ 			| FIRST_P
+ 			| FOLLOWING
+ 			| FORCE
++			| FORMAT
+ 			| FORWARD
+ 			| FUNCTION
+ 			| FUNCTIONS
+@@ -15807,6 +15865,7 @@ unreserved_keyword:
+ 			| INSTEAD
+ 			| INVOKER
+ 			| ISOLATION
++			| JSON
+ 			| KEY
+ 			| LABEL
+ 			| LANGUAGE
+@@ -16323,6 +16382,7 @@ bare_label_keyword:
+ 			| FOLLOWING
+ 			| FORCE
+ 			| FOREIGN
++			| FORMAT
+ 			| FORWARD
+ 			| FREEZE
+ 			| FULL
+@@ -16367,6 +16427,7 @@ bare_label_keyword:
+ 			| IS
+ 			| ISOLATION
+ 			| JOIN
++			| JSON
+ 			| KEY
+ 			| LABEL
+ 			| LANGUAGE
+diff --git a/src/backend/parser/parse_expr.c b/src/backend/parser/parse_expr.c
+index 1c09ea24cdf7..985ddbedf11b 100644
+--- a/src/backend/parser/parse_expr.c
++++ b/src/backend/parser/parse_expr.c
+@@ -34,6 +34,7 @@
+ #include "parser/parse_type.h"
+ #include "utils/builtins.h"
+ #include "utils/date.h"
++#include "utils/fmgroids.h"
+ #include "utils/lsyscache.h"
+ #include "utils/timestamp.h"
+ #include "utils/xml.h"
+@@ -3099,3 +3100,183 @@ ParseExprKindName(ParseExprKind exprKind)
+ 	}
+ 	return "unrecognized expression kind";
+ }
++
++/*
++ * Make string Const node from JSON encoding name.
++ *
++ * UTF8 is default encoding.
++ */
++static Const *
++getJsonEncodingConst(JsonFormat *format)
++{
++	JsonEncoding encoding;
++	const char *enc;
++	Name		encname = palloc(sizeof(NameData));
++
++	if (!format ||
++		format->format_type == JS_FORMAT_DEFAULT ||
++		format->encoding == JS_ENC_DEFAULT)
++		encoding = JS_ENC_UTF8;
++	else
++		encoding = format->encoding;
++
++	switch (encoding)
++	{
++		case JS_ENC_UTF16:
++			enc = "UTF16";
++			break;
++		case JS_ENC_UTF32:
++			enc = "UTF32";
++			break;
++		case JS_ENC_UTF8:
++			enc = "UTF8";
++			break;
++		default:
++			elog(ERROR, "invalid JSON encoding: %d", encoding);
++			break;
++	}
++
++	namestrcpy(encname, enc);
++
++	return makeConst(NAMEOID, -1, InvalidOid, NAMEDATALEN,
++					 NameGetDatum(encname), false, false);
++}
++
++/*
++ * Make bytea => text conversion using specified JSON format encoding.
++ */
++static Node *
++makeJsonByteaToTextConversion(Node *expr, JsonFormat *format, int location)
++{
++	Const	   *encoding = getJsonEncodingConst(format);
++	FuncExpr   *fexpr = makeFuncExpr(F_CONVERT_FROM, TEXTOID,
++									 list_make2(expr, encoding),
++									 InvalidOid, InvalidOid,
++									 COERCE_EXPLICIT_CALL);
++
++	fexpr->location = location;
++
++	return (Node *) fexpr;
++}
++
++/*
++ * Make CaseTestExpr node.
++ */
++static Node *
++makeCaseTestExpr(Node *expr)
++{
++	CaseTestExpr *placeholder = makeNode(CaseTestExpr);
++
++	placeholder->typeId = exprType(expr);
++	placeholder->typeMod = exprTypmod(expr);
++	placeholder->collation = exprCollation(expr);
++
++	return (Node *) placeholder;
++}
++
++/*
++ * Transform JSON value expression using specified input JSON format or
++ * default format otherwise.
++ */
++static Node *
++transformJsonValueExpr(ParseState *pstate, JsonValueExpr *ve,
++					   JsonFormatType default_format)
++{
++	Node	   *expr = transformExprRecurse(pstate, (Node *) ve->raw_expr);
++	Node	   *rawexpr;
++	JsonFormatType format;
++	Oid			exprtype;
++	int			location;
++	char		typcategory;
++	bool		typispreferred;
++
++	if (exprType(expr) == UNKNOWNOID)
++		expr = coerce_to_specific_type(pstate, expr, TEXTOID, "JSON_VALUE_EXPR");
++
++	rawexpr = expr;
++	exprtype = exprType(expr);
++	location = exprLocation(expr);
++
++	get_type_category_preferred(exprtype, &typcategory, &typispreferred);
++
++	if (ve->format->format_type != JS_FORMAT_DEFAULT)
++	{
++		if (ve->format->encoding != JS_ENC_DEFAULT && exprtype != BYTEAOID)
++			ereport(ERROR,
++					(errcode(ERRCODE_DATATYPE_MISMATCH),
++					 errmsg("JSON ENCODING clause is only allowed for bytea input type"),
++					 parser_errposition(pstate, ve->format->location)));
++
++		if (exprtype == JSONOID || exprtype == JSONBOID)
++		{
++			format = JS_FORMAT_DEFAULT;	/* do not format json[b] types */
++			ereport(WARNING,
++					(errmsg("FORMAT JSON has no effect for json and jsonb types"),
++					 parser_errposition(pstate, ve->format->location)));
++		}
++		else
++			format = ve->format->format_type;
++	}
++	else if (exprtype == JSONOID || exprtype == JSONBOID)
++		format = JS_FORMAT_DEFAULT;	/* do not format json[b] types */
++	else
++		format = default_format;
++
++	if (format != JS_FORMAT_DEFAULT)
++	{
++		Oid			targettype = format == JS_FORMAT_JSONB ? JSONBOID : JSONOID;
++		Node	   *orig = makeCaseTestExpr(expr);
++		Node	   *coerced;
++
++		expr = orig;
++
++		if (exprtype != BYTEAOID && typcategory != TYPCATEGORY_STRING)
++			ereport(ERROR,
++					(errcode(ERRCODE_DATATYPE_MISMATCH),
++					 errmsg(ve->format->format_type == JS_FORMAT_DEFAULT ?
++							"cannot use non-string types with implicit FORMAT JSON clause" :
++							"cannot use non-string types with explicit FORMAT JSON clause"),
++					 parser_errposition(pstate, ve->format->location >= 0 ?
++										ve->format->location : location)));
++
++		/* Convert encoded JSON text from bytea. */
++		if (format == JS_FORMAT_JSON && exprtype == BYTEAOID)
++		{
++			expr = makeJsonByteaToTextConversion(expr, ve->format, location);
++			exprtype = TEXTOID;
++		}
++
++		/* Try to coerce to the target type. */
++		coerced = coerce_to_target_type(pstate, expr, exprtype,
++										targettype, -1,
++										COERCION_EXPLICIT,
++										COERCE_EXPLICIT_CAST,
++										location);
++
++		if (!coerced)
++		{
++			/* If coercion failed, use to_json()/to_jsonb() functions. */
++			Oid			fnoid = targettype == JSONOID ? F_TO_JSON : F_TO_JSONB;
++			FuncExpr   *fexpr = makeFuncExpr(fnoid, targettype,
++											 list_make1(expr),
++											 InvalidOid, InvalidOid,
++											 COERCE_EXPLICIT_CALL);
++			fexpr->location = location;
++
++			coerced = (Node *) fexpr;
++		}
++
++		if (coerced == orig)
++			expr = rawexpr;
++		else
++		{
++			ve = copyObject(ve);
++			ve->raw_expr = (Expr *) rawexpr;
++			ve->formatted_expr = (Expr *) coerced;
++
++			expr = (Node *) ve;
++		}
++	}
++
++	return expr;
++}
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index 7f4f3f736991..c7860a758016 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -8266,6 +8266,11 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
+ 					return false;
+ 			}
+ 
++		case T_JsonValueExpr:
++			/* maybe simple, check args */
++			return isSimpleNode((Node *) ((JsonValueExpr *) node)->raw_expr,
++								node, prettyFlags);
++
+ 		default:
+ 			break;
+ 	}
+@@ -8371,6 +8376,48 @@ get_rule_expr_paren(Node *node, deparse_context *context,
+ 		appendStringInfoChar(context->buf, ')');
+ }
+ 
++/*
++ * get_json_format			- Parse back a JsonFormat node
++ */
++static void
++get_json_format(JsonFormat *format, deparse_context *context)
++{
++	if (format->format_type == JS_FORMAT_DEFAULT)
++		return;
++
++	appendStringInfoString(context->buf,
++						   format->format_type == JS_FORMAT_JSONB ?
++						   " FORMAT JSONB" : " FORMAT JSON");
++
++	if (format->encoding != JS_ENC_DEFAULT)
++	{
++		const char *encoding =
++			format->encoding == JS_ENC_UTF16 ? "UTF16" :
++			format->encoding == JS_ENC_UTF32 ? "UTF32" : "UTF8";
++
++		appendStringInfo(context->buf, " ENCODING %s", encoding);
++	}
++}
++
++/*
++ * get_json_returning		- Parse back a JsonReturning structure
++ */
++static void
++get_json_returning(JsonReturning *returning, deparse_context *context,
++				   bool json_format_by_default)
++{
++	if (!OidIsValid(returning->typid))
++		return;
++
++	appendStringInfo(context->buf, " RETURNING %s",
++					 format_type_with_typemod(returning->typid,
++											  returning->typmod));
++
++	if (!json_format_by_default ||
++		returning->format->format_type !=
++			(returning->typid == JSONBOID ? JS_FORMAT_JSONB : JS_FORMAT_JSON))
++		get_json_format(returning->format, context);
++}
+ 
+ /* ----------
+  * get_rule_expr			- Parse back an expression
+@@ -9531,6 +9578,15 @@ get_rule_expr(Node *node, deparse_context *context,
+ 			}
+ 			break;
+ 
++		case T_JsonValueExpr:
++			{
++				JsonValueExpr *jve = (JsonValueExpr *) node;
++
++				get_rule_expr((Node *) jve->raw_expr, context, false);
++				get_json_format(jve->format, context);
++			}
++			break;
++
+ 		case T_List:
+ 			{
+ 				char	   *sep;
+diff --git a/src/backend/utils/misc/queryjumble.c b/src/backend/utils/misc/queryjumble.c
+index a67487e5fe88..84435420e4cd 100644
+--- a/src/backend/utils/misc/queryjumble.c
++++ b/src/backend/utils/misc/queryjumble.c
+@@ -737,6 +737,32 @@ JumbleExpr(JumbleState *jstate, Node *node)
+ 				JumbleExpr(jstate, (Node *) conf->exclRelTlist);
+ 			}
+ 			break;
++		case T_JsonFormat:
++			{
++				JsonFormat *format = (JsonFormat *) node;
++
++				APP_JUMB(format->type);
++				APP_JUMB(format->encoding);
++			}
++			break;
++		case T_JsonReturning:
++			{
++				JsonReturning *returning = (JsonReturning *) node;
++
++				JumbleExpr(jstate, (Node *) returning->format);
++				APP_JUMB(returning->typid);
++				APP_JUMB(returning->typmod);
++			}
++			break;
++		case T_JsonValueExpr:
++			{
++				JsonValueExpr *expr = (JsonValueExpr *) node;
++
++				JumbleExpr(jstate, (Node *) expr->raw_expr);
++				JumbleExpr(jstate, (Node *) expr->formatted_expr);
++				JumbleExpr(jstate, (Node *) expr->format);
++			}
++			break;
+ 		case T_List:
+ 			foreach(temp, (List *) node)
+ 			{
+diff --git a/src/include/nodes/makefuncs.h b/src/include/nodes/makefuncs.h
+index 50de4c62af70..ec8b71a68561 100644
+--- a/src/include/nodes/makefuncs.h
++++ b/src/include/nodes/makefuncs.h
+@@ -106,4 +106,9 @@ extern GroupingSet *makeGroupingSet(GroupingSetKind kind, List *content, int loc
+ 
+ extern VacuumRelation *makeVacuumRelation(RangeVar *relation, Oid oid, List *va_cols);
+ 
++extern JsonFormat *makeJsonFormat(JsonFormatType type, JsonEncoding encoding,
++								  int location);
++extern JsonValueExpr *makeJsonValueExpr(Expr *expr, JsonFormat *format);
++extern JsonEncoding makeJsonEncoding(char *name);
++
+ #endif							/* MAKEFUNC_H */
+diff --git a/src/include/nodes/nodes.h b/src/include/nodes/nodes.h
+index 5d075f0c346b..59737f103495 100644
+--- a/src/include/nodes/nodes.h
++++ b/src/include/nodes/nodes.h
+@@ -201,6 +201,9 @@ typedef enum NodeTag
+ 	T_FromExpr,
+ 	T_OnConflictExpr,
+ 	T_IntoClause,
++	T_JsonFormat,
++	T_JsonReturning,
++	T_JsonValueExpr,
+ 
+ 	/*
+ 	 * TAGS FOR EXPRESSION STATE NODES (execnodes.h)
+@@ -491,6 +494,7 @@ typedef enum NodeTag
+ 	T_VacuumRelation,
+ 	T_PublicationObjSpec,
+ 	T_PublicationTable,
++	T_JsonOutput,
+ 
+ 	/*
+ 	 * TAGS FOR REPLICATION GRAMMAR PARSE NODES (replnodes.h)
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index 2f618cb22926..712e56b5f287 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -1553,6 +1553,19 @@ typedef struct TriggerTransition
+ 	bool		isTable;
+ } TriggerTransition;
+ 
++/* Nodes for SQL/JSON support */
++
++/*
++ * JsonOutput -
++ *		representation of JSON output clause (RETURNING type [FORMAT format])
++ */
++typedef struct JsonOutput
++{
++	NodeTag		type;
++	TypeName   *typeName;		/* RETURNING type name, if specified */
++	JsonReturning returning;	/* RETURNING FORMAT clause and type Oids */
++} JsonOutput;
++
+ /*****************************************************************************
+  *		Raw Grammar Output Statements
+  *****************************************************************************/
+diff --git a/src/include/nodes/primnodes.h b/src/include/nodes/primnodes.h
+index 439e4b4a9db8..8e3c99bdb525 100644
+--- a/src/include/nodes/primnodes.h
++++ b/src/include/nodes/primnodes.h
+@@ -1233,6 +1233,65 @@ typedef struct XmlExpr
+ 	int			location;		/* token location, or -1 if unknown */
+ } XmlExpr;
+ 
++/*
++ * JsonEncoding -
++ *		representation of JSON ENCODING clause
++ */
++typedef enum JsonEncoding
++{
++	JS_ENC_DEFAULT,				/* unspecified */
++	JS_ENC_UTF8,
++	JS_ENC_UTF16,
++	JS_ENC_UTF32,
++} JsonEncoding;
++
++/*
++ * JsonFormatType -
++ *		enumeration of JSON formats used in JSON FORMAT clause
++ */
++typedef enum JsonFormatType
++{
++	JS_FORMAT_DEFAULT,			/* unspecified */
++	JS_FORMAT_JSON,				/* FORMAT JSON [ENCODING ...] */
++	JS_FORMAT_JSONB				/* implicit internal format for RETURNING jsonb */
++} JsonFormatType;
++
++/*
++ * JsonFormat -
++ *		representation of JSON FORMAT clause
++ */
++typedef struct JsonFormat
++{
++	NodeTag		type;
++	JsonFormatType format_type;	/* format type */
++	JsonEncoding encoding;		/* JSON encoding */
++	int			location;		/* token location, or -1 if unknown */
++} JsonFormat;
++
++/*
++ * JsonReturning -
++ *		transformed representation of JSON RETURNING clause
++ */
++typedef struct JsonReturning
++{
++	NodeTag		type;
++	JsonFormat *format;			/* output JSON format */
++	Oid			typid;			/* target type Oid */
++	int32		typmod;			/* target type modifier */
++} JsonReturning;
++
++/*
++ * JsonValueExpr -
++ *		representation of JSON value expression (expr [FORMAT json_format])
++ */
++typedef struct JsonValueExpr
++{
++	NodeTag		type;
++	Expr	   *raw_expr;		/* raw expression */
++	Expr	   *formatted_expr;	/* formatted expression or NULL */
++	JsonFormat *format;			/* FORMAT clause, if specified */
++} JsonValueExpr;
++
+ /* ----------------
+  * NullTest
+  *
+diff --git a/src/include/parser/kwlist.h b/src/include/parser/kwlist.h
+index bcef7eed2f37..f3502b8be4dc 100644
+--- a/src/include/parser/kwlist.h
++++ b/src/include/parser/kwlist.h
+@@ -175,6 +175,7 @@ PG_KEYWORD("following", FOLLOWING, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("for", FOR, RESERVED_KEYWORD, AS_LABEL)
+ PG_KEYWORD("force", FORCE, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("foreign", FOREIGN, RESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("format", FORMAT, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("forward", FORWARD, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("freeze", FREEZE, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("from", FROM, RESERVED_KEYWORD, AS_LABEL)
+@@ -227,6 +228,7 @@ PG_KEYWORD("is", IS, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("isnull", ISNULL, TYPE_FUNC_NAME_KEYWORD, AS_LABEL)
+ PG_KEYWORD("isolation", ISOLATION, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("join", JOIN, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("json", JSON, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("key", KEY, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("label", LABEL, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("language", LANGUAGE, UNRESERVED_KEYWORD, BARE_LABEL)

@@ -1,0 +1,4074 @@
+From 741d7f1047fe52da7ced6fa9cea661ce9320c8d4 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 22 Jun 2021 21:43:12 -0400
+Subject: [PATCH] Use annotations to reduce instability of isolation-test
+ results.
+
+We've long contended with isolation test results that aren't entirely
+stable.  Some test scripts insert long delays to try to force stable
+results, which is not terribly desirable; but other erratic failure
+modes remain, causing unrepeatable buildfarm failures.  I've spent a
+fair amount of time trying to solve this by improving the server-side
+support code, without much success: that way is fundamentally unable
+to cope with diffs that stem from chance ordering of arrival of
+messages from different server processes.
+
+We can improve matters on the client side, however, by annotating
+the test scripts themselves to show the desired reporting order
+of events that might occur in different orders.  This patch adds
+three types of annotations to deal with (a) test steps that might or
+might not complete their waits before the isolationtester can see them
+waiting; (b) test steps in different sessions that can legitimately
+complete in either order; and (c) NOTIFY messages that might arrive
+before or after the completion of a step in another session.  We might
+need more annotation types later, but this seems to be enough to deal
+with the instabilities we've seen in the buildfarm.  It also lets us
+get rid of all the long delays that were previously used, cutting more
+than a minute off the runtime of the isolation tests.
+
+Back-patch to all supported branches, because the buildfarm
+instabilities affect all the branches, and because it seems desirable
+to keep isolationtester's capabilities the same across all branches
+to simplify possible future back-patching of tests.
+
+Discussion: https://postgr.es/m/327948.1623725828@sss.pgh.pa.us
+---
+ .../expected/concurrent_ddl_dml.out           |   2 +-
+ src/test/isolation/README                     |  85 +-
+ src/test/isolation/expected/alter-table-3.out |  32 +-
+ src/test/isolation/expected/alter-table-4.out |   2 +-
+ src/test/isolation/expected/deadlock-hard.out |   2 +-
+ .../isolation/expected/deadlock-simple.out    |   2 +-
+ .../detach-partition-concurrently-3.out       | 200 +++--
+ .../detach-partition-concurrently-4.out       | 118 ++-
+ .../expected/eval-plan-qual-trigger.out       |  18 +-
+ .../isolation/expected/eval-plan-qual.out     |   6 +-
+ .../isolation/expected/fk-deadlock2_1.out     |  12 +-
+ .../isolation/expected/fk-deadlock2_2.out     |  12 +-
+ src/test/isolation/expected/fk-deadlock_1.out |  12 +-
+ .../isolation/expected/fk-partitioned-1.out   |  12 +-
+ .../isolation/expected/fk-partitioned-2.out   |  12 +-
+ .../expected/insert-conflict-do-nothing-2.out |   8 +-
+ .../expected/insert-conflict-specconflict.out |   4 +-
+ .../expected/lock-committed-keyupdate.out     |  24 +-
+ .../expected/lock-update-delete_1.out         |   8 +-
+ src/test/isolation/expected/multiple-cic.out  |   3 +-
+ .../isolation/expected/multiple-cic_1.out     |  20 -
+ .../expected/multixact-no-forget_1.out        |   4 +-
+ src/test/isolation/expected/nowait-4.out      |   2 +-
+ src/test/isolation/expected/nowait-4_1.out    |   2 +-
+ src/test/isolation/expected/nowait-5.out      |   2 +-
+ .../expected/partition-concurrent-attach.out  |   6 +-
+ .../expected/partition-key-update-1.out       |  14 +-
+ .../expected/partition-key-update-3.out       |  12 +-
+ .../expected/propagate-lock-delete.out        |  16 +-
+ .../expected/read-write-unique-2.out          |   2 +-
+ .../expected/read-write-unique-3.out          |   2 +-
+ .../expected/read-write-unique-4.out          |   6 +-
+ .../isolation/expected/read-write-unique.out  |   2 +-
+ src/test/isolation/expected/sequence-ddl.out  |   2 +-
+ .../isolation/expected/skip-locked-4_1.out    |   2 +-
+ src/test/isolation/expected/timeouts.out      |  16 +-
+ .../isolation/expected/tuplelock-update.out   |  21 +-
+ src/test/isolation/isolationtester.c          | 780 +++++++++++-------
+ src/test/isolation/isolationtester.h          |  47 +-
+ src/test/isolation/specparse.y                |  87 +-
+ src/test/isolation/specs/deadlock-hard.spec   |  12 +-
+ src/test/isolation/specs/deadlock-soft-2.spec |  15 +-
+ .../detach-partition-concurrently-3.spec      |  50 +-
+ .../detach-partition-concurrently-4.spec      |  34 +-
+ .../specs/insert-conflict-specconflict.spec   |  16 +-
+ src/test/isolation/specs/multiple-cic.spec    |   5 +-
+ src/test/isolation/specs/timeouts.spec        |  28 +-
+ .../isolation/specs/tuplelock-update.spec     |   9 +-
+ src/test/isolation/specscanner.l              |  12 +
+ 49 files changed, 1077 insertions(+), 723 deletions(-)
+ delete mode 100644 src/test/isolation/expected/multiple-cic_1.out
+
+diff --git a/contrib/test_decoding/expected/concurrent_ddl_dml.out b/contrib/test_decoding/expected/concurrent_ddl_dml.out
+index 1f9e7661b753..53578c8ed60f 100644
+--- a/contrib/test_decoding/expected/concurrent_ddl_dml.out
++++ b/contrib/test_decoding/expected/concurrent_ddl_dml.out
+@@ -257,7 +257,7 @@ step s1_insert_tbl2: INSERT INTO tbl2 (val1, val2) VALUES (1, 1);
+ step s2_alter_tbl1_boolean: ALTER TABLE tbl1 ALTER COLUMN val2 TYPE boolean; <waiting ...>
+ step s1_commit: COMMIT;
+ step s2_alter_tbl1_boolean: <... completed>
+-error in steps s1_commit s2_alter_tbl1_boolean: ERROR:  column "val2" cannot be cast automatically to type boolean
++ERROR:  column "val2" cannot be cast automatically to type boolean
+ step s2_get_changes: SELECT data FROM pg_logical_slot_get_changes('isolation_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
+ data           
+ 
+diff --git a/src/test/isolation/README b/src/test/isolation/README
+index 6ae71523258a..9d568e53543d 100644
+--- a/src/test/isolation/README
++++ b/src/test/isolation/README
+@@ -57,11 +57,16 @@ Test specification
+ ==================
+ 
+ Each isolation test is defined by a specification file, stored in the specs
+-subdirectory. A test specification consists of four parts, in this order:
++subdirectory.  A test specification defines some SQL "steps", groups them
++into "sessions" (where all the steps of one session will be run in the
++same backend), and specifies the "permutations" or orderings of the steps
++that are to be run.
++
++A test specification consists of four parts, in this order:
+ 
+ setup { <SQL> }
+ 
+-  The given SQL block is executed once, in one session only, before running
++  The given SQL block is executed once (per permutation) before running
+   the test.  Create any test tables or other required objects here.  This
+   part is optional.  Multiple setup blocks are allowed if needed; each is
+   run separately, in the given order.  (The reason for allowing multiple
+@@ -81,8 +86,8 @@ session "<name>"
+   session is executed in its own connection. A session part consists
+   of three parts: setup, teardown and one or more "steps". The per-session
+   setup and teardown parts have the same syntax as the per-test setup and
+-  teardown described above, but they are executed in each session. The
+-  setup part typically contains a "BEGIN" command to begin a transaction.
++  teardown described above, but they are executed in each session. The setup
++  part might, for example, contain a "BEGIN" command to begin a transaction.
+ 
+   Each step has the syntax
+ 
+@@ -101,7 +106,8 @@ permutation "<step name>" ...
+   order).  Note that the list of steps in a manually specified
+   "permutation" line doesn't actually have to be a permutation of the
+   available steps; it could for instance repeat some steps more than once,
+-  or leave others out.
++  or leave others out.  Also, each step name can be annotated with some
++  parenthesized markers, which are described below.
+ 
+ Lines beginning with a # are considered comments.
+ 
+@@ -110,7 +116,8 @@ specified in the spec file, or automatically generated), the isolation
+ tester runs the main setup part, then per-session setup parts, then
+ the selected session steps, then per-session teardown, then the main
+ teardown script.  Each selected step is sent to the connection associated
+-with its session.
++with its session.  The main setup and teardown scripts are run in a
++separate "control" session.
+ 
+ 
+ Support for blocking commands
+@@ -129,3 +136,69 @@ tests take a very long time to run, and they serve no useful testing purpose.
+ Note that isolationtester recognizes that a command has blocked by looking
+ to see if it is shown as waiting in the pg_locks view; therefore, only
+ blocks on heavyweight locks will be detected.
++
++
++Dealing with race conditions
++============================
++
++In some cases, the isolationtester's output for a test script may vary
++due to timing issues.  One way to deal with that is to create variant
++expected-files, which follow the usual PG convention that variants for
++foo.spec are named foo_1.out, foo_2.out, etc.  However, this method is
++discouraged since the extra files are a nuisance for maintenance.
++Instead, it's usually possible to stabilize the test output by applying
++special markers to some of the step names listed in a permutation line.
++
++The general form of a permutation entry is
++
++	<step name> [ ( <marker> [ , <marker> ... ] ) ]
++
++where each marker defines a "blocking condition".  The step will not be
++reported as completed before all the blocking conditions are satisfied.
++The possible markers are:
++
++	*
++	<other step name>
++	<other step name> notices <n>
++
++An asterisk marker, such as mystep(*), forces the isolationtester to
++report the step as "waiting" as soon as it's been launched, regardless of
++whether it would have been detected as waiting later.  This is useful for
++stabilizing cases that are sometimes reported as waiting and other times
++reported as immediately completing, depending on the relative speeds of
++the step and the isolationtester's status-monitoring queries.
++
++A marker consisting solely of a step name indicates that this step may
++not be reported as completing until that other step has completed.
++This allows stabilizing cases where two queries might be seen to complete
++in either order.  Note that this step can be *launched* before the other
++step has completed.  (If the other step is used more than once in the
++current permutation, this step cannot complete while any of those
++instances is active.)
++
++A marker of the form "<other step name> notices <n>" (where <n> is a
++positive integer) indicates that this step may not be reported as
++completing until the other step's session has returned at least <n>
++NOTICE messages, counting from when this step is launched.  This is useful
++for stabilizing cases where a step can return NOTICE messages before it
++actually completes, and those messages must be synchronized with the
++completions of other steps.
++
++Notice that these markers can only delay reporting of the completion
++of a step, not the launch of a step.  The isolationtester will launch
++the next step in a permutation as soon as (A) all prior steps of the
++same session are done, and (B) the immediately preceding step in the
++permutation is done or deemed blocked.  For this purpose, "deemed
++blocked" means that it has been seen to be waiting on a database lock,
++or that it is complete but the report of its completion is delayed by
++one of these markers.
++
++In some cases it is important not to launch a step until after the
++completion of a step in another session that could have been deemed
++blocked.  An example is that if step s1 in session A is issuing a
++cancel for step s2 in session B, we'd better not launch B's next step
++till we're sure s1 is done.  If s1 is blockable, trouble could ensue.
++The best way to prevent that is to create an empty step in session A
++and run it, without any markers, just before the next session B step.
++The empty step cannot be launched until s1 is done, and in turn the
++next session B step cannot be launched until the empty step finishes.
+diff --git a/src/test/isolation/expected/alter-table-3.out b/src/test/isolation/expected/alter-table-3.out
+index b4f3b5a86d1f..aad837206977 100644
+--- a/src/test/isolation/expected/alter-table-3.out
++++ b/src/test/isolation/expected/alter-table-3.out
+@@ -54,7 +54,7 @@ i
+ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s1a s1b s2a s1c s1d s2b s2c s2d
+@@ -97,7 +97,7 @@ i
+ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s1a s1b s2a s2b s1c s1d s2c s2d
+@@ -126,7 +126,7 @@ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s1a s1b s2a s2b s2c s1c s1d s2d
+@@ -141,7 +141,7 @@ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s1a s2a s1b s1c s1d s2b s2c s2d
+@@ -184,7 +184,7 @@ i
+ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s1a s2a s1b s2b s1c s1d s2c s2d
+@@ -213,7 +213,7 @@ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s1a s2a s1b s2b s2c s1c s1d s2d
+@@ -228,7 +228,7 @@ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s1a s2a s2b s1b s1c s1d s2c s2d
+@@ -257,7 +257,7 @@ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s1a s2a s2b s1b s2c s1c s1d s2d
+@@ -272,7 +272,7 @@ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s1a s2a s2b s2c s1b s1c s1d s2d
+@@ -371,7 +371,7 @@ i
+ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s2a s1a s1b s2b s1c s1d s2c s2d
+@@ -400,7 +400,7 @@ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s2a s1a s1b s2b s2c s1c s1d s2d
+@@ -415,7 +415,7 @@ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s2a s1a s2b s1b s1c s1d s2c s2d
+@@ -444,7 +444,7 @@ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s2a s1a s2b s1b s2c s1c s1d s2d
+@@ -459,7 +459,7 @@ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s2a s1a s2b s2c s1b s1c s1d s2d
+@@ -544,7 +544,7 @@ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s2a s2b s1a s1b s2c s1c s1d s2d
+@@ -559,7 +559,7 @@ step s2c: INSERT INTO a VALUES (0); <waiting ...>
+ step s1c: ALTER TABLE a ENABLE TRIGGER t;
+ step s1d: COMMIT;
+ step s2c: <... completed>
+-error in steps s1d s2c: ERROR:  duplicate key value violates unique constraint "a_pkey"
++ERROR:  duplicate key value violates unique constraint "a_pkey"
+ step s2d: COMMIT;
+ 
+ starting permutation: s2a s2b s1a s2c s1b s1c s1d s2d
+diff --git a/src/test/isolation/expected/alter-table-4.out b/src/test/isolation/expected/alter-table-4.out
+index d2dac0be0984..1009844f06f3 100644
+--- a/src/test/isolation/expected/alter-table-4.out
++++ b/src/test/isolation/expected/alter-table-4.out
+@@ -50,7 +50,7 @@ step s1modc1a: ALTER TABLE c1 ALTER COLUMN a TYPE float;
+ step s2sel: SELECT SUM(a) FROM p; <waiting ...>
+ step s1c: COMMIT;
+ step s2sel: <... completed>
+-error in steps s1c s2sel: ERROR:  attribute "a" of relation "c1" does not match parent's type
++ERROR:  attribute "a" of relation "c1" does not match parent's type
+ step s2sel: SELECT SUM(a) FROM p;
+ sum            
+ 
+diff --git a/src/test/isolation/expected/deadlock-hard.out b/src/test/isolation/expected/deadlock-hard.out
+index b4ce01962d64..460653f2b86a 100644
+--- a/src/test/isolation/expected/deadlock-hard.out
++++ b/src/test/isolation/expected/deadlock-hard.out
+@@ -18,8 +18,8 @@ step s6a7: LOCK TABLE a7; <waiting ...>
+ step s7a8: LOCK TABLE a8; <waiting ...>
+ step s8a1: LOCK TABLE a1; <waiting ...>
+ step s8a1: <... completed>
++ERROR:  deadlock detected
+ step s7a8: <... completed>
+-error in steps s8a1 s7a8: ERROR:  deadlock detected
+ step s8c: COMMIT;
+ step s7c: COMMIT;
+ step s6a7: <... completed>
+diff --git a/src/test/isolation/expected/deadlock-simple.out b/src/test/isolation/expected/deadlock-simple.out
+index e0d2c4ef12be..8be1538dd581 100644
+--- a/src/test/isolation/expected/deadlock-simple.out
++++ b/src/test/isolation/expected/deadlock-simple.out
+@@ -5,7 +5,7 @@ step s1as: LOCK TABLE a1 IN ACCESS SHARE MODE;
+ step s2as: LOCK TABLE a1 IN ACCESS SHARE MODE;
+ step s1ae: LOCK TABLE a1 IN ACCESS EXCLUSIVE MODE; <waiting ...>
+ step s2ae: LOCK TABLE a1 IN ACCESS EXCLUSIVE MODE;
++ERROR:  deadlock detected
+ step s1ae: <... completed>
+-error in steps s2ae s1ae: ERROR:  deadlock detected
+ step s1c: COMMIT;
+ step s2c: COMMIT;
+diff --git a/src/test/isolation/expected/detach-partition-concurrently-3.out b/src/test/isolation/expected/detach-partition-concurrently-3.out
+index 96ee090d531c..7ac22a6b15f0 100644
+--- a/src/test/isolation/expected/detach-partition-concurrently-3.out
++++ b/src/test/isolation/expected/detach-partition-concurrently-3.out
+@@ -1,6 +1,6 @@
+ Parsed test spec with 2 sessions
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s1describe s1alter
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s1describe s1alter
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -8,13 +8,12 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s1describe: SELECT 'd3_listp' AS root, * FROM pg_partition_tree('d3_listp')
+ 					  UNION ALL SELECT 'd3_listp1', * FROM pg_partition_tree('d3_listp1');
+@@ -26,7 +25,7 @@ d3_listp1      d3_listp1                     t              0
+ step s1alter: ALTER TABLE d3_listp1 ALTER a DROP NOT NULL;
+ ERROR:  cannot alter partition "d3_listp1" with an incomplete detach
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1insert s1c
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1insert s1c
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -34,18 +33,17 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1insert: INSERT INTO d3_listp VALUES (1);
+ ERROR:  no partition of relation "d3_listp" found for row
+ step s1c: COMMIT;
+ 
+-starting permutation: s2snitch s1brr s1s s2detach s1cancel s2noop s1insert s1c s1spart
++starting permutation: s2snitch s1brr s1s s2detach s1cancel s1insert s1c s1spart
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1brr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+ step s1s: SELECT * FROM d3_listp;
+@@ -53,13 +51,12 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1insert: INSERT INTO d3_listp VALUES (1);
+ step s1c: COMMIT;
+ step s1spart: SELECT * FROM d3_listp1;
+@@ -68,7 +65,7 @@ a
+ 1              
+ 1              
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s1insertpart
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s1insertpart
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -76,17 +73,16 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s1insertpart: INSERT INTO d3_listp1 VALUES (1);
+ 
+-starting permutation: s2snitch s1b s1s s2detach2 s1cancel s2noop s1c s1brr s1insert s1s s1insert s1c
++starting permutation: s2snitch s1b s1s s2detach2 s1cancel s1c s1brr s1insert s1s s1insert s1c
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -94,13 +90,12 @@ a
+ 
+ 1              
+ step s2detach2: ALTER TABLE d3_listp DETACH PARTITION d3_listp2 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach2: <... completed>
+-error in steps s1cancel s2detach2: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s1brr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+ step s1insert: INSERT INTO d3_listp VALUES (1);
+@@ -112,7 +107,7 @@ a
+ step s1insert: INSERT INTO d3_listp VALUES (1);
+ step s1c: COMMIT;
+ 
+-starting permutation: s2snitch s1b s1s s2detach2 s1cancel s2noop s1c s1brr s1s s1insert s1s s1c
++starting permutation: s2snitch s1b s1s s2detach2 s1cancel s1c s1brr s1s s1insert s1s s1c
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -120,13 +115,12 @@ a
+ 
+ 1              
+ step s2detach2: ALTER TABLE d3_listp DETACH PARTITION d3_listp2 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach2: <... completed>
+-error in steps s1cancel s2detach2: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s1brr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+ step s1s: SELECT * FROM d3_listp;
+@@ -141,7 +135,7 @@ a
+ 1              
+ step s1c: COMMIT;
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s1drop s1list
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s1drop s1list
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -149,13 +143,12 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s1drop: DROP TABLE d3_listp;
+ step s1list: SELECT relname FROM pg_catalog.pg_class
+@@ -163,7 +156,7 @@ step s1list: SELECT relname FROM pg_catalog.pg_class
+ relname        
+ 
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s1trunc s1spart
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s1trunc s1spart
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -171,13 +164,12 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s1trunc: TRUNCATE TABLE d3_listp;
+ step s1spart: SELECT * FROM d3_listp1;
+@@ -185,7 +177,7 @@ a
+ 
+ 1              
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s2detach2 s1c
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1noop s2detach2 s1c
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -193,18 +185,18 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
++step s1noop: 
+ step s2detach2: ALTER TABLE d3_listp DETACH PARTITION d3_listp2 CONCURRENTLY;
+ ERROR:  partition "d3_listp1" already pending detach in partitioned table "public.d3_listp"
+ step s1c: COMMIT;
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s2detachfinal s1c s2detach2
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1noop s2detachfinal s1c s2detach2
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -212,19 +204,19 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
++step s1noop: 
+ step s2detachfinal: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 FINALIZE; <waiting ...>
+ step s1c: COMMIT;
+ step s2detachfinal: <... completed>
+ step s2detach2: ALTER TABLE d3_listp DETACH PARTITION d3_listp2 CONCURRENTLY;
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s1droppart s2detach2
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s1droppart s2detach2
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -232,18 +224,17 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s1droppart: DROP TABLE d3_listp1;
+ step s2detach2: ALTER TABLE d3_listp DETACH PARTITION d3_listp2 CONCURRENTLY;
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s2begin s2drop s1s s2commit
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s2begin s2drop s1s s2commit
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -251,13 +242,12 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s2begin: BEGIN;
+ step s2drop: DROP TABLE d3_listp1;
+@@ -267,7 +257,7 @@ step s1s: <... completed>
+ a              
+ 
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s1b s1spart s2detachfinal s1c
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s1b s1spart s2detachfinal s1c
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -275,13 +265,12 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s1b: BEGIN;
+ step s1spart: SELECT * FROM d3_listp1;
+@@ -292,7 +281,7 @@ step s2detachfinal: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 FINALIZE; <w
+ step s1c: COMMIT;
+ step s2detachfinal: <... completed>
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s1b s1s s2detachfinal s1c
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s1b s1s s2detachfinal s1c
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -300,13 +289,12 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -315,7 +303,7 @@ a
+ step s2detachfinal: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 FINALIZE;
+ step s1c: COMMIT;
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s1b s1spart s2detachfinal s1c
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s1b s1spart s2detachfinal s1c
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -323,13 +311,12 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s1b: BEGIN;
+ step s1spart: SELECT * FROM d3_listp1;
+@@ -340,7 +327,7 @@ step s2detachfinal: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 FINALIZE; <w
+ step s1c: COMMIT;
+ step s2detachfinal: <... completed>
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s2begin s2detachfinal s2commit
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s2begin s2detachfinal s2commit
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -348,19 +335,18 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s2begin: BEGIN;
+ step s2detachfinal: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 FINALIZE;
+ step s2commit: COMMIT;
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s2begin s2detachfinal s1spart s2commit
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s2begin s2detachfinal s1spart s2commit
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -368,13 +354,12 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s2begin: BEGIN;
+ step s2detachfinal: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 FINALIZE;
+@@ -385,7 +370,7 @@ a
+ 
+ 1              
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1c s2begin s2detachfinal s1insertpart s2commit
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1c s2begin s2detachfinal s1insertpart s2commit
+ step s2snitch: INSERT INTO d3_pid SELECT pg_backend_pid();
+ step s1b: BEGIN;
+ step s1s: SELECT * FROM d3_listp;
+@@ -393,13 +378,12 @@ a
+ 
+ 1              
+ step s2detach: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; <waiting ...>
+-step s1cancel: SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: SELECT pg_cancel_backend(pid) FROM d3_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: COMMIT;
+ step s2begin: BEGIN;
+ step s2detachfinal: ALTER TABLE d3_listp DETACH PARTITION d3_listp1 FINALIZE;
+diff --git a/src/test/isolation/expected/detach-partition-concurrently-4.out b/src/test/isolation/expected/detach-partition-concurrently-4.out
+index e5dc40d0769e..d49736a17d54 100644
+--- a/src/test/isolation/expected/detach-partition-concurrently-4.out
++++ b/src/test/isolation/expected/detach-partition-concurrently-4.out
+@@ -1,6 +1,6 @@
+ Parsed test spec with 3 sessions
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s1insert s1c
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1insert s1c
+ step s2snitch: insert into d4_pid select pg_backend_pid();
+ step s1b: begin;
+ step s1s: select * from d4_primary;
+@@ -9,13 +9,12 @@ a
+ 1              
+ 2              
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently; <waiting ...>
+-step s1cancel: select pg_cancel_backend(pid), pg_sleep(0.1) from d4_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: select pg_cancel_backend(pid) from d4_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1insert: insert into d4_fk values (1);
+ ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s1c: commit;
+@@ -30,11 +29,11 @@ a
+ 2              
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently; <waiting ...>
+ step s1insert: insert into d4_fk values (1);
++ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s2detach: <... completed>
+-error in steps s1insert s2detach: ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s1c: commit;
+ 
+-starting permutation: s2snitch s1brr s1s s2detach s1cancel s2noop s1insert s1c
++starting permutation: s2snitch s1brr s1s s2detach s1cancel s1insert s1c
+ step s2snitch: insert into d4_pid select pg_backend_pid();
+ step s1brr: begin isolation level repeatable read;
+ step s1s: select * from d4_primary;
+@@ -43,13 +42,12 @@ a
+ 1              
+ 2              
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently; <waiting ...>
+-step s1cancel: select pg_cancel_backend(pid), pg_sleep(0.1) from d4_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: select pg_cancel_backend(pid) from d4_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1insert: insert into d4_fk values (1);
+ ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s1c: commit;
+@@ -64,22 +62,21 @@ a
+ 2              
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently; <waiting ...>
+ step s1insert: insert into d4_fk values (1);
++ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s2detach: <... completed>
+-error in steps s1insert s2detach: ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s1c: commit;
+ 
+-starting permutation: s2snitch s1b s1declare s2detach s1cancel s2noop s1fetchall s1insert s1c
++starting permutation: s2snitch s1b s1declare s2detach s1cancel s1fetchall s1insert s1c
+ step s2snitch: insert into d4_pid select pg_backend_pid();
+ step s1b: begin;
+ step s1declare: declare f cursor for select * from d4_primary;
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently; <waiting ...>
+-step s1cancel: select pg_cancel_backend(pid), pg_sleep(0.1) from d4_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: select pg_cancel_backend(pid) from d4_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1fetchall: fetch all from f;
+ a              
+ 
+@@ -100,22 +97,21 @@ a
+ 1              
+ 2              
+ step s1insert: insert into d4_fk values (1);
++ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s2detach: <... completed>
+-error in steps s1insert s2detach: ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s1c: commit;
+ 
+-starting permutation: s2snitch s1b s1declare s2detach s1cancel s2noop s1svpt s1insert s1rollback s1fetchall s1c
++starting permutation: s2snitch s1b s1declare s2detach s1cancel s1svpt s1insert s1rollback s1fetchall s1c
+ step s2snitch: insert into d4_pid select pg_backend_pid();
+ step s1b: begin;
+ step s1declare: declare f cursor for select * from d4_primary;
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently; <waiting ...>
+-step s1cancel: select pg_cancel_backend(pid), pg_sleep(0.1) from d4_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: select pg_cancel_backend(pid) from d4_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1svpt: savepoint f;
+ step s1insert: insert into d4_fk values (1);
+ ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+@@ -144,16 +140,15 @@ a
+ step s1c: commit;
+ step s2detach: <... completed>
+ 
+-starting permutation: s2snitch s1b s2detach s1declare s1cancel s2noop s1fetchall s1insert s1c
++starting permutation: s2snitch s1b s2detach s1declare s1cancel s1fetchall s1insert s1c
+ step s2snitch: insert into d4_pid select pg_backend_pid();
+ step s1b: begin;
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently;
+ step s1declare: declare f cursor for select * from d4_primary;
+-step s1cancel: select pg_cancel_backend(pid), pg_sleep(0.1) from d4_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: select pg_cancel_backend(pid) from d4_pid;
++pg_cancel_backend
+ 
+-t                             
+-step s2noop: UNLISTEN noop;
++t              
+ step s1fetchall: fetch all from f;
+ a              
+ 
+@@ -175,16 +170,15 @@ step s1insert: insert into d4_fk values (1);
+ ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s1c: commit;
+ 
+-starting permutation: s2snitch s1b s2detach s1declare s1cancel s2noop s1svpt s1insert s1rollback s1fetchall s1c
++starting permutation: s2snitch s1b s2detach s1declare s1cancel s1svpt s1insert s1rollback s1fetchall s1c
+ step s2snitch: insert into d4_pid select pg_backend_pid();
+ step s1b: begin;
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently;
+ step s1declare: declare f cursor for select * from d4_primary;
+-step s1cancel: select pg_cancel_backend(pid), pg_sleep(0.1) from d4_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: select pg_cancel_backend(pid) from d4_pid;
++pg_cancel_backend
+ 
+-t                             
+-step s2noop: UNLISTEN noop;
++t              
+ step s1svpt: savepoint f;
+ step s1insert: insert into d4_fk values (1);
+ ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+@@ -210,7 +204,7 @@ a
+ 2              
+ step s1c: commit;
+ 
+-starting permutation: s2snitch s1brr s1declare2 s1fetchone s2detach s1cancel s2noop s1updcur s1c
++starting permutation: s2snitch s1brr s1declare2 s1fetchone s2detach s1cancel s1updcur s1c
+ step s2snitch: insert into d4_pid select pg_backend_pid();
+ step s1brr: begin isolation level repeatable read;
+ step s1declare2: declare f cursor for select * from d4_fk where a = 2;
+@@ -219,13 +213,12 @@ a
+ 
+ 2              
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently; <waiting ...>
+-step s1cancel: select pg_cancel_backend(pid), pg_sleep(0.1) from d4_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: select pg_cancel_backend(pid) from d4_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1updcur: update d4_fk set a = 1 where current of f;
+ ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s1c: commit;
+@@ -240,8 +233,8 @@ a
+ 2              
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently; <waiting ...>
+ step s1updcur: update d4_fk set a = 1 where current of f;
++ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s2detach: <... completed>
+-error in steps s1updcur s2detach: ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s1c: commit;
+ 
+ starting permutation: s2snitch s1brr s1declare2 s1fetchone s1updcur s2detach s1c
+@@ -256,7 +249,7 @@ step s1updcur: update d4_fk set a = 1 where current of f;
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently; <waiting ...>
+ step s1c: commit;
+ step s2detach: <... completed>
+-error in steps s1c s2detach: ERROR:  removing partition "d4_primary1" violates foreign key constraint "d4_fk_a_fkey1"
++ERROR:  removing partition "d4_primary1" violates foreign key constraint "d4_fk_a_fkey1"
+ 
+ starting permutation: s2snitch s1b s1s s2detach s3insert s1c
+ step s2snitch: insert into d4_pid select pg_backend_pid();
+@@ -272,7 +265,7 @@ ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk
+ step s1c: commit;
+ step s2detach: <... completed>
+ 
+-starting permutation: s2snitch s1b s1s s2detach s3brr s3insert s3commit s1cancel s2noop s1c
++starting permutation: s2snitch s1b s1s s2detach s3brr s3insert s3commit s1cancel s1c
+ step s2snitch: insert into d4_pid select pg_backend_pid();
+ step s1b: begin;
+ step s1s: select * from d4_primary;
+@@ -285,13 +278,12 @@ step s3brr: begin isolation level repeatable read;
+ step s3insert: insert into d4_fk values (1);
+ ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s3commit: commit;
+-step s1cancel: select pg_cancel_backend(pid), pg_sleep(0.1) from d4_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: select pg_cancel_backend(pid) from d4_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
+ step s1c: commit;
+ 
+ starting permutation: s2snitch s1b s1s s2detach s3brr s3insert s3commit s1c
+@@ -310,7 +302,7 @@ step s3commit: commit;
+ step s1c: commit;
+ step s2detach: <... completed>
+ 
+-starting permutation: s2snitch s1brr s1s s2detach s1cancel s2noop s3vacfreeze s1s s1insert s1c
++starting permutation: s2snitch s1brr s1s s2detach s1cancel s1noop s3vacfreeze s1s s1insert s1c
+ step s2snitch: insert into d4_pid select pg_backend_pid();
+ step s1brr: begin isolation level repeatable read;
+ step s1s: select * from d4_primary;
+@@ -319,13 +311,13 @@ a
+ 1              
+ 2              
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently; <waiting ...>
+-step s1cancel: select pg_cancel_backend(pid), pg_sleep(0.1) from d4_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: select pg_cancel_backend(pid) from d4_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
++step s1noop: 
+ step s3vacfreeze: vacuum freeze pg_catalog.pg_inherits;
+ step s1s: select * from d4_primary;
+ a              
+@@ -336,7 +328,7 @@ step s1insert: insert into d4_fk values (1);
+ ERROR:  insert or update on table "d4_fk" violates foreign key constraint "d4_fk_a_fkey"
+ step s1c: commit;
+ 
+-starting permutation: s2snitch s1b s1s s2detach s1cancel s2noop s3vacfreeze s1s s1insert s1c
++starting permutation: s2snitch s1b s1s s2detach s1cancel s1noop s3vacfreeze s1s s1insert s1c
+ step s2snitch: insert into d4_pid select pg_backend_pid();
+ step s1b: begin;
+ step s1s: select * from d4_primary;
+@@ -345,13 +337,13 @@ a
+ 1              
+ 2              
+ step s2detach: alter table d4_primary detach partition d4_primary1 concurrently; <waiting ...>
+-step s1cancel: select pg_cancel_backend(pid), pg_sleep(0.1) from d4_pid;
+-pg_cancel_backendpg_sleep       
++step s1cancel: select pg_cancel_backend(pid) from d4_pid;
++pg_cancel_backend
+ 
+-t                             
++t              
+ step s2detach: <... completed>
+-error in steps s1cancel s2detach: ERROR:  canceling statement due to user request
+-step s2noop: UNLISTEN noop;
++ERROR:  canceling statement due to user request
++step s1noop: 
+ step s3vacfreeze: vacuum freeze pg_catalog.pg_inherits;
+ step s1s: select * from d4_primary;
+ a              
+diff --git a/src/test/isolation/expected/eval-plan-qual-trigger.out b/src/test/isolation/expected/eval-plan-qual-trigger.out
+index f0d975ce0c57..833834afaaf0 100644
+--- a/src/test/isolation/expected/eval-plan-qual-trigger.out
++++ b/src/test/isolation/expected/eval-plan-qual-trigger.out
+@@ -1,3 +1,9 @@
++unused step name: s2_r
++unused step name: s3_b_rc
++unused step name: s3_c
++unused step name: s3_del_a
++unused step name: s3_r
++unused step name: s3_upd_a_data
+ Parsed test spec with 4 sessions
+ 
+ starting permutation: s1_trig_rep_b_u s1_trig_rep_a_u s1_ins_a s1_ins_b s1_b_rc s2_b_rc s1_upd_a_data s1_c s2_upd_a_data s2_c s0_rep
+@@ -609,7 +615,7 @@ s2: NOTICE:  trigger: name rep_b_i; when: BEFORE; lev: ROWs; op: INSERT; old: <N
+ step s2_ins_a: INSERT INTO trigtest VALUES ('key-a', 'val-a-s2') RETURNING *; <waiting ...>
+ step s1_c: COMMIT;
+ step s2_ins_a: <... completed>
+-error in steps s1_c s2_ins_a: ERROR:  duplicate key value violates unique constraint "trigtest_pkey"
++ERROR:  duplicate key value violates unique constraint "trigtest_pkey"
+ step s2_c: COMMIT;
+ step s0_rep: SELECT * FROM trigtest ORDER BY key, data
+ key            data           
+@@ -2023,7 +2029,7 @@ step s2_upd_a_data:
+  <waiting ...>
+ step s1_c: COMMIT;
+ step s2_upd_a_data: <... completed>
+-error in steps s1_c s2_upd_a_data: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2_c: COMMIT;
+ step s0_rep: SELECT * FROM trigtest ORDER BY key, data
+ key            data           
+@@ -2136,7 +2142,7 @@ step s2_upd_a_data:
+  <waiting ...>
+ step s1_c: COMMIT;
+ step s2_upd_a_data: <... completed>
+-error in steps s1_c s2_upd_a_data: ERROR:  could not serialize access due to concurrent delete
++ERROR:  could not serialize access due to concurrent delete
+ step s2_c: COMMIT;
+ step s0_rep: SELECT * FROM trigtest ORDER BY key, data
+ key            data           
+@@ -2202,9 +2208,3 @@ key            data
+ 
+ key-a          val-a-s1-ups2  
+ key-b          val-b-s1       
+-unused step name: s2_r
+-unused step name: s3_b_rc
+-unused step name: s3_c
+-unused step name: s3_del_a
+-unused step name: s3_r
+-unused step name: s3_upd_a_data
+diff --git a/src/test/isolation/expected/eval-plan-qual.out b/src/test/isolation/expected/eval-plan-qual.out
+index 3e55a55c6347..df8fa8b0a54b 100644
+--- a/src/test/isolation/expected/eval-plan-qual.out
++++ b/src/test/isolation/expected/eval-plan-qual.out
+@@ -551,7 +551,7 @@ balance
+ step updwctefail: WITH doup AS (UPDATE accounts SET balance = balance + 1100 WHERE accountid = 'checking' RETURNING *, update_checking(999)) UPDATE accounts a SET balance = doup.balance + 100 FROM doup RETURNING *; <waiting ...>
+ step c1: COMMIT;
+ step updwctefail: <... completed>
+-error in steps c1 updwctefail: ERROR:  tuple to be updated was already modified by an operation triggered by the current command
++ERROR:  tuple to be updated was already modified by an operation triggered by the current command
+ step c2: COMMIT;
+ step read: SELECT * FROM accounts ORDER BY accountid;
+ accountid      balance        
+@@ -584,7 +584,7 @@ balance
+ step delwctefail: WITH doup AS (UPDATE accounts SET balance = balance + 1100 WHERE accountid = 'checking' RETURNING *, update_checking(999)) DELETE FROM accounts a USING doup RETURNING *; <waiting ...>
+ step c1: COMMIT;
+ step delwctefail: <... completed>
+-error in steps c1 delwctefail: ERROR:  tuple to be deleted was already modified by an operation triggered by the current command
++ERROR:  tuple to be deleted was already modified by an operation triggered by the current command
+ step c2: COMMIT;
+ step read: SELECT * FROM accounts ORDER BY accountid;
+ accountid      balance        
+@@ -931,7 +931,7 @@ step complexpartupdate_route_err1:
+  <waiting ...>
+ step c1: COMMIT;
+ step complexpartupdate_route_err1: <... completed>
+-error in steps c1 complexpartupdate_route_err1: ERROR:  tuple to be locked was already moved to another partition due to concurrent update
++ERROR:  tuple to be locked was already moved to another partition due to concurrent update
+ step c2: COMMIT;
+ 
+ starting permutation: simplepartupdate_noroute complexpartupdate_route c1 c2
+diff --git a/src/test/isolation/expected/fk-deadlock2_1.out b/src/test/isolation/expected/fk-deadlock2_1.out
+index 382734811cbb..e1d8c692cbda 100644
+--- a/src/test/isolation/expected/fk-deadlock2_1.out
++++ b/src/test/isolation/expected/fk-deadlock2_1.out
+@@ -14,7 +14,7 @@ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ step s2u1: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s1c: COMMIT;
+ step s2u1: <... completed>
+-error in steps s1c s2u1: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ step s2c: COMMIT;
+@@ -26,7 +26,7 @@ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s2u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ step s2c: COMMIT;
+ step s1u2: <... completed>
+-error in steps s2c s1u2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s1u1 s2u1 s2u2 s1u2 s2c s1c
+@@ -36,7 +36,7 @@ step s2u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s2c: COMMIT;
+ step s1u2: <... completed>
+-error in steps s2c s1u2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s1u1 s2u1 s2u2 s2c s1u2 s1c
+@@ -55,7 +55,7 @@ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s2u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ step s2c: COMMIT;
+ step s1u2: <... completed>
+-error in steps s2c s1u2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s2u1 s1u1 s2u2 s1u2 s2c s1c
+@@ -65,7 +65,7 @@ step s2u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s2c: COMMIT;
+ step s1u2: <... completed>
+-error in steps s2c s1u2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s2u1 s1u1 s2u2 s2c s1u2 s1c
+@@ -84,7 +84,7 @@ step s1u1: UPDATE A SET Col1 = 1 WHERE AID = 1;
+ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s2c: COMMIT;
+ step s1u2: <... completed>
+-error in steps s2c s1u2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s2u1 s2u2 s1u1 s2c s1u2 s1c
+diff --git a/src/test/isolation/expected/fk-deadlock2_2.out b/src/test/isolation/expected/fk-deadlock2_2.out
+index b6be4b98926b..97873709138a 100644
+--- a/src/test/isolation/expected/fk-deadlock2_2.out
++++ b/src/test/isolation/expected/fk-deadlock2_2.out
+@@ -14,7 +14,7 @@ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ step s2u1: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s1c: COMMIT;
+ step s2u1: <... completed>
+-error in steps s1c s2u1: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ step s2c: COMMIT;
+@@ -26,7 +26,7 @@ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s2u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ step s2c: COMMIT;
+ step s1u2: <... completed>
+-error in steps s2c s1u2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s1u1 s2u1 s2u2 s1u2 s2c s1c
+@@ -36,7 +36,7 @@ step s2u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s2c: COMMIT;
+ step s1u2: <... completed>
+-error in steps s2c s1u2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s1u1 s2u1 s2u2 s2c s1u2 s1c
+@@ -55,7 +55,7 @@ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s2u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ step s2c: COMMIT;
+ step s1u2: <... completed>
+-error in steps s2c s1u2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s2u1 s1u1 s2u2 s1u2 s2c s1c
+@@ -65,7 +65,7 @@ step s2u2: UPDATE B SET Col2 = 1 WHERE BID = 2;
+ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s2c: COMMIT;
+ step s1u2: <... completed>
+-error in steps s2c s1u2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s2u1 s1u1 s2u2 s2c s1u2 s1c
+@@ -84,7 +84,7 @@ step s1u1: UPDATE A SET Col1 = 1 WHERE AID = 1;
+ step s1u2: UPDATE B SET Col2 = 1 WHERE BID = 2; <waiting ...>
+ step s2c: COMMIT;
+ step s1u2: <... completed>
+-error in steps s2c s1u2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s2u1 s2u2 s1u1 s2c s1u2 s1c
+diff --git a/src/test/isolation/expected/fk-deadlock_1.out b/src/test/isolation/expected/fk-deadlock_1.out
+index 0dae5d3a5a4f..c95169274460 100644
+--- a/src/test/isolation/expected/fk-deadlock_1.out
++++ b/src/test/isolation/expected/fk-deadlock_1.out
+@@ -24,7 +24,7 @@ step s2i: INSERT INTO child VALUES (2, 1);
+ step s2u: UPDATE parent SET aux = 'baz'; <waiting ...>
+ step s1c: COMMIT;
+ step s2u: <... completed>
+-error in steps s1c s2u: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ 
+ starting permutation: s1i s2i s1u s1c s2u s2c
+@@ -43,7 +43,7 @@ step s1u: UPDATE parent SET aux = 'bar';
+ step s2u: UPDATE parent SET aux = 'baz'; <waiting ...>
+ step s1c: COMMIT;
+ step s2u: <... completed>
+-error in steps s1c s2u: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ 
+ starting permutation: s1i s2i s2u s1u s2c s1c
+@@ -53,7 +53,7 @@ step s2u: UPDATE parent SET aux = 'baz';
+ step s1u: UPDATE parent SET aux = 'bar'; <waiting ...>
+ step s2c: COMMIT;
+ step s1u: <... completed>
+-error in steps s2c s1u: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s1i s2i s2u s2c s1u s1c
+@@ -81,7 +81,7 @@ step s1u: UPDATE parent SET aux = 'bar';
+ step s2u: UPDATE parent SET aux = 'baz'; <waiting ...>
+ step s1c: COMMIT;
+ step s2u: <... completed>
+-error in steps s1c s2u: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ 
+ starting permutation: s2i s1i s2u s1u s2c s1c
+@@ -91,7 +91,7 @@ step s2u: UPDATE parent SET aux = 'baz';
+ step s1u: UPDATE parent SET aux = 'bar'; <waiting ...>
+ step s2c: COMMIT;
+ step s1u: <... completed>
+-error in steps s2c s1u: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s2i s1i s2u s2c s1u s1c
+@@ -110,7 +110,7 @@ step s1i: INSERT INTO child VALUES (1, 1);
+ step s1u: UPDATE parent SET aux = 'bar'; <waiting ...>
+ step s2c: COMMIT;
+ step s1u: <... completed>
+-error in steps s2c s1u: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s2i s2u s1i s2c s1u s1c
+diff --git a/src/test/isolation/expected/fk-partitioned-1.out b/src/test/isolation/expected/fk-partitioned-1.out
+index aea2b6d56b44..45f2f8cba710 100644
+--- a/src/test/isolation/expected/fk-partitioned-1.out
++++ b/src/test/isolation/expected/fk-partitioned-1.out
+@@ -25,7 +25,7 @@ step s2b: begin;
+ step s2a: alter table pfk attach partition pfk1 for values in (1); <waiting ...>
+ step s1c: commit;
+ step s2a: <... completed>
+-error in steps s1c s2a: ERROR:  insert or update on table "pfk1" violates foreign key constraint "pfk_a_fkey"
++ERROR:  insert or update on table "pfk1" violates foreign key constraint "pfk_a_fkey"
+ step s2c: commit;
+ 
+ starting permutation: s1b s2b s1d s1c s2a s2c
+@@ -44,7 +44,7 @@ step s1d: delete from ppk1 where a = 1;
+ step s2a: alter table pfk attach partition pfk1 for values in (1); <waiting ...>
+ step s1c: commit;
+ step s2a: <... completed>
+-error in steps s1c s2a: ERROR:  insert or update on table "pfk1" violates foreign key constraint "pfk_a_fkey"
++ERROR:  insert or update on table "pfk1" violates foreign key constraint "pfk_a_fkey"
+ step s2c: commit;
+ 
+ starting permutation: s1b s2b s2a s1d s2c s1c
+@@ -54,7 +54,7 @@ step s2a: alter table pfk attach partition pfk1 for values in (1);
+ step s1d: delete from ppk1 where a = 1; <waiting ...>
+ step s2c: commit;
+ step s1d: <... completed>
+-error in steps s2c s1d: ERROR:  update or delete on table "ppk1" violates foreign key constraint "pfk_a_fkey1" on table "pfk"
++ERROR:  update or delete on table "ppk1" violates foreign key constraint "pfk_a_fkey1" on table "pfk"
+ step s1c: commit;
+ 
+ starting permutation: s1b s2b s2a s2c s1d s1c
+@@ -82,7 +82,7 @@ step s1d: delete from ppk1 where a = 1;
+ step s2a: alter table pfk attach partition pfk1 for values in (1); <waiting ...>
+ step s1c: commit;
+ step s2a: <... completed>
+-error in steps s1c s2a: ERROR:  insert or update on table "pfk1" violates foreign key constraint "pfk_a_fkey"
++ERROR:  insert or update on table "pfk1" violates foreign key constraint "pfk_a_fkey"
+ step s2c: commit;
+ 
+ starting permutation: s2b s1b s2a s1d s2c s1c
+@@ -92,7 +92,7 @@ step s2a: alter table pfk attach partition pfk1 for values in (1);
+ step s1d: delete from ppk1 where a = 1; <waiting ...>
+ step s2c: commit;
+ step s1d: <... completed>
+-error in steps s2c s1d: ERROR:  update or delete on table "ppk1" violates foreign key constraint "pfk_a_fkey1" on table "pfk"
++ERROR:  update or delete on table "ppk1" violates foreign key constraint "pfk_a_fkey1" on table "pfk"
+ step s1c: commit;
+ 
+ starting permutation: s2b s1b s2a s2c s1d s1c
+@@ -111,7 +111,7 @@ step s1b: begin;
+ step s1d: delete from ppk1 where a = 1; <waiting ...>
+ step s2c: commit;
+ step s1d: <... completed>
+-error in steps s2c s1d: ERROR:  update or delete on table "ppk1" violates foreign key constraint "pfk_a_fkey1" on table "pfk"
++ERROR:  update or delete on table "ppk1" violates foreign key constraint "pfk_a_fkey1" on table "pfk"
+ step s1c: commit;
+ 
+ starting permutation: s2b s2a s1b s2c s1d s1c
+diff --git a/src/test/isolation/expected/fk-partitioned-2.out b/src/test/isolation/expected/fk-partitioned-2.out
+index 722b615c6ea3..278bec4fdfc3 100644
+--- a/src/test/isolation/expected/fk-partitioned-2.out
++++ b/src/test/isolation/expected/fk-partitioned-2.out
+@@ -7,7 +7,7 @@ step s2b: begin;
+ step s2i: insert into pfk values (1); <waiting ...>
+ step s1c: commit;
+ step s2i: <... completed>
+-error in steps s1c s2i: ERROR:  insert or update on table "pfk1" violates foreign key constraint "pfk_a_fkey"
++ERROR:  insert or update on table "pfk1" violates foreign key constraint "pfk_a_fkey"
+ step s2c: commit;
+ 
+ starting permutation: s1b s1d s2bs s2i s1c s2c
+@@ -20,7 +20,7 @@ step s2bs: begin isolation level serializable; select 1;
+ step s2i: insert into pfk values (1); <waiting ...>
+ step s1c: commit;
+ step s2i: <... completed>
+-error in steps s1c s2i: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: commit;
+ 
+ starting permutation: s1b s2b s1d s2i s1c s2c
+@@ -30,7 +30,7 @@ step s1d: delete from ppk where a = 1;
+ step s2i: insert into pfk values (1); <waiting ...>
+ step s1c: commit;
+ step s2i: <... completed>
+-error in steps s1c s2i: ERROR:  insert or update on table "pfk1" violates foreign key constraint "pfk_a_fkey"
++ERROR:  insert or update on table "pfk1" violates foreign key constraint "pfk_a_fkey"
+ step s2c: commit;
+ 
+ starting permutation: s1b s2bs s1d s2i s1c s2c
+@@ -43,7 +43,7 @@ step s1d: delete from ppk where a = 1;
+ step s2i: insert into pfk values (1); <waiting ...>
+ step s1c: commit;
+ step s2i: <... completed>
+-error in steps s1c s2i: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: commit;
+ 
+ starting permutation: s1b s2b s2i s1d s2c s1c
+@@ -53,7 +53,7 @@ step s2i: insert into pfk values (1);
+ step s1d: delete from ppk where a = 1; <waiting ...>
+ step s2c: commit;
+ step s1d: <... completed>
+-error in steps s2c s1d: ERROR:  update or delete on table "ppk1" violates foreign key constraint "pfk_a_fkey1" on table "pfk"
++ERROR:  update or delete on table "ppk1" violates foreign key constraint "pfk_a_fkey1" on table "pfk"
+ step s1c: commit;
+ 
+ starting permutation: s1b s2bs s2i s1d s2c s1c
+@@ -66,5 +66,5 @@ step s2i: insert into pfk values (1);
+ step s1d: delete from ppk where a = 1; <waiting ...>
+ step s2c: commit;
+ step s1d: <... completed>
+-error in steps s2c s1d: ERROR:  update or delete on table "ppk1" violates foreign key constraint "pfk_a_fkey1" on table "pfk"
++ERROR:  update or delete on table "ppk1" violates foreign key constraint "pfk_a_fkey1" on table "pfk"
+ step s1c: commit;
+diff --git a/src/test/isolation/expected/insert-conflict-do-nothing-2.out b/src/test/isolation/expected/insert-conflict-do-nothing-2.out
+index 2332f96978a9..c90002fd021c 100644
+--- a/src/test/isolation/expected/insert-conflict-do-nothing-2.out
++++ b/src/test/isolation/expected/insert-conflict-do-nothing-2.out
+@@ -31,7 +31,7 @@ step donothing1: INSERT INTO ints(key, val) VALUES(1, 'donothing1') ON CONFLICT
+ step donothing2: INSERT INTO ints(key, val) VALUES(1, 'donothing2'), (1, 'donothing3') ON CONFLICT DO NOTHING; <waiting ...>
+ step c1: COMMIT;
+ step donothing2: <... completed>
+-error in steps c1 donothing2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step c2: COMMIT;
+ step show: SELECT * FROM ints;
+ key            val            
+@@ -45,7 +45,7 @@ step donothing2: INSERT INTO ints(key, val) VALUES(1, 'donothing2'), (1, 'donoth
+ step donothing1: INSERT INTO ints(key, val) VALUES(1, 'donothing1') ON CONFLICT DO NOTHING; <waiting ...>
+ step c2: COMMIT;
+ step donothing1: <... completed>
+-error in steps c2 donothing1: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step c1: COMMIT;
+ step show: SELECT * FROM ints;
+ key            val            
+@@ -83,7 +83,7 @@ step donothing1: INSERT INTO ints(key, val) VALUES(1, 'donothing1') ON CONFLICT
+ step donothing2: INSERT INTO ints(key, val) VALUES(1, 'donothing2'), (1, 'donothing3') ON CONFLICT DO NOTHING; <waiting ...>
+ step c1: COMMIT;
+ step donothing2: <... completed>
+-error in steps c1 donothing2: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step c2: COMMIT;
+ step show: SELECT * FROM ints;
+ key            val            
+@@ -97,7 +97,7 @@ step donothing2: INSERT INTO ints(key, val) VALUES(1, 'donothing2'), (1, 'donoth
+ step donothing1: INSERT INTO ints(key, val) VALUES(1, 'donothing1') ON CONFLICT DO NOTHING; <waiting ...>
+ step c2: COMMIT;
+ step donothing1: <... completed>
+-error in steps c2 donothing1: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step c1: COMMIT;
+ step show: SELECT * FROM ints;
+ key            val            
+diff --git a/src/test/isolation/expected/insert-conflict-specconflict.out b/src/test/isolation/expected/insert-conflict-specconflict.out
+index ae361fbd03a4..8d319296ddf7 100644
+--- a/src/test/isolation/expected/insert-conflict-specconflict.out
++++ b/src/test/isolation/expected/insert-conflict-specconflict.out
+@@ -284,7 +284,7 @@ key            data
+ 
+ k1             inserted s1 with conflict update s2
+ 
+-starting permutation: s1_create_non_unique_index s1_confirm_index_order controller_locks controller_show s2_begin s1_upsert s2_upsert controller_show controller_unlock_1_1 controller_unlock_2_1 controller_unlock_1_3 controller_unlock_2_3 controller_show controller_lock_2_4 controller_unlock_2_2 controller_show controller_unlock_1_2 controller_print_speculative_locks controller_unlock_2_4 controller_print_speculative_locks s2_commit controller_show controller_print_speculative_locks
++starting permutation: s1_create_non_unique_index s1_confirm_index_order controller_locks controller_show s2_begin s1_upsert s2_upsert controller_show controller_unlock_1_1 controller_unlock_2_1 controller_unlock_1_3 controller_unlock_2_3 controller_show controller_lock_2_4 controller_unlock_2_2 controller_show controller_unlock_1_2 controller_print_speculative_locks controller_unlock_2_4 s2_noop controller_print_speculative_locks s2_commit s1_noop controller_show controller_print_speculative_locks
+ step s1_create_non_unique_index: CREATE INDEX upserttest_key_idx ON upserttest((blurt_and_lock_4(key)));
+ step s1_confirm_index_order: SELECT 'upserttest_key_uniq_idx'::regclass::int8 < 'upserttest_key_idx'::regclass::int8;
+ ?column?       
+@@ -380,6 +380,7 @@ t
+ s1: NOTICE:  blurt_and_lock_123() called for k1 in session 1
+ s1: NOTICE:  acquiring advisory lock on 2
+ step s2_upsert: <... completed>
++step s2_noop: 
+ step controller_print_speculative_locks: 
+     SELECT pa.application_name, locktype, mode, granted
+     FROM pg_locks pl JOIN pg_stat_activity pa USING (pid)
+@@ -398,6 +399,7 @@ step s2_commit: COMMIT;
+ s1: NOTICE:  blurt_and_lock_123() called for k1 in session 1
+ s1: NOTICE:  acquiring advisory lock on 2
+ step s1_upsert: <... completed>
++step s1_noop: 
+ step controller_show: SELECT * FROM upserttest;
+ key            data           
+ 
+diff --git a/src/test/isolation/expected/lock-committed-keyupdate.out b/src/test/isolation/expected/lock-committed-keyupdate.out
+index 69cdbfba0a7b..2f13a19b9a89 100644
+--- a/src/test/isolation/expected/lock-committed-keyupdate.out
++++ b/src/test/isolation/expected/lock-committed-keyupdate.out
+@@ -192,7 +192,7 @@ pg_advisory_unlock
+ 
+ t              
+ step s2l: <... completed>
+-error in steps s1ul s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ 
+@@ -216,7 +216,7 @@ pg_advisory_unlock
+ 
+ t              
+ step s2l: <... completed>
+-error in steps s1ul s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ 
+@@ -240,7 +240,7 @@ t
+ step s2l: SELECT * FROM lcku_table WHERE pg_advisory_lock(578902068) IS NOT NULL FOR KEY SHARE; <waiting ...>
+ step s1c: COMMIT;
+ step s2l: <... completed>
+-error in steps s1c s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ 
+@@ -269,7 +269,7 @@ pg_advisory_unlock
+ 
+ t              
+ step s2l: <... completed>
+-error in steps s1ul s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ 
+@@ -298,7 +298,7 @@ pg_advisory_unlock
+ 
+ t              
+ step s2l: <... completed>
+-error in steps s1ul s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ 
+@@ -322,7 +322,7 @@ t
+ step s2l: SELECT * FROM lcku_table WHERE pg_advisory_lock(578902068) IS NOT NULL FOR KEY SHARE; <waiting ...>
+ step s1c: COMMIT;
+ step s2l: <... completed>
+-error in steps s1c s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1hint: SELECT * FROM lcku_table;
+ id             value          
+ 
+@@ -351,7 +351,7 @@ pg_advisory_unlock
+ 
+ t              
+ step s2l: <... completed>
+-error in steps s1ul s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ 
+@@ -375,7 +375,7 @@ pg_advisory_unlock
+ 
+ t              
+ step s2l: <... completed>
+-error in steps s1ul s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ 
+@@ -399,7 +399,7 @@ t
+ step s2l: SELECT * FROM lcku_table WHERE pg_advisory_lock(578902068) IS NOT NULL FOR KEY SHARE; <waiting ...>
+ step s1c: COMMIT;
+ step s2l: <... completed>
+-error in steps s1c s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ 
+@@ -428,7 +428,7 @@ pg_advisory_unlock
+ 
+ t              
+ step s2l: <... completed>
+-error in steps s1ul s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ 
+@@ -457,7 +457,7 @@ pg_advisory_unlock
+ 
+ t              
+ step s2l: <... completed>
+-error in steps s1ul s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ pg_advisory_unlock_all
+ 
+@@ -481,7 +481,7 @@ t
+ step s2l: SELECT * FROM lcku_table WHERE pg_advisory_lock(578902068) IS NOT NULL FOR KEY SHARE; <waiting ...>
+ step s1c: COMMIT;
+ step s2l: <... completed>
+-error in steps s1c s2l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1hint: SELECT * FROM lcku_table;
+ id             value          
+ 
+diff --git a/src/test/isolation/expected/lock-update-delete_1.out b/src/test/isolation/expected/lock-update-delete_1.out
+index f1c1c7026f47..77adde718d64 100644
+--- a/src/test/isolation/expected/lock-update-delete_1.out
++++ b/src/test/isolation/expected/lock-update-delete_1.out
+@@ -14,7 +14,7 @@ pg_advisory_unlock
+ t              
+ step s2c: COMMIT;
+ step s1l: <... completed>
+-error in steps s2c s1l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ 
+ starting permutation: s2b s1l s2u s2_blocker2 s2_unlock s2c
+ pg_advisory_lock
+@@ -30,7 +30,7 @@ pg_advisory_unlock
+ t              
+ step s2c: COMMIT;
+ step s1l: <... completed>
+-error in steps s2c s1l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ 
+ starting permutation: s2b s1l s2u s2_blocker3 s2_unlock s2c
+ pg_advisory_lock
+@@ -118,7 +118,7 @@ pg_advisory_unlock
+ 
+ t              
+ step s1l: <... completed>
+-error in steps s2_unlock s1l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ 
+ starting permutation: s2b s1l s2u s2_blocker2 s2c s2_unlock
+ pg_advisory_lock
+@@ -134,7 +134,7 @@ pg_advisory_unlock
+ 
+ t              
+ step s1l: <... completed>
+-error in steps s2_unlock s1l: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ 
+ starting permutation: s2b s1l s2u s2_blocker3 s2c s2_unlock
+ pg_advisory_lock
+diff --git a/src/test/isolation/expected/multiple-cic.out b/src/test/isolation/expected/multiple-cic.out
+index 2bf8fe365e1f..e41e04a48044 100644
+--- a/src/test/isolation/expected/multiple-cic.out
++++ b/src/test/isolation/expected/multiple-cic.out
+@@ -12,8 +12,9 @@ step s1i:
+ step s2i: 
+ 		CREATE INDEX CONCURRENTLY mcic_two_pkey ON mcic_two (id)
+ 		WHERE unlck();
+-
++ <waiting ...>
+ step s1i: <... completed>
++step s2i: <... completed>
+ unlck          
+ 
+ t              
+diff --git a/src/test/isolation/expected/multiple-cic_1.out b/src/test/isolation/expected/multiple-cic_1.out
+deleted file mode 100644
+index e41e04a48044..000000000000
+--- a/src/test/isolation/expected/multiple-cic_1.out
++++ /dev/null
+@@ -1,20 +0,0 @@
+-Parsed test spec with 2 sessions
+-
+-starting permutation: s2l s1i s2i
+-step s2l: SELECT pg_advisory_lock(281457);
+-pg_advisory_lock
+-
+-               
+-step s1i: 
+-		CREATE INDEX CONCURRENTLY mcic_one_pkey ON mcic_one (id)
+-		WHERE lck_shr(281457);
+- <waiting ...>
+-step s2i: 
+-		CREATE INDEX CONCURRENTLY mcic_two_pkey ON mcic_two (id)
+-		WHERE unlck();
+- <waiting ...>
+-step s1i: <... completed>
+-step s2i: <... completed>
+-unlck          
+-
+-t              
+diff --git a/src/test/isolation/expected/multixact-no-forget_1.out b/src/test/isolation/expected/multixact-no-forget_1.out
+index 1c37afef1a2c..205a40099ce4 100644
+--- a/src/test/isolation/expected/multixact-no-forget_1.out
++++ b/src/test/isolation/expected/multixact-no-forget_1.out
+@@ -83,7 +83,7 @@ step s1_commit: COMMIT;
+ step s3_fornokeyupd: SELECT * FROM dont_forget FOR NO KEY UPDATE; <waiting ...>
+ step s2_commit: COMMIT;
+ step s3_fornokeyupd: <... completed>
+-error in steps s2_commit s3_fornokeyupd: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ 
+ starting permutation: s1_lock s2_update s2_abort s3_forupd s1_commit
+ step s1_lock: SELECT * FROM dont_forget FOR KEY SHARE;
+@@ -123,4 +123,4 @@ step s1_commit: COMMIT;
+ step s3_forupd: SELECT * FROM dont_forget FOR UPDATE; <waiting ...>
+ step s2_commit: COMMIT;
+ step s3_forupd: <... completed>
+-error in steps s2_commit s3_forupd: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+diff --git a/src/test/isolation/expected/nowait-4.out b/src/test/isolation/expected/nowait-4.out
+index 26f59bef946b..c1db66581b74 100644
+--- a/src/test/isolation/expected/nowait-4.out
++++ b/src/test/isolation/expected/nowait-4.out
+@@ -14,6 +14,6 @@ pg_advisory_unlock
+ 
+ t              
+ step s1a: <... completed>
+-error in steps s2e s1a: ERROR:  could not obtain lock on row in relation "foo"
++ERROR:  could not obtain lock on row in relation "foo"
+ step s1b: COMMIT;
+ step s2f: COMMIT;
+diff --git a/src/test/isolation/expected/nowait-4_1.out b/src/test/isolation/expected/nowait-4_1.out
+index 959d51baae32..5fa6b3453aca 100644
+--- a/src/test/isolation/expected/nowait-4_1.out
++++ b/src/test/isolation/expected/nowait-4_1.out
+@@ -14,6 +14,6 @@ pg_advisory_unlock
+ 
+ t              
+ step s1a: <... completed>
+-error in steps s2e s1a: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1b: COMMIT;
+ step s2f: COMMIT;
+diff --git a/src/test/isolation/expected/nowait-5.out b/src/test/isolation/expected/nowait-5.out
+index c88aae5ef60b..2682ea1ab32c 100644
+--- a/src/test/isolation/expected/nowait-5.out
++++ b/src/test/isolation/expected/nowait-5.out
+@@ -34,4 +34,4 @@ pg_advisory_unlock
+ 
+ t              
+ step sl1_exec: <... completed>
+-error in steps upd_releaselock sl1_exec: ERROR:  could not obtain lock on row in relation "test_nowait"
++ERROR:  could not obtain lock on row in relation "test_nowait"
+diff --git a/src/test/isolation/expected/partition-concurrent-attach.out b/src/test/isolation/expected/partition-concurrent-attach.out
+index 17fac3998982..4986ee25e8b7 100644
+--- a/src/test/isolation/expected/partition-concurrent-attach.out
++++ b/src/test/isolation/expected/partition-concurrent-attach.out
+@@ -7,7 +7,7 @@ step s2b: begin;
+ step s2i: insert into tpart values (110,'xxx'), (120, 'yyy'), (150, 'zzz'); <waiting ...>
+ step s1c: commit;
+ step s2i: <... completed>
+-error in steps s1c s2i: ERROR:  new row for relation "tpart_default" violates partition constraint
++ERROR:  new row for relation "tpart_default" violates partition constraint
+ step s2c: commit;
+ step s2s: select tableoid::regclass, * from tpart;
+ tableoid       i              j              
+@@ -23,7 +23,7 @@ step s2b: begin;
+ step s2i2: insert into tpart_default (i, j) values (110, 'xxx'), (120, 'yyy'), (150, 'zzz'); <waiting ...>
+ step s1c: commit;
+ step s2i2: <... completed>
+-error in steps s1c s2i2: ERROR:  new row for relation "tpart_default" violates partition constraint
++ERROR:  new row for relation "tpart_default" violates partition constraint
+ step s2c: commit;
+ step s2s: select tableoid::regclass, * from tpart;
+ tableoid       i              j              
+@@ -39,7 +39,7 @@ step s2i: insert into tpart values (110,'xxx'), (120, 'yyy'), (150, 'zzz');
+ step s1a: alter table tpart attach partition tpart_2 for values from (100) to (200); <waiting ...>
+ step s2c: commit;
+ step s1a: <... completed>
+-error in steps s2c s1a: ERROR:  updated partition constraint for default partition "tpart_default_default" would be violated by some row
++ERROR:  updated partition constraint for default partition "tpart_default_default" would be violated by some row
+ step s1c: commit;
+ step s2s: select tableoid::regclass, * from tpart;
+ tableoid       i              j              
+diff --git a/src/test/isolation/expected/partition-key-update-1.out b/src/test/isolation/expected/partition-key-update-1.out
+index c1a9c56ae495..7dee144f2ffb 100644
+--- a/src/test/isolation/expected/partition-key-update-1.out
++++ b/src/test/isolation/expected/partition-key-update-1.out
+@@ -15,7 +15,7 @@ step s1u: UPDATE foo SET a=2 WHERE a=1;
+ step s2d: DELETE FROM foo WHERE a=1; <waiting ...>
+ step s1c: COMMIT;
+ step s2d: <... completed>
+-error in steps s1c s2d: ERROR:  tuple to be locked was already moved to another partition due to concurrent update
++ERROR:  tuple to be locked was already moved to another partition due to concurrent update
+ step s2c: COMMIT;
+ 
+ starting permutation: s1b s2b s1u s2u s1c s2c
+@@ -25,7 +25,7 @@ step s1u: UPDATE foo SET a=2 WHERE a=1;
+ step s2u: UPDATE foo SET b='EFG' WHERE a=1; <waiting ...>
+ step s1c: COMMIT;
+ step s2u: <... completed>
+-error in steps s1c s2u: ERROR:  tuple to be locked was already moved to another partition due to concurrent update
++ERROR:  tuple to be locked was already moved to another partition due to concurrent update
+ step s2c: COMMIT;
+ 
+ starting permutation: s1b s2b s2d s1u s2c s1c
+@@ -52,7 +52,7 @@ step s1u2: UPDATE footrg SET b='EFG' WHERE a=1;
+ step s2u2: UPDATE footrg SET b='XYZ' WHERE a=1; <waiting ...>
+ step s1c: COMMIT;
+ step s2u2: <... completed>
+-error in steps s1c s2u2: ERROR:  tuple to be locked was already moved to another partition due to concurrent update
++ERROR:  tuple to be locked was already moved to another partition due to concurrent update
+ step s2c: COMMIT;
+ 
+ starting permutation: s1b s2b s2u2 s1u2 s2c s1c
+@@ -62,7 +62,7 @@ step s2u2: UPDATE footrg SET b='XYZ' WHERE a=1;
+ step s1u2: UPDATE footrg SET b='EFG' WHERE a=1; <waiting ...>
+ step s2c: COMMIT;
+ step s1u2: <... completed>
+-error in steps s2c s1u2: ERROR:  tuple to be locked was already moved to another partition due to concurrent update
++ERROR:  tuple to be locked was already moved to another partition due to concurrent update
+ step s1c: COMMIT;
+ 
+ starting permutation: s1b s2b s1u3pc s2i s1c s2c
+@@ -72,7 +72,7 @@ step s1u3pc: UPDATE foo_range_parted SET a=11 WHERE a=7;
+ step s2i: INSERT INTO bar VALUES(7); <waiting ...>
+ step s1c: COMMIT;
+ step s2i: <... completed>
+-error in steps s1c s2i: ERROR:  tuple to be locked was already moved to another partition due to concurrent update
++ERROR:  tuple to be locked was already moved to another partition due to concurrent update
+ step s2c: COMMIT;
+ 
+ starting permutation: s1b s2b s1u3pc s2i s1r s2c
+@@ -92,7 +92,7 @@ step s1u3pc: UPDATE foo_range_parted SET a=11 WHERE a=7;
+ step s2i: INSERT INTO bar VALUES(7); <waiting ...>
+ step s1c: COMMIT;
+ step s2i: <... completed>
+-error in steps s1c s2i: ERROR:  tuple to be locked was already moved to another partition due to concurrent update
++ERROR:  tuple to be locked was already moved to another partition due to concurrent update
+ step s2c: COMMIT;
+ 
+ starting permutation: s1b s2b s1u3npc s1u3pc s2i s1r s2c
+@@ -114,7 +114,7 @@ step s1u3pc: UPDATE foo_range_parted SET a=11 WHERE a=7;
+ step s2i: INSERT INTO bar VALUES(7); <waiting ...>
+ step s1c: COMMIT;
+ step s2i: <... completed>
+-error in steps s1c s2i: ERROR:  tuple to be locked was already moved to another partition due to concurrent update
++ERROR:  tuple to be locked was already moved to another partition due to concurrent update
+ step s2c: COMMIT;
+ 
+ starting permutation: s1b s2b s1u3npc s1u3pc s1u3pc s2i s1r s2c
+diff --git a/src/test/isolation/expected/partition-key-update-3.out b/src/test/isolation/expected/partition-key-update-3.out
+index 42dfe64ad31d..a06af2d7196b 100644
+--- a/src/test/isolation/expected/partition-key-update-3.out
++++ b/src/test/isolation/expected/partition-key-update-3.out
+@@ -23,7 +23,7 @@ step s1u: UPDATE foo SET a=2, b=b || ' -> moved by session-1' WHERE a=1;
+ step s3donothing: INSERT INTO foo VALUES(2, 'session-3 donothing'), (2, 'session-3 donothing2') ON CONFLICT DO NOTHING; <waiting ...>
+ step s1c: COMMIT;
+ step s3donothing: <... completed>
+-error in steps s1c s3donothing: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s3c: COMMIT;
+ step s2donothing: INSERT INTO foo VALUES(1, 'session-2 donothing') ON CONFLICT DO NOTHING;
+ step s2c: COMMIT;
+@@ -42,7 +42,7 @@ step s3donothing: INSERT INTO foo VALUES(2, 'session-3 donothing'), (2, 'session
+ step s1c: COMMIT;
+ step s2donothing: <... completed>
+ step s3donothing: <... completed>
+-error in steps s1c s2donothing s3donothing: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ step s3c: COMMIT;
+ step s2select: SELECT * FROM foo ORDER BY a;
+@@ -59,8 +59,8 @@ step s3donothing: INSERT INTO foo VALUES(2, 'session-3 donothing'), (2, 'session
+ step s2donothing: INSERT INTO foo VALUES(1, 'session-2 donothing') ON CONFLICT DO NOTHING; <waiting ...>
+ step s1c: COMMIT;
+ step s3donothing: <... completed>
++ERROR:  could not serialize access due to concurrent update
+ step s2donothing: <... completed>
+-error in steps s1c s3donothing s2donothing: ERROR:  could not serialize access due to concurrent update
+ step s3c: COMMIT;
+ step s2c: COMMIT;
+ step s2select: SELECT * FROM foo ORDER BY a;
+@@ -92,7 +92,7 @@ step s1u: UPDATE foo SET a=2, b=b || ' -> moved by session-1' WHERE a=1;
+ step s3donothing: INSERT INTO foo VALUES(2, 'session-3 donothing'), (2, 'session-3 donothing2') ON CONFLICT DO NOTHING; <waiting ...>
+ step s1c: COMMIT;
+ step s3donothing: <... completed>
+-error in steps s1c s3donothing: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s3c: COMMIT;
+ step s2donothing: INSERT INTO foo VALUES(1, 'session-2 donothing') ON CONFLICT DO NOTHING;
+ step s2c: COMMIT;
+@@ -111,7 +111,7 @@ step s3donothing: INSERT INTO foo VALUES(2, 'session-3 donothing'), (2, 'session
+ step s1c: COMMIT;
+ step s2donothing: <... completed>
+ step s3donothing: <... completed>
+-error in steps s1c s2donothing s3donothing: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s2c: COMMIT;
+ step s3c: COMMIT;
+ step s2select: SELECT * FROM foo ORDER BY a;
+@@ -128,8 +128,8 @@ step s3donothing: INSERT INTO foo VALUES(2, 'session-3 donothing'), (2, 'session
+ step s2donothing: INSERT INTO foo VALUES(1, 'session-2 donothing') ON CONFLICT DO NOTHING; <waiting ...>
+ step s1c: COMMIT;
+ step s3donothing: <... completed>
++ERROR:  could not serialize access due to concurrent update
+ step s2donothing: <... completed>
+-error in steps s1c s3donothing s2donothing: ERROR:  could not serialize access due to concurrent update
+ step s3c: COMMIT;
+ step s2c: COMMIT;
+ step s2select: SELECT * FROM foo ORDER BY a;
+diff --git a/src/test/isolation/expected/propagate-lock-delete.out b/src/test/isolation/expected/propagate-lock-delete.out
+index b668b895f1a7..222b945fee2f 100644
+--- a/src/test/isolation/expected/propagate-lock-delete.out
++++ b/src/test/isolation/expected/propagate-lock-delete.out
+@@ -11,7 +11,7 @@ step s3d: DELETE FROM parent; <waiting ...>
+ step s1c: COMMIT;
+ step s2c: COMMIT;
+ step s3d: <... completed>
+-error in steps s2c s3d: ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
++ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
+ step s3c: COMMIT;
+ 
+ starting permutation: s1b s1l s2b s2l s3b s3u s3svu s3d s1c s2c s3c
+@@ -26,7 +26,7 @@ step s3d: DELETE FROM parent; <waiting ...>
+ step s1c: COMMIT;
+ step s2c: COMMIT;
+ step s3d: <... completed>
+-error in steps s2c s3d: ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
++ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
+ step s3c: COMMIT;
+ 
+ starting permutation: s1b s1l s2b s2l s3b s3u2 s3d s1c s2c s3c
+@@ -40,7 +40,7 @@ step s3d: DELETE FROM parent; <waiting ...>
+ step s1c: COMMIT;
+ step s2c: COMMIT;
+ step s3d: <... completed>
+-error in steps s2c s3d: ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
++ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
+ step s3c: COMMIT;
+ 
+ starting permutation: s1b s1l s2b s2l s3b s3u2 s3svu s3d s1c s2c s3c
+@@ -55,7 +55,7 @@ step s3d: DELETE FROM parent; <waiting ...>
+ step s1c: COMMIT;
+ step s2c: COMMIT;
+ step s3d: <... completed>
+-error in steps s2c s3d: ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
++ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
+ step s3c: COMMIT;
+ 
+ starting permutation: s1b s1l s3b s3u s3d s1c s3c
+@@ -66,7 +66,7 @@ step s3u: UPDATE parent SET c=lower(c);
+ step s3d: DELETE FROM parent; <waiting ...>
+ step s1c: COMMIT;
+ step s3d: <... completed>
+-error in steps s1c s3d: ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
++ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
+ step s3c: COMMIT;
+ 
+ starting permutation: s1b s1l s3b s3u s3svu s3d s1c s3c
+@@ -78,7 +78,7 @@ step s3svu: SAVEPOINT f; UPDATE parent SET c = 'bbb'; ROLLBACK TO f;
+ step s3d: DELETE FROM parent; <waiting ...>
+ step s1c: COMMIT;
+ step s3d: <... completed>
+-error in steps s1c s3d: ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
++ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
+ step s3c: COMMIT;
+ 
+ starting permutation: s1b s1l s3b s3u2 s3d s1c s3c
+@@ -89,7 +89,7 @@ step s3u2: UPDATE parent SET i = i;
+ step s3d: DELETE FROM parent; <waiting ...>
+ step s1c: COMMIT;
+ step s3d: <... completed>
+-error in steps s1c s3d: ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
++ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
+ step s3c: COMMIT;
+ 
+ starting permutation: s1b s1l s3b s3u2 s3svu s3d s1c s3c
+@@ -101,5 +101,5 @@ step s3svu: SAVEPOINT f; UPDATE parent SET c = 'bbb'; ROLLBACK TO f;
+ step s3d: DELETE FROM parent; <waiting ...>
+ step s1c: COMMIT;
+ step s3d: <... completed>
+-error in steps s1c s3d: ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
++ERROR:  update or delete on table "parent" violates foreign key constraint "child_i_fkey" on table "child"
+ step s3c: COMMIT;
+diff --git a/src/test/isolation/expected/read-write-unique-2.out b/src/test/isolation/expected/read-write-unique-2.out
+index 5e27f0adfd2a..a36ae3a97c46 100644
+--- a/src/test/isolation/expected/read-write-unique-2.out
++++ b/src/test/isolation/expected/read-write-unique-2.out
+@@ -11,7 +11,7 @@ step w1: INSERT INTO test VALUES (42);
+ step w2: INSERT INTO test VALUES (42); <waiting ...>
+ step c1: COMMIT;
+ step w2: <... completed>
+-error in steps c1 w2: ERROR:  could not serialize access due to read/write dependencies among transactions
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: COMMIT;
+ 
+ starting permutation: r1 w1 c1 r2 w2 c2
+diff --git a/src/test/isolation/expected/read-write-unique-3.out b/src/test/isolation/expected/read-write-unique-3.out
+index edd3558930c7..5b308de981e5 100644
+--- a/src/test/isolation/expected/read-write-unique-3.out
++++ b/src/test/isolation/expected/read-write-unique-3.out
+@@ -8,5 +8,5 @@ insert_unique
+ step rw2: SELECT insert_unique(1, '2'); <waiting ...>
+ step c1: COMMIT;
+ step rw2: <... completed>
+-error in steps c1 rw2: ERROR:  could not serialize access due to read/write dependencies among transactions
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: COMMIT;
+diff --git a/src/test/isolation/expected/read-write-unique-4.out b/src/test/isolation/expected/read-write-unique-4.out
+index 64ff15751300..5f36837702f2 100644
+--- a/src/test/isolation/expected/read-write-unique-4.out
++++ b/src/test/isolation/expected/read-write-unique-4.out
+@@ -13,7 +13,7 @@ step w1: INSERT INTO invoice VALUES (2016, 3);
+ step w2: INSERT INTO invoice VALUES (2016, 3); <waiting ...>
+ step c1: COMMIT;
+ step w2: <... completed>
+-error in steps c1 w2: ERROR:  could not serialize access due to read/write dependencies among transactions
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: COMMIT;
+ 
+ starting permutation: r1 w1 w2 c1 c2
+@@ -25,7 +25,7 @@ step w1: INSERT INTO invoice VALUES (2016, 3);
+ step w2: INSERT INTO invoice VALUES (2016, 3); <waiting ...>
+ step c1: COMMIT;
+ step w2: <... completed>
+-error in steps c1 w2: ERROR:  duplicate key value violates unique constraint "invoice_pkey"
++ERROR:  duplicate key value violates unique constraint "invoice_pkey"
+ step c2: COMMIT;
+ 
+ starting permutation: r2 w1 w2 c1 c2
+@@ -37,5 +37,5 @@ step w1: INSERT INTO invoice VALUES (2016, 3);
+ step w2: INSERT INTO invoice VALUES (2016, 3); <waiting ...>
+ step c1: COMMIT;
+ step w2: <... completed>
+-error in steps c1 w2: ERROR:  duplicate key value violates unique constraint "invoice_pkey"
++ERROR:  duplicate key value violates unique constraint "invoice_pkey"
+ step c2: COMMIT;
+diff --git a/src/test/isolation/expected/read-write-unique.out b/src/test/isolation/expected/read-write-unique.out
+index fb32ec32615a..b438674230db 100644
+--- a/src/test/isolation/expected/read-write-unique.out
++++ b/src/test/isolation/expected/read-write-unique.out
+@@ -11,7 +11,7 @@ step w1: INSERT INTO test VALUES (42);
+ step w2: INSERT INTO test VALUES (42); <waiting ...>
+ step c1: COMMIT;
+ step w2: <... completed>
+-error in steps c1 w2: ERROR:  could not serialize access due to read/write dependencies among transactions
++ERROR:  could not serialize access due to read/write dependencies among transactions
+ step c2: COMMIT;
+ 
+ starting permutation: r1 w1 c1 r2 w2 c2
+diff --git a/src/test/isolation/expected/sequence-ddl.out b/src/test/isolation/expected/sequence-ddl.out
+index 6766c0aff61f..5cf08d7f3c80 100644
+--- a/src/test/isolation/expected/sequence-ddl.out
++++ b/src/test/isolation/expected/sequence-ddl.out
+@@ -11,7 +11,7 @@ step s1alter: ALTER SEQUENCE seq1 MAXVALUE 10;
+ step s2nv: SELECT nextval('seq1') FROM generate_series(1, 15); <waiting ...>
+ step s1commit: COMMIT;
+ step s2nv: <... completed>
+-error in steps s1commit s2nv: ERROR:  nextval: reached maximum value of sequence "seq1" (10)
++ERROR:  nextval: reached maximum value of sequence "seq1" (10)
+ 
+ starting permutation: s1restart s2nv s1commit
+ step s1restart: ALTER SEQUENCE seq1 RESTART WITH 5;
+diff --git a/src/test/isolation/expected/skip-locked-4_1.out b/src/test/isolation/expected/skip-locked-4_1.out
+index 552429ae8915..e7ea5d7a8d86 100644
+--- a/src/test/isolation/expected/skip-locked-4_1.out
++++ b/src/test/isolation/expected/skip-locked-4_1.out
+@@ -14,6 +14,6 @@ pg_advisory_unlock
+ 
+ t              
+ step s1a: <... completed>
+-error in steps s2e s1a: ERROR:  could not serialize access due to concurrent update
++ERROR:  could not serialize access due to concurrent update
+ step s1b: COMMIT;
+ step s2f: COMMIT;
+diff --git a/src/test/isolation/expected/timeouts.out b/src/test/isolation/expected/timeouts.out
+index ff646279ecb7..d9ecdc95325c 100644
+--- a/src/test/isolation/expected/timeouts.out
++++ b/src/test/isolation/expected/timeouts.out
+@@ -6,7 +6,7 @@ accountid      balance
+ 
+ checking       600            
+ savings        600            
+-step sto: SET statement_timeout = 5000;
++step sto: SET statement_timeout = '10ms';
+ step locktbl: LOCK TABLE accounts; <waiting ...>
+ step locktbl: <... completed>
+ ERROR:  canceling statement due to statement timeout
+@@ -17,7 +17,7 @@ accountid      balance
+ 
+ checking       600            
+ savings        600            
+-step lto: SET lock_timeout = 5000;
++step lto: SET lock_timeout = '10ms';
+ step locktbl: LOCK TABLE accounts; <waiting ...>
+ step locktbl: <... completed>
+ ERROR:  canceling statement due to lock timeout
+@@ -28,7 +28,7 @@ accountid      balance
+ 
+ checking       600            
+ savings        600            
+-step lsto: SET lock_timeout = 5000; SET statement_timeout = 6000;
++step lsto: SET lock_timeout = '10ms'; SET statement_timeout = '10s';
+ step locktbl: LOCK TABLE accounts; <waiting ...>
+ step locktbl: <... completed>
+ ERROR:  canceling statement due to lock timeout
+@@ -39,35 +39,35 @@ accountid      balance
+ 
+ checking       600            
+ savings        600            
+-step slto: SET lock_timeout = 6000; SET statement_timeout = 5000;
++step slto: SET lock_timeout = '10s'; SET statement_timeout = '10ms';
+ step locktbl: LOCK TABLE accounts; <waiting ...>
+ step locktbl: <... completed>
+ ERROR:  canceling statement due to statement timeout
+ 
+ starting permutation: wrtbl sto update
+ step wrtbl: UPDATE accounts SET balance = balance + 100;
+-step sto: SET statement_timeout = 5000;
++step sto: SET statement_timeout = '10ms';
+ step update: DELETE FROM accounts WHERE accountid = 'checking'; <waiting ...>
+ step update: <... completed>
+ ERROR:  canceling statement due to statement timeout
+ 
+ starting permutation: wrtbl lto update
+ step wrtbl: UPDATE accounts SET balance = balance + 100;
+-step lto: SET lock_timeout = 5000;
++step lto: SET lock_timeout = '10ms';
+ step update: DELETE FROM accounts WHERE accountid = 'checking'; <waiting ...>
+ step update: <... completed>
+ ERROR:  canceling statement due to lock timeout
+ 
+ starting permutation: wrtbl lsto update
+ step wrtbl: UPDATE accounts SET balance = balance + 100;
+-step lsto: SET lock_timeout = 5000; SET statement_timeout = 6000;
++step lsto: SET lock_timeout = '10ms'; SET statement_timeout = '10s';
+ step update: DELETE FROM accounts WHERE accountid = 'checking'; <waiting ...>
+ step update: <... completed>
+ ERROR:  canceling statement due to lock timeout
+ 
+ starting permutation: wrtbl slto update
+ step wrtbl: UPDATE accounts SET balance = balance + 100;
+-step slto: SET lock_timeout = 6000; SET statement_timeout = 5000;
++step slto: SET lock_timeout = '10s'; SET statement_timeout = '10ms';
+ step update: DELETE FROM accounts WHERE accountid = 'checking'; <waiting ...>
+ step update: <... completed>
+ ERROR:  canceling statement due to statement timeout
+diff --git a/src/test/isolation/expected/tuplelock-update.out b/src/test/isolation/expected/tuplelock-update.out
+index ea63022e9346..7bd7bbf30a8b 100644
+--- a/src/test/isolation/expected/tuplelock-update.out
++++ b/src/test/isolation/expected/tuplelock-update.out
+@@ -18,19 +18,22 @@ step s1_grablock: SELECT * FROM pktab FOR KEY SHARE;
+ id             data           
+ 
+ 1              2              
+-step s1_advunlock1: SELECT pg_advisory_unlock(142857);
++step s1_advunlock1: SELECT pg_advisory_unlock(142857); <waiting ...>
++step s2_update: <... completed>
++step s1_advunlock1: <... completed>
+ pg_advisory_unlock
+ 
+ t              
+-step s2_update: <... completed>
+-step s1_advunlock2: SELECT pg_sleep(5), pg_advisory_unlock(285714);
+-pg_sleep       pg_advisory_unlock
+-
+-               t              
++step s1_advunlock2: SELECT pg_advisory_unlock(285714); <waiting ...>
+ step s3_update: <... completed>
+-step s1_advunlock3: SELECT pg_sleep(5), pg_advisory_unlock(571428);
+-pg_sleep       pg_advisory_unlock
++step s1_advunlock2: <... completed>
++pg_advisory_unlock
+ 
+-               t              
++t              
++step s1_advunlock3: SELECT pg_advisory_unlock(571428); <waiting ...>
+ step s4_update: <... completed>
++step s1_advunlock3: <... completed>
++pg_advisory_unlock
++
++t              
+ step s1_commit: COMMIT;
+diff --git a/src/test/isolation/isolationtester.c b/src/test/isolation/isolationtester.c
+index 0a73d38daeb3..71546bf92385 100644
+--- a/src/test/isolation/isolationtester.c
++++ b/src/test/isolation/isolationtester.c
+@@ -22,32 +22,55 @@
+ 
+ /*
+  * conns[0] is the global setup, teardown, and watchdog connection.  Additional
+- * connections represent spec-defined sessions.  We also track the backend
+- * PID, in numeric and string formats, for each connection.
++ * connections represent spec-defined sessions.
+  */
+-static PGconn **conns = NULL;
+-static int *backend_pids = NULL;
+-static const char **backend_pid_strs = NULL;
++typedef struct IsoConnInfo
++{
++	/* The libpq connection object for this connection. */
++	PGconn	   *conn;
++	/* The backend PID, in numeric and string formats. */
++	int			backend_pid;
++	const char *backend_pid_str;
++	/* Name of the associated session. */
++	const char *sessionname;
++	/* Active step on this connection, or NULL if idle. */
++	PermutationStep *active_step;
++	/* Number of NOTICE messages received from connection. */
++	int			total_notices;
++} IsoConnInfo;
++
++static IsoConnInfo *conns = NULL;
+ static int	nconns = 0;
+ 
++/* Flag indicating some new NOTICE has arrived */
++static bool any_new_notice = false;
++
+ /* Maximum time to wait before giving up on a step (in usec) */
+ static int64 max_step_wait = 300 * USECS_PER_SEC;
+ 
+ 
++static void check_testspec(TestSpec *testspec);
+ static void run_testspec(TestSpec *testspec);
+ static void run_all_permutations(TestSpec *testspec);
+ static void run_all_permutations_recurse(TestSpec *testspec, int nsteps,
+-										 Step **steps);
++										 PermutationStep **steps);
+ static void run_named_permutations(TestSpec *testspec);
+-static void run_permutation(TestSpec *testspec, int nsteps, Step **steps);
++static void run_permutation(TestSpec *testspec, int nsteps,
++							PermutationStep **steps);
+ 
+-#define STEP_NONBLOCK	0x1		/* return 0 as soon as cmd waits for a lock */
++/* Flag bits for try_complete_step(s) */
++#define STEP_NONBLOCK	0x1		/* return as soon as cmd waits for a lock */
+ #define STEP_RETRY		0x2		/* this is a retry of a previously-waiting cmd */
+-static bool try_complete_step(TestSpec *testspec, Step *step, int flags);
++
++static int	try_complete_steps(TestSpec *testspec, PermutationStep **waiting,
++							   int nwaiting, int flags);
++static bool try_complete_step(TestSpec *testspec, PermutationStep *pstep,
++							  int flags);
+ 
+ static int	step_qsort_cmp(const void *a, const void *b);
+ static int	step_bsearch_cmp(const void *a, const void *b);
+ 
++static bool step_has_blocker(PermutationStep *pstep);
+ static void printResultSet(PGresult *res);
+ static void isotesterNoticeProcessor(void *arg, const char *message);
+ static void blackholeNoticeProcessor(void *arg, const char *message);
+@@ -58,8 +81,8 @@ disconnect_atexit(void)
+ 	int			i;
+ 
+ 	for (i = 0; i < nconns; i++)
+-		if (conns[i])
+-			PQfinish(conns[i]);
++		if (conns[i].conn)
++			PQfinish(conns[i].conn);
+ }
+ 
+ int
+@@ -68,14 +91,10 @@ main(int argc, char **argv)
+ 	const char *conninfo;
+ 	const char *env_wait;
+ 	TestSpec   *testspec;
+-	int			i,
+-				j;
+-	int			n;
+ 	PGresult   *res;
+ 	PQExpBufferData wait_query;
+ 	int			opt;
+-	int			nallsteps;
+-	Step	  **allsteps;
++	int			i;
+ 
+ 	while ((opt = getopt(argc, argv, "V")) != -1)
+ 	{
+@@ -120,35 +139,8 @@ main(int argc, char **argv)
+ 	spec_yyparse();
+ 	testspec = &parseresult;
+ 
+-	/* Create a lookup table of all steps. */
+-	nallsteps = 0;
+-	for (i = 0; i < testspec->nsessions; i++)
+-		nallsteps += testspec->sessions[i]->nsteps;
+-
+-	allsteps = pg_malloc(nallsteps * sizeof(Step *));
+-
+-	n = 0;
+-	for (i = 0; i < testspec->nsessions; i++)
+-	{
+-		for (j = 0; j < testspec->sessions[i]->nsteps; j++)
+-			allsteps[n++] = testspec->sessions[i]->steps[j];
+-	}
+-
+-	qsort(allsteps, nallsteps, sizeof(Step *), &step_qsort_cmp);
+-	testspec->nallsteps = nallsteps;
+-	testspec->allsteps = allsteps;
+-
+-	/* Verify that all step names are unique */
+-	for (i = 1; i < testspec->nallsteps; i++)
+-	{
+-		if (strcmp(testspec->allsteps[i - 1]->name,
+-				   testspec->allsteps[i]->name) == 0)
+-		{
+-			fprintf(stderr, "duplicate step name: %s\n",
+-					testspec->allsteps[i]->name);
+-			exit(1);
+-		}
+-	}
++	/* Perform post-parse checking, and fill in linking fields */
++	check_testspec(testspec);
+ 
+ 	printf("Parsed test spec with %d sessions\n", testspec->nsessions);
+ 
+@@ -157,18 +149,21 @@ main(int argc, char **argv)
+ 	 * extra for lock wait detection and global work.
+ 	 */
+ 	nconns = 1 + testspec->nsessions;
+-	conns = (PGconn **) pg_malloc0(nconns * sizeof(PGconn *));
+-	backend_pids = pg_malloc0(nconns * sizeof(*backend_pids));
+-	backend_pid_strs = pg_malloc0(nconns * sizeof(*backend_pid_strs));
++	conns = (IsoConnInfo *) pg_malloc0(nconns * sizeof(IsoConnInfo));
+ 	atexit(disconnect_atexit);
+ 
+ 	for (i = 0; i < nconns; i++)
+ 	{
+-		conns[i] = PQconnectdb(conninfo);
+-		if (PQstatus(conns[i]) != CONNECTION_OK)
++		if (i == 0)
++			conns[i].sessionname = "control connection";
++		else
++			conns[i].sessionname = testspec->sessions[i - 1]->name;
++
++		conns[i].conn = PQconnectdb(conninfo);
++		if (PQstatus(conns[i].conn) != CONNECTION_OK)
+ 		{
+ 			fprintf(stderr, "Connection %d failed: %s",
+-					i, PQerrorMessage(conns[i]));
++					i, PQerrorMessage(conns[i].conn));
+ 			exit(1);
+ 		}
+ 
+@@ -179,27 +174,17 @@ main(int argc, char **argv)
+ 		 * messages).
+ 		 */
+ 		if (i != 0)
+-			PQsetNoticeProcessor(conns[i],
++			PQsetNoticeProcessor(conns[i].conn,
+ 								 isotesterNoticeProcessor,
+-								 (void *) (testspec->sessions[i - 1]->name));
++								 (void *) &conns[i]);
+ 		else
+-			PQsetNoticeProcessor(conns[i],
++			PQsetNoticeProcessor(conns[i].conn,
+ 								 blackholeNoticeProcessor,
+ 								 NULL);
+ 
+ 		/* Save each connection's backend PID for subsequent use. */
+-		backend_pids[i] = PQbackendPID(conns[i]);
+-		backend_pid_strs[i] = psprintf("%d", backend_pids[i]);
+-	}
+-
+-	/* Set the session index fields in steps. */
+-	for (i = 0; i < testspec->nsessions; i++)
+-	{
+-		Session    *session = testspec->sessions[i];
+-		int			stepindex;
+-
+-		for (stepindex = 0; stepindex < session->nsteps; stepindex++)
+-			session->steps[stepindex]->session = i;
++		conns[i].backend_pid = PQbackendPID(conns[i].conn);
++		conns[i].backend_pid_str = psprintf("%d", conns[i].backend_pid);
+ 	}
+ 
+ 	/*
+@@ -214,16 +199,16 @@ main(int argc, char **argv)
+ 	appendPQExpBufferStr(&wait_query,
+ 						 "SELECT pg_catalog.pg_isolation_test_session_is_blocked($1, '{");
+ 	/* The spec syntax requires at least one session; assume that here. */
+-	appendPQExpBufferStr(&wait_query, backend_pid_strs[1]);
++	appendPQExpBufferStr(&wait_query, conns[1].backend_pid_str);
+ 	for (i = 2; i < nconns; i++)
+-		appendPQExpBuffer(&wait_query, ",%s", backend_pid_strs[i]);
++		appendPQExpBuffer(&wait_query, ",%s", conns[i].backend_pid_str);
+ 	appendPQExpBufferStr(&wait_query, "}')");
+ 
+-	res = PQprepare(conns[0], PREP_WAITING, wait_query.data, 0, NULL);
++	res = PQprepare(conns[0].conn, PREP_WAITING, wait_query.data, 0, NULL);
+ 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+ 	{
+ 		fprintf(stderr, "prepare of lock wait query failed: %s",
+-				PQerrorMessage(conns[0]));
++				PQerrorMessage(conns[0].conn));
+ 		exit(1);
+ 	}
+ 	PQclear(res);
+@@ -238,6 +223,145 @@ main(int argc, char **argv)
+ 	return 0;
+ }
+ 
++/*
++ * Validity-check the test spec and fill in cross-links between nodes.
++ */
++static void
++check_testspec(TestSpec *testspec)
++{
++	int			nallsteps;
++	Step	  **allsteps;
++	int			i,
++				j,
++				k;
++
++	/* Create a sorted lookup table of all steps. */
++	nallsteps = 0;
++	for (i = 0; i < testspec->nsessions; i++)
++		nallsteps += testspec->sessions[i]->nsteps;
++
++	allsteps = pg_malloc(nallsteps * sizeof(Step *));
++
++	k = 0;
++	for (i = 0; i < testspec->nsessions; i++)
++	{
++		for (j = 0; j < testspec->sessions[i]->nsteps; j++)
++			allsteps[k++] = testspec->sessions[i]->steps[j];
++	}
++
++	qsort(allsteps, nallsteps, sizeof(Step *), step_qsort_cmp);
++
++	/* Verify that all step names are unique. */
++	for (i = 1; i < nallsteps; i++)
++	{
++		if (strcmp(allsteps[i - 1]->name,
++				   allsteps[i]->name) == 0)
++		{
++			fprintf(stderr, "duplicate step name: %s\n",
++					allsteps[i]->name);
++			exit(1);
++		}
++	}
++
++	/* Set the session index fields in steps. */
++	for (i = 0; i < testspec->nsessions; i++)
++	{
++		Session    *session = testspec->sessions[i];
++
++		for (j = 0; j < session->nsteps; j++)
++			session->steps[j]->session = i;
++	}
++
++	/*
++	 * If we have manually-specified permutations, link PermutationSteps to
++	 * Steps, and fill in blocker links.
++	 */
++	for (i = 0; i < testspec->npermutations; i++)
++	{
++		Permutation *p = testspec->permutations[i];
++
++		for (j = 0; j < p->nsteps; j++)
++		{
++			PermutationStep *pstep = p->steps[j];
++			Step	  **this = (Step **) bsearch(pstep->name,
++												 allsteps,
++												 nallsteps,
++												 sizeof(Step *),
++												 step_bsearch_cmp);
++
++			if (this == NULL)
++			{
++				fprintf(stderr, "undefined step \"%s\" specified in permutation\n",
++						pstep->name);
++				exit(1);
++			}
++			pstep->step = *this;
++
++			/* Mark the step used, for check below */
++			pstep->step->used = true;
++		}
++
++		/*
++		 * Identify any blocker steps.  We search only the current
++		 * permutation, since steps not used there couldn't be concurrent.
++		 * Note that it's OK to reference later permutation steps, so this
++		 * can't be combined with the previous loop.
++		 */
++		for (j = 0; j < p->nsteps; j++)
++		{
++			PermutationStep *pstep = p->steps[j];
++
++			for (k = 0; k < pstep->nblockers; k++)
++			{
++				PermutationStepBlocker *blocker = pstep->blockers[k];
++				int			n;
++
++				if (blocker->blocktype == PSB_ONCE)
++					continue;	/* nothing to link to */
++
++				blocker->step = NULL;
++				for (n = 0; n < p->nsteps; n++)
++				{
++					PermutationStep *otherp = p->steps[n];
++
++					if (strcmp(otherp->name, blocker->stepname) == 0)
++					{
++						blocker->step = otherp->step;
++						break;
++					}
++				}
++				if (blocker->step == NULL)
++				{
++					fprintf(stderr, "undefined blocking step \"%s\" referenced in permutation step \"%s\"\n",
++							blocker->stepname, pstep->name);
++					exit(1);
++				}
++				/* can't block on completion of step of own session */
++				if (blocker->step->session == pstep->step->session)
++				{
++					fprintf(stderr, "permutation step \"%s\" cannot block on its own session\n",
++							pstep->name);
++					exit(1);
++				}
++			}
++		}
++	}
++
++	/*
++	 * If we have manually-specified permutations, verify that all steps have
++	 * been used, warning about anything defined but not used.  We can skip
++	 * this when using automatically-generated permutations.
++	 */
++	if (testspec->permutations)
++	{
++		for (i = 0; i < nallsteps; i++)
++		{
++			if (!allsteps[i]->used)
++				fprintf(stderr, "unused step name: %s\n", allsteps[i]->name);
++		}
++	}
++}
++
+ static int *piles;
+ 
+ /*
+@@ -247,23 +371,10 @@ static int *piles;
+ static void
+ run_testspec(TestSpec *testspec)
+ {
+-	int			i;
+-
+ 	if (testspec->permutations)
+ 		run_named_permutations(testspec);
+ 	else
+ 		run_all_permutations(testspec);
+-
+-	/*
+-	 * Verify that all steps have been used, complaining about anything
+-	 * defined but not used.
+-	 */
+-	for (i = 0; i < testspec->nallsteps; i++)
+-	{
+-		if (!testspec->allsteps[i]->used)
+-			fprintf(stderr, "unused step name: %s\n",
+-					testspec->allsteps[i]->name);
+-	}
+ }
+ 
+ /*
+@@ -274,14 +385,19 @@ run_all_permutations(TestSpec *testspec)
+ {
+ 	int			nsteps;
+ 	int			i;
+-	Step	  **steps;
++	PermutationStep *steps;
++	PermutationStep **stepptrs;
+ 
+ 	/* Count the total number of steps in all sessions */
+ 	nsteps = 0;
+ 	for (i = 0; i < testspec->nsessions; i++)
+ 		nsteps += testspec->sessions[i]->nsteps;
+ 
+-	steps = pg_malloc(sizeof(Step *) * nsteps);
++	/* Create PermutationStep workspace array */
++	steps = (PermutationStep *) pg_malloc0(sizeof(PermutationStep) * nsteps);
++	stepptrs = (PermutationStep **) pg_malloc(sizeof(PermutationStep *) * nsteps);
++	for (i = 0; i < nsteps; i++)
++		stepptrs[i] = steps + i;
+ 
+ 	/*
+ 	 * To generate the permutations, we conceptually put the steps of each
+@@ -296,28 +412,37 @@ run_all_permutations(TestSpec *testspec)
+ 	for (i = 0; i < testspec->nsessions; i++)
+ 		piles[i] = 0;
+ 
+-	run_all_permutations_recurse(testspec, 0, steps);
++	run_all_permutations_recurse(testspec, 0, stepptrs);
+ }
+ 
+ static void
+-run_all_permutations_recurse(TestSpec *testspec, int nsteps, Step **steps)
++run_all_permutations_recurse(TestSpec *testspec, int nsteps, PermutationStep **steps)
+ {
+ 	int			i;
+-	int			found = 0;
++	bool		found = false;
+ 
+ 	for (i = 0; i < testspec->nsessions; i++)
+ 	{
+ 		/* If there's any more steps in this pile, pick it and recurse */
+ 		if (piles[i] < testspec->sessions[i]->nsteps)
+ 		{
+-			steps[nsteps] = testspec->sessions[i]->steps[piles[i]];
++			Step	   *newstep = testspec->sessions[i]->steps[piles[i]];
++
++			/*
++			 * These automatically-generated PermutationSteps never have
++			 * blocker conditions.  So we need only fill these fields, relying
++			 * on run_all_permutations() to have zeroed the rest:
++			 */
++			steps[nsteps]->name = newstep->name;
++			steps[nsteps]->step = newstep;
++
+ 			piles[i]++;
+ 
+ 			run_all_permutations_recurse(testspec, nsteps + 1, steps);
+ 
+ 			piles[i]--;
+ 
+-			found = 1;
++			found = true;
+ 		}
+ 	}
+ 
+@@ -332,38 +457,13 @@ run_all_permutations_recurse(TestSpec *testspec, int nsteps, Step **steps)
+ static void
+ run_named_permutations(TestSpec *testspec)
+ {
+-	int			i,
+-				j;
++	int			i;
+ 
+ 	for (i = 0; i < testspec->npermutations; i++)
+ 	{
+ 		Permutation *p = testspec->permutations[i];
+-		Step	  **steps;
+-
+-		steps = pg_malloc(p->nsteps * sizeof(Step *));
+-
+-		/* Find all the named steps using the lookup table */
+-		for (j = 0; j < p->nsteps; j++)
+-		{
+-			Step	  **this = (Step **) bsearch(p->stepnames[j],
+-												 testspec->allsteps,
+-												 testspec->nallsteps,
+-												 sizeof(Step *),
+-												 &step_bsearch_cmp);
+-
+-			if (this == NULL)
+-			{
+-				fprintf(stderr, "undefined step \"%s\" specified in permutation\n",
+-						p->stepnames[j]);
+-				exit(1);
+-			}
+-			steps[j] = *this;
+-		}
+-
+-		/* And run them */
+-		run_permutation(testspec, p->nsteps, steps);
+ 
+-		free(steps);
++		run_permutation(testspec, p->nsteps, p->steps);
+ 	}
+ }
+ 
+@@ -385,102 +485,35 @@ step_bsearch_cmp(const void *a, const void *b)
+ 	return strcmp(stepname, step->name);
+ }
+ 
+-/*
+- * If a step caused an error to be reported, print it out and clear it.
+- */
+-static void
+-report_error_message(Step *step)
+-{
+-	if (step->errormsg)
+-	{
+-		fprintf(stdout, "%s\n", step->errormsg);
+-		free(step->errormsg);
+-		step->errormsg = NULL;
+-	}
+-}
+-
+-/*
+- * As above, but reports messages possibly emitted by multiple steps.  This is
+- * useful when we have a blocked command awakened by another one; we want to
+- * report all messages identically, for the case where we don't care which
+- * one fails due to a timeout such as deadlock timeout.
+- */
+-static void
+-report_multiple_error_messages(Step *step, int nextra, Step **extrastep)
+-{
+-	PQExpBufferData buffer;
+-	int			n;
+-
+-	if (nextra == 0)
+-	{
+-		report_error_message(step);
+-		return;
+-	}
+-
+-	initPQExpBuffer(&buffer);
+-	appendPQExpBufferStr(&buffer, step->name);
+-
+-	for (n = 0; n < nextra; ++n)
+-		appendPQExpBuffer(&buffer, " %s", extrastep[n]->name);
+-
+-	if (step->errormsg)
+-	{
+-		fprintf(stdout, "error in steps %s: %s\n", buffer.data,
+-				step->errormsg);
+-		free(step->errormsg);
+-		step->errormsg = NULL;
+-	}
+-
+-	for (n = 0; n < nextra; ++n)
+-	{
+-		if (extrastep[n]->errormsg == NULL)
+-			continue;
+-		fprintf(stdout, "error in steps %s: %s\n",
+-				buffer.data, extrastep[n]->errormsg);
+-		free(extrastep[n]->errormsg);
+-		extrastep[n]->errormsg = NULL;
+-	}
+-
+-	termPQExpBuffer(&buffer);
+-}
+-
+ /*
+  * Run one permutation
+  */
+ static void
+-run_permutation(TestSpec *testspec, int nsteps, Step **steps)
++run_permutation(TestSpec *testspec, int nsteps, PermutationStep **steps)
+ {
+ 	PGresult   *res;
+ 	int			i;
+-	int			w;
+ 	int			nwaiting = 0;
+-	int			nerrorstep = 0;
+-	Step	  **waiting;
+-	Step	  **errorstep;
++	PermutationStep **waiting;
+ 
+-	waiting = pg_malloc(sizeof(Step *) * testspec->nsessions);
+-	errorstep = pg_malloc(sizeof(Step *) * testspec->nsessions);
++	waiting = pg_malloc(sizeof(PermutationStep *) * testspec->nsessions);
+ 
+ 	printf("\nstarting permutation:");
+ 	for (i = 0; i < nsteps; i++)
+-	{
+-		/* Track the permutation as in-use */
+-		steps[i]->used = true;
+ 		printf(" %s", steps[i]->name);
+-	}
+ 	printf("\n");
+ 
+ 	/* Perform setup */
+ 	for (i = 0; i < testspec->nsetupsqls; i++)
+ 	{
+-		res = PQexec(conns[0], testspec->setupsqls[i]);
++		res = PQexec(conns[0].conn, testspec->setupsqls[i]);
+ 		if (PQresultStatus(res) == PGRES_TUPLES_OK)
+ 		{
+ 			printResultSet(res);
+ 		}
+ 		else if (PQresultStatus(res) != PGRES_COMMAND_OK)
+ 		{
+-			fprintf(stderr, "setup failed: %s", PQerrorMessage(conns[0]));
++			fprintf(stderr, "setup failed: %s", PQerrorMessage(conns[0].conn));
+ 			exit(1);
+ 		}
+ 		PQclear(res);
+@@ -491,7 +524,7 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
+ 	{
+ 		if (testspec->sessions[i]->setupsql)
+ 		{
+-			res = PQexec(conns[i + 1], testspec->sessions[i]->setupsql);
++			res = PQexec(conns[i + 1].conn, testspec->sessions[i]->setupsql);
+ 			if (PQresultStatus(res) == PGRES_TUPLES_OK)
+ 			{
+ 				printResultSet(res);
+@@ -499,8 +532,8 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
+ 			else if (PQresultStatus(res) != PGRES_COMMAND_OK)
+ 			{
+ 				fprintf(stderr, "setup of session %s failed: %s",
+-						testspec->sessions[i]->name,
+-						PQerrorMessage(conns[i + 1]));
++						conns[i + 1].sessionname,
++						PQerrorMessage(conns[i + 1].conn));
+ 				exit(1);
+ 			}
+ 			PQclear(res);
+@@ -510,73 +543,96 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
+ 	/* Perform steps */
+ 	for (i = 0; i < nsteps; i++)
+ 	{
+-		Step	   *step = steps[i];
+-		PGconn	   *conn = conns[1 + step->session];
+-		Step	   *oldstep = NULL;
++		PermutationStep *pstep = steps[i];
++		Step	   *step = pstep->step;
++		IsoConnInfo *iconn = &conns[1 + step->session];
++		PGconn	   *conn = iconn->conn;
+ 		bool		mustwait;
++		int			j;
+ 
+ 		/*
+ 		 * Check whether the session that needs to perform the next step is
+ 		 * still blocked on an earlier step.  If so, wait for it to finish.
+-		 *
+-		 * (In older versions of this tool, we allowed precisely one session
+-		 * to be waiting at a time.  If we reached a step that required that
+-		 * session to execute the next command, we would declare the whole
+-		 * permutation invalid, cancel everything, and move on to the next
+-		 * one.  Unfortunately, that made it impossible to test the deadlock
+-		 * detector using this framework, unless the number of processes
+-		 * involved in the deadlock was precisely two.  We now assume that if
+-		 * we reach a step that is still blocked, we need to wait for it to
+-		 * unblock itself.)
+ 		 */
+-		for (w = 0; w < nwaiting; ++w)
++		if (iconn->active_step != NULL)
+ 		{
+-			if (step->session == waiting[w]->session)
+-			{
+-				oldstep = waiting[w];
++			struct timeval start_time;
+ 
+-				/* Wait for previous step on this connection. */
+-				try_complete_step(testspec, oldstep, STEP_RETRY);
+-
+-				/* Remove that step from the waiting[] array. */
+-				if (w + 1 < nwaiting)
+-					memmove(&waiting[w], &waiting[w + 1],
+-							(nwaiting - (w + 1)) * sizeof(Step *));
+-				nwaiting--;
++			gettimeofday(&start_time, NULL);
+ 
+-				break;
+-			}
+-		}
+-		if (oldstep != NULL)
+-		{
+-			/*
+-			 * Check for completion of any steps that were previously waiting.
+-			 * Remove any that have completed from waiting[], and include them
+-			 * in the list for report_multiple_error_messages().
+-			 */
+-			w = 0;
+-			nerrorstep = 0;
+-			while (w < nwaiting)
++			while (iconn->active_step != NULL)
+ 			{
+-				if (try_complete_step(testspec, waiting[w],
+-									  STEP_NONBLOCK | STEP_RETRY))
+-				{
+-					/* Still blocked on a lock, leave it alone. */
+-					w++;
+-				}
+-				else
++				PermutationStep *oldstep = iconn->active_step;
++
++				/*
++				 * Wait for oldstep.  But even though we don't use
++				 * STEP_NONBLOCK, it might not complete because of blocker
++				 * conditions.
++				 */
++				if (!try_complete_step(testspec, oldstep, STEP_RETRY))
+ 				{
+-					/* This one finished, too! */
+-					errorstep[nerrorstep++] = waiting[w];
++					/* Done, so remove oldstep from the waiting[] array. */
++					int			w;
++
++					for (w = 0; w < nwaiting; w++)
++					{
++						if (oldstep == waiting[w])
++							break;
++					}
++					if (w >= nwaiting)
++						abort();	/* can't happen */
+ 					if (w + 1 < nwaiting)
+ 						memmove(&waiting[w], &waiting[w + 1],
+-								(nwaiting - (w + 1)) * sizeof(Step *));
++								(nwaiting - (w + 1)) * sizeof(PermutationStep *));
+ 					nwaiting--;
+ 				}
+-			}
+ 
+-			/* Report all errors together. */
+-			report_multiple_error_messages(oldstep, nerrorstep, errorstep);
++				/*
++				 * Check for other steps that have finished.  We should do
++				 * this if oldstep completed, as it might have unblocked
++				 * something.  On the other hand, if oldstep hasn't completed,
++				 * we must poll all the active steps in hopes of unblocking
++				 * oldstep.  So either way, poll them.
++				 */
++				nwaiting = try_complete_steps(testspec, waiting, nwaiting,
++											  STEP_NONBLOCK | STEP_RETRY);
++
++				/*
++				 * If the target session is still busy, apply a timeout to
++				 * keep from hanging indefinitely, which could happen with
++				 * incorrect blocker annotations.  Use the same 2 *
++				 * max_step_wait limit as try_complete_step does for deciding
++				 * to die.  (We don't bother with trying to cancel anything,
++				 * since it's unclear what to cancel in this case.)
++				 */
++				if (iconn->active_step != NULL)
++				{
++					struct timeval current_time;
++					int64		td;
++
++					gettimeofday(&current_time, NULL);
++					td = (int64) current_time.tv_sec - (int64) start_time.tv_sec;
++					td *= USECS_PER_SEC;
++					td += (int64) current_time.tv_usec - (int64) start_time.tv_usec;
++					if (td > 2 * max_step_wait)
++					{
++						fprintf(stderr, "step %s timed out after %d seconds\n",
++								iconn->active_step->name,
++								(int) (td / USECS_PER_SEC));
++						fprintf(stderr, "active steps are:");
++						for (j = 1; j < nconns; j++)
++						{
++							IsoConnInfo *oconn = &conns[j];
++
++							if (oconn->active_step != NULL)
++								fprintf(stderr, " %s",
++										oconn->active_step->name);
++						}
++						fprintf(stderr, "\n");
++						exit(1);
++					}
++				}
++			}
+ 		}
+ 
+ 		/* Send the query for this step. */
+@@ -587,40 +643,37 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
+ 			exit(1);
+ 		}
+ 
+-		/* Try to complete this step without blocking.  */
+-		mustwait = try_complete_step(testspec, step, STEP_NONBLOCK);
++		/* Remember we launched a step. */
++		iconn->active_step = pstep;
+ 
+-		/* Check for completion of any steps that were previously waiting. */
+-		w = 0;
+-		nerrorstep = 0;
+-		while (w < nwaiting)
++		/* Remember target number of NOTICEs for any blocker conditions. */
++		for (j = 0; j < pstep->nblockers; j++)
+ 		{
+-			if (try_complete_step(testspec, waiting[w],
+-								  STEP_NONBLOCK | STEP_RETRY))
+-				w++;
+-			else
+-			{
+-				errorstep[nerrorstep++] = waiting[w];
+-				if (w + 1 < nwaiting)
+-					memmove(&waiting[w], &waiting[w + 1],
+-							(nwaiting - (w + 1)) * sizeof(Step *));
+-				nwaiting--;
+-			}
++			PermutationStepBlocker *blocker = pstep->blockers[j];
++
++			if (blocker->blocktype == PSB_NUM_NOTICES)
++				blocker->target_notices = blocker->num_notices +
++					conns[blocker->step->session + 1].total_notices;
+ 		}
+ 
+-		/* Report any error from this step, and any steps that it unblocked. */
+-		report_multiple_error_messages(step, nerrorstep, errorstep);
++		/* Try to complete this step without blocking.  */
++		mustwait = try_complete_step(testspec, pstep, STEP_NONBLOCK);
++
++		/* Check for completion of any steps that were previously waiting. */
++		nwaiting = try_complete_steps(testspec, waiting, nwaiting,
++									  STEP_NONBLOCK | STEP_RETRY);
+ 
+ 		/* If this step is waiting, add it to the array of waiters. */
+ 		if (mustwait)
+-			waiting[nwaiting++] = step;
++			waiting[nwaiting++] = pstep;
+ 	}
+ 
+ 	/* Wait for any remaining queries. */
+-	for (w = 0; w < nwaiting; ++w)
++	nwaiting = try_complete_steps(testspec, waiting, nwaiting, STEP_RETRY);
++	if (nwaiting != 0)
+ 	{
+-		try_complete_step(testspec, waiting[w], STEP_RETRY);
+-		report_error_message(waiting[w]);
++		fprintf(stderr, "failed to complete permutation due to mutually-blocking steps\n");
++		exit(1);
+ 	}
+ 
+ 	/* Perform per-session teardown */
+@@ -628,7 +681,7 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
+ 	{
+ 		if (testspec->sessions[i]->teardownsql)
+ 		{
+-			res = PQexec(conns[i + 1], testspec->sessions[i]->teardownsql);
++			res = PQexec(conns[i + 1].conn, testspec->sessions[i]->teardownsql);
+ 			if (PQresultStatus(res) == PGRES_TUPLES_OK)
+ 			{
+ 				printResultSet(res);
+@@ -636,8 +689,8 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
+ 			else if (PQresultStatus(res) != PGRES_COMMAND_OK)
+ 			{
+ 				fprintf(stderr, "teardown of session %s failed: %s",
+-						testspec->sessions[i]->name,
+-						PQerrorMessage(conns[i + 1]));
++						conns[i + 1].sessionname,
++						PQerrorMessage(conns[i + 1].conn));
+ 				/* don't exit on teardown failure */
+ 			}
+ 			PQclear(res);
+@@ -647,7 +700,7 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
+ 	/* Perform teardown */
+ 	if (testspec->teardownsql)
+ 	{
+-		res = PQexec(conns[0], testspec->teardownsql);
++		res = PQexec(conns[0].conn, testspec->teardownsql);
+ 		if (PQresultStatus(res) == PGRES_TUPLES_OK)
+ 		{
+ 			printResultSet(res);
+@@ -655,36 +708,90 @@ run_permutation(TestSpec *testspec, int nsteps, Step **steps)
+ 		else if (PQresultStatus(res) != PGRES_COMMAND_OK)
+ 		{
+ 			fprintf(stderr, "teardown failed: %s",
+-					PQerrorMessage(conns[0]));
++					PQerrorMessage(conns[0].conn));
+ 			/* don't exit on teardown failure */
+ 		}
+ 		PQclear(res);
+ 	}
+ 
+ 	free(waiting);
+-	free(errorstep);
++}
++
++/*
++ * Check for completion of any waiting step(s).
++ * Remove completed ones from the waiting[] array,
++ * and return the new value of nwaiting.
++ * See try_complete_step for the meaning of the flags.
++ */
++static int
++try_complete_steps(TestSpec *testspec, PermutationStep **waiting,
++				   int nwaiting, int flags)
++{
++	int			old_nwaiting;
++	bool		have_blocker;
++
++	do
++	{
++		int			w = 0;
++
++		/* Reset latch; we only care about notices received within loop. */
++		any_new_notice = false;
++
++		/* Likewise, these variables reset for each retry. */
++		old_nwaiting = nwaiting;
++		have_blocker = false;
++
++		/* Scan the array, try to complete steps. */
++		while (w < nwaiting)
++		{
++			if (try_complete_step(testspec, waiting[w], flags))
++			{
++				/* Still blocked, leave it alone. */
++				if (waiting[w]->nblockers > 0)
++					have_blocker = true;
++				w++;
++			}
++			else
++			{
++				/* Done, remove it from array. */
++				if (w + 1 < nwaiting)
++					memmove(&waiting[w], &waiting[w + 1],
++							(nwaiting - (w + 1)) * sizeof(PermutationStep *));
++				nwaiting--;
++			}
++		}
++
++		/*
++		 * If any of the still-waiting steps have blocker conditions attached,
++		 * it's possible that one of the steps we examined afterwards has
++		 * released them (either by completing, or by sending a NOTICE).  If
++		 * any step completions or NOTICEs happened, repeat the loop until
++		 * none occurs.  Without this provision, completion timing could vary
++		 * depending on the order in which the steps appear in the array.
++		 */
++	} while (have_blocker && (nwaiting < old_nwaiting || any_new_notice));
++	return nwaiting;
+ }
+ 
+ /*
+  * Our caller already sent the query associated with this step.  Wait for it
+- * to either complete or (if given the STEP_NONBLOCK flag) to block while
+- * waiting for a lock.  We assume that any lock wait will persist until we
+- * have executed additional steps in the permutation.
++ * to either complete, or hit a blocking condition.
+  *
+  * When calling this function on behalf of a given step for a second or later
+- * time, pass the STEP_RETRY flag.  This only affects the messages printed.
+- *
+- * If the query returns an error, the message is saved in step->errormsg.
+- * Caller should call report_error_message shortly after this, to have it
+- * printed and cleared.
++ * time, pass the STEP_RETRY flag.  Do not pass it on the first call.
+  *
+- * If the STEP_NONBLOCK flag was specified and the query is waiting to acquire
+- * a lock, returns true.  Otherwise, returns false.
++ * Returns true if the step was *not* completed, false if it was completed.
++ * Reasons for non-completion are (a) the STEP_NONBLOCK flag was specified
++ * and the query is waiting to acquire a lock, or (b) the step has an
++ * unsatisfied blocker condition.  When STEP_NONBLOCK is given, we assume
++ * that any lock wait will persist until we have executed additional steps.
+  */
+ static bool
+-try_complete_step(TestSpec *testspec, Step *step, int flags)
++try_complete_step(TestSpec *testspec, PermutationStep *pstep, int flags)
+ {
+-	PGconn	   *conn = conns[1 + step->session];
++	Step	   *step = pstep->step;
++	IsoConnInfo *iconn = &conns[1 + step->session];
++	PGconn	   *conn = iconn->conn;
+ 	fd_set		read_set;
+ 	struct timeval start_time;
+ 	struct timeval timeout;
+@@ -694,6 +801,28 @@ try_complete_step(TestSpec *testspec, Step *step, int flags)
+ 	PGnotify   *notify;
+ 	bool		canceled = false;
+ 
++	/*
++	 * If the step is annotated with (*), then on the first call, force it to
++	 * wait.  This is useful for ensuring consistent output when the step
++	 * might or might not complete so fast that we don't observe it waiting.
++	 */
++	if (!(flags & STEP_RETRY))
++	{
++		int			i;
++
++		for (i = 0; i < pstep->nblockers; i++)
++		{
++			PermutationStepBlocker *blocker = pstep->blockers[i];
++
++			if (blocker->blocktype == PSB_ONCE)
++			{
++				printf("step %s: %s <waiting ...>\n",
++					   step->name, step->sql);
++				return true;
++			}
++		}
++	}
++
+ 	if (sock < 0)
+ 	{
+ 		fprintf(stderr, "invalid socket: %s", PQerrorMessage(conn));
+@@ -727,14 +856,14 @@ try_complete_step(TestSpec *testspec, Step *step, int flags)
+ 			{
+ 				bool		waiting;
+ 
+-				res = PQexecPrepared(conns[0], PREP_WAITING, 1,
+-									 &backend_pid_strs[step->session + 1],
++				res = PQexecPrepared(conns[0].conn, PREP_WAITING, 1,
++									 &conns[step->session + 1].backend_pid_str,
+ 									 NULL, NULL, 0);
+ 				if (PQresultStatus(res) != PGRES_TUPLES_OK ||
+ 					PQntuples(res) != 1)
+ 				{
+ 					fprintf(stderr, "lock wait query failed: %s",
+-							PQerrorMessage(conns[0]));
++							PQerrorMessage(conns[0].conn));
+ 					exit(1);
+ 				}
+ 				waiting = ((PQgetvalue(res, 0, 0))[0] == 't');
+@@ -833,6 +962,19 @@ try_complete_step(TestSpec *testspec, Step *step, int flags)
+ 		}
+ 	}
+ 
++	/*
++	 * The step is done, but we won't report it as complete so long as there
++	 * are blockers.
++	 */
++	if (step_has_blocker(pstep))
++	{
++		if (!(flags & STEP_RETRY))
++			printf("step %s: %s <waiting ...>\n",
++				   step->name, step->sql);
++		return true;
++	}
++
++	/* Otherwise, go ahead and complete it. */
+ 	if (flags & STEP_RETRY)
+ 		printf("step %s: <... completed>\n", step->name);
+ 	else
+@@ -843,16 +985,12 @@ try_complete_step(TestSpec *testspec, Step *step, int flags)
+ 		switch (PQresultStatus(res))
+ 		{
+ 			case PGRES_COMMAND_OK:
++			case PGRES_EMPTY_QUERY:
+ 				break;
+ 			case PGRES_TUPLES_OK:
+ 				printResultSet(res);
+ 				break;
+ 			case PGRES_FATAL_ERROR:
+-				if (step->errormsg != NULL)
+-				{
+-					printf("WARNING: this step had a leftover error message\n");
+-					printf("%s\n", step->errormsg);
+-				}
+ 
+ 				/*
+ 				 * Detail may contain XID values, so we want to just show
+@@ -866,9 +1004,9 @@ try_complete_step(TestSpec *testspec, Step *step, int flags)
+ 														 PG_DIAG_MESSAGE_PRIMARY);
+ 
+ 					if (sev && msg)
+-						step->errormsg = psprintf("%s:  %s", sev, msg);
++						printf("%s:  %s\n", sev, msg);
+ 					else
+-						step->errormsg = pg_strdup(PQresultErrorMessage(res));
++						printf("%s\n", PQresultErrorMessage(res));
+ 				}
+ 				break;
+ 			default:
+@@ -885,12 +1023,13 @@ try_complete_step(TestSpec *testspec, Step *step, int flags)
+ 		/* Try to identify which session it came from */
+ 		const char *sendername = NULL;
+ 		char		pidstring[32];
++		int			i;
+ 
+-		for (int i = 0; i < testspec->nsessions; i++)
++		for (i = 0; i < testspec->nsessions; i++)
+ 		{
+-			if (notify->be_pid == backend_pids[i + 1])
++			if (notify->be_pid == conns[i + 1].backend_pid)
+ 			{
+-				sendername = testspec->sessions[i]->name;
++				sendername = conns[i + 1].sessionname;
+ 				break;
+ 			}
+ 		}
+@@ -907,6 +1046,43 @@ try_complete_step(TestSpec *testspec, Step *step, int flags)
+ 		PQconsumeInput(conn);
+ 	}
+ 
++	/* Connection is now idle. */
++	iconn->active_step = NULL;
++
++	return false;
++}
++
++/* Detect whether a step has any unsatisfied blocker conditions */
++static bool
++step_has_blocker(PermutationStep *pstep)
++{
++	int			i;
++
++	for (i = 0; i < pstep->nblockers; i++)
++	{
++		PermutationStepBlocker *blocker = pstep->blockers[i];
++		IsoConnInfo *iconn;
++
++		switch (blocker->blocktype)
++		{
++			case PSB_ONCE:
++				/* Ignore; try_complete_step handles this specially */
++				break;
++			case PSB_OTHER_STEP:
++				/* Block if referenced step is active */
++				iconn = &conns[1 + blocker->step->session];
++				if (iconn->active_step &&
++					iconn->active_step->step == blocker->step)
++					return true;
++				break;
++			case PSB_NUM_NOTICES:
++				/* Block if not enough notices received yet */
++				iconn = &conns[1 + blocker->step->session];
++				if (iconn->total_notices < blocker->target_notices)
++					return true;
++				break;
++		}
++	}
+ 	return false;
+ }
+ 
+@@ -932,11 +1108,17 @@ printResultSet(PGresult *res)
+ 	}
+ }
+ 
+-/* notice processor, prefixes each message with the session name */
++/* notice processor for regular user sessions */
+ static void
+ isotesterNoticeProcessor(void *arg, const char *message)
+ {
+-	printf("%s: %s", (char *) arg, message);
++	IsoConnInfo *myconn = (IsoConnInfo *) arg;
++
++	/* Prefix the backend's message with the session name. */
++	printf("%s: %s", myconn->sessionname, message);
++	/* Record notices, since we may need this to decide to unblock a step. */
++	myconn->total_notices++;
++	any_new_notice = true;
+ }
+ 
+ /* notice processor, hides the message */
+diff --git a/src/test/isolation/isolationtester.h b/src/test/isolation/isolationtester.h
+index 488ff05928a0..5f300219c203 100644
+--- a/src/test/isolation/isolationtester.h
++++ b/src/test/isolation/isolationtester.h
+@@ -14,31 +14,62 @@
+ #ifndef ISOLATIONTESTER_H
+ #define ISOLATIONTESTER_H
+ 
+-typedef struct Session Session;
++/*
++ * The structs declared here are used in the output of specparse.y.
++ * Except where noted, all fields are set in the grammar and not
++ * changed thereafter.
++ */
+ typedef struct Step Step;
+ 
+-struct Session
++typedef struct
+ {
+ 	char	   *name;
+ 	char	   *setupsql;
+ 	char	   *teardownsql;
+ 	Step	  **steps;
+ 	int			nsteps;
+-};
++} Session;
+ 
+ struct Step
+ {
+-	int			session;
+-	bool		used;
+ 	char	   *name;
+ 	char	   *sql;
+-	char	   *errormsg;
++	/* These fields are filled by check_testspec(): */
++	int			session;		/* identifies owning session */
++	bool		used;			/* has step been used in a permutation? */
+ };
+ 
++typedef enum
++{
++	PSB_ONCE,					/* force step to wait once */
++	PSB_OTHER_STEP,				/* wait for another step to complete first */
++	PSB_NUM_NOTICES				/* wait for N notices from another session */
++} PermutationStepBlockerType;
++
++typedef struct
++{
++	char	   *stepname;
++	PermutationStepBlockerType blocktype;
++	int			num_notices;	/* only used for PSB_NUM_NOTICES */
++	/* These fields are filled by check_testspec(): */
++	Step	   *step;			/* link to referenced step (if any) */
++	/* These fields are runtime workspace: */
++	int			target_notices; /* total notices needed from other session */
++} PermutationStepBlocker;
++
++typedef struct
++{
++	char	   *name;			/* name of referenced Step */
++	PermutationStepBlocker **blockers;
++	int			nblockers;
++	/* These fields are filled by check_testspec(): */
++	Step	   *step;			/* link to referenced Step */
++} PermutationStep;
++
+ typedef struct
+ {
+ 	int			nsteps;
+-	char	  **stepnames;
++	PermutationStep **steps;
+ } Permutation;
+ 
+ typedef struct
+@@ -50,8 +81,6 @@ typedef struct
+ 	int			nsessions;
+ 	Permutation **permutations;
+ 	int			npermutations;
+-	Step	  **allsteps;
+-	int			nallsteps;
+ } TestSpec;
+ 
+ extern TestSpec parseresult;
+diff --git a/src/test/isolation/specparse.y b/src/test/isolation/specparse.y
+index ae3a99996136..04dbb576a710 100644
+--- a/src/test/isolation/specparse.y
++++ b/src/test/isolation/specparse.y
+@@ -25,9 +25,12 @@ TestSpec		parseresult;			/* result of parsing is left here */
+ %union
+ {
+ 	char	   *str;
++	int			integer;
+ 	Session	   *session;
+ 	Step	   *step;
+ 	Permutation *permutation;
++	PermutationStep *permutationstep;
++	PermutationStepBlocker *blocker;
+ 	struct
+ 	{
+ 		void  **elements;
+@@ -39,13 +42,16 @@ TestSpec		parseresult;			/* result of parsing is left here */
+ %type <str>  opt_setup opt_teardown
+ %type <str> setup
+ %type <ptr_list> step_list session_list permutation_list opt_permutation_list
+-%type <ptr_list> string_literal_list
++%type <ptr_list> permutation_step_list blocker_list
+ %type <session> session
+ %type <step> step
+ %type <permutation> permutation
++%type <permutationstep> permutation_step
++%type <blocker> blocker
+ 
+ %token <str> sqlblock string_literal
+-%token PERMUTATION SESSION SETUP STEP TEARDOWN TEST
++%token <integer> INTEGER
++%token NOTICES PERMUTATION SESSION SETUP STEP TEARDOWN TEST
+ 
+ %%
+ 
+@@ -145,8 +151,8 @@ step:
+ 				$$ = pg_malloc(sizeof(Step));
+ 				$$->name = $2;
+ 				$$->sql = $3;
++				$$->session = -1; /* until filled */
+ 				$$->used = false;
+-				$$->errormsg = NULL;
+ 			}
+ 		;
+ 
+@@ -180,23 +186,23 @@ permutation_list:
+ 
+ 
+ permutation:
+-			PERMUTATION string_literal_list
++			PERMUTATION permutation_step_list
+ 			{
+ 				$$ = pg_malloc(sizeof(Permutation));
+-				$$->stepnames = (char **) $2.elements;
+ 				$$->nsteps = $2.nelements;
++				$$->steps = (PermutationStep **) $2.elements;
+ 			}
+ 		;
+ 
+-string_literal_list:
+-			string_literal_list string_literal
++permutation_step_list:
++			permutation_step_list permutation_step
+ 			{
+ 				$$.elements = pg_realloc($1.elements,
+ 										 ($1.nelements + 1) * sizeof(void *));
+ 				$$.elements[$1.nelements] = $2;
+ 				$$.nelements = $1.nelements + 1;
+ 			}
+-			| string_literal
++			| permutation_step
+ 			{
+ 				$$.nelements = 1;
+ 				$$.elements = pg_malloc(sizeof(void *));
+@@ -204,6 +210,71 @@ string_literal_list:
+ 			}
+ 		;
+ 
++permutation_step:
++			string_literal
++			{
++				$$ = pg_malloc(sizeof(PermutationStep));
++				$$->name = $1;
++				$$->blockers = NULL;
++				$$->nblockers = 0;
++				$$->step = NULL;
++			}
++			| string_literal '(' blocker_list ')'
++			{
++				$$ = pg_malloc(sizeof(PermutationStep));
++				$$->name = $1;
++				$$->blockers = (PermutationStepBlocker **) $3.elements;
++				$$->nblockers = $3.nelements;
++				$$->step = NULL;
++			}
++		;
++
++blocker_list:
++			blocker_list ',' blocker
++			{
++				$$.elements = pg_realloc($1.elements,
++										 ($1.nelements + 1) * sizeof(void *));
++				$$.elements[$1.nelements] = $3;
++				$$.nelements = $1.nelements + 1;
++			}
++			| blocker
++			{
++				$$.nelements = 1;
++				$$.elements = pg_malloc(sizeof(void *));
++				$$.elements[0] = $1;
++			}
++		;
++
++blocker:
++			string_literal
++			{
++				$$ = pg_malloc(sizeof(PermutationStepBlocker));
++				$$->stepname = $1;
++				$$->blocktype = PSB_OTHER_STEP;
++				$$->num_notices = -1;
++				$$->step = NULL;
++				$$->target_notices = -1;
++			}
++			| string_literal NOTICES INTEGER
++			{
++				$$ = pg_malloc(sizeof(PermutationStepBlocker));
++				$$->stepname = $1;
++				$$->blocktype = PSB_NUM_NOTICES;
++				$$->num_notices = $3;
++				$$->step = NULL;
++				$$->target_notices = -1;
++			}
++			| '*'
++			{
++				$$ = pg_malloc(sizeof(PermutationStepBlocker));
++				$$->stepname = NULL;
++				$$->blocktype = PSB_ONCE;
++				$$->num_notices = -1;
++				$$->step = NULL;
++				$$->target_notices = -1;
++			}
++		;
++
+ %%
+ 
+ #include "specscanner.c"
+diff --git a/src/test/isolation/specs/deadlock-hard.spec b/src/test/isolation/specs/deadlock-hard.spec
+index 67aad66e6638..3316d75e953d 100644
+--- a/src/test/isolation/specs/deadlock-hard.spec
++++ b/src/test/isolation/specs/deadlock-hard.spec
+@@ -63,9 +63,17 @@ step "s7a8"	{ LOCK TABLE a8; }
+ step "s7c"	{ COMMIT; }
+ 
+ session "s8"
+-setup		{ BEGIN; SET deadlock_timeout = '10s'; }
++setup		{ BEGIN; SET deadlock_timeout = '10ms'; }
+ step "s8a8"	{ LOCK TABLE a8; }
+ step "s8a1"	{ LOCK TABLE a1; }
+ step "s8c"	{ COMMIT; }
+ 
+-permutation "s1a1" "s2a2" "s3a3" "s4a4" "s5a5" "s6a6" "s7a7" "s8a8" "s1a2" "s2a3" "s3a4" "s4a5" "s5a6" "s6a7" "s7a8" "s8a1" "s8c" "s7c" "s6c" "s5c" "s4c" "s3c" "s2c" "s1c"
++# Note: when s8a1 detects the deadlock and fails, s7a8 is released, making
++# it timing-dependent which query completion is received first by the tester.
++# To ensure output stability, add a blocking mark to force s8a1's completion
++# to be reported first.  There is a second timing dependency, too: the tester
++# might or might not observe s8a1 during its short lock wait state.  Apply a
++# dummy blocking mark to s8a1 to ensure it will be reported as "waiting"
++# regardless of that.
++
++permutation "s1a1" "s2a2" "s3a3" "s4a4" "s5a5" "s6a6" "s7a7" "s8a8" "s1a2" "s2a3" "s3a4" "s4a5" "s5a6" "s6a7" "s7a8"("s8a1") "s8a1"(*) "s8c" "s7c" "s6c" "s5c" "s4c" "s3c" "s2c" "s1c"
+diff --git a/src/test/isolation/specs/deadlock-soft-2.spec b/src/test/isolation/specs/deadlock-soft-2.spec
+index 46b73bc0823f..6ff915f6061d 100644
+--- a/src/test/isolation/specs/deadlock-soft-2.spec
++++ b/src/test/isolation/specs/deadlock-soft-2.spec
+@@ -2,12 +2,6 @@
+ # jump over both s3 and s4 and acquire the lock on a2 immediately,
+ # since s3 and s4 are hard-blocked on a1.
+ 
+-# The expected output for this test assumes that isolationtester will
+-# detect step s1b as waiting before the deadlock detector runs and
+-# releases s1 from its blocked state.  To leave enough time for that
+-# to happen even in very slow (CLOBBER_CACHE_ALWAYS) cases, we must
+-# increase deadlock_timeout.
+-
+ setup
+ {
+   CREATE TABLE a1 ();
+@@ -20,7 +14,7 @@ teardown
+ }
+ 
+ session "s1"
+-setup		{ BEGIN; SET deadlock_timeout = '5s'; }
++setup		{ BEGIN; SET deadlock_timeout = '10ms'; }
+ step "s1a"	{ LOCK TABLE a1 IN SHARE UPDATE EXCLUSIVE MODE; }
+ step "s1b"	{ LOCK TABLE a2 IN SHARE UPDATE EXCLUSIVE MODE; }
+ step "s1c"	{ COMMIT; }
+@@ -41,4 +35,9 @@ setup		{ BEGIN; SET deadlock_timeout = '100s'; }
+ step "s4a"	{ LOCK TABLE a2 IN ACCESS EXCLUSIVE MODE; }
+ step "s4c"	{ COMMIT; }
+ 
+-permutation "s1a" "s2a" "s2b" "s3a" "s4a" "s1b" "s1c" "s2c" "s3c" "s4c"
++# The expected output for this test assumes that isolationtester will
++# detect step s1b as waiting before the deadlock detector runs and
++# releases s1 from its blocked state.  To ensure that happens even in
++# very slow (CLOBBER_CACHE_ALWAYS) cases, apply a (*) annotation.
++
++permutation "s1a" "s2a" "s2b" "s3a" "s4a" "s1b"(*) "s1c" "s2c" "s3c" "s4c"
+diff --git a/src/test/isolation/specs/detach-partition-concurrently-3.spec b/src/test/isolation/specs/detach-partition-concurrently-3.spec
+index 13ad84ac0373..5c8d45fee5dd 100644
+--- a/src/test/isolation/specs/detach-partition-concurrently-3.spec
++++ b/src/test/isolation/specs/detach-partition-concurrently-3.spec
+@@ -1,8 +1,11 @@
+ # Try various things to happen to a partition with an incomplete detach
+ #
+-# Note: Always keep "s2noop" right after "s1cancel" in permutations.  This
+-# reduces the probability of the timing problem that the cancel error report
+-# is shown together with the next query instead of with the cancel query.
++# Note: When using "s1cancel", mark the target step (the one to be canceled)
++# as being blocked by "s1cancel".  This ensures consistent reporting regardless
++# of whether "s1cancel" returns before or after the other step reports failure.
++# Also, ensure the step after "s1cancel" is also an s1 step (use "s1noop" if
++# necessary).  This ensures we won't move on to the next step until the cancel
++# is complete.
+ 
+ setup
+ {
+@@ -22,8 +25,8 @@ step "s1b"			{ BEGIN; }
+ step "s1brr"		{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
+ step "s1s"			{ SELECT * FROM d3_listp; }
+ step "s1spart"		{ SELECT * FROM d3_listp1; }
+-# Sleep 0.1s after sending cancel, to give s2 time to react
+-step "s1cancel" 	{ SELECT pg_cancel_backend(pid), pg_sleep(0.1) FROM d3_pid; }
++step "s1cancel" 	{ SELECT pg_cancel_backend(pid) FROM d3_pid; }
++step "s1noop"		{ }
+ step "s1c"			{ COMMIT; }
+ step "s1alter"		{ ALTER TABLE d3_listp1 ALTER a DROP NOT NULL; }
+ step "s1insert"		{ INSERT INTO d3_listp VALUES (1); }
+@@ -41,44 +44,43 @@ step "s2begin"		{ BEGIN; }
+ step "s2snitch"		{ INSERT INTO d3_pid SELECT pg_backend_pid(); }
+ step "s2detach"		{ ALTER TABLE d3_listp DETACH PARTITION d3_listp1 CONCURRENTLY; }
+ step "s2detach2"	{ ALTER TABLE d3_listp DETACH PARTITION d3_listp2 CONCURRENTLY; }
+-step "s2noop"		{ UNLISTEN noop; }
+ step "s2detachfinal"	{ ALTER TABLE d3_listp DETACH PARTITION d3_listp1 FINALIZE; }
+ step "s2drop"		{ DROP TABLE d3_listp1; }
+ step "s2commit"		{ COMMIT; }
+ 
+ # Try various things while the partition is in "being detached" state, with
+ # no session waiting.
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s1describe" "s1alter"
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1insert" "s1c"
+-permutation "s2snitch" "s1brr" "s1s" "s2detach" "s1cancel" "s2noop" "s1insert" "s1c" "s1spart"
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s1insertpart"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s1describe" "s1alter"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1insert" "s1c"
++permutation "s2snitch" "s1brr" "s1s" "s2detach"("s1cancel") "s1cancel" "s1insert" "s1c" "s1spart"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s1insertpart"
+ 
+ # Test partition descriptor caching
+-permutation "s2snitch" "s1b" "s1s" "s2detach2" "s1cancel" "s2noop" "s1c" "s1brr" "s1insert" "s1s" "s1insert" "s1c"
+-permutation "s2snitch" "s1b" "s1s" "s2detach2" "s1cancel" "s2noop" "s1c" "s1brr" "s1s" "s1insert" "s1s" "s1c"
++permutation "s2snitch" "s1b" "s1s" "s2detach2"("s1cancel") "s1cancel" "s1c" "s1brr" "s1insert" "s1s" "s1insert" "s1c"
++permutation "s2snitch" "s1b" "s1s" "s2detach2"("s1cancel") "s1cancel" "s1c" "s1brr" "s1s" "s1insert" "s1s" "s1c"
+ 
+ # "drop" here does both tables
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s1drop" "s1list"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s1drop" "s1list"
+ # "truncate" only does parent, not partition
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s1trunc" "s1spart"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s1trunc" "s1spart"
+ 
+ # If a partition pending detach exists, we cannot drop another one
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s2detach2" "s1c"
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s2detachfinal" "s1c" "s2detach2"
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s1droppart" "s2detach2"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1noop" "s2detach2" "s1c"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1noop" "s2detachfinal" "s1c" "s2detach2"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s1droppart" "s2detach2"
+ 
+ # When a partition with incomplete detach is dropped, we grab lock on parent too.
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s2begin" "s2drop" "s1s" "s2commit"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s2begin" "s2drop" "s1s" "s2commit"
+ 
+ # Partially detach, then select and try to complete the detach.  Reading
+ # from partition blocks (AEL is required on partition); reading from parent
+ # does not block.
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s1b" "s1spart" "s2detachfinal" "s1c"
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s1b" "s1s" "s2detachfinal" "s1c"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s1b" "s1spart" "s2detachfinal" "s1c"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s1b" "s1s" "s2detachfinal" "s1c"
+ 
+ # DETACH FINALIZE in a transaction block. No insert/select on the partition
+ # is allowed concurrently with that.
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s1b" "s1spart" "s2detachfinal" "s1c"
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s2begin" "s2detachfinal" "s2commit"
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s2begin" "s2detachfinal" "s1spart" "s2commit"
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s1c" "s2begin" "s2detachfinal" "s1insertpart" "s2commit"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s1b" "s1spart" "s2detachfinal" "s1c"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s2begin" "s2detachfinal" "s2commit"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s2begin" "s2detachfinal" "s1spart" "s2commit"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1c" "s2begin" "s2detachfinal" "s1insertpart" "s2commit"
+diff --git a/src/test/isolation/specs/detach-partition-concurrently-4.spec b/src/test/isolation/specs/detach-partition-concurrently-4.spec
+index 5e4c0018d151..208808bc3d48 100644
+--- a/src/test/isolation/specs/detach-partition-concurrently-4.spec
++++ b/src/test/isolation/specs/detach-partition-concurrently-4.spec
+@@ -4,9 +4,12 @@
+ # because the locking situation is completely different.  I didn't verify
+ # that keeping both variants adds any extra coverage.)
+ #
+-# Note: Always keep "s2noop" right after "s1cancel" in permutations.  This
+-# reduces the probability of the timing problem that the cancel error report
+-# is shown together with the next query instead of with the cancel query.
++# Note: When using "s1cancel", mark the target step (the one to be canceled)
++# as being blocked by "s1cancel".  This ensures consistent reporting regardless
++# of whether "s1cancel" returns before or after the other step reports failure.
++# Also, ensure the step after "s1cancel" is also an s1 step (use "s1noop" if
++# necessary).  This ensures we won't move on to the next step until the cancel
++# is complete.
+ 
+ setup {
+ 	drop table if exists d4_primary, d4_primary1, d4_fk, d4_pid;
+@@ -24,8 +27,8 @@ session "s1"
+ step "s1b"			{ begin; }
+ step "s1brr"		{ begin isolation level repeatable read; }
+ step "s1s"			{ select * from d4_primary; }
+-# Sleep 0.1s after sending cancel, to give s2 time to react
+-step "s1cancel" 	{ select pg_cancel_backend(pid), pg_sleep(0.1) from d4_pid; }
++step "s1cancel" 	{ select pg_cancel_backend(pid) from d4_pid; }
++step "s1noop"		{ }
+ step "s1insert"		{ insert into d4_fk values (1); }
+ step "s1c"			{ commit; }
+ step "s1declare"	{ declare f cursor for select * from d4_primary; }
+@@ -39,7 +42,6 @@ step "s1rollback"	{ rollback to f; }
+ session "s2"
+ step "s2snitch" { insert into d4_pid select pg_backend_pid(); }
+ step "s2detach" { alter table d4_primary detach partition d4_primary1 concurrently; }
+-step "s2noop"	{ UNLISTEN noop; }
+ 
+ session "s3"
+ step "s3brr"		{ begin isolation level repeatable read; }
+@@ -48,34 +50,34 @@ step "s3commit"		{ commit; }
+ step "s3vacfreeze"	{ vacuum freeze pg_catalog.pg_inherits; }
+ 
+ # Trying to insert into a partially detached partition is rejected
+-permutation "s2snitch" "s1b"   "s1s" "s2detach" "s1cancel" "s2noop" "s1insert" "s1c"
++permutation "s2snitch" "s1b"   "s1s" "s2detach"("s1cancel") "s1cancel" "s1insert" "s1c"
+ permutation "s2snitch" "s1b"   "s1s" "s2detach"            "s1insert" "s1c"
+ # ... even under REPEATABLE READ mode.
+-permutation "s2snitch" "s1brr" "s1s" "s2detach" "s1cancel" "s2noop" "s1insert" "s1c"
++permutation "s2snitch" "s1brr" "s1s" "s2detach"("s1cancel") "s1cancel" "s1insert" "s1c"
+ permutation "s2snitch" "s1brr" "s1s" "s2detach"            "s1insert" "s1c"
+ 
+ # If you read the referenced table using a cursor, you can see a row that the
+ # RI query does not see.
+-permutation "s2snitch" "s1b" "s1declare" "s2detach" "s1cancel" "s2noop" "s1fetchall" "s1insert" "s1c"
++permutation "s2snitch" "s1b" "s1declare" "s2detach"("s1cancel") "s1cancel" "s1fetchall" "s1insert" "s1c"
+ permutation "s2snitch" "s1b" "s1declare" "s2detach"            "s1fetchall" "s1insert" "s1c"
+-permutation "s2snitch" "s1b" "s1declare" "s2detach" "s1cancel" "s2noop" "s1svpt" "s1insert" "s1rollback" "s1fetchall" "s1c"
++permutation "s2snitch" "s1b" "s1declare" "s2detach"("s1cancel") "s1cancel" "s1svpt" "s1insert" "s1rollback" "s1fetchall" "s1c"
+ permutation "s2snitch" "s1b" "s1declare" "s2detach"            "s1svpt" "s1insert" "s1rollback" "s1fetchall" "s1c"
+-permutation "s2snitch" "s1b" "s2detach" "s1declare" "s1cancel" "s2noop" "s1fetchall" "s1insert" "s1c"
++permutation "s2snitch" "s1b" "s2detach"("s1cancel") "s1declare" "s1cancel" "s1fetchall" "s1insert" "s1c"
+ permutation "s2snitch" "s1b" "s2detach" "s1declare"            "s1fetchall" "s1insert" "s1c"
+-permutation "s2snitch" "s1b" "s2detach" "s1declare" "s1cancel" "s2noop" "s1svpt" "s1insert" "s1rollback" "s1fetchall" "s1c"
++permutation "s2snitch" "s1b" "s2detach"("s1cancel") "s1declare" "s1cancel" "s1svpt" "s1insert" "s1rollback" "s1fetchall" "s1c"
+ permutation "s2snitch" "s1b" "s2detach" "s1declare"            "s1svpt" "s1insert" "s1rollback" "s1fetchall" "s1c"
+ 
+ # Creating the referencing row using a cursor
+-permutation "s2snitch" "s1brr" "s1declare2" "s1fetchone" "s2detach" "s1cancel" "s2noop" "s1updcur" "s1c"
++permutation "s2snitch" "s1brr" "s1declare2" "s1fetchone" "s2detach"("s1cancel") "s1cancel" "s1updcur" "s1c"
+ permutation "s2snitch" "s1brr" "s1declare2" "s1fetchone" "s2detach"            "s1updcur" "s1c"
+ permutation "s2snitch" "s1brr" "s1declare2" "s1fetchone" "s1updcur" "s2detach" "s1c"
+ 
+ # Try reading the table from an independent session.
+ permutation "s2snitch" "s1b" "s1s" "s2detach" "s3insert" "s1c"
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s3brr" "s3insert" "s3commit" "s1cancel" "s2noop" "s1c"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s3brr" "s3insert" "s3commit" "s1cancel" "s1c"
+ permutation "s2snitch" "s1b" "s1s" "s2detach" "s3brr" "s3insert" "s3commit" "s1c"
+ 
+ # Try one where we VACUUM FREEZE pg_inherits (to verify that xmin change is
+ # handled correctly).
+-permutation "s2snitch" "s1brr" "s1s" "s2detach" "s1cancel" "s2noop" "s3vacfreeze" "s1s" "s1insert" "s1c"
+-permutation "s2snitch" "s1b" "s1s" "s2detach" "s1cancel" "s2noop" "s3vacfreeze" "s1s" "s1insert" "s1c"
++permutation "s2snitch" "s1brr" "s1s" "s2detach"("s1cancel") "s1cancel" "s1noop" "s3vacfreeze" "s1s" "s1insert" "s1c"
++permutation "s2snitch" "s1b" "s1s" "s2detach"("s1cancel") "s1cancel" "s1noop" "s3vacfreeze" "s1s" "s1insert" "s1c"
+diff --git a/src/test/isolation/specs/insert-conflict-specconflict.spec b/src/test/isolation/specs/insert-conflict-specconflict.spec
+index 60283974915d..3bc2bf063026 100644
+--- a/src/test/isolation/specs/insert-conflict-specconflict.spec
++++ b/src/test/isolation/specs/insert-conflict-specconflict.spec
+@@ -83,6 +83,7 @@ step "s1_confirm_index_order" { SELECT 'upserttest_key_uniq_idx'::regclass::int8
+ step "s1_upsert" { INSERT INTO upserttest(key, data) VALUES('k1', 'inserted s1') ON CONFLICT (blurt_and_lock_123(key)) DO UPDATE SET data = upserttest.data || ' with conflict update s1'; }
+ step "s1_insert_toast" { INSERT INTO upserttest VALUES('k2', ctoast_large_val()) ON CONFLICT DO NOTHING; }
+ step "s1_commit"  { COMMIT; }
++step "s1_noop"    { }
+ 
+ session "s2"
+ setup
+@@ -95,6 +96,7 @@ step "s2_begin"  { BEGIN; }
+ step "s2_upsert" { INSERT INTO upserttest(key, data) VALUES('k1', 'inserted s2') ON CONFLICT (blurt_and_lock_123(key)) DO UPDATE SET data = upserttest.data || ' with conflict update s2'; }
+ step "s2_insert_toast" { INSERT INTO upserttest VALUES('k2', ctoast_large_val()) ON CONFLICT DO NOTHING; }
+ step "s2_commit"  { COMMIT; }
++step "s2_noop"    { }
+ 
+ # Test that speculative locks are correctly acquired and released, s2
+ # inserts, s1 updates.
+@@ -223,7 +225,8 @@ permutation
+    "controller_show"
+    "s2_begin"
+    # Both sessions wait on advisory locks
+-   "s1_upsert" "s2_upsert"
++   # (but don't show s2_upsert as complete till we've seen all of s1's notices)
++   "s1_upsert" "s2_upsert" ("s1_upsert" notices 10)
+    "controller_show"
+    # Switch both sessions to wait on the other lock next time (the speculative insertion)
+    "controller_unlock_1_1" "controller_unlock_2_1"
+@@ -244,14 +247,15 @@ permutation
+    "controller_unlock_1_2"
+    # Should report s1 is waiting on speculative lock
+    "controller_print_speculative_locks"
+-   # Allow s2 to insert into the non-unique index and complete s1 will
++   # Allow s2 to insert into the non-unique index and complete.  s1 will
+    # no longer wait on speculative lock, but proceed to wait on the
+-   # transaction to finish.
+-   "controller_unlock_2_4"
+-   # Should report that s1 is now waiting for s1 to commit
++   # transaction to finish.  The no-op step is needed to ensure that
++   # we don't advance to the reporting step until s2_upsert has completed.
++   "controller_unlock_2_4" "s2_noop"
++   # Should report that s1 is now waiting for s2 to commit
+    "controller_print_speculative_locks"
+    # Once s2 commits, s1 is finally free to continue to update
+-   "s2_commit"
++   "s2_commit" "s1_noop"
+    # This should now show a successful UPSERT
+    "controller_show"
+    # Ensure no unexpected locks survive
+diff --git a/src/test/isolation/specs/multiple-cic.spec b/src/test/isolation/specs/multiple-cic.spec
+index 3199667be2c7..3ac1d39d86d4 100644
+--- a/src/test/isolation/specs/multiple-cic.spec
++++ b/src/test/isolation/specs/multiple-cic.spec
+@@ -37,4 +37,7 @@ step "s2i"	{
+ 		WHERE unlck();
+ 	}
+ 
+-permutation "s2l" "s1i" "s2i"
++# (*) marker ensures that s2i is reported as "waiting", even if it
++# completes very quickly
++
++permutation "s2l" "s1i" "s2i"(*)
+diff --git a/src/test/isolation/specs/timeouts.spec b/src/test/isolation/specs/timeouts.spec
+index 7f821d44d0e6..e167e1885af9 100644
+--- a/src/test/isolation/specs/timeouts.spec
++++ b/src/test/isolation/specs/timeouts.spec
+@@ -19,27 +19,31 @@ teardown	{ ABORT; }
+ 
+ session "s2"
+ setup		{ BEGIN ISOLATION LEVEL READ COMMITTED; }
+-step "sto"	{ SET statement_timeout = 5000; }
+-step "lto"	{ SET lock_timeout = 5000; }
+-step "lsto"	{ SET lock_timeout = 5000; SET statement_timeout = 6000; }
+-step "slto"	{ SET lock_timeout = 6000; SET statement_timeout = 5000; }
++step "sto"	{ SET statement_timeout = '10ms'; }
++step "lto"	{ SET lock_timeout = '10ms'; }
++step "lsto"	{ SET lock_timeout = '10ms'; SET statement_timeout = '10s'; }
++step "slto"	{ SET lock_timeout = '10s'; SET statement_timeout = '10ms'; }
+ step "locktbl"	{ LOCK TABLE accounts; }
+ step "update"	{ DELETE FROM accounts WHERE accountid = 'checking'; }
+ teardown	{ ABORT; }
+ 
++# It's possible that the isolation tester will not observe the final
++# steps as "waiting", thanks to the relatively short timeouts we use.
++# We can ensure consistent test output by marking those steps with (*).
++
+ # statement timeout, table-level lock
+-permutation "rdtbl" "sto" "locktbl"
++permutation "rdtbl" "sto" "locktbl"(*)
+ # lock timeout, table-level lock
+-permutation "rdtbl" "lto" "locktbl"
++permutation "rdtbl" "lto" "locktbl"(*)
+ # lock timeout expires first, table-level lock
+-permutation "rdtbl" "lsto" "locktbl"
++permutation "rdtbl" "lsto" "locktbl"(*)
+ # statement timeout expires first, table-level lock
+-permutation "rdtbl" "slto" "locktbl"
++permutation "rdtbl" "slto" "locktbl"(*)
+ # statement timeout, row-level lock
+-permutation "wrtbl" "sto" "update"
++permutation "wrtbl" "sto" "update"(*)
+ # lock timeout, row-level lock
+-permutation "wrtbl" "lto" "update"
++permutation "wrtbl" "lto" "update"(*)
+ # lock timeout expires first, row-level lock
+-permutation "wrtbl" "lsto" "update"
++permutation "wrtbl" "lsto" "update"(*)
+ # statement timeout expires first, row-level lock
+-permutation "wrtbl" "slto" "update"
++permutation "wrtbl" "slto" "update"(*)
+diff --git a/src/test/isolation/specs/tuplelock-update.spec b/src/test/isolation/specs/tuplelock-update.spec
+index 8f5a1f7314ad..d3de0bcbc788 100644
+--- a/src/test/isolation/specs/tuplelock-update.spec
++++ b/src/test/isolation/specs/tuplelock-update.spec
+@@ -18,8 +18,8 @@ step "s1_chain" { UPDATE pktab SET data = DEFAULT; }
+ step "s1_begin" { BEGIN; }
+ step "s1_grablock" { SELECT * FROM pktab FOR KEY SHARE; }
+ step "s1_advunlock1" { SELECT pg_advisory_unlock(142857); }
+-step "s1_advunlock2" { SELECT pg_sleep(5), pg_advisory_unlock(285714); }
+-step "s1_advunlock3" { SELECT pg_sleep(5), pg_advisory_unlock(571428); }
++step "s1_advunlock2" { SELECT pg_advisory_unlock(285714); }
++step "s1_advunlock3" { SELECT pg_advisory_unlock(571428); }
+ step "s1_commit" { COMMIT; }
+ 
+ session "s2"
+@@ -31,4 +31,7 @@ step "s3_update" { UPDATE pktab SET data = DEFAULT WHERE pg_advisory_lock_shared
+ session "s4"
+ step "s4_update" { UPDATE pktab SET data = DEFAULT WHERE pg_advisory_lock_shared(571428) IS NOT NULL; }
+ 
+-permutation "s1_advlock" "s2_update" "s3_update" "s4_update" "s1_chain" "s1_begin" "s1_grablock" "s1_advunlock1" "s1_advunlock2" "s1_advunlock3" "s1_commit"
++# We use blocker annotations on the s1_advunlockN steps so that we will not
++# move on to the next step until the other session's released step finishes.
++# This ensures stable ordering of the test output.
++permutation "s1_advlock" "s2_update" "s3_update" "s4_update" "s1_chain" "s1_begin" "s1_grablock" "s1_advunlock1"("s2_update") "s1_advunlock2"("s3_update") "s1_advunlock3"("s4_update") "s1_commit"
+diff --git a/src/test/isolation/specscanner.l b/src/test/isolation/specscanner.l
+index 19883c265b33..a733bcf3554d 100644
+--- a/src/test/isolation/specscanner.l
++++ b/src/test/isolation/specscanner.l
+@@ -36,6 +36,10 @@ static void addlitchar(char c);
+ %x sql
+ %x qstr
+ 
++digit			[0123456789]
++
++self			[,()*]
++
+ non_newline		[^\n\r]
+ space			[ \t\r\f]
+ 
+@@ -48,12 +52,20 @@ comment			("#"{non_newline}*)
+ 	litbufsize = LITBUF_INIT;
+ %}
+ 
++notices			{ return NOTICES; }
+ permutation		{ return PERMUTATION; }
+ session			{ return SESSION; }
+ setup			{ return SETUP; }
+ step			{ return STEP; }
+ teardown		{ return TEARDOWN; }
+ 
++{digit}+		{
++					yylval.integer = atoi(yytext);
++					return INTEGER;
++				}
++
++{self}			{ return yytext[0]; }
++
+ [\n]			{ yyline++; }
+ {comment}		{ /* ignore */ }
+ {space}			{ /* ignore */ }

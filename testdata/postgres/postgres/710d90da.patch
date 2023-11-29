@@ -1,0 +1,471 @@
+From 710d90da1fd8c1d028215ecaf7402062079e99e9 Mon Sep 17 00:00:00 2001
+From: Teodor Sigaev <teodor@sigaev.ru>
+Date: Tue, 3 Apr 2018 19:46:45 +0300
+Subject: [PATCH] Add prefix operator for TEXT type.
+
+The prefix operator along with SP-GiST indexes can be used as an alternative
+for LIKE 'word%' commands  and it doesn't have a limitation of string/prefix
+length as B-Tree has.
+
+Bump catalog version
+
+Author: Ildus Kurbangaliev with some editorization by me
+Review by: Arthur Zakirov, Alexander Korotkov, and me
+Discussion: https://www.postgresql.org/message-id/flat/20180202180327.222b04b3@wp.localdomain
+---
+ doc/src/sgml/func.sgml                     | 21 +++++++++++
+ doc/src/sgml/spgist.sgml                   |  1 +
+ src/backend/access/spgist/spgtextproc.c    | 43 ++++++++++++++++++++--
+ src/backend/utils/adt/selfuncs.c           | 33 +++++++++++++++++
+ src/backend/utils/adt/varlena.c            | 28 ++++++++++++++
+ src/include/access/stratnum.h              |  3 +-
+ src/include/catalog/catversion.h           |  2 +-
+ src/include/catalog/pg_amop.h              |  1 +
+ src/include/catalog/pg_operator.h          |  2 +
+ src/include/catalog/pg_proc.h              |  5 +++
+ src/include/utils/selfuncs.h               |  7 +++-
+ src/test/regress/expected/create_index.out | 38 +++++++++++++++++++
+ src/test/regress/expected/opr_sanity.out   |  4 +-
+ src/test/regress/sql/create_index.sql      | 10 +++++
+ 14 files changed, 189 insertions(+), 9 deletions(-)
+
+diff --git a/doc/src/sgml/func.sgml b/doc/src/sgml/func.sgml
+index 5abb1c46fbb8..9a1efc14cf76 100644
+--- a/doc/src/sgml/func.sgml
++++ b/doc/src/sgml/func.sgml
+@@ -2274,6 +2274,21 @@
+        <entry><literal>ph</literal></entry>
+       </row>
+ 
++      <row>
++       <entry>
++        <indexterm>
++         <primary>starts_with</primary>
++        </indexterm>
++        <literal><function>starts_with(<parameter>string</parameter>, <parameter>prefix</parameter>)</function></literal>
++       </entry>
++       <entry><type>bool</type></entry>
++       <entry>
++        Returns true if <parameter>string</parameter> starts with <parameter>prefix</parameter>.
++       </entry>
++       <entry><literal>starts_with('alphabet', 'alph')</literal></entry>
++       <entry><literal>t</literal></entry>
++      </row>
++
+       <row>
+        <entry>
+         <indexterm>
+@@ -4033,6 +4048,12 @@ cast(-44 as bit(12))           <lineannotation>111111010100</lineannotation>
+     ILIKE</function>, respectively.  All of these operators are
+     <productname>PostgreSQL</productname>-specific.
+    </para>
++
++   <para>
++    There is also the prefix operator <literal>^@</literal> and corresponding
++    <function>starts_with</function> function which covers cases when only
++    searching by beginning of the string is needed.
++   </para>
+   </sect2>
+ 
+ 
+diff --git a/doc/src/sgml/spgist.sgml b/doc/src/sgml/spgist.sgml
+index e47f70be89bf..06b75190522f 100644
+--- a/doc/src/sgml/spgist.sgml
++++ b/doc/src/sgml/spgist.sgml
+@@ -161,6 +161,7 @@
+        <literal>~&lt;~</literal>
+        <literal>~&gt;=~</literal>
+        <literal>~&gt;~</literal>
++       <literal>^@</literal>
+       </entry>
+      </row>
+      <row>
+diff --git a/src/backend/access/spgist/spgtextproc.c b/src/backend/access/spgist/spgtextproc.c
+index f156b2166e68..76c0305695b2 100644
+--- a/src/backend/access/spgist/spgtextproc.c
++++ b/src/backend/access/spgist/spgtextproc.c
+@@ -67,6 +67,20 @@
+  */
+ #define SPGIST_MAX_PREFIX_LENGTH	Max((int) (BLCKSZ - 258 * 16 - 100), 32)
+ 
++/*
++ * Strategy for collation aware operator on text is equal to btree strategy
++ * plus value of 10.
++ *
++ * Current collation aware strategies and their corresponding btree strategies:
++ * 11 BTLessStrategyNumber
++ * 12 BTLessEqualStrategyNumber
++ * 14 BTGreaterEqualStrategyNumber
++ * 15 BTGreaterStrategyNumber
++ */
++#define SPG_STRATEGY_ADDITION	(10)
++#define SPG_IS_COLLATION_AWARE_STRATEGY(s) ((s) > SPG_STRATEGY_ADDITION \
++										 && (s) != RTPrefixStrategyNumber)
++
+ /* Struct for sorting values in picksplit */
+ typedef struct spgNodePtr
+ {
+@@ -496,10 +510,10 @@ spg_text_inner_consistent(PG_FUNCTION_ARGS)
+ 			 * well end with a partial multibyte character, so that applying
+ 			 * any encoding-sensitive test to it would be risky anyhow.)
+ 			 */
+-			if (strategy > 10)
++			if (SPG_IS_COLLATION_AWARE_STRATEGY(strategy))
+ 			{
+ 				if (collate_is_c)
+-					strategy -= 10;
++					strategy -= SPG_STRATEGY_ADDITION;
+ 				else
+ 					continue;
+ 			}
+@@ -526,6 +540,10 @@ spg_text_inner_consistent(PG_FUNCTION_ARGS)
+ 					if (r < 0)
+ 						res = false;
+ 					break;
++				case RTPrefixStrategyNumber:
++					if (r != 0)
++						res = false;
++					break;
+ 				default:
+ 					elog(ERROR, "unrecognized strategy number: %d",
+ 						 in->scankeys[j].sk_strategy);
+@@ -605,10 +623,27 @@ spg_text_leaf_consistent(PG_FUNCTION_ARGS)
+ 		int			queryLen = VARSIZE_ANY_EXHDR(query);
+ 		int			r;
+ 
+-		if (strategy > 10)
++		if (strategy == RTPrefixStrategyNumber)
++		{
++			/*
++			 * if level >= length of query then reconstrValue is began with
++			 * query (prefix) string and we don't need to check it again.
++			 */
++
++			res = (level >= queryLen) ||
++					DatumGetBool(DirectFunctionCall2(text_starts_with,
++								 out->leafValue, PointerGetDatum(query)));
++
++			if (!res) /* no need to consider remaining conditions */
++				break;
++
++			continue;
++		}
++
++		if (SPG_IS_COLLATION_AWARE_STRATEGY(strategy))
+ 		{
+ 			/* Collation-aware comparison */
+-			strategy -= 10;
++			strategy -= SPG_STRATEGY_ADDITION;
+ 
+ 			/* If asserts enabled, verify encoding of reconstructed string */
+ 			Assert(pg_verifymbstr(fullValue, fullLen, false));
+diff --git a/src/backend/utils/adt/selfuncs.c b/src/backend/utils/adt/selfuncs.c
+index bf240aa9c5ac..f998d859c1c4 100644
+--- a/src/backend/utils/adt/selfuncs.c
++++ b/src/backend/utils/adt/selfuncs.c
+@@ -1488,6 +1488,16 @@ likesel(PG_FUNCTION_ARGS)
+ }
+ 
+ /*
++ *		prefixsel			- selectivity of prefix operator
++ */
++Datum
++prefixsel(PG_FUNCTION_ARGS)
++{
++	PG_RETURN_FLOAT8(patternsel(fcinfo, Pattern_Type_Prefix, false));
++}
++
++/*
++ *
+  *		iclikesel			- Selectivity of ILIKE pattern match.
+  */
+ Datum
+@@ -2906,6 +2916,15 @@ likejoinsel(PG_FUNCTION_ARGS)
+ 	PG_RETURN_FLOAT8(patternjoinsel(fcinfo, Pattern_Type_Like, false));
+ }
+ 
++/*
++ *		prefixjoinsel			- Join selectivity of prefix operator
++ */
++Datum
++prefixjoinsel(PG_FUNCTION_ARGS)
++{
++	PG_RETURN_FLOAT8(patternjoinsel(fcinfo, Pattern_Type_Prefix, false));
++}
++
+ /*
+  *		iclikejoinsel			- Join selectivity of ILIKE pattern match.
+  */
+@@ -5947,6 +5966,20 @@ pattern_fixed_prefix(Const *patt, Pattern_Type ptype, Oid collation,
+ 			result = regex_fixed_prefix(patt, true, collation,
+ 										prefix, rest_selec);
+ 			break;
++		case Pattern_Type_Prefix:
++			/* Prefix type work is trivial.  */
++			result = Pattern_Prefix_Partial;
++			*rest_selec = 1.0;	/* all */
++			*prefix = makeConst(patt->consttype,
++								patt->consttypmod,
++								patt->constcollid,
++								patt->constlen,
++								datumCopy(patt->constvalue,
++										  patt->constbyval,
++										  patt->constlen),
++								patt->constisnull,
++								patt->constbyval);
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized ptype: %d", (int) ptype);
+ 			result = Pattern_Prefix_None;	/* keep compiler quiet */
+diff --git a/src/backend/utils/adt/varlena.c b/src/backend/utils/adt/varlena.c
+index 4346410d5a91..e8500b274dc7 100644
+--- a/src/backend/utils/adt/varlena.c
++++ b/src/backend/utils/adt/varlena.c
+@@ -1761,6 +1761,34 @@ text_ge(PG_FUNCTION_ARGS)
+ 	PG_RETURN_BOOL(result);
+ }
+ 
++Datum
++text_starts_with(PG_FUNCTION_ARGS)
++{
++	Datum		arg1 = PG_GETARG_DATUM(0);
++	Datum		arg2 = PG_GETARG_DATUM(1);
++	bool		result;
++	Size		len1,
++				len2;
++
++	len1 = toast_raw_datum_size(arg1);
++	len2 = toast_raw_datum_size(arg2);
++	if (len2 > len1)
++		result = false;
++	else
++	{
++		text	   *targ1 = DatumGetTextPP(arg1);
++		text	   *targ2 = DatumGetTextPP(arg2);
++
++		result = (memcmp(VARDATA_ANY(targ1), VARDATA_ANY(targ2),
++						 VARSIZE_ANY_EXHDR(targ2)) == 0);
++
++		PG_FREE_IF_COPY(targ1, 0);
++		PG_FREE_IF_COPY(targ2, 1);
++	}
++
++	PG_RETURN_BOOL(result);
++}
++
+ Datum
+ bttextcmp(PG_FUNCTION_ARGS)
+ {
+diff --git a/src/include/access/stratnum.h b/src/include/access/stratnum.h
+index bddfac4c104d..0db11a111794 100644
+--- a/src/include/access/stratnum.h
++++ b/src/include/access/stratnum.h
+@@ -68,8 +68,9 @@ typedef uint16 StrategyNumber;
+ #define RTSubEqualStrategyNumber		25	/* for inet <<= */
+ #define RTSuperStrategyNumber			26	/* for inet << */
+ #define RTSuperEqualStrategyNumber		27	/* for inet >>= */
++#define RTPrefixStrategyNumber			28	/* for text ^@ */
+ 
+-#define RTMaxStrategyNumber				27
++#define RTMaxStrategyNumber				28
+ 
+ 
+ #endif							/* STRATNUM_H */
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index b2806e6595a4..5d55890b9dd3 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	201803311
++#define CATALOG_VERSION_NO	201804031
+ 
+ #endif
+diff --git a/src/include/catalog/pg_amop.h b/src/include/catalog/pg_amop.h
+index 03af581df4e9..00e77d4c61e5 100644
+--- a/src/include/catalog/pg_amop.h
++++ b/src/include/catalog/pg_amop.h
+@@ -799,6 +799,7 @@ DATA(insert (	4017   25 25 11 s	664 4000 0 ));
+ DATA(insert (	4017   25 25 12 s	665 4000 0 ));
+ DATA(insert (	4017   25 25 14 s	667 4000 0 ));
+ DATA(insert (	4017   25 25 15 s	666 4000 0 ));
++DATA(insert (	4017   25 25 28 s	3877 4000 0 ));
+ 
+ /*
+  * btree jsonb_ops
+diff --git a/src/include/catalog/pg_operator.h b/src/include/catalog/pg_operator.h
+index e74f963eb507..6a6f708914cc 100644
+--- a/src/include/catalog/pg_operator.h
++++ b/src/include/catalog/pg_operator.h
+@@ -134,6 +134,8 @@ DESCR("less than");
+ DATA(insert OID =  98 ( "="		   PGNSP PGUID b t t	25	25	16	98 531 texteq eqsel eqjoinsel ));
+ DESCR("equal");
+ #define TextEqualOperator	98
++DATA(insert OID =  3877 ( "^@"	   PGNSP PGUID b f f	25	25	16	0 0 starts_with prefixsel prefixjoinsel ));
++DESCR("starts with");
+ 
+ DATA(insert OID = 349 (  "||"	   PGNSP PGUID b f f 2277 2283 2277 0 0 array_append   -	   -	 ));
+ DESCR("append element onto end of array");
+diff --git a/src/include/catalog/pg_proc.h b/src/include/catalog/pg_proc.h
+index 90d994c71a42..9bf20c059bc5 100644
+--- a/src/include/catalog/pg_proc.h
++++ b/src/include/catalog/pg_proc.h
+@@ -209,6 +209,7 @@ DATA(insert OID =  64 (  int2lt			   PGNSP PGUID 12 1 0 0 0 f f t t f i s 2 0 16
+ DATA(insert OID =  65 (  int4eq			   PGNSP PGUID 12 1 0 0 0 f f t t f i s 2 0 16 "23 23" _null_ _null_ _null_ _null_ _null_ int4eq _null_ _null_ _null_ ));
+ DATA(insert OID =  66 (  int4lt			   PGNSP PGUID 12 1 0 0 0 f f t t f i s 2 0 16 "23 23" _null_ _null_ _null_ _null_ _null_ int4lt _null_ _null_ _null_ ));
+ DATA(insert OID =  67 (  texteq			   PGNSP PGUID 12 1 0 0 0 f f t t f i s 2 0 16 "25 25" _null_ _null_ _null_ _null_ _null_ texteq _null_ _null_ _null_ ));
++DATA(insert OID =  3696 ( starts_with	   PGNSP PGUID 12 1 0 0 0 f f t t f i s 2 0 16 "25 25" _null_ _null_ _null_ _null_ _null_ text_starts_with _null_ _null_ _null_ ));
+ DATA(insert OID =  68 (  xideq			   PGNSP PGUID 12 1 0 0 0 f f t t f i s 2 0 16 "28 28" _null_ _null_ _null_ _null_ _null_ xideq _null_ _null_ _null_ ));
+ DATA(insert OID = 3308 (  xidneq		   PGNSP PGUID 12 1 0 0 0 f f t t f i s 2 0 16 "28 28" _null_ _null_ _null_ _null_ _null_ xidneq _null_ _null_ _null_ ));
+ DATA(insert OID =  69 (  cideq			   PGNSP PGUID 12 1 0 0 0 f f t t f i s 2 0 16 "29 29" _null_ _null_ _null_ _null_ _null_ cideq _null_ _null_ _null_ ));
+@@ -2584,6 +2585,10 @@ DATA(insert OID = 1828 ( nlikejoinsel		PGNSP PGUID 12 1 0 0 0 f f f t f s s 5 0
+ DESCR("join selectivity of NOT LIKE");
+ DATA(insert OID = 1829 ( icregexnejoinsel	PGNSP PGUID 12 1 0 0 0 f f f t f s s 5 0 701 "2281 26 2281 21 2281" _null_ _null_ _null_ _null_  _null_ icregexnejoinsel _null_ _null_ _null_ ));
+ DESCR("join selectivity of case-insensitive regex non-match");
++DATA(insert OID = 3437 ( prefixsel			PGNSP PGUID 12 1 0 0 0 f f f t f s s 4 0 701 "2281 26 2281 23" _null_ _null_ _null_ _null_ _null_ prefixsel _null_ _null_ _null_ ));
++DESCR("restriction selectivity of exact prefix");
++DATA(insert OID = 3438 ( prefixjoinsel		PGNSP PGUID 12 1 0 0 0 f f f t f s s 5 0 701 "2281 26 2281 21 2281" _null_ _null_ _null_ _null_  _null_ prefixjoinsel _null_ _null_ _null_ ));
++DESCR("join selectivity of exact prefix");
+ 
+ /* Aggregate-related functions */
+ DATA(insert OID = 1830 (  float8_avg	   PGNSP PGUID 12 1 0 0 0 f f f t f i s 1 0 701 "1022" _null_ _null_ _null_ _null_ _null_ float8_avg _null_ _null_ _null_ ));
+diff --git a/src/include/utils/selfuncs.h b/src/include/utils/selfuncs.h
+index 299c9f846acd..95e44280c4c1 100644
+--- a/src/include/utils/selfuncs.h
++++ b/src/include/utils/selfuncs.h
+@@ -87,8 +87,11 @@ typedef struct VariableStatData
+ 
+ typedef enum
+ {
+-	Pattern_Type_Like, Pattern_Type_Like_IC,
+-	Pattern_Type_Regex, Pattern_Type_Regex_IC
++	Pattern_Type_Like,
++	Pattern_Type_Like_IC,
++	Pattern_Type_Regex,
++	Pattern_Type_Regex_IC,
++	Pattern_Type_Prefix
+ } Pattern_Type;
+ 
+ typedef enum
+diff --git a/src/test/regress/expected/create_index.out b/src/test/regress/expected/create_index.out
+index 057faff2e5c7..09757c5a7492 100644
+--- a/src/test/regress/expected/create_index.out
++++ b/src/test/regress/expected/create_index.out
+@@ -372,6 +372,12 @@ SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth
+     48
+ (1 row)
+ 
++SELECT count(*) FROM radix_text_tbl WHERE t ^@  'Worth';
++ count 
++-------
++     2
++(1 row)
++
+ SELECT * FROM gpolygon_tbl ORDER BY f1 <-> '(0,0)'::point LIMIT 10;
+                        f1                        
+ -------------------------------------------------
+@@ -1182,6 +1188,21 @@ SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth
+     48
+ (1 row)
+ 
++EXPLAIN (COSTS OFF)
++SELECT count(*) FROM radix_text_tbl WHERE t ^@	 'Worth';
++                         QUERY PLAN                         
++------------------------------------------------------------
++ Aggregate
++   ->  Index Only Scan using sp_radix_ind on radix_text_tbl
++         Index Cond: (t ^@ 'Worth'::text)
++(3 rows)
++
++SELECT count(*) FROM radix_text_tbl WHERE t ^@	 'Worth';
++ count 
++-------
++     2
++(1 row)
++
+ EXPLAIN (COSTS OFF)
+ SELECT * FROM gpolygon_tbl ORDER BY f1 <-> '(0,0)'::point LIMIT 10;
+                      QUERY PLAN                      
+@@ -1763,6 +1784,23 @@ SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth
+     48
+ (1 row)
+ 
++EXPLAIN (COSTS OFF)
++SELECT count(*) FROM radix_text_tbl WHERE t ^@	 'Worth';
++                   QUERY PLAN                   
++------------------------------------------------
++ Aggregate
++   ->  Bitmap Heap Scan on radix_text_tbl
++         Recheck Cond: (t ^@ 'Worth'::text)
++         ->  Bitmap Index Scan on sp_radix_ind
++               Index Cond: (t ^@ 'Worth'::text)
++(5 rows)
++
++SELECT count(*) FROM radix_text_tbl WHERE t ^@	 'Worth';
++ count 
++-------
++     2
++(1 row)
++
+ RESET enable_seqscan;
+ RESET enable_indexscan;
+ RESET enable_bitmapscan;
+diff --git a/src/test/regress/expected/opr_sanity.out b/src/test/regress/expected/opr_sanity.out
+index 01608d2c0446..a1e18a6cebaf 100644
+--- a/src/test/regress/expected/opr_sanity.out
++++ b/src/test/regress/expected/opr_sanity.out
+@@ -718,6 +718,7 @@ sha224(bytea)
+ sha256(bytea)
+ sha384(bytea)
+ sha512(bytea)
++starts_with(text,text)
+ macaddr8_eq(macaddr8,macaddr8)
+ macaddr8_lt(macaddr8,macaddr8)
+ macaddr8_le(macaddr8,macaddr8)
+@@ -1887,7 +1888,8 @@ ORDER BY 1, 2, 3;
+        4000 |           25 | <<=
+        4000 |           26 | >>
+        4000 |           27 | >>=
+-(121 rows)
++       4000 |           28 | ^@
++(122 rows)
+ 
+ -- Check that all opclass search operators have selectivity estimators.
+ -- This is not absolutely required, but it seems a reasonable thing
+diff --git a/src/test/regress/sql/create_index.sql b/src/test/regress/sql/create_index.sql
+index 7f17588b0d7e..c9671a4e13e5 100644
+--- a/src/test/regress/sql/create_index.sql
++++ b/src/test/regress/sql/create_index.sql
+@@ -224,6 +224,8 @@ SELECT count(*) FROM radix_text_tbl WHERE t >    'Worth
+ 
+ SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         St  ';
+ 
++SELECT count(*) FROM radix_text_tbl WHERE t ^@  'Worth';
++
+ SELECT * FROM gpolygon_tbl ORDER BY f1 <-> '(0,0)'::point LIMIT 10;
+ 
+ SELECT circle_center(f1), round(radius(f1)) as radius FROM gcircle_tbl ORDER BY f1 <-> '(200,300)'::point LIMIT 10;
+@@ -441,6 +443,10 @@ EXPLAIN (COSTS OFF)
+ SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         St  ';
+ SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         St  ';
+ 
++EXPLAIN (COSTS OFF)
++SELECT count(*) FROM radix_text_tbl WHERE t ^@	 'Worth';
++SELECT count(*) FROM radix_text_tbl WHERE t ^@	 'Worth';
++
+ EXPLAIN (COSTS OFF)
+ SELECT * FROM gpolygon_tbl ORDER BY f1 <-> '(0,0)'::point LIMIT 10;
+ SELECT * FROM gpolygon_tbl ORDER BY f1 <-> '(0,0)'::point LIMIT 10;
+@@ -578,6 +584,10 @@ EXPLAIN (COSTS OFF)
+ SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         St  ';
+ SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         St  ';
+ 
++EXPLAIN (COSTS OFF)
++SELECT count(*) FROM radix_text_tbl WHERE t ^@	 'Worth';
++SELECT count(*) FROM radix_text_tbl WHERE t ^@	 'Worth';
++
+ RESET enable_seqscan;
+ RESET enable_indexscan;
+ RESET enable_bitmapscan;

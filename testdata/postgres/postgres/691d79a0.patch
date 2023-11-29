@@ -1,0 +1,129 @@
+From 691d79a0793328a45b01348675ba677aa7623bec Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Wed, 31 Oct 2018 14:47:41 -0700
+Subject: [PATCH] Disallow starting server with insufficient wal_level for
+ existing slot.
+
+Previously it was possible to create a slot, change wal_level, and
+restart, even if the new wal_level was insufficient for the
+slot. That's a problem for both logical and physical slots, because
+the necessary WAL records are not generated.
+
+This removes a few tests in newer versions that, somewhat
+inexplicably, whether restarting with a too low wal_level worked (a
+buggy behaviour!).
+
+Reported-By: Joshua D. Drake
+Author: Andres Freund
+Discussion: https://postgr.es/m/20181029191304.lbsmhshkyymhw22w@alap3.anarazel.de
+Backpatch: 9.4-, where replication slots where introduced
+---
+ src/backend/replication/logical/logical.c   |  5 ++++
+ src/backend/replication/slot.c              | 30 +++++++++++++++++++++
+ src/test/recovery/t/006_logical_decoding.pl | 23 +---------------
+ 3 files changed, 36 insertions(+), 22 deletions(-)
+
+diff --git a/src/backend/replication/logical/logical.c b/src/backend/replication/logical/logical.c
+index bb83fc9d42dc..9f99e4f04996 100644
+--- a/src/backend/replication/logical/logical.c
++++ b/src/backend/replication/logical/logical.c
+@@ -79,6 +79,11 @@ CheckLogicalDecodingRequirements(void)
+ {
+ 	CheckSlotRequirements();
+ 
++	/*
++	 * NB: Adding a new requirement likely means that RestoreSlotFromDisk()
++	 * needs the same check.
++	 */
++
+ 	if (wal_level < WAL_LEVEL_LOGICAL)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+diff --git a/src/backend/replication/slot.c b/src/backend/replication/slot.c
+index 800ca144882f..b30332abad99 100644
+--- a/src/backend/replication/slot.c
++++ b/src/backend/replication/slot.c
+@@ -971,6 +971,11 @@ ReplicationSlotsDropDBSlots(Oid dboid)
+ void
+ CheckSlotRequirements(void)
+ {
++	/*
++	 * NB: Adding a new requirement likely means that RestoreSlotFromDisk()
++	 * needs the same check.
++	 */
++
+ 	if (max_replication_slots == 0)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+@@ -1502,6 +1507,31 @@ RestoreSlotFromDisk(const char *name)
+ 		return;
+ 	}
+ 
++	/*
++	 * Verify that requirements for the specific slot type are met. That's
++	 * important because if these aren't met we're not guaranteed to retain
++	 * all the necessary resources for the slot.
++	 *
++	 * NB: We have to do so *after* the above checks for ephemeral slots,
++	 * because otherwise a slot that shouldn't exist anymore could prevent
++	 * restarts.
++	 *
++	 * NB: Changing the requirements here also requires adapting
++	 * CheckSlotRequirements() and CheckLogicalDecodingRequirements().
++	 */
++	if (cp.slotdata.database != InvalidOid && wal_level < WAL_LEVEL_LOGICAL)
++		ereport(FATAL,
++				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++				 errmsg("logical replication slots \"%s\" exists, but wal_level < logical",
++						NameStr(cp.slotdata.name)),
++				 errhint("Change wal_level to be replica or higher.")));
++	else if (wal_level < WAL_LEVEL_REPLICA)
++		ereport(FATAL,
++				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++				 errmsg("physical replication slots \"%s\" exists, but wal_level < replica",
++						NameStr(cp.slotdata.name)),
++				 errhint("Change wal_level to be replica or higher.")));
++
+ 	/* nothing can be active yet, don't lock anything */
+ 	for (i = 0; i < max_replication_slots; i++)
+ 	{
+diff --git a/src/test/recovery/t/006_logical_decoding.pl b/src/test/recovery/t/006_logical_decoding.pl
+index e3a5fe9bc014..884b0aedd1ee 100644
+--- a/src/test/recovery/t/006_logical_decoding.pl
++++ b/src/test/recovery/t/006_logical_decoding.pl
+@@ -7,7 +7,7 @@
+ use warnings;
+ use PostgresNode;
+ use TestLib;
+-use Test::More tests => 16;
++use Test::More tests => 10;
+ use Config;
+ 
+ # Initialize master node
+@@ -135,26 +135,5 @@
+ is($node_master->slot('otherdb_slot')->{'slot_name'},
+ 	undef, 'logical slot was actually dropped with DB');
+ 
+-# Restarting a node with wal_level = logical that has existing
+-# slots must succeed, but decoding from those slots must fail.
+-$node_master->safe_psql('postgres', 'ALTER SYSTEM SET wal_level = replica');
+-is($node_master->safe_psql('postgres', 'SHOW wal_level'),
+-	'logical', 'wal_level is still logical before restart');
+-$node_master->restart;
+-is($node_master->safe_psql('postgres', 'SHOW wal_level'),
+-	'replica', 'wal_level is replica');
+-isnt($node_master->slot('test_slot')->{'catalog_xmin'},
+-	'0', 'restored slot catalog_xmin is nonzero');
+-is( $node_master->psql(
+-		'postgres',
+-		qq[SELECT pg_logical_slot_get_changes('test_slot', NULL, NULL);]),
+-	3,
+-	'reading from slot with wal_level < logical fails');
+-is( $node_master->psql(
+-		'postgres', q[SELECT pg_drop_replication_slot('test_slot')]),
+-	0,
+-	'can drop logical slot while wal_level = replica');
+-is($node_master->slot('test_slot')->{'catalog_xmin'}, '', 'slot was dropped');
+-
+ # done with the node
+ $node_master->stop;

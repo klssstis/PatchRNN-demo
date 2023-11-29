@@ -1,0 +1,323 @@
+From 624aa2a13bd02dd584bb0995c883b5b93b2152df Mon Sep 17 00:00:00 2001
+From: Dean Rasheed <dean.a.rasheed@gmail.com>
+Date: Thu, 21 Jul 2022 19:23:13 +0100
+Subject: [PATCH] Make the name optional in CREATE STATISTICS.
+
+This allows users to omit the statistics name in a CREATE STATISTICS
+command, letting the system auto-generate a sensible, unique name,
+putting the statistics object in the same schema as the table.
+
+Simon Riggs, reviewed by Matthias van de Meent.
+
+Discussion: https://postgr.es/m/CANbhV-FGD2d_C3zFTfT2aRfX_TaPSgOeKES58RLZx5XzQp5NhA@mail.gmail.com
+---
+ doc/src/sgml/ref/create_statistics.sgml | 12 ++--
+ src/backend/commands/statscmds.c        |  7 +-
+ src/backend/parser/gram.y               | 13 +++-
+ src/test/regress/expected/stats_ext.out | 87 +++++++++++++++----------
+ src/test/regress/sql/stats_ext.sql      | 20 ++++--
+ 5 files changed, 86 insertions(+), 53 deletions(-)
+
+diff --git a/doc/src/sgml/ref/create_statistics.sgml b/doc/src/sgml/ref/create_statistics.sgml
+index 9a8c904c0885..b847944f37df 100644
+--- a/doc/src/sgml/ref/create_statistics.sgml
++++ b/doc/src/sgml/ref/create_statistics.sgml
+@@ -21,11 +21,11 @@ PostgreSQL documentation
+ 
+  <refsynopsisdiv>
+ <synopsis>
+-CREATE STATISTICS [ IF NOT EXISTS ] <replaceable class="parameter">statistics_name</replaceable>
++CREATE STATISTICS [ [ IF NOT EXISTS ] <replaceable class="parameter">statistics_name</replaceable> ]
+     ON ( <replaceable class="parameter">expression</replaceable> )
+     FROM <replaceable class="parameter">table_name</replaceable>
+ 
+-CREATE STATISTICS [ IF NOT EXISTS ] <replaceable class="parameter">statistics_name</replaceable>
++CREATE STATISTICS [ [ IF NOT EXISTS ] <replaceable class="parameter">statistics_name</replaceable> ]
+     [ ( <replaceable class="parameter">statistics_kind</replaceable> [, ... ] ) ]
+     ON { <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) }, { <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [, ...]
+     FROM <replaceable class="parameter">table_name</replaceable>
+@@ -60,8 +60,8 @@ CREATE STATISTICS [ IF NOT EXISTS ] <replaceable class="parameter">statistics_na
+    If a schema name is given (for example, <literal>CREATE STATISTICS
+    myschema.mystat ...</literal>) then the statistics object is created in the
+    specified schema.  Otherwise it is created in the current schema.
+-   The name of the statistics object must be distinct from the name of any
+-   other statistics object in the same schema.
++   If given, the name of the statistics object must be distinct from the name
++   of any other statistics object in the same schema.
+   </para>
+  </refsect1>
+ 
+@@ -78,6 +78,7 @@ CREATE STATISTICS [ IF NOT EXISTS ] <replaceable class="parameter">statistics_na
+       exists.  A notice is issued in this case.  Note that only the name of
+       the statistics object is considered here, not the details of its
+       definition.
++      Statistics name is required when <literal>IF NOT EXISTS</literal> is specified.
+      </para>
+     </listitem>
+    </varlistentry>
+@@ -88,6 +89,9 @@ CREATE STATISTICS [ IF NOT EXISTS ] <replaceable class="parameter">statistics_na
+      <para>
+       The name (optionally schema-qualified) of the statistics object to be
+       created.
++      If the name is omitted, <productname>PostgreSQL</productname> chooses a
++      suitable name based on the parent table's name and the defined column
++      name(s) and/or expression(s).
+      </para>
+     </listitem>
+    </varlistentry>
+diff --git a/src/backend/commands/statscmds.c b/src/backend/commands/statscmds.c
+index cd5e2f2b6b0e..415016969dd9 100644
+--- a/src/backend/commands/statscmds.c
++++ b/src/backend/commands/statscmds.c
+@@ -155,10 +155,9 @@ CreateStatistics(CreateStatsStmt *stmt)
+ 
+ 	/*
+ 	 * If the node has a name, split it up and determine creation namespace.
+-	 * If not (a possibility not considered by the grammar, but one which can
+-	 * occur via the "CREATE TABLE ... (LIKE)" command), then we put the
+-	 * object in the same namespace as the relation, and cons up a name for
+-	 * it.
++	 * If not, put the object in the same namespace as the relation, and cons
++	 * up a name for it.  (This can happen either via "CREATE STATISTICS ..."
++	 * or via "CREATE TABLE ... (LIKE)".)
+ 	 */
+ 	if (stmt->defnames)
+ 		namespaceId = QualifiedNameGetCreationNamespace(stmt->defnames,
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index d649a1b8d13b..0a874a04aa1a 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -434,7 +434,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 				old_aggr_definition old_aggr_list
+ 				oper_argtypes RuleActionList RuleActionMulti
+ 				opt_column_list columnList opt_name_list
+-				sort_clause opt_sort_clause sortby_list index_params stats_params
++				sort_clause opt_sort_clause sortby_list index_params
++				opt_stats_name stats_params
+ 				opt_include opt_c_include index_including_params
+ 				name_list role_list from_clause from_list opt_array_bounds
+ 				qualified_name_list any_name any_name_list type_name_list
+@@ -4533,7 +4534,7 @@ ExistingIndex:   USING INDEX name					{ $$ = $3; }
+ /*****************************************************************************
+  *
+  *		QUERY :
+- *				CREATE STATISTICS [IF NOT EXISTS] stats_name [(stat types)]
++ *				CREATE STATISTICS [[IF NOT EXISTS] stats_name] [(stat types)]
+  *					ON expression-list FROM from_list
+  *
+  * Note: the expectation here is that the clauses after ON are a subset of
+@@ -4545,7 +4546,7 @@ ExistingIndex:   USING INDEX name					{ $$ = $3; }
+  *****************************************************************************/
+ 
+ CreateStatsStmt:
+-			CREATE STATISTICS any_name
++			CREATE STATISTICS opt_stats_name
+ 			opt_name_list ON stats_params FROM from_list
+ 				{
+ 					CreateStatsStmt *n = makeNode(CreateStatsStmt);
+@@ -4573,6 +4574,12 @@ CreateStatsStmt:
+ 				}
+ 			;
+ 
++/* Statistics name is optional unless IF NOT EXISTS is specified */
++opt_stats_name:
++			any_name								{ $$ = $1; }
++			| /*EMPTY*/								{ $$ = NULL; }
++		;
++
+ /*
+  * Statistics attributes can be either simple column references, or arbitrary
+  * expressions in parens.  For compatibility with index attributes permitted
+diff --git a/src/test/regress/expected/stats_ext.out b/src/test/regress/expected/stats_ext.out
+index 042316aeed88..8f5fd546ebd2 100644
+--- a/src/test/regress/expected/stats_ext.out
++++ b/src/test/regress/expected/stats_ext.out
+@@ -3062,11 +3062,11 @@ CREATE STATISTICS tststats.priv_test_stats (mcv) ON a, b
+ ANALYZE tststats.priv_test_tbl;
+ -- Check printing info about extended statistics by \dX
+ create table stts_t1 (a int, b int);
+-create statistics stts_1 (ndistinct) on a, b from stts_t1;
+-create statistics stts_2 (ndistinct, dependencies) on a, b from stts_t1;
+-create statistics stts_3 (ndistinct, dependencies, mcv) on a, b from stts_t1;
++create statistics (ndistinct) on a, b from stts_t1;
++create statistics (ndistinct, dependencies) on a, b from stts_t1;
++create statistics (ndistinct, dependencies, mcv) on a, b from stts_t1;
+ create table stts_t2 (a int, b int, c int);
+-create statistics stts_4 on b, c from stts_t2;
++create statistics on b, c from stts_t2;
+ create table stts_t3 (col1 int, col2 int, col3 int);
+ create statistics stts_hoge on col1, col2, col3 from stts_t3;
+ create schema stts_s1;
+@@ -3084,24 +3084,24 @@ set search_path to public, stts_s1, stts_s2, tststats;
+  public   | mcv_lists_arrays_stats | a, b, c FROM mcv_lists_arrays                                    |           |              | defined
+  public   | mcv_lists_bool_stats   | a, b, c FROM mcv_lists_bool                                      |           |              | defined
+  public   | mcv_lists_stats        | a, b, d FROM mcv_lists                                           |           |              | defined
+- public   | stts_1                 | a, b FROM stts_t1                                                | defined   |              | 
+- public   | stts_2                 | a, b FROM stts_t1                                                | defined   | defined      | 
+- public   | stts_3                 | a, b FROM stts_t1                                                | defined   | defined      | defined
+- public   | stts_4                 | b, c FROM stts_t2                                                | defined   | defined      | defined
+  public   | stts_hoge              | col1, col2, col3 FROM stts_t3                                    | defined   | defined      | defined
++ public   | stts_t1_a_b_stat       | a, b FROM stts_t1                                                | defined   |              | 
++ public   | stts_t1_a_b_stat1      | a, b FROM stts_t1                                                | defined   | defined      | 
++ public   | stts_t1_a_b_stat2      | a, b FROM stts_t1                                                | defined   | defined      | defined
++ public   | stts_t2_b_c_stat       | b, c FROM stts_t2                                                | defined   | defined      | defined
+  stts_s1  | stts_foo               | col1, col2 FROM stts_t3                                          | defined   | defined      | defined
+  stts_s2  | stts_yama              | col1, col3 FROM stts_t3                                          |           | defined      | defined
+  tststats | priv_test_stats        | a, b FROM priv_test_tbl                                          |           |              | defined
+ (12 rows)
+ 
+-\dX stts_?
+-                       List of extended statistics
+- Schema |  Name  |    Definition     | Ndistinct | Dependencies |   MCV   
+---------+--------+-------------------+-----------+--------------+---------
+- public | stts_1 | a, b FROM stts_t1 | defined   |              | 
+- public | stts_2 | a, b FROM stts_t1 | defined   | defined      | 
+- public | stts_3 | a, b FROM stts_t1 | defined   | defined      | defined
+- public | stts_4 | b, c FROM stts_t2 | defined   | defined      | defined
++\dX stts_t*
++                             List of extended statistics
++ Schema |       Name        |    Definition     | Ndistinct | Dependencies |   MCV   
++--------+-------------------+-------------------+-----------+--------------+---------
++ public | stts_t1_a_b_stat  | a, b FROM stts_t1 | defined   |              | 
++ public | stts_t1_a_b_stat1 | a, b FROM stts_t1 | defined   | defined      | 
++ public | stts_t1_a_b_stat2 | a, b FROM stts_t1 | defined   | defined      | defined
++ public | stts_t2_b_c_stat  | b, c FROM stts_t2 | defined   | defined      | defined
+ (4 rows)
+ 
+ \dX *stts_hoge
+@@ -3119,24 +3119,24 @@ set search_path to public, stts_s1, stts_s2, tststats;
+  public   | mcv_lists_arrays_stats | a, b, c FROM mcv_lists_arrays                                    |           |              | defined
+  public   | mcv_lists_bool_stats   | a, b, c FROM mcv_lists_bool                                      |           |              | defined
+  public   | mcv_lists_stats        | a, b, d FROM mcv_lists                                           |           |              | defined
+- public   | stts_1                 | a, b FROM stts_t1                                                | defined   |              | 
+- public   | stts_2                 | a, b FROM stts_t1                                                | defined   | defined      | 
+- public   | stts_3                 | a, b FROM stts_t1                                                | defined   | defined      | defined
+- public   | stts_4                 | b, c FROM stts_t2                                                | defined   | defined      | defined
+  public   | stts_hoge              | col1, col2, col3 FROM stts_t3                                    | defined   | defined      | defined
++ public   | stts_t1_a_b_stat       | a, b FROM stts_t1                                                | defined   |              | 
++ public   | stts_t1_a_b_stat1      | a, b FROM stts_t1                                                | defined   | defined      | 
++ public   | stts_t1_a_b_stat2      | a, b FROM stts_t1                                                | defined   | defined      | defined
++ public   | stts_t2_b_c_stat       | b, c FROM stts_t2                                                | defined   | defined      | defined
+  stts_s1  | stts_foo               | col1, col2 FROM stts_t3                                          | defined   | defined      | defined
+  stts_s2  | stts_yama              | col1, col3 FROM stts_t3                                          |           | defined      | defined
+  tststats | priv_test_stats        | a, b FROM priv_test_tbl                                          |           |              | defined
+ (12 rows)
+ 
+-\dX+ stts_?
+-                       List of extended statistics
+- Schema |  Name  |    Definition     | Ndistinct | Dependencies |   MCV   
+---------+--------+-------------------+-----------+--------------+---------
+- public | stts_1 | a, b FROM stts_t1 | defined   |              | 
+- public | stts_2 | a, b FROM stts_t1 | defined   | defined      | 
+- public | stts_3 | a, b FROM stts_t1 | defined   | defined      | defined
+- public | stts_4 | b, c FROM stts_t2 | defined   | defined      | defined
++\dX+ stts_t*
++                             List of extended statistics
++ Schema |       Name        |    Definition     | Ndistinct | Dependencies |   MCV   
++--------+-------------------+-------------------+-----------+--------------+---------
++ public | stts_t1_a_b_stat  | a, b FROM stts_t1 | defined   |              | 
++ public | stts_t1_a_b_stat1 | a, b FROM stts_t1 | defined   | defined      | 
++ public | stts_t1_a_b_stat2 | a, b FROM stts_t1 | defined   | defined      | defined
++ public | stts_t2_b_c_stat  | b, c FROM stts_t2 | defined   | defined      | defined
+ (4 rows)
+ 
+ \dX+ *stts_hoge
+@@ -3153,6 +3153,21 @@ set search_path to public, stts_s1, stts_s2, tststats;
+  stts_s2 | stts_yama | col1, col3 FROM stts_t3 |           | defined      | defined
+ (1 row)
+ 
++create statistics (mcv) ON a, b, (a+b), (a-b) FROM stts_t1;
++create statistics (mcv) ON a, b, (a+b), (a-b) FROM stts_t1;
++create statistics (mcv) ON (a+b), (a-b) FROM stts_t1;
++\dX stts_t*expr*
++                                           List of extended statistics
++ Schema |            Name             |             Definition              | Ndistinct | Dependencies |   MCV   
++--------+-----------------------------+-------------------------------------+-----------+--------------+---------
++ public | stts_t1_a_b_expr_expr_stat  | a, b, (a + b), (a - b) FROM stts_t1 |           |              | defined
++ public | stts_t1_a_b_expr_expr_stat1 | a, b, (a + b), (a - b) FROM stts_t1 |           |              | defined
++ public | stts_t1_expr_expr_stat      | (a + b), (a - b) FROM stts_t1       |           |              | defined
++(3 rows)
++
++drop statistics stts_t1_a_b_expr_expr_stat;
++drop statistics stts_t1_a_b_expr_expr_stat1;
++drop statistics stts_t1_expr_expr_stat;
+ set search_path to public, stts_s1;
+ \dX
+                                                        List of extended statistics
+@@ -3162,11 +3177,11 @@ set search_path to public, stts_s1;
+  public  | mcv_lists_arrays_stats | a, b, c FROM mcv_lists_arrays                                    |           |              | defined
+  public  | mcv_lists_bool_stats   | a, b, c FROM mcv_lists_bool                                      |           |              | defined
+  public  | mcv_lists_stats        | a, b, d FROM mcv_lists                                           |           |              | defined
+- public  | stts_1                 | a, b FROM stts_t1                                                | defined   |              | 
+- public  | stts_2                 | a, b FROM stts_t1                                                | defined   | defined      | 
+- public  | stts_3                 | a, b FROM stts_t1                                                | defined   | defined      | defined
+- public  | stts_4                 | b, c FROM stts_t2                                                | defined   | defined      | defined
+  public  | stts_hoge              | col1, col2, col3 FROM stts_t3                                    | defined   | defined      | defined
++ public  | stts_t1_a_b_stat       | a, b FROM stts_t1                                                | defined   |              | 
++ public  | stts_t1_a_b_stat1      | a, b FROM stts_t1                                                | defined   | defined      | 
++ public  | stts_t1_a_b_stat2      | a, b FROM stts_t1                                                | defined   | defined      | defined
++ public  | stts_t2_b_c_stat       | b, c FROM stts_t2                                                | defined   | defined      | defined
+  stts_s1 | stts_foo               | col1, col2 FROM stts_t3                                          | defined   | defined      | defined
+ (10 rows)
+ 
+@@ -3180,11 +3195,11 @@ set role regress_stats_ext;
+  public | mcv_lists_arrays_stats | a, b, c FROM mcv_lists_arrays                                    |           |              | defined
+  public | mcv_lists_bool_stats   | a, b, c FROM mcv_lists_bool                                      |           |              | defined
+  public | mcv_lists_stats        | a, b, d FROM mcv_lists                                           |           |              | defined
+- public | stts_1                 | a, b FROM stts_t1                                                | defined   |              | 
+- public | stts_2                 | a, b FROM stts_t1                                                | defined   | defined      | 
+- public | stts_3                 | a, b FROM stts_t1                                                | defined   | defined      | defined
+- public | stts_4                 | b, c FROM stts_t2                                                | defined   | defined      | defined
+  public | stts_hoge              | col1, col2, col3 FROM stts_t3                                    | defined   | defined      | defined
++ public | stts_t1_a_b_stat       | a, b FROM stts_t1                                                | defined   |              | 
++ public | stts_t1_a_b_stat1      | a, b FROM stts_t1                                                | defined   | defined      | 
++ public | stts_t1_a_b_stat2      | a, b FROM stts_t1                                                | defined   | defined      | defined
++ public | stts_t2_b_c_stat       | b, c FROM stts_t2                                                | defined   | defined      | defined
+ (9 rows)
+ 
+ reset role;
+diff --git a/src/test/regress/sql/stats_ext.sql b/src/test/regress/sql/stats_ext.sql
+index 6b954c9e5007..5fd865f50918 100644
+--- a/src/test/regress/sql/stats_ext.sql
++++ b/src/test/regress/sql/stats_ext.sql
+@@ -1555,12 +1555,12 @@ ANALYZE tststats.priv_test_tbl;
+ 
+ -- Check printing info about extended statistics by \dX
+ create table stts_t1 (a int, b int);
+-create statistics stts_1 (ndistinct) on a, b from stts_t1;
+-create statistics stts_2 (ndistinct, dependencies) on a, b from stts_t1;
+-create statistics stts_3 (ndistinct, dependencies, mcv) on a, b from stts_t1;
++create statistics (ndistinct) on a, b from stts_t1;
++create statistics (ndistinct, dependencies) on a, b from stts_t1;
++create statistics (ndistinct, dependencies, mcv) on a, b from stts_t1;
+ 
+ create table stts_t2 (a int, b int, c int);
+-create statistics stts_4 on b, c from stts_t2;
++create statistics on b, c from stts_t2;
+ 
+ create table stts_t3 (col1 int, col2 int, col3 int);
+ create statistics stts_hoge on col1, col2, col3 from stts_t3;
+@@ -1575,13 +1575,21 @@ analyze stts_t1;
+ set search_path to public, stts_s1, stts_s2, tststats;
+ 
+ \dX
+-\dX stts_?
++\dX stts_t*
+ \dX *stts_hoge
+ \dX+
+-\dX+ stts_?
++\dX+ stts_t*
+ \dX+ *stts_hoge
+ \dX+ stts_s2.stts_yama
+ 
++create statistics (mcv) ON a, b, (a+b), (a-b) FROM stts_t1;
++create statistics (mcv) ON a, b, (a+b), (a-b) FROM stts_t1;
++create statistics (mcv) ON (a+b), (a-b) FROM stts_t1;
++\dX stts_t*expr*
++drop statistics stts_t1_a_b_expr_expr_stat;
++drop statistics stts_t1_a_b_expr_expr_stat1;
++drop statistics stts_t1_expr_expr_stat;
++
+ set search_path to public, stts_s1;
+ \dX
+ 

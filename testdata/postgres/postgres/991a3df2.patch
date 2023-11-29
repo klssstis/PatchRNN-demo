@@ -1,0 +1,842 @@
+From 991a3df227e9e8b16d7399df3961dfaae4ae677c Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 25 May 2023 10:28:33 -0400
+Subject: [PATCH] Fix filtering of "cloned" outer-join quals some more.
+
+We've had multiple issues with the clause_is_computable_at logic that
+I introduced in 2489d76c4: it's been known to accept more than one
+clone of the same qual at the same plan node, and also to accept no
+clones at all.  It's looking impractical to get it 100% right on the
+basis of the currently-stored information, so fix it by introducing a
+new RestrictInfo field "incompatible_relids" that explicitly shows
+which outer joins a given clone mustn't be pushed above.
+
+In principle we could populate this field in every RestrictInfo, but
+that would cost space and there doesn't presently seem to be a need
+for it in general.  Also, while deconstruct_distribute_oj_quals can
+easily fill the field with the remaining members of the commutative
+join set that it's considering, computing it in the general case
+seems again pretty complicated.  So for now, just fill it for
+clone quals.
+
+Along the way, fix a bug that may or may not be only latent:
+equivclass.c was generating replacement clauses with is_pushed_down
+and has_clone/is_clone markings that didn't match their
+required_relids.  This led me to conclude that leaving the clone flags
+out of make_restrictinfo's purview wasn't such a great idea after all,
+so add them.
+
+Per report from Richard Guo.
+
+Discussion: https://postgr.es/m/CAMbWs48EYi_9-pSd0ORes1kTmTeAjT4Q3gu49hJtYCbSn2JyeA@mail.gmail.com
+---
+ contrib/postgres_fdw/postgres_fdw.c       |   3 +
+ src/backend/optimizer/README              |  15 ++-
+ src/backend/optimizer/path/equivclass.c   |  21 +++-
+ src/backend/optimizer/plan/initsplan.c    |  55 ++++++++--
+ src/backend/optimizer/util/inherit.c      |  10 +-
+ src/backend/optimizer/util/orclauses.c    |   3 +
+ src/backend/optimizer/util/relnode.c      |  22 ++--
+ src/backend/optimizer/util/restrictinfo.c | 119 ++++++++--------------
+ src/include/nodes/pathnodes.h             |  12 +++
+ src/include/optimizer/restrictinfo.h      |   9 +-
+ src/test/regress/expected/join.out        |  21 ++++
+ src/test/regress/sql/join.sql             |   6 ++
+ 12 files changed, 178 insertions(+), 118 deletions(-)
+
+diff --git a/contrib/postgres_fdw/postgres_fdw.c b/contrib/postgres_fdw/postgres_fdw.c
+index 428ea3810fe3..c5cada55fb73 100644
+--- a/contrib/postgres_fdw/postgres_fdw.c
++++ b/contrib/postgres_fdw/postgres_fdw.c
+@@ -6521,8 +6521,11 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
+ 									  expr,
+ 									  true,
+ 									  false,
++									  false,
++									  false,
+ 									  root->qual_security_level,
+ 									  grouped_rel->relids,
++									  NULL,
+ 									  NULL);
+ 			if (is_foreign_expr(root, grouped_rel, expr))
+ 				fpinfo->remote_conds = lappend(fpinfo->remote_conds, rinfo);
+diff --git a/src/backend/optimizer/README b/src/backend/optimizer/README
+index f1a96b858402..2ab4f3dbf379 100644
+--- a/src/backend/optimizer/README
++++ b/src/backend/optimizer/README
+@@ -539,14 +539,13 @@ set includes the A/B join relid which is not in the input.  However,
+ if we form B/C after A/B, then both forms of the clause are applicable
+ so far as that test can tell.  We have to look more closely to notice
+ that the "Pbc" clause form refers to relation B which is no longer
+-directly accessible.  While this check is straightforward, it's not
+-especially cheap (see clause_is_computable_at()).  To avoid doing it
+-unnecessarily, we mark the variant versions of a redundant clause as
+-either "has_clone" or "is_clone".  When considering a clone clause,
+-we must check clause_is_computable_at() to disentangle which version
+-to apply at the current join level.  (In debug builds, we also Assert
+-that non-clone clauses are validly computable at the current level;
+-but that seems too expensive for production usage.)
++directly accessible.  While such a check could be performed using the
++per-relation RelOptInfo.nulling_relids data, it would be annoyingly
++expensive to do over and over as we consider different join paths.
++To make this simple and reliable, we compute an "incompatible_relids"
++set for each variant version (clone) of a redundant clause.  A clone
++clause should not be applied if any of the outer-join relids listed in
++incompatible_relids has already been computed below the current join.
+ 
+ 
+ Optimizer Functions
+diff --git a/src/backend/optimizer/path/equivclass.c b/src/backend/optimizer/path/equivclass.c
+index 2db1bf644870..7fa502d6e25d 100644
+--- a/src/backend/optimizer/path/equivclass.c
++++ b/src/backend/optimizer/path/equivclass.c
+@@ -197,9 +197,12 @@ process_equivalence(PlannerInfo *root,
+ 				make_restrictinfo(root,
+ 								  (Expr *) ntest,
+ 								  restrictinfo->is_pushed_down,
++								  restrictinfo->has_clone,
++								  restrictinfo->is_clone,
+ 								  restrictinfo->pseudoconstant,
+ 								  restrictinfo->security_level,
+ 								  NULL,
++								  restrictinfo->incompatible_relids,
+ 								  restrictinfo->outer_relids);
+ 		}
+ 		return false;
+@@ -1972,7 +1975,8 @@ create_join_clause(PlannerInfo *root,
+  * clause into the regular processing, because otherwise the join will be
+  * seen as a clauseless join and avoided during join order searching.
+  * We handle this by generating a constant-TRUE clause that is marked with
+- * required_relids that make it a join between the correct relations.
++ * the same required_relids etc as the removed outer-join clause, thus
++ * making it a join clause between the correct relations.
+  */
+ void
+ reconsider_outer_join_clauses(PlannerInfo *root)
+@@ -2001,10 +2005,13 @@ reconsider_outer_join_clauses(PlannerInfo *root)
+ 				/* throw back a dummy replacement clause (see notes above) */
+ 				rinfo = make_restrictinfo(root,
+ 										  (Expr *) makeBoolConst(true, false),
+-										  true, /* is_pushed_down */
++										  rinfo->is_pushed_down,
++										  rinfo->has_clone,
++										  rinfo->is_clone,
+ 										  false,	/* pseudoconstant */
+ 										  0,	/* security_level */
+ 										  rinfo->required_relids,
++										  rinfo->incompatible_relids,
+ 										  rinfo->outer_relids);
+ 				distribute_restrictinfo_to_rels(root, rinfo);
+ 			}
+@@ -2026,10 +2033,13 @@ reconsider_outer_join_clauses(PlannerInfo *root)
+ 				/* throw back a dummy replacement clause (see notes above) */
+ 				rinfo = make_restrictinfo(root,
+ 										  (Expr *) makeBoolConst(true, false),
+-										  true, /* is_pushed_down */
++										  rinfo->is_pushed_down,
++										  rinfo->has_clone,
++										  rinfo->is_clone,
+ 										  false,	/* pseudoconstant */
+ 										  0,	/* security_level */
+ 										  rinfo->required_relids,
++										  rinfo->incompatible_relids,
+ 										  rinfo->outer_relids);
+ 				distribute_restrictinfo_to_rels(root, rinfo);
+ 			}
+@@ -2051,10 +2061,13 @@ reconsider_outer_join_clauses(PlannerInfo *root)
+ 				/* throw back a dummy replacement clause (see notes above) */
+ 				rinfo = make_restrictinfo(root,
+ 										  (Expr *) makeBoolConst(true, false),
+-										  true, /* is_pushed_down */
++										  rinfo->is_pushed_down,
++										  rinfo->has_clone,
++										  rinfo->is_clone,
+ 										  false,	/* pseudoconstant */
+ 										  0,	/* security_level */
+ 										  rinfo->required_relids,
++										  rinfo->incompatible_relids,
+ 										  rinfo->outer_relids);
+ 				distribute_restrictinfo_to_rels(root, rinfo);
+ 			}
+diff --git a/src/backend/optimizer/plan/initsplan.c b/src/backend/optimizer/plan/initsplan.c
+index 5cbb7b9a86bd..69ef483d2833 100644
+--- a/src/backend/optimizer/plan/initsplan.c
++++ b/src/backend/optimizer/plan/initsplan.c
+@@ -109,6 +109,7 @@ static void distribute_quals_to_rels(PlannerInfo *root, List *clauses,
+ 									 Relids qualscope,
+ 									 Relids ojscope,
+ 									 Relids outerjoin_nonnullable,
++									 Relids incompatible_relids,
+ 									 bool allow_equivalence,
+ 									 bool has_clone,
+ 									 bool is_clone,
+@@ -120,6 +121,7 @@ static void distribute_qual_to_rels(PlannerInfo *root, Node *clause,
+ 									Relids qualscope,
+ 									Relids ojscope,
+ 									Relids outerjoin_nonnullable,
++									Relids incompatible_relids,
+ 									bool allow_equivalence,
+ 									bool has_clone,
+ 									bool is_clone,
+@@ -1132,7 +1134,8 @@ deconstruct_distribute(PlannerInfo *root, JoinTreeItem *jtitem)
+ 								 jtitem,
+ 								 NULL,
+ 								 root->qual_security_level,
+-								 jtitem->qualscope, NULL, NULL,
++								 jtitem->qualscope,
++								 NULL, NULL, NULL,
+ 								 true, false, false,
+ 								 NULL);
+ 
+@@ -1143,7 +1146,8 @@ deconstruct_distribute(PlannerInfo *root, JoinTreeItem *jtitem)
+ 								 jtitem,
+ 								 NULL,
+ 								 root->qual_security_level,
+-								 jtitem->qualscope, NULL, NULL,
++								 jtitem->qualscope,
++								 NULL, NULL, NULL,
+ 								 true, false, false,
+ 								 NULL);
+ 	}
+@@ -1226,6 +1230,7 @@ deconstruct_distribute(PlannerInfo *root, JoinTreeItem *jtitem)
+ 								 root->qual_security_level,
+ 								 jtitem->qualscope,
+ 								 ojscope, jtitem->nonnullable_rels,
++								 NULL,	/* incompatible_relids */
+ 								 true,	/* allow_equivalence */
+ 								 false, false,	/* not clones */
+ 								 postponed_oj_qual_list);
+@@ -1285,6 +1290,7 @@ process_security_barrier_quals(PlannerInfo *root,
+ 								 jtitem->qualscope,
+ 								 jtitem->qualscope,
+ 								 NULL,
++								 NULL,
+ 								 true,
+ 								 false, false,	/* not clones */
+ 								 NULL);
+@@ -1887,6 +1893,7 @@ deconstruct_distribute_oj_quals(PlannerInfo *root,
+ 	{
+ 		Relids		joins_above;
+ 		Relids		joins_below;
++		Relids		incompatible_joins;
+ 		Relids		joins_so_far;
+ 		List	   *quals;
+ 		int			save_last_rinfo_serial;
+@@ -1920,6 +1927,15 @@ deconstruct_distribute_oj_quals(PlannerInfo *root,
+ 												   joins_below,
+ 												   NULL);
+ 
++		/*
++		 * We'll need to mark the lower versions of the quals as not safe to
++		 * apply above not-yet-processed joins of the stack.  This prevents
++		 * possibly applying a cloned qual at the wrong join level.
++		 */
++		incompatible_joins = bms_union(joins_below, joins_above);
++		incompatible_joins = bms_add_member(incompatible_joins,
++											sjinfo->ojrelid);
++
+ 		/*
+ 		 * Each time we produce RestrictInfo(s) from these quals, reset the
+ 		 * last_rinfo_serial counter, so that the RestrictInfos for the "same"
+@@ -1979,13 +1995,19 @@ deconstruct_distribute_oj_quals(PlannerInfo *root,
+ 			 * relation B will appear nulled by the syntactically-upper OJ
+ 			 * within the Pbc clause, but those of relation C will not.  (In
+ 			 * the notation used by optimizer/README, we're converting a qual
+-			 * of the form Pbc to Pb*c.)
++			 * of the form Pbc to Pb*c.)  Of course, we must also remove that
++			 * bit from the incompatible_joins value, else we'll make a qual
++			 * that can't be placed anywhere.
+ 			 */
+ 			if (above_sjinfo)
++			{
+ 				quals = (List *)
+ 					add_nulling_relids((Node *) quals,
+ 									   sjinfo->syn_lefthand,
+ 									   bms_make_singleton(othersj->ojrelid));
++				incompatible_joins = bms_del_member(incompatible_joins,
++													othersj->ojrelid);
++			}
+ 
+ 			/* Compute qualscope and ojscope for this join level */
+ 			this_qualscope = bms_union(qualscope, joins_so_far);
+@@ -2027,6 +2049,7 @@ deconstruct_distribute_oj_quals(PlannerInfo *root,
+ 									 root->qual_security_level,
+ 									 this_qualscope,
+ 									 this_ojscope, nonnullable_rels,
++									 bms_copy(incompatible_joins),
+ 									 allow_equivalence,
+ 									 has_clone,
+ 									 is_clone,
+@@ -2039,13 +2062,17 @@ deconstruct_distribute_oj_quals(PlannerInfo *root,
+ 			 * Vars coming from the lower join's RHS.  (Again, we are
+ 			 * converting a qual of the form Pbc to Pb*c, but now we are
+ 			 * putting back bits that were there in the parser output and were
+-			 * temporarily stripped above.)
++			 * temporarily stripped above.)  Update incompatible_joins too.
+ 			 */
+ 			if (below_sjinfo)
++			{
+ 				quals = (List *)
+ 					add_nulling_relids((Node *) quals,
+ 									   othersj->syn_righthand,
+ 									   bms_make_singleton(othersj->ojrelid));
++				incompatible_joins = bms_del_member(incompatible_joins,
++													othersj->ojrelid);
++			}
+ 
+ 			/* ... and track joins processed so far */
+ 			joins_so_far = bms_add_member(joins_so_far, othersj->ojrelid);
+@@ -2060,6 +2087,7 @@ deconstruct_distribute_oj_quals(PlannerInfo *root,
+ 								 root->qual_security_level,
+ 								 qualscope,
+ 								 ojscope, nonnullable_rels,
++								 NULL,	/* incompatible_relids */
+ 								 true,	/* allow_equivalence */
+ 								 false, false,	/* not clones */
+ 								 NULL); /* no more postponement */
+@@ -2086,6 +2114,7 @@ distribute_quals_to_rels(PlannerInfo *root, List *clauses,
+ 						 Relids qualscope,
+ 						 Relids ojscope,
+ 						 Relids outerjoin_nonnullable,
++						 Relids incompatible_relids,
+ 						 bool allow_equivalence,
+ 						 bool has_clone,
+ 						 bool is_clone,
+@@ -2104,6 +2133,7 @@ distribute_quals_to_rels(PlannerInfo *root, List *clauses,
+ 								qualscope,
+ 								ojscope,
+ 								outerjoin_nonnullable,
++								incompatible_relids,
+ 								allow_equivalence,
+ 								has_clone,
+ 								is_clone,
+@@ -2135,6 +2165,9 @@ distribute_quals_to_rels(PlannerInfo *root, List *clauses,
+  *		base+OJ rels appearing on the outer (nonnullable) side of the join
+  *		(for FULL JOIN this includes both sides of the join, and must in fact
+  *		equal qualscope)
++ * 'incompatible_relids': the set of outer-join relid(s) that must not be
++ *		computed below this qual.  We only bother to compute this for
++ *		"clone" quals, otherwise it can be left NULL.
+  * 'allow_equivalence': true if it's okay to convert clause into an
+  *		EquivalenceClass
+  * 'has_clone': has_clone property to assign to the qual
+@@ -2159,6 +2192,7 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
+ 						Relids qualscope,
+ 						Relids ojscope,
+ 						Relids outerjoin_nonnullable,
++						Relids incompatible_relids,
+ 						bool allow_equivalence,
+ 						bool has_clone,
+ 						bool is_clone,
+@@ -2377,15 +2411,14 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
+ 	restrictinfo = make_restrictinfo(root,
+ 									 (Expr *) clause,
+ 									 is_pushed_down,
++									 has_clone,
++									 is_clone,
+ 									 pseudoconstant,
+ 									 security_level,
+ 									 relids,
++									 incompatible_relids,
+ 									 outerjoin_nonnullable);
+ 
+-	/* Apply appropriate clone marking, too */
+-	restrictinfo->has_clone = has_clone;
+-	restrictinfo->is_clone = is_clone;
+-
+ 	/*
+ 	 * If it's a join clause, add vars used in the clause to targetlists of
+ 	 * their relations, so that they will be emitted by the plan nodes that
+@@ -2750,9 +2783,12 @@ process_implied_equality(PlannerInfo *root,
+ 	restrictinfo = make_restrictinfo(root,
+ 									 (Expr *) clause,
+ 									 true,	/* is_pushed_down */
++									 false, /* !has_clone */
++									 false, /* !is_clone */
+ 									 pseudoconstant,
+ 									 security_level,
+ 									 relids,
++									 NULL,	/* incompatible_relids */
+ 									 NULL); /* outer_relids */
+ 
+ 	/*
+@@ -2841,9 +2877,12 @@ build_implied_join_equality(PlannerInfo *root,
+ 	restrictinfo = make_restrictinfo(root,
+ 									 clause,
+ 									 true,	/* is_pushed_down */
++									 false, /* !has_clone */
++									 false, /* !is_clone */
+ 									 false, /* pseudoconstant */
+ 									 security_level,	/* security_level */
+ 									 qualscope, /* required_relids */
++									 NULL,	/* incompatible_relids */
+ 									 NULL); /* outer_relids */
+ 
+ 	/* Set mergejoinability/hashjoinability flags */
+diff --git a/src/backend/optimizer/util/inherit.c b/src/backend/optimizer/util/inherit.c
+index bae9688e4611..94de855a2278 100644
+--- a/src/backend/optimizer/util/inherit.c
++++ b/src/backend/optimizer/util/inherit.c
+@@ -894,9 +894,11 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
+ 								 make_restrictinfo(root,
+ 												   (Expr *) onecq,
+ 												   rinfo->is_pushed_down,
++												   rinfo->has_clone,
++												   rinfo->is_clone,
+ 												   pseudoconstant,
+ 												   rinfo->security_level,
+-												   NULL, NULL));
++												   NULL, NULL, NULL));
+ 			/* track minimum security level among child quals */
+ 			cq_min_security = Min(cq_min_security, rinfo->security_level);
+ 		}
+@@ -929,9 +931,11 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
+ 				/* not likely that we'd see constants here, so no check */
+ 				childquals = lappend(childquals,
+ 									 make_restrictinfo(root, qual,
+-													   true, false,
++													   true,
++													   false, false,
++													   false,
+ 													   security_level,
+-													   NULL, NULL));
++													   NULL, NULL, NULL));
+ 				cq_min_security = Min(cq_min_security, security_level);
+ 			}
+ 			security_level++;
+diff --git a/src/backend/optimizer/util/orclauses.c b/src/backend/optimizer/util/orclauses.c
+index ca8b5ff92fc1..6ef9d14b902a 100644
+--- a/src/backend/optimizer/util/orclauses.c
++++ b/src/backend/optimizer/util/orclauses.c
+@@ -267,8 +267,11 @@ consider_new_or_clause(PlannerInfo *root, RelOptInfo *rel,
+ 								 orclause,
+ 								 true,
+ 								 false,
++								 false,
++								 false,
+ 								 join_or_rinfo->security_level,
+ 								 NULL,
++								 NULL,
+ 								 NULL);
+ 
+ 	/*
+diff --git a/src/backend/optimizer/util/relnode.c b/src/backend/optimizer/util/relnode.c
+index 32a407f54b55..15e3910b79af 100644
+--- a/src/backend/optimizer/util/relnode.c
++++ b/src/backend/optimizer/util/relnode.c
+@@ -1346,27 +1346,21 @@ subbuild_joinrel_restrictlist(PlannerInfo *root,
+ 				Assert(!RINFO_IS_PUSHED_DOWN(rinfo, joinrel->relids));
+ 				if (!bms_is_subset(rinfo->required_relids, both_input_relids))
+ 					continue;
+-				if (!clause_is_computable_at(root, rinfo, both_input_relids))
++				if (bms_overlap(rinfo->incompatible_relids, both_input_relids))
+ 					continue;
+ 			}
+ 			else
+ 			{
+ 				/*
+ 				 * For non-clone clauses, we just Assert it's OK.  These might
+-				 * be either join or filter clauses.
++				 * be either join or filter clauses; if it's a join clause
++				 * then it should not refer to the current join's output.
++				 * (There is little point in checking incompatible_relids,
++				 * because it'll be NULL.)
+ 				 */
+-#ifdef USE_ASSERT_CHECKING
+-				if (RINFO_IS_PUSHED_DOWN(rinfo, joinrel->relids))
+-					Assert(clause_is_computable_at(root, rinfo,
+-												   joinrel->relids));
+-				else
+-				{
+-					Assert(bms_is_subset(rinfo->required_relids,
+-										 both_input_relids));
+-					Assert(clause_is_computable_at(root, rinfo,
+-												   both_input_relids));
+-				}
+-#endif
++				Assert(RINFO_IS_PUSHED_DOWN(rinfo, joinrel->relids) ||
++					   bms_is_subset(rinfo->required_relids,
++									 both_input_relids));
+ 			}
+ 
+ 			/*
+diff --git a/src/backend/optimizer/util/restrictinfo.c b/src/backend/optimizer/util/restrictinfo.c
+index 760d24bebf3a..d6d26a2b515c 100644
+--- a/src/backend/optimizer/util/restrictinfo.c
++++ b/src/backend/optimizer/util/restrictinfo.c
+@@ -25,16 +25,22 @@ static RestrictInfo *make_restrictinfo_internal(PlannerInfo *root,
+ 												Expr *clause,
+ 												Expr *orclause,
+ 												bool is_pushed_down,
++												bool has_clone,
++												bool is_clone,
+ 												bool pseudoconstant,
+ 												Index security_level,
+ 												Relids required_relids,
++												Relids incompatible_relids,
+ 												Relids outer_relids);
+ static Expr *make_sub_restrictinfos(PlannerInfo *root,
+ 									Expr *clause,
+ 									bool is_pushed_down,
++									bool has_clone,
++									bool is_clone,
+ 									bool pseudoconstant,
+ 									Index security_level,
+ 									Relids required_relids,
++									Relids incompatible_relids,
+ 									Relids outer_relids);
+ 
+ 
+@@ -43,16 +49,12 @@ static Expr *make_sub_restrictinfos(PlannerInfo *root,
+  *
+  * Build a RestrictInfo node containing the given subexpression.
+  *
+- * The is_pushed_down and pseudoconstant flags for the
++ * The is_pushed_down, has_clone, is_clone, and pseudoconstant flags for the
+  * RestrictInfo must be supplied by the caller, as well as the correct values
+- * for security_level and outer_relids.
++ * for security_level, incompatible_relids, and outer_relids.
+  * required_relids can be NULL, in which case it defaults to the actual clause
+  * contents (i.e., clause_relids).
+  *
+- * Note that there aren't options to set the has_clone and is_clone flags:
+- * we always initialize those to false.  There's just one place that wants
+- * something different, so making all callers pass them seems inconvenient.
+- *
+  * We initialize fields that depend only on the given subexpression, leaving
+  * others that depend on context (or may never be needed at all) to be filled
+  * later.
+@@ -61,9 +63,12 @@ RestrictInfo *
+ make_restrictinfo(PlannerInfo *root,
+ 				  Expr *clause,
+ 				  bool is_pushed_down,
++				  bool has_clone,
++				  bool is_clone,
+ 				  bool pseudoconstant,
+ 				  Index security_level,
+ 				  Relids required_relids,
++				  Relids incompatible_relids,
+ 				  Relids outer_relids)
+ {
+ 	/*
+@@ -74,9 +79,12 @@ make_restrictinfo(PlannerInfo *root,
+ 		return (RestrictInfo *) make_sub_restrictinfos(root,
+ 													   clause,
+ 													   is_pushed_down,
++													   has_clone,
++													   is_clone,
+ 													   pseudoconstant,
+ 													   security_level,
+ 													   required_relids,
++													   incompatible_relids,
+ 													   outer_relids);
+ 
+ 	/* Shouldn't be an AND clause, else AND/OR flattening messed up */
+@@ -86,9 +94,12 @@ make_restrictinfo(PlannerInfo *root,
+ 									  clause,
+ 									  NULL,
+ 									  is_pushed_down,
++									  has_clone,
++									  is_clone,
+ 									  pseudoconstant,
+ 									  security_level,
+ 									  required_relids,
++									  incompatible_relids,
+ 									  outer_relids);
+ }
+ 
+@@ -102,9 +113,12 @@ make_restrictinfo_internal(PlannerInfo *root,
+ 						   Expr *clause,
+ 						   Expr *orclause,
+ 						   bool is_pushed_down,
++						   bool has_clone,
++						   bool is_clone,
+ 						   bool pseudoconstant,
+ 						   Index security_level,
+ 						   Relids required_relids,
++						   Relids incompatible_relids,
+ 						   Relids outer_relids)
+ {
+ 	RestrictInfo *restrictinfo = makeNode(RestrictInfo);
+@@ -114,10 +128,11 @@ make_restrictinfo_internal(PlannerInfo *root,
+ 	restrictinfo->orclause = orclause;
+ 	restrictinfo->is_pushed_down = is_pushed_down;
+ 	restrictinfo->pseudoconstant = pseudoconstant;
+-	restrictinfo->has_clone = false;	/* may get set by caller */
+-	restrictinfo->is_clone = false; /* may get set by caller */
++	restrictinfo->has_clone = has_clone;
++	restrictinfo->is_clone = is_clone;
+ 	restrictinfo->can_join = false; /* may get set below */
+ 	restrictinfo->security_level = security_level;
++	restrictinfo->incompatible_relids = incompatible_relids;
+ 	restrictinfo->outer_relids = outer_relids;
+ 
+ 	/*
+@@ -244,9 +259,9 @@ make_restrictinfo_internal(PlannerInfo *root,
+  * implicit-AND lists at top level of RestrictInfo lists.  Only ORs and
+  * simple clauses are valid RestrictInfos.
+  *
+- * The same is_pushed_down and pseudoconstant flag
++ * The same is_pushed_down, has_clone, is_clone, and pseudoconstant flag
+  * values can be applied to all RestrictInfo nodes in the result.  Likewise
+- * for security_level and outer_relids.
++ * for security_level, incompatible_relids, and outer_relids.
+  *
+  * The given required_relids are attached to our top-level output,
+  * but any OR-clause constituents are allowed to default to just the
+@@ -256,9 +271,12 @@ static Expr *
+ make_sub_restrictinfos(PlannerInfo *root,
+ 					   Expr *clause,
+ 					   bool is_pushed_down,
++					   bool has_clone,
++					   bool is_clone,
+ 					   bool pseudoconstant,
+ 					   Index security_level,
+ 					   Relids required_relids,
++					   Relids incompatible_relids,
+ 					   Relids outer_relids)
+ {
+ 	if (is_orclause(clause))
+@@ -271,17 +289,23 @@ make_sub_restrictinfos(PlannerInfo *root,
+ 							 make_sub_restrictinfos(root,
+ 													lfirst(temp),
+ 													is_pushed_down,
++													has_clone,
++													is_clone,
+ 													pseudoconstant,
+ 													security_level,
+ 													NULL,
++													incompatible_relids,
+ 													outer_relids));
+ 		return (Expr *) make_restrictinfo_internal(root,
+ 												   clause,
+ 												   make_orclause(orlist),
+ 												   is_pushed_down,
++												   has_clone,
++												   is_clone,
+ 												   pseudoconstant,
+ 												   security_level,
+ 												   required_relids,
++												   incompatible_relids,
+ 												   outer_relids);
+ 	}
+ 	else if (is_andclause(clause))
+@@ -294,9 +318,12 @@ make_sub_restrictinfos(PlannerInfo *root,
+ 							  make_sub_restrictinfos(root,
+ 													 lfirst(temp),
+ 													 is_pushed_down,
++													 has_clone,
++													 is_clone,
+ 													 pseudoconstant,
+ 													 security_level,
+ 													 required_relids,
++													 incompatible_relids,
+ 													 outer_relids));
+ 		return make_andclause(andlist);
+ 	}
+@@ -305,9 +332,12 @@ make_sub_restrictinfos(PlannerInfo *root,
+ 												   clause,
+ 												   NULL,
+ 												   is_pushed_down,
++												   has_clone,
++												   is_clone,
+ 												   pseudoconstant,
+ 												   security_level,
+ 												   required_relids,
++												   incompatible_relids,
+ 												   outer_relids);
+ }
+ 
+@@ -513,77 +543,12 @@ extract_actual_join_clauses(List *restrictinfo_list,
+ 		{
+ 			/* joinquals shouldn't have been marked pseudoconstant */
+ 			Assert(!rinfo->pseudoconstant);
+-			Assert(!rinfo_is_constant_true(rinfo));
+-			*joinquals = lappend(*joinquals, rinfo->clause);
++			if (!rinfo_is_constant_true(rinfo))
++				*joinquals = lappend(*joinquals, rinfo->clause);
+ 		}
+ 	}
+ }
+ 
+-/*
+- * clause_is_computable_at
+- *		Test whether a clause is computable at a given evaluation level.
+- *
+- * There are two conditions for whether an expression can actually be
+- * evaluated at a given join level: the evaluation context must include
+- * all the relids (both base and OJ) used by the expression, and we must
+- * not have already evaluated any outer joins that null Vars/PHVs of the
+- * expression and are not listed in their nullingrels.
+- *
+- * This function checks the second condition; we assume the caller already
+- * saw to the first one.
+- *
+- * For speed reasons, we don't individually examine each Var/PHV of the
+- * expression, but just look at the overall clause_relids (the union of the
+- * varnos and varnullingrels).  This could give a misleading answer if the
+- * Vars of a given varno don't all have the same varnullingrels; but that
+- * really shouldn't happen within a single scalar expression or RestrictInfo
+- * clause.  Despite that, this is still annoyingly expensive :-(
+- */
+-bool
+-clause_is_computable_at(PlannerInfo *root,
+-						RestrictInfo *rinfo,
+-						Relids eval_relids)
+-{
+-	Relids		clause_relids;
+-	ListCell   *lc;
+-
+-	/* Nothing to do if no outer joins have been performed yet. */
+-	if (!bms_overlap(eval_relids, root->outer_join_rels))
+-		return true;
+-
+-	/*
+-	 * For an ordinary qual clause, we consider the actual clause_relids as
+-	 * explained above.  However, it's possible for multiple members of a
+-	 * group of clone quals to have the same clause_relids, so for clones use
+-	 * the required_relids instead to ensure we select just one of them.
+-	 */
+-	if (rinfo->has_clone || rinfo->is_clone)
+-		clause_relids = rinfo->required_relids;
+-	else
+-		clause_relids = rinfo->clause_relids;
+-
+-	foreach(lc, root->join_info_list)
+-	{
+-		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+-
+-		/* Ignore outer joins that are not yet performed. */
+-		if (!bms_is_member(sjinfo->ojrelid, eval_relids))
+-			continue;
+-
+-		/* OK if clause lists it (we assume all Vars in it agree). */
+-		if (bms_is_member(sjinfo->ojrelid, clause_relids))
+-			continue;
+-
+-		/* Else, trouble if clause mentions any nullable Vars. */
+-		if (bms_overlap(clause_relids, sjinfo->min_righthand) ||
+-			(sjinfo->jointype == JOIN_FULL &&
+-			 bms_overlap(clause_relids, sjinfo->min_lefthand)))
+-			return false;		/* doesn't work */
+-	}
+-
+-	return true;				/* OK */
+-}
+-
+ /*
+  * join_clause_is_movable_to
+  *		Test whether a join clause is a safe candidate for parameterization
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index 23dd671bf4eb..c17b53f7adbd 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -2430,6 +2430,15 @@ typedef struct LimitPath
+  * conditions.  Possibly we should rename it to reflect that meaning?  But
+  * see also the comments for RINFO_IS_PUSHED_DOWN, below.)
+  *
++ * There is also an incompatible_relids field, which is a set of outer-join
++ * relids above which we cannot evaluate the clause (because they might null
++ * Vars it uses that should not be nulled yet).  In principle this could be
++ * filled in any RestrictInfo as the set of OJ relids that appear above the
++ * clause and null Vars that it uses.  In practice we only bother to populate
++ * it for "clone" clauses, as it's currently only needed to prevent multiple
++ * clones of the same clause from being accepted for evaluation at the same
++ * join level.
++ *
+  * There is also an outer_relids field, which is NULL except for outer join
+  * clauses; for those, it is the set of relids on the outer side of the
+  * clause's outer join.  (These are rels that the clause cannot be applied to
+@@ -2537,6 +2546,9 @@ typedef struct RestrictInfo
+ 	/* The set of relids required to evaluate the clause: */
+ 	Relids		required_relids;
+ 
++	/* Relids above which we cannot evaluate the clause (see comment above) */
++	Relids		incompatible_relids;
++
+ 	/* If an outer-join clause, the outer-side relations, else NULL: */
+ 	Relids		outer_relids;
+ 
+diff --git a/src/include/optimizer/restrictinfo.h b/src/include/optimizer/restrictinfo.h
+index 57e7a7999d28..e140e619ace7 100644
+--- a/src/include/optimizer/restrictinfo.h
++++ b/src/include/optimizer/restrictinfo.h
+@@ -19,14 +19,18 @@
+ 
+ /* Convenience macro for the common case of a valid-everywhere qual */
+ #define make_simple_restrictinfo(root, clause)  \
+-	make_restrictinfo(root, clause, true, false, 0, NULL, NULL)
++	make_restrictinfo(root, clause, true, false, false, false, 0, \
++		NULL, NULL, NULL)
+ 
+ extern RestrictInfo *make_restrictinfo(PlannerInfo *root,
+ 									   Expr *clause,
+ 									   bool is_pushed_down,
++									   bool has_clone,
++									   bool is_clone,
+ 									   bool pseudoconstant,
+ 									   Index security_level,
+ 									   Relids required_relids,
++									   Relids incompatible_relids,
+ 									   Relids outer_relids);
+ extern RestrictInfo *commute_restrictinfo(RestrictInfo *rinfo, Oid comm_op);
+ extern bool restriction_is_or_clause(RestrictInfo *restrictinfo);
+@@ -39,9 +43,6 @@ extern void extract_actual_join_clauses(List *restrictinfo_list,
+ 										Relids joinrelids,
+ 										List **joinquals,
+ 										List **otherquals);
+-extern bool clause_is_computable_at(PlannerInfo *root,
+-									RestrictInfo *rinfo,
+-									Relids eval_relids);
+ extern bool join_clause_is_movable_to(RestrictInfo *rinfo, RelOptInfo *baserel);
+ extern bool join_clause_is_movable_into(RestrictInfo *rinfo,
+ 										Relids currentrelids,
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index 1fd75c8f5825..cd3db330d742 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -2568,6 +2568,27 @@ select * from onek t1
+          ->  Seq Scan on onek t4
+ (13 rows)
+ 
++explain (costs off)
++select * from int8_tbl t1 left join
++    (int8_tbl t2 left join int8_tbl t3 full join int8_tbl t4 on false on false)
++    left join int8_tbl t5 on t2.q1 = t5.q1
++on t2.q2 = 123;
++                    QUERY PLAN                    
++--------------------------------------------------
++ Nested Loop Left Join
++   ->  Seq Scan on int8_tbl t1
++   ->  Materialize
++         ->  Nested Loop Left Join
++               Join Filter: (t2.q1 = t5.q1)
++               ->  Nested Loop Left Join
++                     Join Filter: false
++                     ->  Seq Scan on int8_tbl t2
++                           Filter: (q2 = 123)
++                     ->  Result
++                           One-Time Filter: false
++               ->  Seq Scan on int8_tbl t5
++(12 rows)
++
+ --
+ -- check a case where we formerly got confused by conflicting sort orders
+ -- in redundant merge join path keys
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index 84547c7dffa1..ec7f81481c73 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -508,6 +508,12 @@ select * from onek t1
+     left join onek t3 on t2.unique1 = t3.unique1
+     left join onek t4 on t3.unique1 = t4.unique1 and t2.unique2 = t4.unique2;
+ 
++explain (costs off)
++select * from int8_tbl t1 left join
++    (int8_tbl t2 left join int8_tbl t3 full join int8_tbl t4 on false on false)
++    left join int8_tbl t5 on t2.q1 = t5.q1
++on t2.q2 = 123;
++
+ --
+ -- check a case where we formerly got confused by conflicting sort orders
+ -- in redundant merge join path keys

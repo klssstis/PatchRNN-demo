@@ -1,0 +1,420 @@
+From 705d433fd5e29ac173ef46a5acd4a2d7336f5573 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Thu, 8 Nov 2018 16:22:09 -0300
+Subject: [PATCH] Revise attribute handling code on partition creation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The original code to propagate NOT NULL and default expressions
+specified when creating a partition was mostly copy-pasted from
+typed-tables creation, but not being a great match it contained some
+duplicity, inefficiency and bugs.
+
+This commit fixes the bug that NOT NULL constraints declared in the
+parent table would not be honored in the partition.  One reported issue
+that is not fixed is that a DEFAULT declared in the child is not used
+when inserting through the parent.  That would amount to a behavioral
+change that's better not back-patched.
+
+This rewrite makes the code simpler:
+
+1. instead of checking for duplicate column names in its own block,
+reuse the original one that already did that;
+
+2. instead of concatenating the list of columns from parent and the one
+declared in the partition and scanning the result to (incorrectly)
+propagate defaults and not-null constraints, just scan the latter
+searching the former for a match, and merging sensibly.  This works
+because we know the list in the parent is already correct and there can
+only be one parent.
+
+This rewrite makes ColumnDef->is_from_parent unused, so it's removed
+on branch master; on released branches, it's kept as an unused field in
+order not to cause ABI incompatibilities.
+
+This commit also adds a test case for creating partitions with
+collations mismatching that on the parent table, something that is
+closely related to the code being patched.  No code change is introduced
+though, since that'd be a behavior change that could break some (broken)
+working applications.
+
+Amit Langote wrote a less invasive fix for the original
+NOT NULL/defaults bug, but while I kept the tests he added, I ended up
+not using his original code.  Ashutosh Bapat reviewed Amit's fix.  Amit
+reviewed mine.
+
+Author: Álvaro Herrera, Amit Langote
+Reviewed-by: Ashutosh Bapat, Amit Langote
+Reported-by: Jürgen Strobel (bug #15212)
+Discussion: https://postgr.es/m/152746742177.1291.9847032632907407358@wrigleys.postgresql.org
+---
+ src/backend/commands/sequence.c            |  1 -
+ src/backend/commands/tablecmds.c           | 99 ++++++++++------------
+ src/backend/nodes/copyfuncs.c              |  1 -
+ src/backend/nodes/equalfuncs.c             |  1 -
+ src/backend/nodes/makefuncs.c              |  1 -
+ src/backend/nodes/outfuncs.c               |  1 -
+ src/backend/parser/gram.y                  |  4 -
+ src/backend/parser/parse_utilcmd.c         |  2 -
+ src/include/nodes/parsenodes.h             |  1 -
+ src/test/regress/expected/create_table.out | 26 ++++++
+ src/test/regress/sql/create_table.sql      | 19 +++++
+ 11 files changed, 91 insertions(+), 65 deletions(-)
+
+diff --git a/src/backend/commands/sequence.c b/src/backend/commands/sequence.c
+index 89122d4ad756..6d89925b2372 100644
+--- a/src/backend/commands/sequence.c
++++ b/src/backend/commands/sequence.c
+@@ -172,7 +172,6 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
+ 		coldef->is_local = true;
+ 		coldef->is_not_null = true;
+ 		coldef->is_from_type = false;
+-		coldef->is_from_parent = false;
+ 		coldef->storage = 0;
+ 		coldef->raw_default = NULL;
+ 		coldef->cooked_default = NULL;
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index 6048334c7556..a0279ae38384 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -1892,17 +1892,6 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
+ 				 errmsg("tables can have at most %d columns",
+ 						MaxHeapAttributeNumber)));
+ 
+-	/*
+-	 * In case of a partition, there are no new column definitions, only dummy
+-	 * ColumnDefs created for column constraints.  We merge them with the
+-	 * constraints inherited from the parent.
+-	 */
+-	if (is_partition)
+-	{
+-		saved_schema = schema;
+-		schema = NIL;
+-	}
+-
+ 	/*
+ 	 * Check for duplicate names in the explicit list of attributes.
+ 	 *
+@@ -1916,17 +1905,19 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
+ 		ListCell   *rest = lnext(entry);
+ 		ListCell   *prev = entry;
+ 
+-		if (coldef->typeName == NULL)
+-
++		if (!is_partition && coldef->typeName == NULL)
++		{
+ 			/*
+ 			 * Typed table column option that does not belong to a column from
+ 			 * the type.  This works because the columns from the type come
+-			 * first in the list.
++			 * first in the list.  (We omit this check for partition column
++			 * lists; those are processed separately below.)
+ 			 */
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_UNDEFINED_COLUMN),
+ 					 errmsg("column \"%s\" does not exist",
+ 							coldef->colname)));
++		}
+ 
+ 		while (rest != NULL)
+ 		{
+@@ -1959,6 +1950,17 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
+ 		}
+ 	}
+ 
++	/*
++	 * In case of a partition, there are no new column definitions, only dummy
++	 * ColumnDefs created for column constraints.  Set them aside for now and
++	 * process them at the end.
++	 */
++	if (is_partition)
++	{
++		saved_schema = schema;
++		schema = NIL;
++	}
++
+ 	/*
+ 	 * Scan the parents left-to-right, and merge their attributes to form a
+ 	 * list of inherited attributes (inhSchema).  Also check to see if we need
+@@ -2175,7 +2177,6 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
+ 				def->is_local = false;
+ 				def->is_not_null = attribute->attnotnull;
+ 				def->is_from_type = false;
+-				def->is_from_parent = true;
+ 				def->storage = attribute->attstorage;
+ 				def->raw_default = NULL;
+ 				def->cooked_default = NULL;
+@@ -2428,59 +2429,51 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
+ 	/*
+ 	 * Now that we have the column definition list for a partition, we can
+ 	 * check whether the columns referenced in the column constraint specs
+-	 * actually exist.  Also, we merge the constraints into the corresponding
+-	 * column definitions.
++	 * actually exist.  Also, we merge NOT NULL and defaults into each
++	 * corresponding column definition.
+ 	 */
+-	if (is_partition && list_length(saved_schema) > 0)
++	if (is_partition)
+ 	{
+-		schema = list_concat(schema, saved_schema);
+-
+-		foreach(entry, schema)
++		foreach(entry, saved_schema)
+ 		{
+-			ColumnDef  *coldef = lfirst(entry);
+-			ListCell   *rest = lnext(entry);
+-			ListCell   *prev = entry;
++			ColumnDef  *restdef = lfirst(entry);
++			bool		found = false;
++			ListCell   *l;
+ 
+-			/*
+-			 * Partition column option that does not belong to a column from
+-			 * the parent.  This works because the columns from the parent
+-			 * come first in the list (see above).
+-			 */
+-			if (coldef->typeName == NULL)
+-				ereport(ERROR,
+-						(errcode(ERRCODE_UNDEFINED_COLUMN),
+-						 errmsg("column \"%s\" does not exist",
+-								coldef->colname)));
+-			while (rest != NULL)
++			foreach(l, schema)
+ 			{
+-				ColumnDef  *restdef = lfirst(rest);
+-				ListCell   *next = lnext(rest); /* need to save it in case we
+-												 * delete it */
++				ColumnDef  *coldef = lfirst(l);
+ 
+ 				if (strcmp(coldef->colname, restdef->colname) == 0)
+ 				{
++					found = true;
++					coldef->is_not_null |= restdef->is_not_null;
++
+ 					/*
+-					 * merge the column options into the column from the
+-					 * parent
++					 * Override the parent's default value for this column
++					 * (coldef->cooked_default) with the partition's local
++					 * definition (restdef->raw_default), if there's one. It
++					 * should be physically impossible to get a cooked default
++					 * in the local definition or a raw default in the
++					 * inherited definition, but make sure they're nulls, for
++					 * future-proofing.
+ 					 */
+-					if (coldef->is_from_parent)
++					Assert(restdef->cooked_default == NULL);
++					Assert(coldef->raw_default == NULL);
++					if (restdef->raw_default)
+ 					{
+-						coldef->is_not_null = restdef->is_not_null;
+ 						coldef->raw_default = restdef->raw_default;
+-						coldef->cooked_default = restdef->cooked_default;
+-						coldef->constraints = restdef->constraints;
+-						coldef->is_from_parent = false;
+-						list_delete_cell(schema, rest, prev);
++						coldef->cooked_default = NULL;
+ 					}
+-					else
+-						ereport(ERROR,
+-								(errcode(ERRCODE_DUPLICATE_COLUMN),
+-								 errmsg("column \"%s\" specified more than once",
+-										coldef->colname)));
+ 				}
+-				prev = rest;
+-				rest = next;
+ 			}
++
++			/* complain for constraints on columns not in parent */
++			if (!found)
++				ereport(ERROR,
++						(errcode(ERRCODE_UNDEFINED_COLUMN),
++						 errmsg("column \"%s\" does not exist",
++								restdef->colname)));
+ 		}
+ 	}
+ 
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index e8ea59e34afd..db4996840968 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -2873,7 +2873,6 @@ _copyColumnDef(const ColumnDef *from)
+ 	COPY_SCALAR_FIELD(is_local);
+ 	COPY_SCALAR_FIELD(is_not_null);
+ 	COPY_SCALAR_FIELD(is_from_type);
+-	COPY_SCALAR_FIELD(is_from_parent);
+ 	COPY_SCALAR_FIELD(storage);
+ 	COPY_NODE_FIELD(raw_default);
+ 	COPY_NODE_FIELD(cooked_default);
+diff --git a/src/backend/nodes/equalfuncs.c b/src/backend/nodes/equalfuncs.c
+index 3bb91c95958e..3a084b4d1f13 100644
+--- a/src/backend/nodes/equalfuncs.c
++++ b/src/backend/nodes/equalfuncs.c
+@@ -2553,7 +2553,6 @@ _equalColumnDef(const ColumnDef *a, const ColumnDef *b)
+ 	COMPARE_SCALAR_FIELD(is_local);
+ 	COMPARE_SCALAR_FIELD(is_not_null);
+ 	COMPARE_SCALAR_FIELD(is_from_type);
+-	COMPARE_SCALAR_FIELD(is_from_parent);
+ 	COMPARE_SCALAR_FIELD(storage);
+ 	COMPARE_NODE_FIELD(raw_default);
+ 	COMPARE_NODE_FIELD(cooked_default);
+diff --git a/src/backend/nodes/makefuncs.c b/src/backend/nodes/makefuncs.c
+index 1bd2599c2c58..4a2e669a864d 100644
+--- a/src/backend/nodes/makefuncs.c
++++ b/src/backend/nodes/makefuncs.c
+@@ -496,7 +496,6 @@ makeColumnDef(const char *colname, Oid typeOid, int32 typmod, Oid collOid)
+ 	n->is_local = true;
+ 	n->is_not_null = false;
+ 	n->is_from_type = false;
+-	n->is_from_parent = false;
+ 	n->storage = 0;
+ 	n->raw_default = NULL;
+ 	n->cooked_default = NULL;
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index 69731ccdea2e..f0c396530dff 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -2874,7 +2874,6 @@ _outColumnDef(StringInfo str, const ColumnDef *node)
+ 	WRITE_BOOL_FIELD(is_local);
+ 	WRITE_BOOL_FIELD(is_not_null);
+ 	WRITE_BOOL_FIELD(is_from_type);
+-	WRITE_BOOL_FIELD(is_from_parent);
+ 	WRITE_CHAR_FIELD(storage);
+ 	WRITE_NODE_FIELD(raw_default);
+ 	WRITE_NODE_FIELD(cooked_default);
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 6d23bfb0b35c..2effd511358a 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -3388,7 +3388,6 @@ columnDef:	ColId Typename create_generic_options ColQualList
+ 					n->is_local = true;
+ 					n->is_not_null = false;
+ 					n->is_from_type = false;
+-					n->is_from_parent = false;
+ 					n->storage = 0;
+ 					n->raw_default = NULL;
+ 					n->cooked_default = NULL;
+@@ -3410,7 +3409,6 @@ columnOptions:	ColId ColQualList
+ 					n->is_local = true;
+ 					n->is_not_null = false;
+ 					n->is_from_type = false;
+-					n->is_from_parent = false;
+ 					n->storage = 0;
+ 					n->raw_default = NULL;
+ 					n->cooked_default = NULL;
+@@ -3429,7 +3427,6 @@ columnOptions:	ColId ColQualList
+ 					n->is_local = true;
+ 					n->is_not_null = false;
+ 					n->is_from_type = false;
+-					n->is_from_parent = false;
+ 					n->storage = 0;
+ 					n->raw_default = NULL;
+ 					n->cooked_default = NULL;
+@@ -12267,7 +12264,6 @@ TableFuncElement:	ColId Typename opt_collate_clause
+ 					n->is_local = true;
+ 					n->is_not_null = false;
+ 					n->is_from_type = false;
+-					n->is_from_parent = false;
+ 					n->storage = 0;
+ 					n->raw_default = NULL;
+ 					n->cooked_default = NULL;
+diff --git a/src/backend/parser/parse_utilcmd.c b/src/backend/parser/parse_utilcmd.c
+index a6a2de94ea42..2e222d822b35 100644
+--- a/src/backend/parser/parse_utilcmd.c
++++ b/src/backend/parser/parse_utilcmd.c
+@@ -988,7 +988,6 @@ transformTableLikeClause(CreateStmtContext *cxt, TableLikeClause *table_like_cla
+ 		def->is_local = true;
+ 		def->is_not_null = attribute->attnotnull;
+ 		def->is_from_type = false;
+-		def->is_from_parent = false;
+ 		def->storage = 0;
+ 		def->raw_default = NULL;
+ 		def->cooked_default = NULL;
+@@ -1265,7 +1264,6 @@ transformOfType(CreateStmtContext *cxt, TypeName *ofTypename)
+ 		n->is_local = true;
+ 		n->is_not_null = false;
+ 		n->is_from_type = true;
+-		n->is_from_parent = false;
+ 		n->storage = 0;
+ 		n->raw_default = NULL;
+ 		n->cooked_default = NULL;
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index aa4a0dba2a64..9da8bf2f8870 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -649,7 +649,6 @@ typedef struct ColumnDef
+ 	bool		is_local;		/* column has local (non-inherited) def'n */
+ 	bool		is_not_null;	/* NOT NULL constraint specified? */
+ 	bool		is_from_type;	/* column definition came from table type */
+-	bool		is_from_parent; /* column def came from partition parent */
+ 	char		storage;		/* attstorage setting, or 0 for default */
+ 	Node	   *raw_default;	/* default value (untransformed parse tree) */
+ 	Node	   *cooked_default; /* default value (transformed expr tree) */
+diff --git a/src/test/regress/expected/create_table.out b/src/test/regress/expected/create_table.out
+index beb1acacc7f1..7b184330ed50 100644
+--- a/src/test/regress/expected/create_table.out
++++ b/src/test/regress/expected/create_table.out
+@@ -728,6 +728,32 @@ LINE 1: ...TITION OF parted FOR VALUES IN ('c') PARTITION BY RANGE (c);
+ CREATE TABLE part_c PARTITION OF parted (b WITH OPTIONS NOT NULL DEFAULT 0) FOR VALUES IN ('c') PARTITION BY RANGE ((b));
+ -- create a level-2 partition
+ CREATE TABLE part_c_1_10 PARTITION OF part_c FOR VALUES FROM (1) TO (10);
++-- check that NOT NULL and default value are inherited correctly
++create table parted_notnull_inh_test (a int default 1, b int not null default 0) partition by list (a);
++create table parted_notnull_inh_test1 partition of parted_notnull_inh_test (a not null, b default 1) for values in (1);
++insert into parted_notnull_inh_test (b) values (null);
++ERROR:  null value in column "b" violates not-null constraint
++DETAIL:  Failing row contains (1, null).
++-- note that while b's default is overriden, a's default is preserved
++\d parted_notnull_inh_test1
++      Table "public.parted_notnull_inh_test1"
++ Column |  Type   | Collation | Nullable | Default 
++--------+---------+-----------+----------+---------
++ a      | integer |           | not null | 1
++ b      | integer |           | not null | 1
++Partition of: parted_notnull_inh_test FOR VALUES IN (1)
++
++drop table parted_notnull_inh_test;
++-- check for a conflicting COLLATE clause
++create table parted_collate_must_match (a text collate "C", b text collate "C")
++  partition by range (a);
++-- on the partition key
++create table parted_collate_must_match1 partition of parted_collate_must_match
++  (a collate "POSIX") for values from ('a') to ('m');
++-- on another column
++create table parted_collate_must_match2 partition of parted_collate_must_match
++  (b collate "POSIX") for values from ('m') to ('z');
++drop table parted_collate_must_match;
+ -- Partition bound in describe output
+ \d+ part_b
+                                    Table "public.part_b"
+diff --git a/src/test/regress/sql/create_table.sql b/src/test/regress/sql/create_table.sql
+index da301c8b68b6..2af4455ecf8b 100644
+--- a/src/test/regress/sql/create_table.sql
++++ b/src/test/regress/sql/create_table.sql
+@@ -654,6 +654,25 @@ CREATE TABLE part_c PARTITION OF parted (b WITH OPTIONS NOT NULL DEFAULT 0) FOR
+ -- create a level-2 partition
+ CREATE TABLE part_c_1_10 PARTITION OF part_c FOR VALUES FROM (1) TO (10);
+ 
++-- check that NOT NULL and default value are inherited correctly
++create table parted_notnull_inh_test (a int default 1, b int not null default 0) partition by list (a);
++create table parted_notnull_inh_test1 partition of parted_notnull_inh_test (a not null, b default 1) for values in (1);
++insert into parted_notnull_inh_test (b) values (null);
++-- note that while b's default is overriden, a's default is preserved
++\d parted_notnull_inh_test1
++drop table parted_notnull_inh_test;
++
++-- check for a conflicting COLLATE clause
++create table parted_collate_must_match (a text collate "C", b text collate "C")
++  partition by range (a);
++-- on the partition key
++create table parted_collate_must_match1 partition of parted_collate_must_match
++  (a collate "POSIX") for values from ('a') to ('m');
++-- on another column
++create table parted_collate_must_match2 partition of parted_collate_must_match
++  (b collate "POSIX") for values from ('m') to ('z');
++drop table parted_collate_must_match;
++
+ -- Partition bound in describe output
+ \d+ part_b
+ 

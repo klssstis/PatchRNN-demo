@@ -1,0 +1,126 @@
+From 806fad7573e2b44de57888e3c04eab8eec4a69a8 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Tue, 25 Apr 2023 09:42:19 +0900
+Subject: [PATCH] Fix buffer refcount leak with FDW bulk inserts
+
+The leak would show up when using batch inserts with foreign tables
+included in a partition tree, as the slots used in the batch were not
+reset once processed.  In order to fix this problem, some
+ExecClearTuple() are added to clean up the slots used once a batch is
+filled and processed, mapping with the number of slots currently in use
+as tracked by the counter ri_NumSlots.
+
+This buffer refcount leak has been introduced in b676ac4 with the
+addition of the executor facility to improve bulk inserts for FDWs, so
+backpatch down to 14.
+
+Alexander has provided the patch (slightly modified by me).  The test
+for postgres_fdw comes from me, based on the test case that the author
+has sent in the report.
+
+Author: Alexander Pyhalov
+Discussion: https://postgr.es/m/b035780a740efd38dc30790c76927255@postgrespro.ru
+Backpatch-through: 14
+---
+ .../postgres_fdw/expected/postgres_fdw.out    | 22 +++++++++++++++++++
+ contrib/postgres_fdw/sql/postgres_fdw.sql     | 18 +++++++++++++++
+ src/backend/executor/nodeModifyTable.c        | 10 +++++++--
+ 3 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/contrib/postgres_fdw/expected/postgres_fdw.out b/contrib/postgres_fdw/expected/postgres_fdw.out
+index fd5752bd5bf3..826baac9f180 100644
+--- a/contrib/postgres_fdw/expected/postgres_fdw.out
++++ b/contrib/postgres_fdw/expected/postgres_fdw.out
+@@ -6930,6 +6930,28 @@ select * from grem1;
+ (2 rows)
+ 
+ delete from grem1;
++-- batch insert with foreign partitions.
++-- This schema uses two partitions, one local and one remote with a modulo
++-- to loop across all of them in batches.
++create table tab_batch_local (id int, data text);
++insert into tab_batch_local select i, 'test'|| i from generate_series(1, 45) i;
++create table tab_batch_sharded (id int, data text) partition by hash(id);
++create table tab_batch_sharded_p0 partition of tab_batch_sharded
++  for values with (modulus 2, remainder 0);
++create table tab_batch_sharded_p1_remote (id int, data text);
++create foreign table tab_batch_sharded_p1 partition of tab_batch_sharded
++  for values with (modulus 2, remainder 1)
++  server loopback options (table_name 'tab_batch_sharded_p1_remote');
++insert into tab_batch_sharded select * from tab_batch_local;
++select count(*) from tab_batch_sharded;
++ count 
++-------
++    45
++(1 row)
++
++drop table tab_batch_local;
++drop table tab_batch_sharded;
++drop table tab_batch_sharded_p1_remote;
+ alter server loopback options (drop batch_size);
+ -- ===================================================================
+ -- test local triggers
+diff --git a/contrib/postgres_fdw/sql/postgres_fdw.sql b/contrib/postgres_fdw/sql/postgres_fdw.sql
+index c05046f86763..15f3af6c293b 100644
+--- a/contrib/postgres_fdw/sql/postgres_fdw.sql
++++ b/contrib/postgres_fdw/sql/postgres_fdw.sql
+@@ -1657,6 +1657,24 @@ insert into grem1 (a) values (1), (2);
+ select * from gloc1;
+ select * from grem1;
+ delete from grem1;
++-- batch insert with foreign partitions.
++-- This schema uses two partitions, one local and one remote with a modulo
++-- to loop across all of them in batches.
++create table tab_batch_local (id int, data text);
++insert into tab_batch_local select i, 'test'|| i from generate_series(1, 45) i;
++create table tab_batch_sharded (id int, data text) partition by hash(id);
++create table tab_batch_sharded_p0 partition of tab_batch_sharded
++  for values with (modulus 2, remainder 0);
++create table tab_batch_sharded_p1_remote (id int, data text);
++create foreign table tab_batch_sharded_p1 partition of tab_batch_sharded
++  for values with (modulus 2, remainder 1)
++  server loopback options (table_name 'tab_batch_sharded_p1_remote');
++insert into tab_batch_sharded select * from tab_batch_local;
++select count(*) from tab_batch_sharded;
++drop table tab_batch_local;
++drop table tab_batch_sharded;
++drop table tab_batch_sharded_p1_remote;
++
+ alter server loopback options (drop batch_size);
+ 
+ -- ===================================================================
+diff --git a/src/backend/executor/nodeModifyTable.c b/src/backend/executor/nodeModifyTable.c
+index 6aa8c03defb9..dc1a2ec551a7 100644
+--- a/src/backend/executor/nodeModifyTable.c
++++ b/src/backend/executor/nodeModifyTable.c
+@@ -856,7 +856,6 @@ ExecInsert(ModifyTableContext *context,
+ 								resultRelInfo->ri_PlanSlots,
+ 								resultRelInfo->ri_NumSlots,
+ 								estate, canSetTag);
+-				resultRelInfo->ri_NumSlots = 0;
+ 				flushed = true;
+ 			}
+ 
+@@ -1261,6 +1260,14 @@ ExecBatchInsert(ModifyTableState *mtstate,
+ 
+ 	if (canSetTag && numInserted > 0)
+ 		estate->es_processed += numInserted;
++
++	/* Clean up all the slots, ready for the next batch */
++	for (i = 0; i < numSlots; i++)
++	{
++		ExecClearTuple(slots[i]);
++		ExecClearTuple(planSlots[i]);
++	}
++	resultRelInfo->ri_NumSlots = 0;
+ }
+ 
+ /*
+@@ -1284,7 +1291,6 @@ ExecPendingInserts(EState *estate)
+ 						resultRelInfo->ri_PlanSlots,
+ 						resultRelInfo->ri_NumSlots,
+ 						estate, mtstate->canSetTag);
+-		resultRelInfo->ri_NumSlots = 0;
+ 	}
+ 
+ 	list_free(estate->es_insert_pending_result_relations);

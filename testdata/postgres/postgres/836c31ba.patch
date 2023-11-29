@@ -1,0 +1,70 @@
+From 836c31ba508c154bc4c4ebb6270761586a6df797 Mon Sep 17 00:00:00 2001
+From: David Rowley <drowley@postgresql.org>
+Date: Mon, 13 Feb 2023 17:11:03 +1300
+Subject: [PATCH] Disable WindowAgg inverse transitions when subplans are
+ present
+
+When an aggregate function is used as a WindowFunc and a tuple transitions
+out of the window frame, we ordinarily try to make use of the aggregate
+function's inverse transition function to "unaggregate" the exiting tuple.
+
+This optimization is disabled for various cases, including when the
+aggregate contains a volatile function.  In such a case we'd be unable to
+ensure that the transition value was calculated to the same value during
+transitions and inverse transitions.  Unfortunately, we did this check by
+calling contain_volatile_functions() which does not recursively search
+SubPlans for volatile functions.  If the aggregate function's arguments or
+its FILTER clause contained a subplan with volatile functions then we'd
+fail to notice this.
+
+Here we fix this by just disabling the optimization when the WindowFunc
+contains any subplans.  Volatile functions are not the only reason that a
+subplan may have nonrepeatable results.
+
+Bug: #17777
+Reported-by: Anban Company
+Discussion: https://postgr.es/m/17777-860b739b6efde977%40postgresql.org
+Reviewed-by: Tom Lane
+Backpatch-through: 11
+---
+ src/backend/executor/nodeWindowAgg.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/executor/nodeWindowAgg.c b/src/backend/executor/nodeWindowAgg.c
+index d61d57e9a87c..7c07fb068480 100644
+--- a/src/backend/executor/nodeWindowAgg.c
++++ b/src/backend/executor/nodeWindowAgg.c
+@@ -41,6 +41,7 @@
+ #include "executor/nodeWindowAgg.h"
+ #include "miscadmin.h"
+ #include "nodes/nodeFuncs.h"
++#include "optimizer/clauses.h"
+ #include "optimizer/optimizer.h"
+ #include "parser/parse_agg.h"
+ #include "parser/parse_coerce.h"
+@@ -2803,16 +2804,24 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
+ 	 * aggregate's arguments (and FILTER clause if any) contain any calls to
+ 	 * volatile functions.  Otherwise, the difference between restarting and
+ 	 * not restarting the aggregation would be user-visible.
++	 *
++	 * We also don't risk using moving aggregates when there are subplans in
++	 * the arguments or FILTER clause.  This is partly because
++	 * contain_volatile_functions() doesn't look inside subplans; but there
++	 * are other reasons why a subplan's output might be volatile.  For
++	 * example, syncscan mode can render the results nonrepeatable.
+ 	 */
+ 	if (!OidIsValid(aggform->aggminvtransfn))
+ 		use_ma_code = false;	/* sine qua non */
+ 	else if (aggform->aggmfinalmodify == AGGMODIFY_READ_ONLY &&
+-			 aggform->aggfinalmodify != AGGMODIFY_READ_ONLY)
++		aggform->aggfinalmodify != AGGMODIFY_READ_ONLY)
+ 		use_ma_code = true;		/* decision forced by safety */
+ 	else if (winstate->frameOptions & FRAMEOPTION_START_UNBOUNDED_PRECEDING)
+ 		use_ma_code = false;	/* non-moving frame head */
+ 	else if (contain_volatile_functions((Node *) wfunc))
+ 		use_ma_code = false;	/* avoid possible behavioral change */
++	else if (contain_subplans((Node *) wfunc))
++		use_ma_code = false;	/* subplans might contain volatile functions */
+ 	else
+ 		use_ma_code = true;		/* yes, let's use it */
+ 	if (use_ma_code)

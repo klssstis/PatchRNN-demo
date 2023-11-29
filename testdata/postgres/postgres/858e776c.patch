@@ -1,0 +1,1311 @@
+From 858e776c84f48841e7e16fba7b690b76e54f3675 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 27 Dec 2022 12:26:01 -0500
+Subject: [PATCH] Convert the reg* input functions to report (most) errors
+ softly.
+
+This is not really complete, but it catches most cases of practical
+interest.  The main omissions are:
+
+* regtype, regprocedure, and regoperator parse type names by
+calling the main grammar, so any grammar-detected syntax error
+will still be a hard error.  Also, if one includes a type
+modifier in such a type specification, errors detected by the
+typmodin function will be hard errors.
+
+* Lookup errors are handled just by passing missing_ok = true
+to the relevant catalog lookup function.  Because we've used
+quite a restrictive definition of "missing_ok", this means that
+edge cases such as "the named schema exists, but you lack
+USAGE permission on it" are still hard errors.
+
+It would make sense to me to replace most/all missing_ok
+parameters with an escontext parameter and then allow these
+additional lookup failure cases to be trapped too.  But that's
+a job for some other day.
+
+Discussion: https://postgr.es/m/3342239.1671988406@sss.pgh.pa.us
+---
+ src/backend/catalog/objectaddress.c   |   5 +-
+ src/backend/parser/parse_type.c       |  50 +++--
+ src/backend/tsearch/dict_thesaurus.c  |   4 +-
+ src/backend/utils/adt/misc.c          |   2 +-
+ src/backend/utils/adt/regproc.c       | 269 ++++++++++++++++++--------
+ src/backend/utils/adt/tsvector_op.c   |   2 +-
+ src/backend/utils/cache/ts_cache.c    |  31 ++-
+ src/backend/utils/fmgr/funcapi.c      |   2 +-
+ src/include/parser/parse_type.h       |   5 +-
+ src/include/utils/regproc.h           |   2 +-
+ src/pl/plperl/plperl.c                |   2 +-
+ src/pl/plpgsql/src/pl_gram.y          |   2 +-
+ src/pl/plpython/plpy_spi.c            |   2 +-
+ src/pl/tcl/pltcl.c                    |   5 +-
+ src/test/regress/expected/regproc.out | 125 +++++++++++-
+ src/test/regress/sql/regproc.sql      |  23 +++
+ 16 files changed, 403 insertions(+), 128 deletions(-)
+
+diff --git a/src/backend/catalog/objectaddress.c b/src/backend/catalog/objectaddress.c
+index 109bdfb33f62..a1df8b1ddcd6 100644
+--- a/src/backend/catalog/objectaddress.c
++++ b/src/backend/catalog/objectaddress.c
+@@ -2182,7 +2182,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+ 					 errmsg("name or argument lists may not contain nulls")));
+-		typename = typeStringToTypeName(TextDatumGetCString(elems[0]));
++		typename = typeStringToTypeName(TextDatumGetCString(elems[0]), NULL);
+ 	}
+ 	else if (type == OBJECT_LARGEOBJECT)
+ 	{
+@@ -2238,7 +2238,8 @@ pg_get_object_address(PG_FUNCTION_ARGS)
+ 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+ 						 errmsg("name or argument lists may not contain nulls")));
+ 			args = lappend(args,
+-						   typeStringToTypeName(TextDatumGetCString(elems[i])));
++						   typeStringToTypeName(TextDatumGetCString(elems[i]),
++												NULL));
+ 		}
+ 	}
+ 	else
+diff --git a/src/backend/parser/parse_type.c b/src/backend/parser/parse_type.c
+index f7ad6894596e..8f3850aa4e85 100644
+--- a/src/backend/parser/parse_type.c
++++ b/src/backend/parser/parse_type.c
+@@ -727,10 +727,15 @@ pts_error_callback(void *arg)
+  * Given a string that is supposed to be a SQL-compatible type declaration,
+  * such as "int4" or "integer" or "character varying(32)", parse
+  * the string and return the result as a TypeName.
+- * If the string cannot be parsed as a type, an error is raised.
++ *
++ * If the string cannot be parsed as a type, an error is raised,
++ * unless escontext is an ErrorSaveContext node, in which case we may
++ * fill that and return NULL.  But note that the ErrorSaveContext option
++ * is mostly aspirational at present: errors detected by the main
++ * grammar, rather than here, will still be thrown.
+  */
+ TypeName *
+-typeStringToTypeName(const char *str)
++typeStringToTypeName(const char *str, Node *escontext)
+ {
+ 	List	   *raw_parsetree_list;
+ 	TypeName   *typeName;
+@@ -763,49 +768,54 @@ typeStringToTypeName(const char *str)
+ 	return typeName;
+ 
+ fail:
+-	ereport(ERROR,
++	ereturn(escontext, NULL,
+ 			(errcode(ERRCODE_SYNTAX_ERROR),
+ 			 errmsg("invalid type name \"%s\"", str)));
+-	return NULL;				/* keep compiler quiet */
+ }
+ 
+ /*
+  * Given a string that is supposed to be a SQL-compatible type declaration,
+  * such as "int4" or "integer" or "character varying(32)", parse
+  * the string and convert it to a type OID and type modifier.
+- * If missing_ok is true, InvalidOid is returned rather than raising an error
+- * when the type name is not found.
++ *
++ * If escontext is an ErrorSaveContext node, then errors are reported by
++ * filling escontext and returning false, instead of throwing them.
+  */
+-void
+-parseTypeString(const char *str, Oid *typeid_p, int32 *typmod_p, bool missing_ok)
++bool
++parseTypeString(const char *str, Oid *typeid_p, int32 *typmod_p,
++				Node *escontext)
+ {
+ 	TypeName   *typeName;
+ 	Type		tup;
+ 
+-	typeName = typeStringToTypeName(str);
++	typeName = typeStringToTypeName(str, escontext);
++	if (typeName == NULL)
++		return false;
+ 
+-	tup = LookupTypeName(NULL, typeName, typmod_p, missing_ok);
++	tup = LookupTypeName(NULL, typeName, typmod_p,
++						 (escontext && IsA(escontext, ErrorSaveContext)));
+ 	if (tup == NULL)
+ 	{
+-		if (!missing_ok)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_UNDEFINED_OBJECT),
+-					 errmsg("type \"%s\" does not exist",
+-							TypeNameToString(typeName)),
+-					 parser_errposition(NULL, typeName->location)));
+-		*typeid_p = InvalidOid;
++		ereturn(escontext, false,
++				(errcode(ERRCODE_UNDEFINED_OBJECT),
++				 errmsg("type \"%s\" does not exist",
++						TypeNameToString(typeName))));
+ 	}
+ 	else
+ 	{
+ 		Form_pg_type typ = (Form_pg_type) GETSTRUCT(tup);
+ 
+ 		if (!typ->typisdefined)
+-			ereport(ERROR,
++		{
++			ReleaseSysCache(tup);
++			ereturn(escontext, false,
+ 					(errcode(ERRCODE_UNDEFINED_OBJECT),
+ 					 errmsg("type \"%s\" is only a shell",
+-							TypeNameToString(typeName)),
+-					 parser_errposition(NULL, typeName->location)));
++							TypeNameToString(typeName))));
++		}
+ 		*typeid_p = typ->oid;
+ 		ReleaseSysCache(tup);
+ 	}
++
++	return true;
+ }
+diff --git a/src/backend/tsearch/dict_thesaurus.c b/src/backend/tsearch/dict_thesaurus.c
+index b8c08bcf7ba5..3df29e3345bd 100644
+--- a/src/backend/tsearch/dict_thesaurus.c
++++ b/src/backend/tsearch/dict_thesaurus.c
+@@ -599,6 +599,7 @@ thesaurus_init(PG_FUNCTION_ARGS)
+ 	DictThesaurus *d;
+ 	char	   *subdictname = NULL;
+ 	bool		fileloaded = false;
++	List	   *namelist;
+ 	ListCell   *l;
+ 
+ 	d = (DictThesaurus *) palloc0(sizeof(DictThesaurus));
+@@ -642,7 +643,8 @@ thesaurus_init(PG_FUNCTION_ARGS)
+ 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+ 				 errmsg("missing Dictionary parameter")));
+ 
+-	d->subdictOid = get_ts_dict_oid(stringToQualifiedNameList(subdictname), false);
++	namelist = stringToQualifiedNameList(subdictname, NULL);
++	d->subdictOid = get_ts_dict_oid(namelist, false);
+ 	d->subdict = lookup_ts_dictionary_cache(d->subdictOid);
+ 
+ 	compileTheLexeme(d);
+diff --git a/src/backend/utils/adt/misc.c b/src/backend/utils/adt/misc.c
+index 7808fbd44862..40ac4d4c3420 100644
+--- a/src/backend/utils/adt/misc.c
++++ b/src/backend/utils/adt/misc.c
+@@ -724,7 +724,7 @@ pg_input_is_valid_common(FunctionCallInfo fcinfo,
+ 		Oid			typoid;
+ 
+ 		/* Parse type-name argument to obtain type OID and encoded typmod. */
+-		parseTypeString(typnamestr, &typoid, &my_extra->typmod, false);
++		(void) parseTypeString(typnamestr, &typoid, &my_extra->typmod, NULL);
+ 
+ 		/* Update type-specific info if typoid changed. */
+ 		if (my_extra->typoid != typoid)
+diff --git a/src/backend/utils/adt/regproc.c b/src/backend/utils/adt/regproc.c
+index a6d695d6cbfa..14d76c856d79 100644
+--- a/src/backend/utils/adt/regproc.c
++++ b/src/backend/utils/adt/regproc.c
+@@ -31,7 +31,9 @@
+ #include "catalog/pg_ts_dict.h"
+ #include "catalog/pg_type.h"
+ #include "lib/stringinfo.h"
++#include "mb/pg_wchar.h"
+ #include "miscadmin.h"
++#include "nodes/miscnodes.h"
+ #include "parser/parse_type.h"
+ #include "parser/scansup.h"
+ #include "utils/acl.h"
+@@ -43,8 +45,9 @@
+ 
+ static bool parseNumericOid(char *string, Oid *result, Node *escontext);
+ static bool parseDashOrOid(char *string, Oid *result, Node *escontext);
+-static void parseNameAndArgTypes(const char *string, bool allowNone,
+-								 List **names, int *nargs, Oid *argtypes);
++static bool parseNameAndArgTypes(const char *string, bool allowNone,
++								 List **names, int *nargs, Oid *argtypes,
++								 Node *escontext);
+ 
+ 
+ /*****************************************************************************
+@@ -63,12 +66,13 @@ Datum
+ regprocin(PG_FUNCTION_ARGS)
+ {
+ 	char	   *pro_name_or_oid = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	RegProcedure result;
+ 	List	   *names;
+ 	FuncCandidateList clist;
+ 
+ 	/* Handle "-" or numeric OID */
+-	if (parseDashOrOid(pro_name_or_oid, &result, fcinfo->context))
++	if (parseDashOrOid(pro_name_or_oid, &result, escontext))
+ 		PG_RETURN_OID(result);
+ 
+ 	/* Else it's a name, possibly schema-qualified */
+@@ -84,15 +88,18 @@ regprocin(PG_FUNCTION_ARGS)
+ 	 * Normal case: parse the name into components and see if it matches any
+ 	 * pg_proc entries in the current search path.
+ 	 */
+-	names = stringToQualifiedNameList(pro_name_or_oid);
+-	clist = FuncnameGetCandidates(names, -1, NIL, false, false, false, false);
++	names = stringToQualifiedNameList(pro_name_or_oid, escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
++
++	clist = FuncnameGetCandidates(names, -1, NIL, false, false, false, true);
+ 
+ 	if (clist == NULL)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+ 				 errmsg("function \"%s\" does not exist", pro_name_or_oid)));
+ 	else if (clist->next != NULL)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+ 				 errmsg("more than one function named \"%s\"",
+ 						pro_name_or_oid)));
+@@ -113,12 +120,16 @@ to_regproc(PG_FUNCTION_ARGS)
+ 	char	   *pro_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+ 	List	   *names;
+ 	FuncCandidateList clist;
++	ErrorSaveContext escontext = {T_ErrorSaveContext};
+ 
+ 	/*
+ 	 * Parse the name into components and see if it matches any pg_proc
+ 	 * entries in the current search path.
+ 	 */
+-	names = stringToQualifiedNameList(pro_name);
++	names = stringToQualifiedNameList(pro_name, (Node *) &escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
++
+ 	clist = FuncnameGetCandidates(names, -1, NIL, false, false, false, true);
+ 
+ 	if (clist == NULL || clist->next != NULL)
+@@ -222,6 +233,7 @@ Datum
+ regprocedurein(PG_FUNCTION_ARGS)
+ {
+ 	char	   *pro_name_or_oid = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	RegProcedure result;
+ 	List	   *names;
+ 	int			nargs;
+@@ -229,7 +241,7 @@ regprocedurein(PG_FUNCTION_ARGS)
+ 	FuncCandidateList clist;
+ 
+ 	/* Handle "-" or numeric OID */
+-	if (parseDashOrOid(pro_name_or_oid, &result, fcinfo->context))
++	if (parseDashOrOid(pro_name_or_oid, &result, escontext))
+ 		PG_RETURN_OID(result);
+ 
+ 	/* The rest of this wouldn't work in bootstrap mode */
+@@ -242,10 +254,13 @@ regprocedurein(PG_FUNCTION_ARGS)
+ 	 * which one exactly matches the given argument types.  (There will not be
+ 	 * more than one match.)
+ 	 */
+-	parseNameAndArgTypes(pro_name_or_oid, false, &names, &nargs, argtypes);
++	if (!parseNameAndArgTypes(pro_name_or_oid, false,
++							  &names, &nargs, argtypes,
++							  escontext))
++		PG_RETURN_NULL();
+ 
+ 	clist = FuncnameGetCandidates(names, nargs, NIL, false, false,
+-								  false, false);
++								  false, true);
+ 
+ 	for (; clist; clist = clist->next)
+ 	{
+@@ -254,7 +269,7 @@ regprocedurein(PG_FUNCTION_ARGS)
+ 	}
+ 
+ 	if (clist == NULL)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+ 				 errmsg("function \"%s\" does not exist", pro_name_or_oid)));
+ 
+@@ -276,13 +291,17 @@ to_regprocedure(PG_FUNCTION_ARGS)
+ 	int			nargs;
+ 	Oid			argtypes[FUNC_MAX_ARGS];
+ 	FuncCandidateList clist;
++	ErrorSaveContext escontext = {T_ErrorSaveContext};
+ 
+ 	/*
+ 	 * Parse the name and arguments, look up potential matches in the current
+ 	 * namespace search list, and scan to see which one exactly matches the
+ 	 * given argument types.    (There will not be more than one match.)
+ 	 */
+-	parseNameAndArgTypes(pro_name, false, &names, &nargs, argtypes);
++	if (!parseNameAndArgTypes(pro_name, false,
++							  &names, &nargs, argtypes,
++							  (Node *) &escontext))
++		PG_RETURN_NULL();
+ 
+ 	clist = FuncnameGetCandidates(names, nargs, NIL, false, false, false, true);
+ 
+@@ -484,12 +503,13 @@ Datum
+ regoperin(PG_FUNCTION_ARGS)
+ {
+ 	char	   *opr_name_or_oid = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	Oid			result;
+ 	List	   *names;
+ 	FuncCandidateList clist;
+ 
+ 	/* Handle "0" or numeric OID */
+-	if (parseNumericOid(opr_name_or_oid, &result, fcinfo->context))
++	if (parseNumericOid(opr_name_or_oid, &result, escontext))
+ 		PG_RETURN_OID(result);
+ 
+ 	/* Else it's a name, possibly schema-qualified */
+@@ -502,15 +522,18 @@ regoperin(PG_FUNCTION_ARGS)
+ 	 * Normal case: parse the name into components and see if it matches any
+ 	 * pg_operator entries in the current search path.
+ 	 */
+-	names = stringToQualifiedNameList(opr_name_or_oid);
+-	clist = OpernameGetCandidates(names, '\0', false);
++	names = stringToQualifiedNameList(opr_name_or_oid, escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
++
++	clist = OpernameGetCandidates(names, '\0', true);
+ 
+ 	if (clist == NULL)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+ 				 errmsg("operator does not exist: %s", opr_name_or_oid)));
+ 	else if (clist->next != NULL)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+ 				 errmsg("more than one operator named %s",
+ 						opr_name_or_oid)));
+@@ -531,12 +554,16 @@ to_regoper(PG_FUNCTION_ARGS)
+ 	char	   *opr_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+ 	List	   *names;
+ 	FuncCandidateList clist;
++	ErrorSaveContext escontext = {T_ErrorSaveContext};
+ 
+ 	/*
+ 	 * Parse the name into components and see if it matches any pg_operator
+ 	 * entries in the current search path.
+ 	 */
+-	names = stringToQualifiedNameList(opr_name);
++	names = stringToQualifiedNameList(opr_name, (Node *) &escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
++
+ 	clist = OpernameGetCandidates(names, '\0', true);
+ 
+ 	if (clist == NULL || clist->next != NULL)
+@@ -646,13 +673,14 @@ Datum
+ regoperatorin(PG_FUNCTION_ARGS)
+ {
+ 	char	   *opr_name_or_oid = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	Oid			result;
+ 	List	   *names;
+ 	int			nargs;
+ 	Oid			argtypes[FUNC_MAX_ARGS];
+ 
+ 	/* Handle "0" or numeric OID */
+-	if (parseNumericOid(opr_name_or_oid, &result, fcinfo->context))
++	if (parseNumericOid(opr_name_or_oid, &result, escontext))
+ 		PG_RETURN_OID(result);
+ 
+ 	/* The rest of this wouldn't work in bootstrap mode */
+@@ -665,14 +693,18 @@ regoperatorin(PG_FUNCTION_ARGS)
+ 	 * which one exactly matches the given argument types.  (There will not be
+ 	 * more than one match.)
+ 	 */
+-	parseNameAndArgTypes(opr_name_or_oid, true, &names, &nargs, argtypes);
++	if (!parseNameAndArgTypes(opr_name_or_oid, true,
++							  &names, &nargs, argtypes,
++							  escontext))
++		PG_RETURN_NULL();
++
+ 	if (nargs == 1)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_UNDEFINED_PARAMETER),
+ 				 errmsg("missing argument"),
+ 				 errhint("Use NONE to denote the missing argument of a unary operator.")));
+ 	if (nargs != 2)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+ 				 errmsg("too many arguments"),
+ 				 errhint("Provide two argument types for operator.")));
+@@ -680,7 +712,7 @@ regoperatorin(PG_FUNCTION_ARGS)
+ 	result = OpernameGetOprid(names, argtypes[0], argtypes[1]);
+ 
+ 	if (!OidIsValid(result))
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+ 				 errmsg("operator does not exist: %s", opr_name_or_oid)));
+ 
+@@ -700,23 +732,20 @@ to_regoperator(PG_FUNCTION_ARGS)
+ 	List	   *names;
+ 	int			nargs;
+ 	Oid			argtypes[FUNC_MAX_ARGS];
++	ErrorSaveContext escontext = {T_ErrorSaveContext};
+ 
+ 	/*
+ 	 * Parse the name and arguments, look up potential matches in the current
+ 	 * namespace search list, and scan to see which one exactly matches the
+ 	 * given argument types.    (There will not be more than one match.)
+ 	 */
+-	parseNameAndArgTypes(opr_name_or_oid, true, &names, &nargs, argtypes);
+-	if (nargs == 1)
+-		ereport(ERROR,
+-				(errcode(ERRCODE_UNDEFINED_PARAMETER),
+-				 errmsg("missing argument"),
+-				 errhint("Use NONE to denote the missing argument of a unary operator.")));
++	if (!parseNameAndArgTypes(opr_name_or_oid, true,
++							  &names, &nargs, argtypes,
++							  (Node *) &escontext))
++		PG_RETURN_NULL();
++
+ 	if (nargs != 2)
+-		ereport(ERROR,
+-				(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+-				 errmsg("too many arguments"),
+-				 errhint("Provide two argument types for operator.")));
++		PG_RETURN_NULL();
+ 
+ 	result = OpernameGetOprid(names, argtypes[0], argtypes[1]);
+ 
+@@ -903,11 +932,12 @@ Datum
+ regclassin(PG_FUNCTION_ARGS)
+ {
+ 	char	   *class_name_or_oid = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	Oid			result;
+ 	List	   *names;
+ 
+ 	/* Handle "-" or numeric OID */
+-	if (parseDashOrOid(class_name_or_oid, &result, fcinfo->context))
++	if (parseDashOrOid(class_name_or_oid, &result, escontext))
+ 		PG_RETURN_OID(result);
+ 
+ 	/* Else it's a name, possibly schema-qualified */
+@@ -920,10 +950,18 @@ regclassin(PG_FUNCTION_ARGS)
+ 	 * Normal case: parse the name into components and see if it matches any
+ 	 * pg_class entries in the current search path.
+ 	 */
+-	names = stringToQualifiedNameList(class_name_or_oid);
++	names = stringToQualifiedNameList(class_name_or_oid, escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
+ 
+ 	/* We might not even have permissions on this relation; don't lock it. */
+-	result = RangeVarGetRelid(makeRangeVarFromNameList(names), NoLock, false);
++	result = RangeVarGetRelid(makeRangeVarFromNameList(names), NoLock, true);
++
++	if (!OidIsValid(result))
++		ereturn(escontext, (Datum) 0,
++				(errcode(ERRCODE_UNDEFINED_TABLE),
++				 errmsg("relation \"%s\" does not exist",
++						NameListToString(names))));
+ 
+ 	PG_RETURN_OID(result);
+ }
+@@ -939,12 +977,15 @@ to_regclass(PG_FUNCTION_ARGS)
+ 	char	   *class_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+ 	Oid			result;
+ 	List	   *names;
++	ErrorSaveContext escontext = {T_ErrorSaveContext};
+ 
+ 	/*
+ 	 * Parse the name into components and see if it matches any pg_class
+ 	 * entries in the current search path.
+ 	 */
+-	names = stringToQualifiedNameList(class_name);
++	names = stringToQualifiedNameList(class_name, (Node *) &escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
+ 
+ 	/* We might not even have permissions on this relation; don't lock it. */
+ 	result = RangeVarGetRelid(makeRangeVarFromNameList(names), NoLock, true);
+@@ -1045,11 +1086,12 @@ Datum
+ regcollationin(PG_FUNCTION_ARGS)
+ {
+ 	char	   *collation_name_or_oid = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	Oid			result;
+ 	List	   *names;
+ 
+ 	/* Handle "-" or numeric OID */
+-	if (parseDashOrOid(collation_name_or_oid, &result, fcinfo->context))
++	if (parseDashOrOid(collation_name_or_oid, &result, escontext))
+ 		PG_RETURN_OID(result);
+ 
+ 	/* Else it's a name, possibly schema-qualified */
+@@ -1062,9 +1104,17 @@ regcollationin(PG_FUNCTION_ARGS)
+ 	 * Normal case: parse the name into components and see if it matches any
+ 	 * pg_collation entries in the current search path.
+ 	 */
+-	names = stringToQualifiedNameList(collation_name_or_oid);
++	names = stringToQualifiedNameList(collation_name_or_oid, escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
++
++	result = get_collation_oid(names, true);
+ 
+-	result = get_collation_oid(names, false);
++	if (!OidIsValid(result))
++		ereturn(escontext, (Datum) 0,
++				(errcode(ERRCODE_UNDEFINED_OBJECT),
++				 errmsg("collation \"%s\" for encoding \"%s\" does not exist",
++						NameListToString(names), GetDatabaseEncodingName())));
+ 
+ 	PG_RETURN_OID(result);
+ }
+@@ -1080,12 +1130,15 @@ to_regcollation(PG_FUNCTION_ARGS)
+ 	char	   *collation_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+ 	Oid			result;
+ 	List	   *names;
++	ErrorSaveContext escontext = {T_ErrorSaveContext};
+ 
+ 	/*
+ 	 * Parse the name into components and see if it matches any pg_collation
+ 	 * entries in the current search path.
+ 	 */
+-	names = stringToQualifiedNameList(collation_name);
++	names = stringToQualifiedNameList(collation_name, (Node *) &escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
+ 
+ 	result = get_collation_oid(names, true);
+ 
+@@ -1192,11 +1245,12 @@ Datum
+ regtypein(PG_FUNCTION_ARGS)
+ {
+ 	char	   *typ_name_or_oid = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	Oid			result;
+ 	int32		typmod;
+ 
+ 	/* Handle "-" or numeric OID */
+-	if (parseDashOrOid(typ_name_or_oid, &result, fcinfo->context))
++	if (parseDashOrOid(typ_name_or_oid, &result, escontext))
+ 		PG_RETURN_OID(result);
+ 
+ 	/* Else it's a type name, possibly schema-qualified or decorated */
+@@ -1207,9 +1261,10 @@ regtypein(PG_FUNCTION_ARGS)
+ 
+ 	/*
+ 	 * Normal case: invoke the full parser to deal with special cases such as
+-	 * array syntax.
++	 * array syntax.  We don't need to check for parseTypeString failure,
++	 * since we'll just return anyway.
+ 	 */
+-	parseTypeString(typ_name_or_oid, &result, &typmod, false);
++	(void) parseTypeString(typ_name_or_oid, &result, &typmod, escontext);
+ 
+ 	PG_RETURN_OID(result);
+ }
+@@ -1225,13 +1280,12 @@ to_regtype(PG_FUNCTION_ARGS)
+ 	char	   *typ_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+ 	Oid			result;
+ 	int32		typmod;
++	ErrorSaveContext escontext = {T_ErrorSaveContext};
+ 
+ 	/*
+ 	 * Invoke the full parser to deal with special cases such as array syntax.
+ 	 */
+-	parseTypeString(typ_name, &result, &typmod, true);
+-
+-	if (OidIsValid(result))
++	if (parseTypeString(typ_name, &result, &typmod, (Node *) &escontext))
+ 		PG_RETURN_OID(result);
+ 	else
+ 		PG_RETURN_NULL();
+@@ -1318,11 +1372,12 @@ Datum
+ regconfigin(PG_FUNCTION_ARGS)
+ {
+ 	char	   *cfg_name_or_oid = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	Oid			result;
+ 	List	   *names;
+ 
+ 	/* Handle "-" or numeric OID */
+-	if (parseDashOrOid(cfg_name_or_oid, &result, fcinfo->context))
++	if (parseDashOrOid(cfg_name_or_oid, &result, escontext))
+ 		PG_RETURN_OID(result);
+ 
+ 	/* The rest of this wouldn't work in bootstrap mode */
+@@ -1333,9 +1388,17 @@ regconfigin(PG_FUNCTION_ARGS)
+ 	 * Normal case: parse the name into components and see if it matches any
+ 	 * pg_ts_config entries in the current search path.
+ 	 */
+-	names = stringToQualifiedNameList(cfg_name_or_oid);
++	names = stringToQualifiedNameList(cfg_name_or_oid, escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
+ 
+-	result = get_ts_config_oid(names, false);
++	result = get_ts_config_oid(names, true);
++
++	if (!OidIsValid(result))
++		ereturn(escontext, (Datum) 0,
++				(errcode(ERRCODE_UNDEFINED_OBJECT),
++				 errmsg("text search configuration \"%s\" does not exist",
++						NameListToString(names))));
+ 
+ 	PG_RETURN_OID(result);
+ }
+@@ -1419,11 +1482,12 @@ Datum
+ regdictionaryin(PG_FUNCTION_ARGS)
+ {
+ 	char	   *dict_name_or_oid = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	Oid			result;
+ 	List	   *names;
+ 
+ 	/* Handle "-" or numeric OID */
+-	if (parseDashOrOid(dict_name_or_oid, &result, fcinfo->context))
++	if (parseDashOrOid(dict_name_or_oid, &result, escontext))
+ 		PG_RETURN_OID(result);
+ 
+ 	/* The rest of this wouldn't work in bootstrap mode */
+@@ -1434,9 +1498,17 @@ regdictionaryin(PG_FUNCTION_ARGS)
+ 	 * Normal case: parse the name into components and see if it matches any
+ 	 * pg_ts_dict entries in the current search path.
+ 	 */
+-	names = stringToQualifiedNameList(dict_name_or_oid);
++	names = stringToQualifiedNameList(dict_name_or_oid, escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
++
++	result = get_ts_dict_oid(names, true);
+ 
+-	result = get_ts_dict_oid(names, false);
++	if (!OidIsValid(result))
++		ereturn(escontext, (Datum) 0,
++				(errcode(ERRCODE_UNDEFINED_OBJECT),
++				 errmsg("text search dictionary \"%s\" does not exist",
++						NameListToString(names))));
+ 
+ 	PG_RETURN_OID(result);
+ }
+@@ -1520,11 +1592,12 @@ Datum
+ regrolein(PG_FUNCTION_ARGS)
+ {
+ 	char	   *role_name_or_oid = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	Oid			result;
+ 	List	   *names;
+ 
+ 	/* Handle "-" or numeric OID */
+-	if (parseDashOrOid(role_name_or_oid, &result, fcinfo->context))
++	if (parseDashOrOid(role_name_or_oid, &result, escontext))
+ 		PG_RETURN_OID(result);
+ 
+ 	/* The rest of this wouldn't work in bootstrap mode */
+@@ -1532,14 +1605,22 @@ regrolein(PG_FUNCTION_ARGS)
+ 		elog(ERROR, "regrole values must be OIDs in bootstrap mode");
+ 
+ 	/* Normal case: see if the name matches any pg_authid entry. */
+-	names = stringToQualifiedNameList(role_name_or_oid);
++	names = stringToQualifiedNameList(role_name_or_oid, escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
+ 
+ 	if (list_length(names) != 1)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_INVALID_NAME),
+ 				 errmsg("invalid name syntax")));
+ 
+-	result = get_role_oid(strVal(linitial(names)), false);
++	result = get_role_oid(strVal(linitial(names)), true);
++
++	if (!OidIsValid(result))
++		ereturn(escontext, (Datum) 0,
++				(errcode(ERRCODE_UNDEFINED_OBJECT),
++				 errmsg("role \"%s\" does not exist",
++						strVal(linitial(names)))));
+ 
+ 	PG_RETURN_OID(result);
+ }
+@@ -1555,13 +1636,14 @@ to_regrole(PG_FUNCTION_ARGS)
+ 	char	   *role_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+ 	Oid			result;
+ 	List	   *names;
++	ErrorSaveContext escontext = {T_ErrorSaveContext};
+ 
+-	names = stringToQualifiedNameList(role_name);
++	names = stringToQualifiedNameList(role_name, (Node *) &escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
+ 
+ 	if (list_length(names) != 1)
+-		ereport(ERROR,
+-				(errcode(ERRCODE_INVALID_NAME),
+-				 errmsg("invalid name syntax")));
++		PG_RETURN_NULL();
+ 
+ 	result = get_role_oid(strVal(linitial(names)), true);
+ 
+@@ -1635,11 +1717,12 @@ Datum
+ regnamespacein(PG_FUNCTION_ARGS)
+ {
+ 	char	   *nsp_name_or_oid = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	Oid			result;
+ 	List	   *names;
+ 
+ 	/* Handle "-" or numeric OID */
+-	if (parseDashOrOid(nsp_name_or_oid, &result, fcinfo->context))
++	if (parseDashOrOid(nsp_name_or_oid, &result, escontext))
+ 		PG_RETURN_OID(result);
+ 
+ 	/* The rest of this wouldn't work in bootstrap mode */
+@@ -1647,14 +1730,22 @@ regnamespacein(PG_FUNCTION_ARGS)
+ 		elog(ERROR, "regnamespace values must be OIDs in bootstrap mode");
+ 
+ 	/* Normal case: see if the name matches any pg_namespace entry. */
+-	names = stringToQualifiedNameList(nsp_name_or_oid);
++	names = stringToQualifiedNameList(nsp_name_or_oid, escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
+ 
+ 	if (list_length(names) != 1)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_INVALID_NAME),
+ 				 errmsg("invalid name syntax")));
+ 
+-	result = get_namespace_oid(strVal(linitial(names)), false);
++	result = get_namespace_oid(strVal(linitial(names)), true);
++
++	if (!OidIsValid(result))
++		ereturn(escontext, (Datum) 0,
++				(errcode(ERRCODE_UNDEFINED_SCHEMA),
++				 errmsg("schema \"%s\" does not exist",
++						strVal(linitial(names)))));
+ 
+ 	PG_RETURN_OID(result);
+ }
+@@ -1670,13 +1761,14 @@ to_regnamespace(PG_FUNCTION_ARGS)
+ 	char	   *nsp_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+ 	Oid			result;
+ 	List	   *names;
++	ErrorSaveContext escontext = {T_ErrorSaveContext};
+ 
+-	names = stringToQualifiedNameList(nsp_name);
++	names = stringToQualifiedNameList(nsp_name, (Node *) &escontext);
++	if (names == NIL)
++		PG_RETURN_NULL();
+ 
+ 	if (list_length(names) != 1)
+-		ereport(ERROR,
+-				(errcode(ERRCODE_INVALID_NAME),
+-				 errmsg("invalid name syntax")));
++		PG_RETURN_NULL();
+ 
+ 	result = get_namespace_oid(strVal(linitial(names)), true);
+ 
+@@ -1763,9 +1855,13 @@ text_regclass(PG_FUNCTION_ARGS)
+ 
+ /*
+  * Given a C string, parse it into a qualified-name list.
++ *
++ * If escontext is an ErrorSaveContext node, invalid input will be
++ * reported there instead of being thrown, and we return NIL.
++ * (NIL is not possible as a success return, since empty-input is an error.)
+  */
+ List *
+-stringToQualifiedNameList(const char *string)
++stringToQualifiedNameList(const char *string, Node *escontext)
+ {
+ 	char	   *rawname;
+ 	List	   *result = NIL;
+@@ -1776,12 +1872,12 @@ stringToQualifiedNameList(const char *string)
+ 	rawname = pstrdup(string);
+ 
+ 	if (!SplitIdentifierString(rawname, '.', &namelist))
+-		ereport(ERROR,
++		ereturn(escontext, NIL,
+ 				(errcode(ERRCODE_INVALID_NAME),
+ 				 errmsg("invalid name syntax")));
+ 
+ 	if (namelist == NIL)
+-		ereport(ERROR,
++		ereturn(escontext, NIL,
+ 				(errcode(ERRCODE_INVALID_NAME),
+ 				 errmsg("invalid name syntax")));
+ 
+@@ -1858,10 +1954,14 @@ parseDashOrOid(char *string, Oid *result, Node *escontext)
+  *
+  * If allowNone is true, accept "NONE" and return it as InvalidOid (this is
+  * for unary operators).
++ *
++ * Returns true on success, false on failure (the latter only possible
++ * if escontext is an ErrorSaveContext node).
+  */
+-static void
++static bool
+ parseNameAndArgTypes(const char *string, bool allowNone, List **names,
+-					 int *nargs, Oid *argtypes)
++					 int *nargs, Oid *argtypes,
++					 Node *escontext)
+ {
+ 	char	   *rawname;
+ 	char	   *ptr;
+@@ -1886,13 +1986,15 @@ parseNameAndArgTypes(const char *string, bool allowNone, List **names,
+ 			break;
+ 	}
+ 	if (*ptr == '\0')
+-		ereport(ERROR,
++		ereturn(escontext, false,
+ 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 				 errmsg("expected a left parenthesis")));
+ 
+ 	/* Separate the name and parse it into a list */
+ 	*ptr++ = '\0';
+-	*names = stringToQualifiedNameList(rawname);
++	*names = stringToQualifiedNameList(rawname, escontext);
++	if (*names == NIL)
++		return false;
+ 
+ 	/* Check for the trailing right parenthesis and remove it */
+ 	ptr2 = ptr + strlen(ptr);
+@@ -1902,7 +2004,7 @@ parseNameAndArgTypes(const char *string, bool allowNone, List **names,
+ 			break;
+ 	}
+ 	if (*ptr2 != ')')
+-		ereport(ERROR,
++		ereturn(escontext, false,
+ 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 				 errmsg("expected a right parenthesis")));
+ 
+@@ -1921,7 +2023,7 @@ parseNameAndArgTypes(const char *string, bool allowNone, List **names,
+ 		{
+ 			/* End of string.  Okay unless we had a comma before. */
+ 			if (had_comma)
+-				ereport(ERROR,
++				ereturn(escontext, false,
+ 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 						 errmsg("expected a type name")));
+ 			break;
+@@ -1953,7 +2055,7 @@ parseNameAndArgTypes(const char *string, bool allowNone, List **names,
+ 			}
+ 		}
+ 		if (in_quote || paren_count != 0)
+-			ereport(ERROR,
++			ereturn(escontext, false,
+ 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 					 errmsg("improper type name")));
+ 
+@@ -1985,10 +2087,11 @@ parseNameAndArgTypes(const char *string, bool allowNone, List **names,
+ 		else
+ 		{
+ 			/* Use full parser to resolve the type name */
+-			parseTypeString(typename, &typeid, &typmod, false);
++			if (!parseTypeString(typename, &typeid, &typmod, escontext))
++				return false;
+ 		}
+ 		if (*nargs >= FUNC_MAX_ARGS)
+-			ereport(ERROR,
++			ereturn(escontext, false,
+ 					(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+ 					 errmsg("too many arguments")));
+ 
+@@ -1997,4 +2100,6 @@ parseNameAndArgTypes(const char *string, bool allowNone, List **names,
+ 	}
+ 
+ 	pfree(rawname);
++
++	return true;
+ }
+diff --git a/src/backend/utils/adt/tsvector_op.c b/src/backend/utils/adt/tsvector_op.c
+index caeb85b4ca18..66ce710598ab 100644
+--- a/src/backend/utils/adt/tsvector_op.c
++++ b/src/backend/utils/adt/tsvector_op.c
+@@ -2652,7 +2652,7 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
+ 	{
+ 		List	   *names;
+ 
+-		names = stringToQualifiedNameList(trigger->tgargs[1]);
++		names = stringToQualifiedNameList(trigger->tgargs[1], NULL);
+ 		/* require a schema so that results are not search path dependent */
+ 		if (list_length(names) < 2)
+ 			ereport(ERROR,
+diff --git a/src/backend/utils/cache/ts_cache.c b/src/backend/utils/cache/ts_cache.c
+index 450ea34336ab..043abd341dfd 100644
+--- a/src/backend/utils/cache/ts_cache.c
++++ b/src/backend/utils/cache/ts_cache.c
+@@ -38,6 +38,7 @@
+ #include "catalog/pg_ts_template.h"
+ #include "commands/defrem.h"
+ #include "miscadmin.h"
++#include "nodes/miscnodes.h"
+ #include "tsearch/ts_cache.h"
+ #include "utils/builtins.h"
+ #include "utils/catcache.h"
+@@ -556,6 +557,8 @@ lookup_ts_config_cache(Oid cfgId)
+ Oid
+ getTSCurrentConfig(bool emitError)
+ {
++	List	   *namelist;
++
+ 	/* if we have a cached value, return it */
+ 	if (OidIsValid(TSCurrentConfigCache))
+ 		return TSCurrentConfigCache;
+@@ -576,9 +579,22 @@ getTSCurrentConfig(bool emitError)
+ 	}
+ 
+ 	/* Look up the config */
+-	TSCurrentConfigCache =
+-		get_ts_config_oid(stringToQualifiedNameList(TSCurrentConfig),
+-						  !emitError);
++	if (emitError)
++	{
++		namelist = stringToQualifiedNameList(TSCurrentConfig, NULL);
++		TSCurrentConfigCache = get_ts_config_oid(namelist, false);
++	}
++	else
++	{
++		ErrorSaveContext escontext = {T_ErrorSaveContext};
++
++		namelist = stringToQualifiedNameList(TSCurrentConfig,
++											 (Node *) &escontext);
++		if (namelist != NIL)
++			TSCurrentConfigCache = get_ts_config_oid(namelist, true);
++		else
++			TSCurrentConfigCache = InvalidOid;	/* bad name list syntax */
++	}
+ 
+ 	return TSCurrentConfigCache;
+ }
+@@ -594,12 +610,19 @@ check_default_text_search_config(char **newval, void **extra, GucSource source)
+ 	 */
+ 	if (IsTransactionState() && MyDatabaseId != InvalidOid)
+ 	{
++		ErrorSaveContext escontext = {T_ErrorSaveContext};
++		List	   *namelist;
+ 		Oid			cfgId;
+ 		HeapTuple	tuple;
+ 		Form_pg_ts_config cfg;
+ 		char	   *buf;
+ 
+-		cfgId = get_ts_config_oid(stringToQualifiedNameList(*newval), true);
++		namelist = stringToQualifiedNameList(*newval,
++											 (Node *) &escontext);
++		if (namelist != NIL)
++			cfgId = get_ts_config_oid(namelist, true);
++		else
++			cfgId = InvalidOid; /* bad name list syntax */
+ 
+ 		/*
+ 		 * When source == PGC_S_TEST, don't throw a hard error for a
+diff --git a/src/backend/utils/fmgr/funcapi.c b/src/backend/utils/fmgr/funcapi.c
+index 87cbb1d3e384..51e58934040d 100644
+--- a/src/backend/utils/fmgr/funcapi.c
++++ b/src/backend/utils/fmgr/funcapi.c
+@@ -1876,7 +1876,7 @@ RelationNameGetTupleDesc(const char *relname)
+ 	List	   *relname_list;
+ 
+ 	/* Open relation and copy the tuple description */
+-	relname_list = stringToQualifiedNameList(relname);
++	relname_list = stringToQualifiedNameList(relname, NULL);
+ 	relvar = makeRangeVarFromNameList(relname_list);
+ 	rel = relation_openrv(relvar, AccessShareLock);
+ 	tupdesc = CreateTupleDescCopy(RelationGetDescr(rel));
+diff --git a/src/include/parser/parse_type.h b/src/include/parser/parse_type.h
+index 4e5624d721c9..c6c92a000976 100644
+--- a/src/include/parser/parse_type.h
++++ b/src/include/parser/parse_type.h
+@@ -51,8 +51,9 @@ extern Datum stringTypeDatum(Type tp, char *string, int32 atttypmod);
+ extern Oid	typeidTypeRelid(Oid type_id);
+ extern Oid	typeOrDomainTypeRelid(Oid type_id);
+ 
+-extern TypeName *typeStringToTypeName(const char *str);
+-extern void parseTypeString(const char *str, Oid *typeid_p, int32 *typmod_p, bool missing_ok);
++extern TypeName *typeStringToTypeName(const char *str, Node *escontext);
++extern bool parseTypeString(const char *str, Oid *typeid_p, int32 *typmod_p,
++							Node *escontext);
+ 
+ /* true if typeid is composite, or domain over composite, but not RECORD */
+ #define ISCOMPLEX(typeid) (typeOrDomainTypeRelid(typeid) != InvalidOid)
+diff --git a/src/include/utils/regproc.h b/src/include/utils/regproc.h
+index 0e2965ff934c..4c3311d8e2d2 100644
+--- a/src/include/utils/regproc.h
++++ b/src/include/utils/regproc.h
+@@ -25,7 +25,7 @@ extern char *format_procedure_extended(Oid procedure_oid, bits16 flags);
+ #define FORMAT_OPERATOR_FORCE_QUALIFY	0x02	/* force qualification */
+ extern char *format_operator_extended(Oid operator_oid, bits16 flags);
+ 
+-extern List *stringToQualifiedNameList(const char *string);
++extern List *stringToQualifiedNameList(const char *string, Node *escontext);
+ extern char *format_procedure(Oid procedure_oid);
+ extern char *format_procedure_qualified(Oid procedure_oid);
+ extern void format_procedure_parts(Oid procedure_oid, List **objnames,
+diff --git a/src/pl/plperl/plperl.c b/src/pl/plperl/plperl.c
+index 8f21e0d70112..8143ae40a010 100644
+--- a/src/pl/plperl/plperl.c
++++ b/src/pl/plperl/plperl.c
+@@ -3613,7 +3613,7 @@ plperl_spi_prepare(char *query, int argc, SV **argv)
+ 			char	   *typstr;
+ 
+ 			typstr = sv2cstr(argv[i]);
+-			parseTypeString(typstr, &typId, &typmod, false);
++			(void) parseTypeString(typstr, &typId, &typmod, NULL);
+ 			pfree(typstr);
+ 
+ 			getTypeInputInfo(typId, &typInput, &typIOParam);
+diff --git a/src/pl/plpgsql/src/pl_gram.y b/src/pl/plpgsql/src/pl_gram.y
+index f7cf2b4b899a..fe63766e5d55 100644
+--- a/src/pl/plpgsql/src/pl_gram.y
++++ b/src/pl/plpgsql/src/pl_gram.y
+@@ -3725,7 +3725,7 @@ parse_datatype(const char *string, int location)
+ 	error_context_stack = &syntax_errcontext;
+ 
+ 	/* Let the main parser try to parse it under standard SQL rules */
+-	typeName = typeStringToTypeName(string);
++	typeName = typeStringToTypeName(string, NULL);
+ 	typenameTypeIdAndMod(NULL, typeName, &type_id, &typmod);
+ 
+ 	/* Restore former ereport callback */
+diff --git a/src/pl/plpython/plpy_spi.c b/src/pl/plpython/plpy_spi.c
+index 6b9f8d5b4384..ff87b27de090 100644
+--- a/src/pl/plpython/plpy_spi.c
++++ b/src/pl/plpython/plpy_spi.c
+@@ -105,7 +105,7 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
+ 			 *information for input conversion.
+ 			 ********************************************************/
+ 
+-			parseTypeString(sptr, &typeId, &typmod, false);
++			(void) parseTypeString(sptr, &typeId, &typmod, NULL);
+ 
+ 			Py_DECREF(optr);
+ 
+diff --git a/src/pl/tcl/pltcl.c b/src/pl/tcl/pltcl.c
+index 4185fb122109..185d5bed99fb 100644
+--- a/src/pl/tcl/pltcl.c
++++ b/src/pl/tcl/pltcl.c
+@@ -615,7 +615,7 @@ call_pltcl_start_proc(Oid prolang, bool pltrusted)
+ 	error_context_stack = &errcallback;
+ 
+ 	/* Parse possibly-qualified identifier and look up the function */
+-	namelist = stringToQualifiedNameList(start_proc);
++	namelist = stringToQualifiedNameList(start_proc, NULL);
+ 	procOid = LookupFuncName(namelist, 0, NULL, false);
+ 
+ 	/* Current user must have permission to call function */
+@@ -2603,7 +2603,8 @@ pltcl_SPI_prepare(ClientData cdata, Tcl_Interp *interp,
+ 						typIOParam;
+ 			int32		typmod;
+ 
+-			parseTypeString(Tcl_GetString(argsObj[i]), &typId, &typmod, false);
++			(void) parseTypeString(Tcl_GetString(argsObj[i]),
++								   &typId, &typmod, NULL);
+ 
+ 			getTypeInputInfo(typId, &typInput, &typIOParam);
+ 
+diff --git a/src/test/regress/expected/regproc.out b/src/test/regress/expected/regproc.out
+index e45ff5483fb1..0c5e1d4be637 100644
+--- a/src/test/regress/expected/regproc.out
++++ b/src/test/regress/expected/regproc.out
+@@ -245,7 +245,7 @@ LINE 1: SELECT regtype('int3');
+                        ^
+ -- with schemaname
+ SELECT regoper('ng_catalog.||/');
+-ERROR:  schema "ng_catalog" does not exist
++ERROR:  operator does not exist: ng_catalog.||/
+ LINE 1: SELECT regoper('ng_catalog.||/');
+                        ^
+ SELECT regoperator('ng_catalog.+(int4,int4)');
+@@ -253,15 +253,15 @@ ERROR:  operator does not exist: ng_catalog.+(int4,int4)
+ LINE 1: SELECT regoperator('ng_catalog.+(int4,int4)');
+                            ^
+ SELECT regproc('ng_catalog.now');
+-ERROR:  schema "ng_catalog" does not exist
++ERROR:  function "ng_catalog.now" does not exist
+ LINE 1: SELECT regproc('ng_catalog.now');
+                        ^
+ SELECT regprocedure('ng_catalog.abs(numeric)');
+-ERROR:  schema "ng_catalog" does not exist
++ERROR:  function "ng_catalog.abs(numeric)" does not exist
+ LINE 1: SELECT regprocedure('ng_catalog.abs(numeric)');
+                             ^
+ SELECT regclass('ng_catalog.pg_class');
+-ERROR:  schema "ng_catalog" does not exist
++ERROR:  relation "ng_catalog.pg_class" does not exist
+ LINE 1: SELECT regclass('ng_catalog.pg_class');
+                         ^
+ SELECT regtype('ng_catalog.int4');
+@@ -269,7 +269,7 @@ ERROR:  schema "ng_catalog" does not exist
+ LINE 1: SELECT regtype('ng_catalog.int4');
+                        ^
+ SELECT regcollation('ng_catalog."POSIX"');
+-ERROR:  schema "ng_catalog" does not exist
++ERROR:  collation "ng_catalog.POSIX" for encoding "SQL_ASCII" does not exist
+ LINE 1: SELECT regcollation('ng_catalog."POSIX"');
+                             ^
+ -- schemaname not applicable
+@@ -406,7 +406,11 @@ SELECT to_regrole('"regress_regrole_test"');
+ (1 row)
+ 
+ SELECT to_regrole('foo.bar');
+-ERROR:  invalid name syntax
++ to_regrole 
++------------
++ 
++(1 row)
++
+ SELECT to_regrole('Nonexistent');
+  to_regrole 
+ ------------
+@@ -420,7 +424,11 @@ SELECT to_regrole('"Nonexistent"');
+ (1 row)
+ 
+ SELECT to_regrole('foo.bar');
+-ERROR:  invalid name syntax
++ to_regrole 
++------------
++ 
++(1 row)
++
+ SELECT to_regnamespace('Nonexistent');
+  to_regnamespace 
+ -----------------
+@@ -434,4 +442,105 @@ SELECT to_regnamespace('"Nonexistent"');
+ (1 row)
+ 
+ SELECT to_regnamespace('foo.bar');
+-ERROR:  invalid name syntax
++ to_regnamespace 
++-----------------
++ 
++(1 row)
++
++-- Test soft-error API
++SELECT pg_input_error_message('ng_catalog.pg_class', 'regclass');
++            pg_input_error_message             
++-----------------------------------------------
++ relation "ng_catalog.pg_class" does not exist
++(1 row)
++
++SELECT pg_input_error_message('ng_catalog."POSIX"', 'regcollation');
++                        pg_input_error_message                        
++----------------------------------------------------------------------
++ collation "ng_catalog.POSIX" for encoding "SQL_ASCII" does not exist
++(1 row)
++
++SELECT pg_input_error_message('no_such_config', 'regconfig');
++                  pg_input_error_message                   
++-----------------------------------------------------------
++ text search configuration "no_such_config" does not exist
++(1 row)
++
++SELECT pg_input_error_message('no_such_dictionary', 'regdictionary');
++                   pg_input_error_message                   
++------------------------------------------------------------
++ text search dictionary "no_such_dictionary" does not exist
++(1 row)
++
++SELECT pg_input_error_message('Nonexistent', 'regnamespace');
++       pg_input_error_message        
++-------------------------------------
++ schema "nonexistent" does not exist
++(1 row)
++
++SELECT pg_input_error_message('ng_catalog.||/', 'regoper');
++         pg_input_error_message          
++-----------------------------------------
++ operator does not exist: ng_catalog.||/
++(1 row)
++
++SELECT pg_input_error_message('-', 'regoper');
++     pg_input_error_message     
++--------------------------------
++ more than one operator named -
++(1 row)
++
++SELECT pg_input_error_message('ng_catalog.+(int4,int4)', 'regoperator');
++              pg_input_error_message              
++--------------------------------------------------
++ operator does not exist: ng_catalog.+(int4,int4)
++(1 row)
++
++SELECT pg_input_error_message('-', 'regoperator');
++   pg_input_error_message    
++-----------------------------
++ expected a left parenthesis
++(1 row)
++
++SELECT pg_input_error_message('ng_catalog.now', 'regproc');
++          pg_input_error_message          
++------------------------------------------
++ function "ng_catalog.now" does not exist
++(1 row)
++
++SELECT pg_input_error_message('ng_catalog.abs(numeric)', 'regprocedure');
++              pg_input_error_message               
++---------------------------------------------------
++ function "ng_catalog.abs(numeric)" does not exist
++(1 row)
++
++SELECT pg_input_error_message('ng_catalog.abs(numeric', 'regprocedure');
++    pg_input_error_message    
++------------------------------
++ expected a right parenthesis
++(1 row)
++
++SELECT pg_input_error_message('regress_regrole_test', 'regrole');
++           pg_input_error_message           
++--------------------------------------------
++ role "regress_regrole_test" does not exist
++(1 row)
++
++SELECT pg_input_error_message('no_such_type', 'regtype');
++       pg_input_error_message       
++------------------------------------
++ type "no_such_type" does not exist
++(1 row)
++
++-- Some cases that should be soft errors, but are not yet
++SELECT pg_input_error_message('incorrect type name syntax', 'regtype');
++ERROR:  syntax error at or near "type"
++LINE 1: SELECT pg_input_error_message('incorrect type name syntax', ...
++                  ^
++CONTEXT:  invalid type name "incorrect type name syntax"
++SELECT pg_input_error_message('numeric(1,2,3)', 'regtype');  -- bogus typmod
++ERROR:  invalid NUMERIC type modifier
++SELECT pg_input_error_message('way.too.many.names', 'regtype');
++ERROR:  improper qualified name (too many dotted names): way.too.many.names
++SELECT pg_input_error_message('no_such_catalog.schema.name', 'regtype');
++ERROR:  cross-database references are not implemented: no_such_catalog.schema.name
+diff --git a/src/test/regress/sql/regproc.sql b/src/test/regress/sql/regproc.sql
+index faab0c15ce8f..aa1f1bb17a2c 100644
+--- a/src/test/regress/sql/regproc.sql
++++ b/src/test/regress/sql/regproc.sql
+@@ -120,3 +120,26 @@ SELECT to_regrole('foo.bar');
+ SELECT to_regnamespace('Nonexistent');
+ SELECT to_regnamespace('"Nonexistent"');
+ SELECT to_regnamespace('foo.bar');
++
++-- Test soft-error API
++
++SELECT pg_input_error_message('ng_catalog.pg_class', 'regclass');
++SELECT pg_input_error_message('ng_catalog."POSIX"', 'regcollation');
++SELECT pg_input_error_message('no_such_config', 'regconfig');
++SELECT pg_input_error_message('no_such_dictionary', 'regdictionary');
++SELECT pg_input_error_message('Nonexistent', 'regnamespace');
++SELECT pg_input_error_message('ng_catalog.||/', 'regoper');
++SELECT pg_input_error_message('-', 'regoper');
++SELECT pg_input_error_message('ng_catalog.+(int4,int4)', 'regoperator');
++SELECT pg_input_error_message('-', 'regoperator');
++SELECT pg_input_error_message('ng_catalog.now', 'regproc');
++SELECT pg_input_error_message('ng_catalog.abs(numeric)', 'regprocedure');
++SELECT pg_input_error_message('ng_catalog.abs(numeric', 'regprocedure');
++SELECT pg_input_error_message('regress_regrole_test', 'regrole');
++SELECT pg_input_error_message('no_such_type', 'regtype');
++
++-- Some cases that should be soft errors, but are not yet
++SELECT pg_input_error_message('incorrect type name syntax', 'regtype');
++SELECT pg_input_error_message('numeric(1,2,3)', 'regtype');  -- bogus typmod
++SELECT pg_input_error_message('way.too.many.names', 'regtype');
++SELECT pg_input_error_message('no_such_catalog.schema.name', 'regtype');

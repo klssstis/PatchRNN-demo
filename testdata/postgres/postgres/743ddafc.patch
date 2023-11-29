@@ -1,0 +1,418 @@
+From 743ddafc7124604c1f59b5d9f661be47a987a8d0 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 16 Nov 2023 10:05:14 -0500
+Subject: [PATCH] Ensure we preprocess expressions before checking their
+ volatility.
+
+contain_mutable_functions and contain_volatile_functions give
+reliable answers only after expression preprocessing (specifically
+eval_const_expressions).  Some places understand this, but some did
+not get the memo --- which is not entirely their fault, because the
+problem is documented only in places far away from those functions.
+Introduce wrapper functions that allow doing the right thing easily,
+and add commentary in hopes of preventing future mistakes from
+copy-and-paste of code that's only conditionally safe.
+
+Two actual bugs of this ilk are fixed here.  We failed to preprocess
+column GENERATED expressions before checking mutability, so that the
+code could fail to detect the use of a volatile function
+default-argument expression, or it could reject a polymorphic function
+that is actually immutable on the datatype of interest.  Likewise,
+column DEFAULT expressions weren't preprocessed before determining if
+it's safe to apply the attmissingval mechanism.  A false negative
+would just result in an unnecessary table rewrite, but a false
+positive could allow the attmissingval mechanism to be used in a case
+where it should not be, resulting in unexpected initial values in a
+new column.
+
+In passing, re-order the steps in ComputePartitionAttrs so that its
+checks for invalid column references are done before applying
+expression_planner, rather than after.  The previous coding would
+not complain if a partition expression contains a disallowed column
+reference that gets optimized away by constant folding, which seems
+to me to be a behavior we do not want.
+
+Per bug #18097 from Jim Keener.  Back-patch to all supported versions.
+
+Discussion: https://postgr.es/m/18097-ebb179674f22932f@postgresql.org
+---
+ src/backend/catalog/heap.c                 |  7 ++-
+ src/backend/commands/copyfrom.c            |  6 +-
+ src/backend/commands/indexcmds.c           | 31 +---------
+ src/backend/commands/tablecmds.c           | 50 ++++++++--------
+ src/backend/optimizer/util/clauses.c       | 66 ++++++++++++++++++++++
+ src/include/optimizer/optimizer.h          |  2 +
+ src/test/regress/expected/fast_default.out | 18 ++++++
+ src/test/regress/expected/generated.out    |  3 +
+ src/test/regress/sql/fast_default.sql      | 11 ++++
+ src/test/regress/sql/generated.sql         |  3 +
+ 10 files changed, 141 insertions(+), 56 deletions(-)
+
+diff --git a/src/backend/catalog/heap.c b/src/backend/catalog/heap.c
+index d03c9616786d..7224d9669504 100644
+--- a/src/backend/catalog/heap.c
++++ b/src/backend/catalog/heap.c
+@@ -2365,7 +2365,8 @@ AddRelationNewConstraints(Relation rel,
+ 			continue;
+ 
+ 		/* If the DEFAULT is volatile we cannot use a missing value */
+-		if (colDef->missingMode && contain_volatile_functions((Node *) expr))
++		if (colDef->missingMode &&
++			contain_volatile_functions_after_planning((Expr *) expr))
+ 			colDef->missingMode = false;
+ 
+ 		defOid = StoreAttrDefault(rel, colDef->attnum, expr, is_internal,
+@@ -3087,9 +3088,11 @@ cookDefault(ParseState *pstate,
+ 
+ 	if (attgenerated)
+ 	{
++		/* Disallow refs to other generated columns */
+ 		check_nested_generated(pstate, expr);
+ 
+-		if (contain_mutable_functions(expr))
++		/* Disallow mutable functions */
++		if (contain_mutable_functions_after_planning((Expr *) expr))
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+ 					 errmsg("generation expression is not immutable")));
+diff --git a/src/backend/commands/copyfrom.c b/src/backend/commands/copyfrom.c
+index cec80baceaf4..f4861652a956 100644
+--- a/src/backend/commands/copyfrom.c
++++ b/src/backend/commands/copyfrom.c
+@@ -887,6 +887,9 @@ CopyFrom(CopyFromState cstate)
+ 		 * Can't support multi-inserts if there are any volatile function
+ 		 * expressions in WHERE clause.  Similarly to the trigger case above,
+ 		 * such expressions may query the table we're inserting into.
++		 *
++		 * Note: the whereClause was already preprocessed in DoCopy(), so it's
++		 * okay to use contain_volatile_functions() directly.
+ 		 */
+ 		insertMethod = CIM_SINGLE;
+ 	}
+@@ -1616,7 +1619,8 @@ BeginCopyFrom(ParseState *pstate,
+ 				 * known to be safe for use with the multi-insert
+ 				 * optimization. Hence we use this special case function
+ 				 * checker rather than the standard check for
+-				 * contain_volatile_functions().
++				 * contain_volatile_functions().  Note also that we already
++				 * ran the expression through expression_planner().
+ 				 */
+ 				if (!volatile_defexprs)
+ 					volatile_defexprs = contain_volatile_functions_not_nextval((Node *) defexpr);
+diff --git a/src/backend/commands/indexcmds.c b/src/backend/commands/indexcmds.c
+index c160d8a301f0..0b3b8e98b803 100644
+--- a/src/backend/commands/indexcmds.c
++++ b/src/backend/commands/indexcmds.c
+@@ -1791,33 +1791,6 @@ DefineIndex(Oid tableId,
+ }
+ 
+ 
+-/*
+- * CheckMutability
+- *		Test whether given expression is mutable
+- */
+-static bool
+-CheckMutability(Expr *expr)
+-{
+-	/*
+-	 * First run the expression through the planner.  This has a couple of
+-	 * important consequences.  First, function default arguments will get
+-	 * inserted, which may affect volatility (consider "default now()").
+-	 * Second, inline-able functions will get inlined, which may allow us to
+-	 * conclude that the function is really less volatile than it's marked. As
+-	 * an example, polymorphic functions must be marked with the most volatile
+-	 * behavior that they have for any input type, but once we inline the
+-	 * function we may be able to conclude that it's not so volatile for the
+-	 * particular input type we're dealing with.
+-	 *
+-	 * We assume here that expression_planner() won't scribble on its input.
+-	 */
+-	expr = expression_planner(expr);
+-
+-	/* Now we can search for non-immutable functions */
+-	return contain_mutable_functions((Node *) expr);
+-}
+-
+-
+ /*
+  * CheckPredicate
+  *		Checks that the given partial-index predicate is valid.
+@@ -1841,7 +1814,7 @@ CheckPredicate(Expr *predicate)
+ 	 * A predicate using mutable functions is probably wrong, for the same
+ 	 * reasons that we don't allow an index expression to use one.
+ 	 */
+-	if (CheckMutability(predicate))
++	if (contain_mutable_functions_after_planning(predicate))
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+ 				 errmsg("functions in index predicate must be marked IMMUTABLE")));
+@@ -1985,7 +1958,7 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
+ 				 * same data every time, it's not clear what the index entries
+ 				 * mean at all.
+ 				 */
+-				if (CheckMutability((Expr *) expr))
++				if (contain_mutable_functions_after_planning((Expr *) expr))
+ 					ereport(ERROR,
+ 							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+ 							 errmsg("functions in index expression must be marked IMMUTABLE")));
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index e456ccd767e1..323d9bf87020 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -18159,30 +18159,6 @@ ComputePartitionAttrs(ParseState *pstate, Relation rel, List *partParams, AttrNu
+ 				partattrs[attn] = 0;	/* marks the column as expression */
+ 				*partexprs = lappend(*partexprs, expr);
+ 
+-				/*
+-				 * Try to simplify the expression before checking for
+-				 * mutability.  The main practical value of doing it in this
+-				 * order is that an inline-able SQL-language function will be
+-				 * accepted if its expansion is immutable, whether or not the
+-				 * function itself is marked immutable.
+-				 *
+-				 * Note that expression_planner does not change the passed in
+-				 * expression destructively and we have already saved the
+-				 * expression to be stored into the catalog above.
+-				 */
+-				expr = (Node *) expression_planner((Expr *) expr);
+-
+-				/*
+-				 * Partition expression cannot contain mutable functions,
+-				 * because a given row must always map to the same partition
+-				 * as long as there is no change in the partition boundary
+-				 * structure.
+-				 */
+-				if (contain_mutable_functions(expr))
+-					ereport(ERROR,
+-							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+-							 errmsg("functions in partition key expression must be marked IMMUTABLE")));
+-
+ 				/*
+ 				 * transformPartitionSpec() should have already rejected
+ 				 * subqueries, aggregates, window functions, and SRFs, based
+@@ -18224,6 +18200,32 @@ ComputePartitionAttrs(ParseState *pstate, Relation rel, List *partParams, AttrNu
+ 								 parser_errposition(pstate, pelem->location)));
+ 				}
+ 
++				/*
++				 * Preprocess the expression before checking for mutability.
++				 * This is essential for the reasons described in
++				 * contain_mutable_functions_after_planning.  However, we call
++				 * expression_planner for ourselves rather than using that
++				 * function, because if constant-folding reduces the
++				 * expression to a constant, we'd like to know that so we can
++				 * complain below.
++				 *
++				 * Like contain_mutable_functions_after_planning, assume that
++				 * expression_planner won't scribble on its input, so this
++				 * won't affect the partexprs entry we saved above.
++				 */
++				expr = (Node *) expression_planner((Expr *) expr);
++
++				/*
++				 * Partition expressions cannot contain mutable functions,
++				 * because a given row must always map to the same partition
++				 * as long as there is no change in the partition boundary
++				 * structure.
++				 */
++				if (contain_mutable_functions(expr))
++					ereport(ERROR,
++							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
++							 errmsg("functions in partition key expression must be marked IMMUTABLE")));
++
+ 				/*
+ 				 * While it is not exactly *wrong* for a partition expression
+ 				 * to be a constant, it seems better to reject such keys.
+diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
+index 948c2bf06db0..507c101661ce 100644
+--- a/src/backend/optimizer/util/clauses.c
++++ b/src/backend/optimizer/util/clauses.c
+@@ -360,6 +360,11 @@ contain_subplans_walker(Node *node, void *context)
+  * mistakenly think that something like "WHERE random() < 0.5" can be treated
+  * as a constant qualification.
+  *
++ * This will give the right answer only for clauses that have been put
++ * through expression preprocessing.  Callers outside the planner typically
++ * should use contain_mutable_functions_after_planning() instead, for the
++ * reasons given there.
++ *
+  * We will recursively look into Query nodes (i.e., SubLink sub-selects)
+  * but not into SubPlans.  See comments for contain_volatile_functions().
+  */
+@@ -446,6 +451,34 @@ contain_mutable_functions_walker(Node *node, void *context)
+ 								  context);
+ }
+ 
++/*
++ * contain_mutable_functions_after_planning
++ *	  Test whether given expression contains mutable functions.
++ *
++ * This is a wrapper for contain_mutable_functions() that is safe to use from
++ * outside the planner.  The difference is that it first runs the expression
++ * through expression_planner().  There are two key reasons why we need that:
++ *
++ * First, function default arguments will get inserted, which may affect
++ * volatility (consider "default now()").
++ *
++ * Second, inline-able functions will get inlined, which may allow us to
++ * conclude that the function is really less volatile than it's marked.
++ * As an example, polymorphic functions must be marked with the most volatile
++ * behavior that they have for any input type, but once we inline the
++ * function we may be able to conclude that it's not so volatile for the
++ * particular input type we're dealing with.
++ */
++bool
++contain_mutable_functions_after_planning(Expr *expr)
++{
++	/* We assume here that expression_planner() won't scribble on its input */
++	expr = expression_planner(expr);
++
++	/* Now we can search for non-immutable functions */
++	return contain_mutable_functions((Node *) expr);
++}
++
+ 
+ /*****************************************************************************
+  *		Check clauses for volatile functions
+@@ -459,6 +492,11 @@ contain_mutable_functions_walker(Node *node, void *context)
+  * volatile function) is found. This test prevents, for example,
+  * invalid conversions of volatile expressions into indexscan quals.
+  *
++ * This will give the right answer only for clauses that have been put
++ * through expression preprocessing.  Callers outside the planner typically
++ * should use contain_volatile_functions_after_planning() instead, for the
++ * reasons given there.
++ *
+  * We will recursively look into Query nodes (i.e., SubLink sub-selects)
+  * but not into SubPlans.  This is a bit odd, but intentional.  If we are
+  * looking at a SubLink, we are probably deciding whether a query tree
+@@ -582,6 +620,34 @@ contain_volatile_functions_walker(Node *node, void *context)
+ 								  context);
+ }
+ 
++/*
++ * contain_volatile_functions_after_planning
++ *	  Test whether given expression contains volatile functions.
++ *
++ * This is a wrapper for contain_volatile_functions() that is safe to use from
++ * outside the planner.  The difference is that it first runs the expression
++ * through expression_planner().  There are two key reasons why we need that:
++ *
++ * First, function default arguments will get inserted, which may affect
++ * volatility (consider "default random()").
++ *
++ * Second, inline-able functions will get inlined, which may allow us to
++ * conclude that the function is really less volatile than it's marked.
++ * As an example, polymorphic functions must be marked with the most volatile
++ * behavior that they have for any input type, but once we inline the
++ * function we may be able to conclude that it's not so volatile for the
++ * particular input type we're dealing with.
++ */
++bool
++contain_volatile_functions_after_planning(Expr *expr)
++{
++	/* We assume here that expression_planner() won't scribble on its input */
++	expr = expression_planner(expr);
++
++	/* Now we can search for volatile functions */
++	return contain_volatile_functions((Node *) expr);
++}
++
+ /*
+  * Special purpose version of contain_volatile_functions() for use in COPY:
+  * ignore nextval(), but treat all other functions normally.
+diff --git a/src/include/optimizer/optimizer.h b/src/include/optimizer/optimizer.h
+index 11fd5013c741..6e8b81c51d5e 100644
+--- a/src/include/optimizer/optimizer.h
++++ b/src/include/optimizer/optimizer.h
+@@ -138,7 +138,9 @@ extern Expr *canonicalize_qual(Expr *qual, bool is_check);
+ /* in util/clauses.c: */
+ 
+ extern bool contain_mutable_functions(Node *clause);
++extern bool contain_mutable_functions_after_planning(Expr *expr);
+ extern bool contain_volatile_functions(Node *clause);
++extern bool contain_volatile_functions_after_planning(Expr *expr);
+ extern bool contain_volatile_functions_not_nextval(Node *clause);
+ 
+ extern Node *eval_const_expressions(PlannerInfo *root, Node *node);
+diff --git a/src/test/regress/expected/fast_default.out b/src/test/regress/expected/fast_default.out
+index 91f25717b5a5..59365dad964a 100644
+--- a/src/test/regress/expected/fast_default.out
++++ b/src/test/regress/expected/fast_default.out
+@@ -272,7 +272,25 @@ SELECT comp();
+  Rewritten
+ (1 row)
+ 
++-- check that we notice insertion of a volatile default argument
++CREATE FUNCTION foolme(timestamptz DEFAULT clock_timestamp())
++  RETURNS timestamptz
++  IMMUTABLE AS 'select $1' LANGUAGE sql;
++ALTER TABLE T ADD COLUMN c3 timestamptz DEFAULT foolme();
++NOTICE:  rewriting table t for reason 2
++SELECT attname, atthasmissing, attmissingval FROM pg_attribute
++  WHERE attrelid = 't'::regclass AND attnum > 0
++  ORDER BY attnum;
++ attname | atthasmissing | attmissingval 
++---------+---------------+---------------
++ pk      | f             | 
++ c1      | f             | 
++ c2      | f             | 
++ c3      | f             | 
++(4 rows)
++
+ DROP TABLE T;
++DROP FUNCTION foolme(timestamptz);
+ -- Simple querie
+ CREATE TABLE T (pk INT NOT NULL PRIMARY KEY);
+ SELECT set('t');
+diff --git a/src/test/regress/expected/generated.out b/src/test/regress/expected/generated.out
+index dc97ed3fe01d..a2f38d0f50af 100644
+--- a/src/test/regress/expected/generated.out
++++ b/src/test/regress/expected/generated.out
+@@ -61,6 +61,9 @@ LINE 1: ..._3 (a int PRIMARY KEY, b int GENERATED ALWAYS AS (c * 2) STO...
+ -- generation expression must be immutable
+ CREATE TABLE gtest_err_4 (a int PRIMARY KEY, b double precision GENERATED ALWAYS AS (random()) STORED);
+ ERROR:  generation expression is not immutable
++-- ... but be sure that the immutability test is accurate
++CREATE TABLE gtest2 (a int, b text GENERATED ALWAYS AS (a || ' sec') STORED);
++DROP TABLE gtest2;
+ -- cannot have default/identity and generated
+ CREATE TABLE gtest_err_5a (a int PRIMARY KEY, b int DEFAULT 5 GENERATED ALWAYS AS (a * 2) STORED);
+ ERROR:  both default and generation expression specified for column "b" of table "gtest_err_5a"
+diff --git a/src/test/regress/sql/fast_default.sql b/src/test/regress/sql/fast_default.sql
+index 16a3b7ca51d1..dc9df78a35d5 100644
+--- a/src/test/regress/sql/fast_default.sql
++++ b/src/test/regress/sql/fast_default.sql
+@@ -256,7 +256,18 @@ ALTER TABLE T ADD COLUMN c2 TIMESTAMP DEFAULT clock_timestamp();
+ 
+ SELECT comp();
+ 
++-- check that we notice insertion of a volatile default argument
++CREATE FUNCTION foolme(timestamptz DEFAULT clock_timestamp())
++  RETURNS timestamptz
++  IMMUTABLE AS 'select $1' LANGUAGE sql;
++ALTER TABLE T ADD COLUMN c3 timestamptz DEFAULT foolme();
++
++SELECT attname, atthasmissing, attmissingval FROM pg_attribute
++  WHERE attrelid = 't'::regclass AND attnum > 0
++  ORDER BY attnum;
++
+ DROP TABLE T;
++DROP FUNCTION foolme(timestamptz);
+ 
+ -- Simple querie
+ CREATE TABLE T (pk INT NOT NULL PRIMARY KEY);
+diff --git a/src/test/regress/sql/generated.sql b/src/test/regress/sql/generated.sql
+index 8ddecf0cc38d..298f6b3aa8b4 100644
+--- a/src/test/regress/sql/generated.sql
++++ b/src/test/regress/sql/generated.sql
+@@ -26,6 +26,9 @@ CREATE TABLE gtest_err_3 (a int PRIMARY KEY, b int GENERATED ALWAYS AS (c * 2) S
+ 
+ -- generation expression must be immutable
+ CREATE TABLE gtest_err_4 (a int PRIMARY KEY, b double precision GENERATED ALWAYS AS (random()) STORED);
++-- ... but be sure that the immutability test is accurate
++CREATE TABLE gtest2 (a int, b text GENERATED ALWAYS AS (a || ' sec') STORED);
++DROP TABLE gtest2;
+ 
+ -- cannot have default/identity and generated
+ CREATE TABLE gtest_err_5a (a int PRIMARY KEY, b int DEFAULT 5 GENERATED ALWAYS AS (a * 2) STORED);
