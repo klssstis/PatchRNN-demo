@@ -1,0 +1,132 @@
+From 9e108984fb35d8f9e2c2bffa10c0034f9161e802 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Wed, 22 Jul 2020 14:52:23 +0900
+Subject: [PATCH] Fix corner case with PGP decompression in pgcrypto
+
+A compressed stream may end with an empty packet, and PGP decompression
+finished before reading this empty packet in the remaining stream.  This
+caused a failure in pgcrypto, handling this case as corrupted data.
+This commit makes sure to consume such extra data, avoiding a failure
+when decompression the entire stream.  This corner case was reproducible
+with a data length of 16kB, and existed since its introduction in
+e94dd6a.  A cheap regression test is added to cover this case.
+
+Thanks to Jeff Janes for the extra investigation.
+
+Reported-by: Frank Gagnepain
+Author: Kyotaro Horiguchi, Michael Paquier
+Discussion: https://postgr.es/m/16476-692ef7b84e5fb893@postgresql.org
+Backpatch-through: 9.5
+---
+ contrib/pgcrypto/expected/pgp-compression.out | 30 +++++++++++++++++++
+ contrib/pgcrypto/pgp-compress.c               | 22 +++++++-------
+ contrib/pgcrypto/sql/pgp-compression.sql      | 21 +++++++++++++
+ 3 files changed, 62 insertions(+), 11 deletions(-)
+
+diff --git a/contrib/pgcrypto/expected/pgp-compression.out b/contrib/pgcrypto/expected/pgp-compression.out
+index 32b350b8fe05..d4c57feba30b 100644
+--- a/contrib/pgcrypto/expected/pgp-compression.out
++++ b/contrib/pgcrypto/expected/pgp-compression.out
+@@ -48,3 +48,33 @@ select pgp_sym_decrypt(
+  Secret message
+ (1 row)
+ 
++-- check corner case involving an input string of 16kB, as per bug #16476.
++SELECT setseed(0);
++ setseed 
++---------
++ 
++(1 row)
++
++WITH random_string AS
++(
++  -- This generates a random string of 16366 bytes.  This is chosen
++  -- as random so that it does not get compressed, and the decompression
++  -- would work on a string with the same length as the origin, making the
++  -- test behavior more predictible.  lpad() ensures that the generated
++  -- hexadecimal value is completed by extra zero characters if random()
++  -- has generated a value strictly lower than 16.
++  SELECT string_agg(decode(lpad(to_hex((random()*256)::int), 2, '0'), 'hex'), '') as bytes
++    FROM generate_series(0, 16365)
++)
++SELECT bytes =
++    pgp_sym_decrypt_bytea(
++      pgp_sym_encrypt_bytea(bytes, 'key',
++                            'compress-algo=1,compress-level=1'),
++                            'key', 'expect-compress-algo=1')
++    AS is_same
++  FROM random_string;
++ is_same 
++---------
++ t
++(1 row)
++
+diff --git a/contrib/pgcrypto/pgp-compress.c b/contrib/pgcrypto/pgp-compress.c
+index 0505bdee9237..17f5b2ef93dc 100644
+--- a/contrib/pgcrypto/pgp-compress.c
++++ b/contrib/pgcrypto/pgp-compress.c
+@@ -243,6 +243,17 @@ decompress_read(void *priv, PullFilter *src, int len,
+ 	struct DecomprData *dec = priv;
+ 
+ restart:
++	if (dec->stream.avail_in == 0)
++	{
++		uint8	   *tmp;
++
++		res = pullf_read(src, 8192, &tmp);
++		if (res < 0)
++			return res;
++		dec->stream.next_in = tmp;
++		dec->stream.avail_in = res;
++	}
++
+ 	if (dec->buf_data > 0)
+ 	{
+ 		if (len > dec->buf_data)
+@@ -256,17 +267,6 @@ decompress_read(void *priv, PullFilter *src, int len,
+ 	if (dec->eof)
+ 		return 0;
+ 
+-	if (dec->stream.avail_in == 0)
+-	{
+-		uint8	   *tmp;
+-
+-		res = pullf_read(src, 8192, &tmp);
+-		if (res < 0)
+-			return res;
+-		dec->stream.next_in = tmp;
+-		dec->stream.avail_in = res;
+-	}
+-
+ 	dec->stream.next_out = dec->buf;
+ 	dec->stream.avail_out = dec->buf_len;
+ 	dec->pos = dec->buf;
+diff --git a/contrib/pgcrypto/sql/pgp-compression.sql b/contrib/pgcrypto/sql/pgp-compression.sql
+index ca9ee1fc0088..87c59c6cabc4 100644
+--- a/contrib/pgcrypto/sql/pgp-compression.sql
++++ b/contrib/pgcrypto/sql/pgp-compression.sql
+@@ -28,3 +28,24 @@ select pgp_sym_decrypt(
+ 	pgp_sym_encrypt('Secret message', 'key',
+ 			'compress-algo=2, compress-level=0'),
+ 	'key', 'expect-compress-algo=0');
++
++-- check corner case involving an input string of 16kB, as per bug #16476.
++SELECT setseed(0);
++WITH random_string AS
++(
++  -- This generates a random string of 16366 bytes.  This is chosen
++  -- as random so that it does not get compressed, and the decompression
++  -- would work on a string with the same length as the origin, making the
++  -- test behavior more predictible.  lpad() ensures that the generated
++  -- hexadecimal value is completed by extra zero characters if random()
++  -- has generated a value strictly lower than 16.
++  SELECT string_agg(decode(lpad(to_hex((random()*256)::int), 2, '0'), 'hex'), '') as bytes
++    FROM generate_series(0, 16365)
++)
++SELECT bytes =
++    pgp_sym_decrypt_bytea(
++      pgp_sym_encrypt_bytea(bytes, 'key',
++                            'compress-algo=1,compress-level=1'),
++                            'key', 'expect-compress-algo=1')
++    AS is_same
++  FROM random_string;

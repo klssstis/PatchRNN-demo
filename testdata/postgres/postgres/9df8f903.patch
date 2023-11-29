@@ -1,0 +1,971 @@
+From 9df8f903eb6758be5a19e66cdf77e922e9329c31 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 17 May 2023 11:13:52 -0400
+Subject: [PATCH] Fix some issues with improper placement of outer join
+ clauses.
+
+After applying outer-join identity 3 in the forward direction,
+it was possible for the planner to mistakenly apply a qual clause
+from above the two outer joins at the now-lower join level.
+This can give the wrong answer, since a value that would get nulled
+by the now-upper join might not yet be null.
+
+To fix, when we perform such a transformation, consider that the
+now-lower join hasn't really completed the outer join it's nominally
+responsible for and thus its relid set should not include that OJ's
+relid (nor should its output Vars have that nullingrel bit set).
+Instead we add those bits when the now-upper join is performed.
+The existing rules for qual placement then suffice to prevent
+higher qual clauses from dropping below the now-upper join.
+There are a few complications from needing to consider transitive
+closures in case multiple pushdowns have happened, but all in all
+it's not a very complex patch.
+
+This is all new logic (from 2489d76c4) so no need to back-patch.
+The added test cases all have the same results as in v15.
+
+Tom Lane and Richard Guo
+
+Discussion: https://postgr.es/m/0b819232-4b50-f245-1c7d-c8c61bf41827@postgrespro.ru
+---
+ src/backend/optimizer/README              |  21 ++++
+ src/backend/optimizer/path/costsize.c     |   6 +-
+ src/backend/optimizer/path/equivclass.c   |  21 ++--
+ src/backend/optimizer/path/indxpath.c     |   2 +-
+ src/backend/optimizer/path/joinrels.c     | 123 +++++++++++++++++--
+ src/backend/optimizer/plan/analyzejoins.c |  16 ++-
+ src/backend/optimizer/plan/initsplan.c    |  60 ++++-----
+ src/backend/optimizer/util/orclauses.c    |   3 +-
+ src/backend/optimizer/util/relnode.c      |  71 ++++++++---
+ src/include/nodes/pathnodes.h             |  17 ++-
+ src/include/optimizer/pathnode.h          |   1 +
+ src/include/optimizer/paths.h             |   5 +-
+ src/test/regress/expected/join.out        | 143 ++++++++++++++++++++++
+ src/test/regress/sql/join.sql             |  47 +++++++
+ 14 files changed, 450 insertions(+), 86 deletions(-)
+
+diff --git a/src/backend/optimizer/README b/src/backend/optimizer/README
+index 227278eb6c0c..f1a96b858402 100644
+--- a/src/backend/optimizer/README
++++ b/src/backend/optimizer/README
+@@ -507,6 +507,27 @@ problem for join relation identification either, since whether a semijoin
+ has been completed is again implicit in the set of base relations
+ included in the join.
+ 
++As usual, outer join identity 3 complicates matters.  If we start with
++	(A leftjoin B on (Pab)) leftjoin C on (Pbc)
++then the parser will have marked any C Vars appearing above these joins
++with the RT index of the B/C join.  If we now transform to
++	A leftjoin (B leftjoin C on (Pbc)) on (Pab)
++then it would appear that a clause using only such Vars could be pushed
++down and applied as a filter clause (not a join clause) at the lower
++B/C join.  But *this might not give the right answer* since the clause
++might see a non-null value for the C Var that will be replaced by null
++once the A/B join is performed.  We handle this by saying that the
++pushed-down join hasn't completely performed the work of the B/C join
++and hence is not entitled to include that outer join relid in its
++relid set.  When we form the A/B join, both outer joins' relids will
++be added to its relid set, and then the upper clause will be applied
++at the correct join level.  (Note there is no problem when identity 3
++is applied in the other direction: if we started with the second form
++then upper C Vars are marked with both outer join relids, so they
++cannot drop below whichever join is applied second.)  Similarly,
++Vars representing the output of a pushed-down join do not acquire
++nullingrel bits for that join until after the upper join is performed.
++
+ There is one additional complication for qual clause placement, which
+ occurs when we have made multiple versions of an outer-join clause as
+ described previously (that is, we have both "Pbc" and "Pb*c" forms of
+diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
+index e60603df814c..0b271dae84f6 100644
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -4789,7 +4789,8 @@ compute_semi_anti_join_factors(PlannerInfo *root,
+ 	norm_sjinfo.ojrelid = 0;
+ 	norm_sjinfo.commute_above_l = NULL;
+ 	norm_sjinfo.commute_above_r = NULL;
+-	norm_sjinfo.commute_below = NULL;
++	norm_sjinfo.commute_below_l = NULL;
++	norm_sjinfo.commute_below_r = NULL;
+ 	/* we don't bother trying to make the remaining fields valid */
+ 	norm_sjinfo.lhs_strict = false;
+ 	norm_sjinfo.semi_can_btree = false;
+@@ -4957,7 +4958,8 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
+ 	sjinfo.ojrelid = 0;
+ 	sjinfo.commute_above_l = NULL;
+ 	sjinfo.commute_above_r = NULL;
+-	sjinfo.commute_below = NULL;
++	sjinfo.commute_below_l = NULL;
++	sjinfo.commute_below_r = NULL;
+ 	/* we don't bother trying to make the remaining fields valid */
+ 	sjinfo.lhs_strict = false;
+ 	sjinfo.semi_can_btree = false;
+diff --git a/src/backend/optimizer/path/equivclass.c b/src/backend/optimizer/path/equivclass.c
+index 9949d5b1d3b3..2db1bf644870 100644
+--- a/src/backend/optimizer/path/equivclass.c
++++ b/src/backend/optimizer/path/equivclass.c
+@@ -1366,19 +1366,20 @@ generate_base_implied_equalities_broken(PlannerInfo *root,
+  * commutative duplicates, i.e. if the algorithm selects "a.x = b.y" but
+  * we already have "b.y = a.x", we return the existing clause.
+  *
+- * If we are considering an outer join, ojrelid is the associated OJ relid,
+- * otherwise it's zero.
++ * If we are considering an outer join, sjinfo is the associated OJ info,
++ * otherwise it can be NULL.
+  *
+  * join_relids should always equal bms_union(outer_relids, inner_rel->relids)
+- * plus ojrelid if that's not zero.  We could simplify this function's API by
+- * computing it internally, but most callers have the value at hand anyway.
++ * plus whatever add_outer_joins_to_relids() would add.  We could simplify
++ * this function's API by computing it internally, but most callers have the
++ * value at hand anyway.
+  */
+ List *
+ generate_join_implied_equalities(PlannerInfo *root,
+ 								 Relids join_relids,
+ 								 Relids outer_relids,
+ 								 RelOptInfo *inner_rel,
+-								 Index ojrelid)
++								 SpecialJoinInfo *sjinfo)
+ {
+ 	List	   *result = NIL;
+ 	Relids		inner_relids = inner_rel->relids;
+@@ -1396,8 +1397,10 @@ generate_join_implied_equalities(PlannerInfo *root,
+ 		nominal_inner_relids = inner_rel->top_parent_relids;
+ 		/* ECs will be marked with the parent's relid, not the child's */
+ 		nominal_join_relids = bms_union(outer_relids, nominal_inner_relids);
+-		if (ojrelid != 0)
+-			nominal_join_relids = bms_add_member(nominal_join_relids, ojrelid);
++		nominal_join_relids = add_outer_joins_to_relids(root,
++														nominal_join_relids,
++														sjinfo,
++														NULL);
+ 	}
+ 	else
+ 	{
+@@ -1418,7 +1421,7 @@ generate_join_implied_equalities(PlannerInfo *root,
+ 	 * At inner joins, we can be smarter: only consider eclasses mentioning
+ 	 * both input rels.
+ 	 */
+-	if (ojrelid != 0)
++	if (sjinfo && sjinfo->ojrelid != 0)
+ 		matching_ecs = get_eclass_indexes_for_relids(root, nominal_join_relids);
+ 	else
+ 		matching_ecs = get_common_eclass_indexes(root, nominal_inner_relids,
+@@ -1467,7 +1470,7 @@ generate_join_implied_equalities(PlannerInfo *root,
+  * generate_join_implied_equalities_for_ecs
+  *	  As above, but consider only the listed ECs.
+  *
+- * For the sole current caller, we can assume ojrelid == 0, that is we are
++ * For the sole current caller, we can assume sjinfo == NULL, that is we are
+  * not interested in outer-join filter clauses.  This might need to change
+  * in future.
+  */
+diff --git a/src/backend/optimizer/path/indxpath.c b/src/backend/optimizer/path/indxpath.c
+index 9f4698f2a280..1436dbc2f2f3 100644
+--- a/src/backend/optimizer/path/indxpath.c
++++ b/src/backend/optimizer/path/indxpath.c
+@@ -3364,7 +3364,7 @@ check_index_predicates(PlannerInfo *root, RelOptInfo *rel)
+ 																   otherrels),
+ 														 otherrels,
+ 														 rel,
+-														 0));
++														 NULL));
+ 
+ 	/*
+ 	 * Normally we remove quals that are implied by a partial index's
+diff --git a/src/backend/optimizer/path/joinrels.c b/src/backend/optimizer/path/joinrels.c
+index 4c6ea3a2f021..2feab2184f43 100644
+--- a/src/backend/optimizer/path/joinrels.c
++++ b/src/backend/optimizer/path/joinrels.c
+@@ -691,6 +691,7 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
+ 	Relids		joinrelids;
+ 	SpecialJoinInfo *sjinfo;
+ 	bool		reversed;
++	List	   *pushed_down_joins = NIL;
+ 	SpecialJoinInfo sjinfo_data;
+ 	RelOptInfo *joinrel;
+ 	List	   *restrictlist;
+@@ -710,9 +711,12 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
+ 		return NULL;
+ 	}
+ 
+-	/* If we have an outer join, add its RTI to form the canonical relids. */
+-	if (sjinfo && sjinfo->ojrelid != 0)
+-		joinrelids = bms_add_member(joinrelids, sjinfo->ojrelid);
++	/*
++	 * Add outer join relid(s) to form the canonical relids.  Any added outer
++	 * joins besides sjinfo itself are appended to pushed_down_joins.
++	 */
++	joinrelids = add_outer_joins_to_relids(root, joinrelids, sjinfo,
++										   &pushed_down_joins);
+ 
+ 	/* Swap rels if needed to match the join info. */
+ 	if (reversed)
+@@ -740,7 +744,8 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
+ 		sjinfo->ojrelid = 0;
+ 		sjinfo->commute_above_l = NULL;
+ 		sjinfo->commute_above_r = NULL;
+-		sjinfo->commute_below = NULL;
++		sjinfo->commute_below_l = NULL;
++		sjinfo->commute_below_r = NULL;
+ 		/* we don't bother trying to make the remaining fields valid */
+ 		sjinfo->lhs_strict = false;
+ 		sjinfo->semi_can_btree = false;
+@@ -753,7 +758,8 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
+ 	 * Find or build the join RelOptInfo, and compute the restrictlist that
+ 	 * goes with this particular joining.
+ 	 */
+-	joinrel = build_join_rel(root, joinrelids, rel1, rel2, sjinfo,
++	joinrel = build_join_rel(root, joinrelids, rel1, rel2,
++							 sjinfo, pushed_down_joins,
+ 							 &restrictlist);
+ 
+ 	/*
+@@ -775,6 +781,108 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
+ 	return joinrel;
+ }
+ 
++/*
++ * add_outer_joins_to_relids
++ *	  Add relids to input_relids to represent any outer joins that will be
++ *	  calculated at this join.
++ *
++ * input_relids is the union of the relid sets of the two input relations.
++ * Note that we modify this in-place and return it; caller must bms_copy()
++ * it first, if a separate value is desired.
++ *
++ * sjinfo represents the join being performed.
++ *
++ * If the current join completes the calculation of any outer joins that
++ * have been pushed down per outer-join identity 3, those relids will be
++ * added to the result along with sjinfo's own relid.  If pushed_down_joins
++ * is not NULL, then also the SpecialJoinInfos for such added outer joins will
++ * be appended to *pushed_down_joins (so caller must initialize it to NIL).
++ */
++Relids
++add_outer_joins_to_relids(PlannerInfo *root, Relids input_relids,
++						  SpecialJoinInfo *sjinfo,
++						  List **pushed_down_joins)
++{
++	/* Nothing to do if this isn't an outer join with an assigned relid. */
++	if (sjinfo == NULL || sjinfo->ojrelid == 0)
++		return input_relids;
++
++	/*
++	 * If it's not a left join, we have no rules that would permit executing
++	 * it in non-syntactic order, so just form the syntactic relid set.  (This
++	 * is just a quick-exit test; we'd come to the same conclusion anyway,
++	 * since its commute_below_l and commute_above_l sets must be empty.)
++	 */
++	if (sjinfo->jointype != JOIN_LEFT)
++		return bms_add_member(input_relids, sjinfo->ojrelid);
++
++	/*
++	 * We cannot add the OJ relid if this join has been pushed into the RHS of
++	 * a syntactically-lower left join per OJ identity 3.  (If it has, then we
++	 * cannot claim that its outputs represent the final state of its RHS.)
++	 * There will not be any other OJs that can be added either, so we're
++	 * done.
++	 */
++	if (!bms_is_subset(sjinfo->commute_below_l, input_relids))
++		return input_relids;
++
++	/* OK to add OJ's own relid */
++	input_relids = bms_add_member(input_relids, sjinfo->ojrelid);
++
++	/*
++	 * Contrariwise, if we are now forming the final result of such a commuted
++	 * pair of OJs, it's time to add the relid(s) of the pushed-down join(s).
++	 * We can skip this if this join was never a candidate to be pushed up.
++	 */
++	if (sjinfo->commute_above_l)
++	{
++		Relids		commute_above_rels = bms_copy(sjinfo->commute_above_l);
++		ListCell   *lc;
++
++		/*
++		 * The current join could complete the nulling of more than one
++		 * pushed-down join, so we have to examine all the SpecialJoinInfos.
++		 * Because join_info_list was built in bottom-up order, it's
++		 * sufficient to traverse it once: an ojrelid we add in one loop
++		 * iteration would not have affected decisions of earlier iterations.
++		 */
++		foreach(lc, root->join_info_list)
++		{
++			SpecialJoinInfo *othersj = (SpecialJoinInfo *) lfirst(lc);
++
++			if (othersj == sjinfo ||
++				othersj->ojrelid == 0 || othersj->jointype != JOIN_LEFT)
++				continue;		/* definitely not interesting */
++
++			if (!bms_is_member(othersj->ojrelid, commute_above_rels))
++				continue;
++
++			/* Add it if not already present but conditions now satisfied */
++			if (!bms_is_member(othersj->ojrelid, input_relids) &&
++				bms_is_subset(othersj->min_lefthand, input_relids) &&
++				bms_is_subset(othersj->min_righthand, input_relids) &&
++				bms_is_subset(othersj->commute_below_l, input_relids))
++			{
++				input_relids = bms_add_member(input_relids, othersj->ojrelid);
++				/* report such pushed down outer joins, if asked */
++				if (pushed_down_joins != NULL)
++					*pushed_down_joins = lappend(*pushed_down_joins, othersj);
++
++				/*
++				 * We must also check any joins that othersj potentially
++				 * commutes with.  They likewise must appear later in
++				 * join_info_list than othersj itself, so we can visit them
++				 * later in this loop.
++				 */
++				commute_above_rels = bms_add_members(commute_above_rels,
++													 othersj->commute_above_l);
++			}
++		}
++	}
++
++	return input_relids;
++}
++
+ /*
+  * populate_joinrel_with_paths
+  *	  Add paths to the given joinrel for given pair of joining relations. The
+@@ -1534,9 +1642,8 @@ try_partitionwise_join(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
+ 
+ 		/* Build correct join relids for child join */
+ 		child_joinrelids = bms_union(child_rel1->relids, child_rel2->relids);
+-		if (child_sjinfo->ojrelid != 0)
+-			child_joinrelids = bms_add_member(child_joinrelids,
+-											  child_sjinfo->ojrelid);
++		child_joinrelids = add_outer_joins_to_relids(root, child_joinrelids,
++													 child_sjinfo, NULL);
+ 
+ 		/* Find the AppendRelInfo structures */
+ 		appinfos = find_appinfos_by_relids(root, child_joinrelids, &nappinfos);
+diff --git a/src/backend/optimizer/plan/analyzejoins.c b/src/backend/optimizer/plan/analyzejoins.c
+index 657b6e59074a..7463b3696ac9 100644
+--- a/src/backend/optimizer/plan/analyzejoins.c
++++ b/src/backend/optimizer/plan/analyzejoins.c
+@@ -88,8 +88,11 @@ remove_useless_joins(PlannerInfo *root, List *joinlist)
+ 		 */
+ 		innerrelid = bms_singleton_member(sjinfo->min_righthand);
+ 
+-		/* Compute the relid set for the join we are considering */
+-		joinrelids = bms_union(sjinfo->min_lefthand, sjinfo->min_righthand);
++		/*
++		 * Compute the relid set for the join we are considering.  We can
++		 * assume things are done in syntactic order.
++		 */
++		joinrelids = bms_union(sjinfo->syn_lefthand, sjinfo->syn_righthand);
+ 		if (sjinfo->ojrelid != 0)
+ 			joinrelids = bms_add_member(joinrelids, sjinfo->ojrelid);
+ 
+@@ -201,8 +204,8 @@ join_is_removable(PlannerInfo *root, SpecialJoinInfo *sjinfo)
+ 	if (!rel_supports_distinctness(root, innerrel))
+ 		return false;
+ 
+-	/* Compute the relid set for the join we are considering */
+-	inputrelids = bms_union(sjinfo->min_lefthand, sjinfo->min_righthand);
++	/* Compute the syntactic relid set for the join we are considering */
++	inputrelids = bms_union(sjinfo->syn_lefthand, sjinfo->syn_righthand);
+ 	Assert(sjinfo->ojrelid != 0);
+ 	joinrelids = bms_copy(inputrelids);
+ 	joinrelids = bms_add_member(joinrelids, sjinfo->ojrelid);
+@@ -399,7 +402,8 @@ remove_rel_from_query(PlannerInfo *root, int relid, int ojrelid,
+ 		/* relid cannot appear in these fields, but ojrelid can: */
+ 		sjinfo->commute_above_l = bms_del_member(sjinfo->commute_above_l, ojrelid);
+ 		sjinfo->commute_above_r = bms_del_member(sjinfo->commute_above_r, ojrelid);
+-		sjinfo->commute_below = bms_del_member(sjinfo->commute_below, ojrelid);
++		sjinfo->commute_below_l = bms_del_member(sjinfo->commute_below_l, ojrelid);
++		sjinfo->commute_below_r = bms_del_member(sjinfo->commute_below_r, ojrelid);
+ 	}
+ 
+ 	/*
+@@ -665,7 +669,7 @@ reduce_unique_semijoins(PlannerInfo *root)
+ 														 joinrelids,
+ 														 sjinfo->min_lefthand,
+ 														 innerrel,
+-														 0),
++														 NULL),
+ 						innerrel->joininfo);
+ 
+ 		/* Test whether the innerrel is unique for those clauses. */
+diff --git a/src/backend/optimizer/plan/initsplan.c b/src/backend/optimizer/plan/initsplan.c
+index 06f90882c447..5cbb7b9a86bd 100644
+--- a/src/backend/optimizer/plan/initsplan.c
++++ b/src/backend/optimizer/plan/initsplan.c
+@@ -1213,8 +1213,8 @@ deconstruct_distribute(PlannerInfo *root, JoinTreeItem *jtitem)
+ 			 * positioning decisions will be made later, when we revisit the
+ 			 * postponed clauses.
+ 			 */
+-			if (sjinfo->commute_below)
+-				ojscope = bms_add_members(ojscope, sjinfo->commute_below);
++			ojscope = bms_add_members(ojscope, sjinfo->commute_below_l);
++			ojscope = bms_add_members(ojscope, sjinfo->commute_below_r);
+ 		}
+ 		else
+ 			postponed_oj_qual_list = NULL;
+@@ -1400,7 +1400,8 @@ make_outerjoininfo(PlannerInfo *root,
+ 	/* these fields may get added to later: */
+ 	sjinfo->commute_above_l = NULL;
+ 	sjinfo->commute_above_r = NULL;
+-	sjinfo->commute_below = NULL;
++	sjinfo->commute_below_l = NULL;
++	sjinfo->commute_below_r = NULL;
+ 
+ 	compute_semijoin_info(root, sjinfo, clause);
+ 
+@@ -1643,37 +1644,30 @@ make_outerjoininfo(PlannerInfo *root,
+ 	 * Now that we've identified the correct min_lefthand and min_righthand,
+ 	 * any commute_below_l or commute_below_r relids that have not gotten
+ 	 * added back into those sets (due to intervening outer joins) are indeed
+-	 * commutable with this one.  Update the derived data in the
+-	 * SpecialJoinInfos.
++	 * commutable with this one.
++	 *
++	 * First, delete any subsequently-added-back relids (this is easier than
++	 * maintaining commute_below_l/r precisely through all the above).
+ 	 */
++	commute_below_l = bms_del_members(commute_below_l, min_lefthand);
++	commute_below_r = bms_del_members(commute_below_r, min_righthand);
++
++	/* Anything left? */
+ 	if (commute_below_l || commute_below_r)
+ 	{
+-		Relids		commute_below;
+-
+-		/*
+-		 * Delete any subsequently-added-back relids (this is easier than
+-		 * maintaining commute_below_l/r precisely through all the above).
+-		 */
+-		commute_below_l = bms_del_members(commute_below_l, min_lefthand);
+-		commute_below_r = bms_del_members(commute_below_r, min_righthand);
+-
+-		/* Anything left? */
+-		commute_below = bms_union(commute_below_l, commute_below_r);
+-		if (!bms_is_empty(commute_below))
++		/* Yup, so we must update the derived data in the SpecialJoinInfos */
++		sjinfo->commute_below_l = commute_below_l;
++		sjinfo->commute_below_r = commute_below_r;
++		foreach(l, root->join_info_list)
+ 		{
+-			/* Yup, so we must update the data structures */
+-			sjinfo->commute_below = commute_below;
+-			foreach(l, root->join_info_list)
+-			{
+-				SpecialJoinInfo *otherinfo = (SpecialJoinInfo *) lfirst(l);
+-
+-				if (bms_is_member(otherinfo->ojrelid, commute_below_l))
+-					otherinfo->commute_above_l =
+-						bms_add_member(otherinfo->commute_above_l, ojrelid);
+-				else if (bms_is_member(otherinfo->ojrelid, commute_below_r))
+-					otherinfo->commute_above_r =
+-						bms_add_member(otherinfo->commute_above_r, ojrelid);
+-			}
++			SpecialJoinInfo *otherinfo = (SpecialJoinInfo *) lfirst(l);
++
++			if (bms_is_member(otherinfo->ojrelid, commute_below_l))
++				otherinfo->commute_above_l =
++					bms_add_member(otherinfo->commute_above_l, ojrelid);
++			else if (bms_is_member(otherinfo->ojrelid, commute_below_r))
++				otherinfo->commute_above_r =
++					bms_add_member(otherinfo->commute_above_r, ojrelid);
+ 		}
+ 	}
+ 
+@@ -1889,8 +1883,7 @@ deconstruct_distribute_oj_quals(PlannerInfo *root,
+ 	 * as-is.
+ 	 */
+ 	Assert(sjinfo->lhs_strict); /* else we shouldn't be here */
+-	if (sjinfo->commute_above_r ||
+-		bms_overlap(sjinfo->commute_below, sjinfo->syn_lefthand))
++	if (sjinfo->commute_above_r || sjinfo->commute_below_l)
+ 	{
+ 		Relids		joins_above;
+ 		Relids		joins_below;
+@@ -1901,8 +1894,7 @@ deconstruct_distribute_oj_quals(PlannerInfo *root,
+ 
+ 		/* Identify the outer joins this one commutes with */
+ 		joins_above = sjinfo->commute_above_r;
+-		joins_below = bms_intersect(sjinfo->commute_below,
+-									sjinfo->syn_lefthand);
++		joins_below = sjinfo->commute_below_l;
+ 
+ 		/*
+ 		 * Generate qual variants with different sets of nullingrels bits.
+diff --git a/src/backend/optimizer/util/orclauses.c b/src/backend/optimizer/util/orclauses.c
+index 85ecdfc14f2a..ca8b5ff92fc1 100644
+--- a/src/backend/optimizer/util/orclauses.c
++++ b/src/backend/optimizer/util/orclauses.c
+@@ -334,7 +334,8 @@ consider_new_or_clause(PlannerInfo *root, RelOptInfo *rel,
+ 		sjinfo.ojrelid = 0;
+ 		sjinfo.commute_above_l = NULL;
+ 		sjinfo.commute_above_r = NULL;
+-		sjinfo.commute_below = NULL;
++		sjinfo.commute_below_l = NULL;
++		sjinfo.commute_below_r = NULL;
+ 		/* we don't bother trying to make the remaining fields valid */
+ 		sjinfo.lhs_strict = false;
+ 		sjinfo.semi_can_btree = false;
+diff --git a/src/backend/optimizer/util/relnode.c b/src/backend/optimizer/util/relnode.c
+index 68fd03359522..8d5f7c5e8dd8 100644
+--- a/src/backend/optimizer/util/relnode.c
++++ b/src/backend/optimizer/util/relnode.c
+@@ -43,6 +43,7 @@ typedef struct JoinHashEntry
+ static void build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
+ 								RelOptInfo *input_rel,
+ 								SpecialJoinInfo *sjinfo,
++								List *pushed_down_joins,
+ 								bool can_null);
+ static List *build_joinrel_restrictlist(PlannerInfo *root,
+ 										RelOptInfo *joinrel,
+@@ -632,6 +633,7 @@ add_join_rel(PlannerInfo *root, RelOptInfo *joinrel)
+  * 'outer_rel' and 'inner_rel' are relation nodes for the relations to be
+  *		joined
+  * 'sjinfo': join context info
++ * 'pushed_down_joins': any pushed-down outer joins that are now completed
+  * 'restrictlist_ptr': result variable.  If not NULL, *restrictlist_ptr
+  *		receives the list of RestrictInfo nodes that apply to this
+  *		particular pair of joinable relations.
+@@ -645,6 +647,7 @@ build_join_rel(PlannerInfo *root,
+ 			   RelOptInfo *outer_rel,
+ 			   RelOptInfo *inner_rel,
+ 			   SpecialJoinInfo *sjinfo,
++			   List *pushed_down_joins,
+ 			   List **restrictlist_ptr)
+ {
+ 	RelOptInfo *joinrel;
+@@ -757,9 +760,9 @@ build_join_rel(PlannerInfo *root,
+ 	 * and inner rels we first try to build it from.  But the contents should
+ 	 * be the same regardless.
+ 	 */
+-	build_joinrel_tlist(root, joinrel, outer_rel, sjinfo,
++	build_joinrel_tlist(root, joinrel, outer_rel, sjinfo, pushed_down_joins,
+ 						(sjinfo->jointype == JOIN_FULL));
+-	build_joinrel_tlist(root, joinrel, inner_rel, sjinfo,
++	build_joinrel_tlist(root, joinrel, inner_rel, sjinfo, pushed_down_joins,
+ 						(sjinfo->jointype != JOIN_INNER));
+ 	add_placeholders_to_joinrel(root, joinrel, outer_rel, inner_rel, sjinfo);
+ 
+@@ -870,8 +873,8 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
+ 
+ 	joinrel->reloptkind = RELOPT_OTHER_JOINREL;
+ 	joinrel->relids = bms_union(outer_rel->relids, inner_rel->relids);
+-	if (sjinfo->ojrelid != 0)
+-		joinrel->relids = bms_add_member(joinrel->relids, sjinfo->ojrelid);
++	joinrel->relids = add_outer_joins_to_relids(root, joinrel->relids, sjinfo,
++												NULL);
+ 	joinrel->rows = 0;
+ 	/* cheap startup cost is interesting iff not all tuples to be retrieved */
+ 	joinrel->consider_startup = (root->tuple_fraction > 0);
+@@ -1042,22 +1045,32 @@ min_join_parameterization(PlannerInfo *root,
+  * from this input relation.  If so, we will (normally) add the join's relid
+  * to the nulling bitmaps of Vars and PHVs bubbled up from the input.
+  *
+- * When forming an outer join's target list, special handling is needed
+- * in case the outer join was commuted with another one per outer join
+- * identity 3 (see optimizer/README).  We must take steps to ensure that
+- * the output Vars have the same nulling bitmaps that they would if the
+- * two joins had been done in syntactic order; else they won't match Vars
+- * appearing higher in the query tree.  We need to do two things:
++ * When forming an outer join's target list, special handling is needed in
++ * case the outer join was commuted with another one per outer join identity 3
++ * (see optimizer/README).  We must take steps to ensure that the output Vars
++ * have the same nulling bitmaps that they would if the two joins had been
++ * done in syntactic order; else they won't match Vars appearing higher in
++ * the query tree.  An exception to the match-the-syntactic-order rule is
++ * that when an outer join is pushed down into another one's RHS per identity
++ * 3, we can't mark its Vars as nulled until the now-upper outer join is also
++ * completed.  So we need to do three things:
+  *
+- * First, we add the outer join's relid to the nulling bitmap only if the Var
+- * or PHV actually comes from within the syntactically nullable side(s) of the
+- * outer join.  This takes care of the possibility that we have transformed
++ * First, we add the outer join's relid to the nulling bitmap only if the
++ * outer join has been completely performed and the Var or PHV actually
++ * comes from within the syntactically nullable side(s) of the outer join.
++ * This takes care of the possibility that we have transformed
+  *		(A leftjoin B on (Pab)) leftjoin C on (Pbc)
+  * to
+  *		A leftjoin (B leftjoin C on (Pbc)) on (Pab)
+- * Here the now-upper A/B join must not mark C columns as nulled by itself.
++ * Here the pushed-down B/C join cannot mark C columns as nulled yet,
++ * while the now-upper A/B join must not mark C columns as nulled by itself.
+  *
+- * Second, any relid in sjinfo->commute_above_r that is already part of
++ * Second, perform the same operation for each SpecialJoinInfo listed in
++ * pushed_down_joins (which, in this example, would be the B/C join when
++ * we are at the now-upper A/B join).  This allows the now-upper join to
++ * complete the marking of "C" Vars that now have fully valid values.
++ *
++ * Third, any relid in sjinfo->commute_above_r that is already part of
+  * the joinrel is added to the nulling bitmaps of nullable Vars and PHVs.
+  * This takes care of the reverse case where we implement
+  *		A leftjoin (B leftjoin C on (Pbc)) on (Pab)
+@@ -1071,10 +1084,12 @@ static void
+ build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
+ 					RelOptInfo *input_rel,
+ 					SpecialJoinInfo *sjinfo,
++					List *pushed_down_joins,
+ 					bool can_null)
+ {
+ 	Relids		relids = joinrel->relids;
+ 	ListCell   *vars;
++	ListCell   *lc;
+ 
+ 	foreach(vars, input_rel->reltarget->exprs)
+ 	{
+@@ -1101,11 +1116,21 @@ build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
+ 					phv = copyObject(phv);
+ 					/* See comments above to understand this logic */
+ 					if (sjinfo->ojrelid != 0 &&
++						bms_is_member(sjinfo->ojrelid, relids) &&
+ 						(bms_is_subset(phv->phrels, sjinfo->syn_righthand) ||
+ 						 (sjinfo->jointype == JOIN_FULL &&
+ 						  bms_is_subset(phv->phrels, sjinfo->syn_lefthand))))
+ 						phv->phnullingrels = bms_add_member(phv->phnullingrels,
+ 															sjinfo->ojrelid);
++					foreach(lc, pushed_down_joins)
++					{
++						SpecialJoinInfo *othersj = (SpecialJoinInfo *) lfirst(lc);
++
++						Assert(bms_is_member(othersj->ojrelid, relids));
++						if (bms_is_subset(phv->phrels, othersj->syn_righthand))
++							phv->phnullingrels = bms_add_member(phv->phnullingrels,
++																othersj->ojrelid);
++					}
+ 					phv->phnullingrels =
+ 						bms_join(phv->phnullingrels,
+ 								 bms_intersect(sjinfo->commute_above_r,
+@@ -1166,11 +1191,21 @@ build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
+ 			var = copyObject(var);
+ 			/* See comments above to understand this logic */
+ 			if (sjinfo->ojrelid != 0 &&
++				bms_is_member(sjinfo->ojrelid, relids) &&
+ 				(bms_is_member(var->varno, sjinfo->syn_righthand) ||
+ 				 (sjinfo->jointype == JOIN_FULL &&
+ 				  bms_is_member(var->varno, sjinfo->syn_lefthand))))
+ 				var->varnullingrels = bms_add_member(var->varnullingrels,
+ 													 sjinfo->ojrelid);
++			foreach(lc, pushed_down_joins)
++			{
++				SpecialJoinInfo *othersj = (SpecialJoinInfo *) lfirst(lc);
++
++				Assert(bms_is_member(othersj->ojrelid, relids));
++				if (bms_is_member(var->varno, othersj->syn_righthand))
++					var->varnullingrels = bms_add_member(var->varnullingrels,
++														 othersj->ojrelid);
++			}
+ 			var->varnullingrels =
+ 				bms_join(var->varnullingrels,
+ 						 bms_intersect(sjinfo->commute_above_r,
+@@ -1259,7 +1294,7 @@ build_joinrel_restrictlist(PlannerInfo *root,
+ 														  joinrel->relids,
+ 														  outer_rel->relids,
+ 														  inner_rel,
+-														  sjinfo->ojrelid));
++														  sjinfo));
+ 
+ 	return result;
+ }
+@@ -1543,7 +1578,7 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
+ 															joinrelids,
+ 															required_outer,
+ 															baserel,
+-															0));
++															NULL));
+ 
+ 	/* Compute set of serial numbers of the enforced clauses */
+ 	pserials = NULL;
+@@ -1666,7 +1701,7 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
+ 												join_and_req,
+ 												required_outer,
+ 												joinrel,
+-												0);
++												NULL);
+ 	/* We only want ones that aren't movable to lower levels */
+ 	dropped_ecs = NIL;
+ 	foreach(lc, eclauses)
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index 7d4f24d2508c..23dd671bf4eb 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -2783,11 +2783,15 @@ typedef struct PlaceHolderVar
+  * 3, when this join is in the RHS of the upper join (so, this is the lower
+  * join in the second form of the identity).
+  *
+- * commute_below is filled with the relids of syntactically-lower outer joins
+- * that have been found to commute with this one per outer join identity 3.
+- * (We need not record which side they are on, since that can be determined
+- * by seeing whether the lower join's relid appears in syn_lefthand or
+- * syn_righthand.)
++ * commute_below_l is filled with the relids of syntactically-lower outer
++ * joins that have been found to commute with this one per outer join identity
++ * 3 and are in the LHS of this join (so, this is the upper join in the first
++ * form of the identity).
++ *
++ * commute_below_r is filled with the relids of syntactically-lower outer
++ * joins that have been found to commute with this one per outer join identity
++ * 3 and are in the RHS of this join (so, this is the upper join in the second
++ * form of the identity).
+  *
+  * lhs_strict is true if the special join's condition cannot succeed when the
+  * LHS variables are all NULL (this means that an outer join can commute with
+@@ -2829,7 +2833,8 @@ struct SpecialJoinInfo
+ 	Index		ojrelid;		/* outer join's RT index; 0 if none */
+ 	Relids		commute_above_l;	/* commuting OJs above this one, if LHS */
+ 	Relids		commute_above_r;	/* commuting OJs above this one, if RHS */
+-	Relids		commute_below;	/* commuting OJs below this one */
++	Relids		commute_below_l;	/* commuting OJs in this one's LHS */
++	Relids		commute_below_r;	/* commuting OJs in this one's RHS */
+ 	bool		lhs_strict;		/* joinclause is strict for some LHS rel */
+ 	/* Remaining fields are set only for JOIN_SEMI jointype: */
+ 	bool		semi_can_btree; /* true if semi_operators are all btree */
+diff --git a/src/include/optimizer/pathnode.h b/src/include/optimizer/pathnode.h
+index 69be701b167f..001e75b5b769 100644
+--- a/src/include/optimizer/pathnode.h
++++ b/src/include/optimizer/pathnode.h
+@@ -311,6 +311,7 @@ extern RelOptInfo *build_join_rel(PlannerInfo *root,
+ 								  RelOptInfo *outer_rel,
+ 								  RelOptInfo *inner_rel,
+ 								  SpecialJoinInfo *sjinfo,
++								  List *pushed_down_joins,
+ 								  List **restrictlist_ptr);
+ extern Relids min_join_parameterization(PlannerInfo *root,
+ 										Relids joinrelids,
+diff --git a/src/include/optimizer/paths.h b/src/include/optimizer/paths.h
+index 5b9db7733d2e..50bc3b503a65 100644
+--- a/src/include/optimizer/paths.h
++++ b/src/include/optimizer/paths.h
+@@ -104,6 +104,9 @@ extern void add_paths_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
+ extern void join_search_one_level(PlannerInfo *root, int level);
+ extern RelOptInfo *make_join_rel(PlannerInfo *root,
+ 								 RelOptInfo *rel1, RelOptInfo *rel2);
++extern Relids add_outer_joins_to_relids(PlannerInfo *root, Relids input_relids,
++										SpecialJoinInfo *sjinfo,
++										List **pushed_down_joins);
+ extern bool have_join_order_restriction(PlannerInfo *root,
+ 										RelOptInfo *rel1, RelOptInfo *rel2);
+ extern bool have_dangerous_phv(PlannerInfo *root,
+@@ -150,7 +153,7 @@ extern List *generate_join_implied_equalities(PlannerInfo *root,
+ 											  Relids join_relids,
+ 											  Relids outer_relids,
+ 											  RelOptInfo *inner_rel,
+-											  Index ojrelid);
++											  SpecialJoinInfo *sjinfo);
+ extern List *generate_join_implied_equalities_for_ecs(PlannerInfo *root,
+ 													  List *eclasses,
+ 													  Relids join_relids,
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index b5f440e43e53..9bafadde66fc 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -2357,6 +2357,149 @@ where b.f1 = t.thousand and a.f1 = b.f1 and (a.f1+b.f1+999) = t.tenthous;
+ ----+----+----------+----------
+ (0 rows)
+ 
++--
++-- checks for correct handling of quals in multiway outer joins
++--
++explain (costs off)
++select t1.f1
++from int4_tbl t1, int4_tbl t2
++  left join int4_tbl t3 on t3.f1 > 0
++  left join int4_tbl t4 on t3.f1 > 1
++where t4.f1 is null;
++                      QUERY PLAN                       
++-------------------------------------------------------
++ Nested Loop
++   ->  Nested Loop Left Join
++         Filter: (t4.f1 IS NULL)
++         ->  Seq Scan on int4_tbl t2
++         ->  Materialize
++               ->  Nested Loop Left Join
++                     Join Filter: (t3.f1 > 1)
++                     ->  Seq Scan on int4_tbl t3
++                           Filter: (f1 > 0)
++                     ->  Materialize
++                           ->  Seq Scan on int4_tbl t4
++   ->  Seq Scan on int4_tbl t1
++(12 rows)
++
++select t1.f1
++from int4_tbl t1, int4_tbl t2
++  left join int4_tbl t3 on t3.f1 > 0
++  left join int4_tbl t4 on t3.f1 > 1
++where t4.f1 is null;
++ f1 
++----
++(0 rows)
++
++explain (costs off)
++select *
++from int4_tbl t1 left join int4_tbl t2 on true
++  left join int4_tbl t3 on t2.f1 > 0
++  left join int4_tbl t4 on t3.f1 > 0;
++                      QUERY PLAN                       
++-------------------------------------------------------
++ Nested Loop Left Join
++   ->  Seq Scan on int4_tbl t1
++   ->  Materialize
++         ->  Nested Loop Left Join
++               Join Filter: (t3.f1 > 0)
++               ->  Nested Loop Left Join
++                     Join Filter: (t2.f1 > 0)
++                     ->  Seq Scan on int4_tbl t2
++                     ->  Materialize
++                           ->  Seq Scan on int4_tbl t3
++               ->  Materialize
++                     ->  Seq Scan on int4_tbl t4
++(12 rows)
++
++explain (costs off)
++select * from onek t1
++  left join onek t2 on t1.unique1 = t2.unique1
++  left join onek t3 on t2.unique1 != t3.unique1
++  left join onek t4 on t3.unique1 = t4.unique1;
++                     QUERY PLAN                     
++----------------------------------------------------
++ Nested Loop Left Join
++   Join Filter: (t2.unique1 <> t3.unique1)
++   ->  Hash Left Join
++         Hash Cond: (t1.unique1 = t2.unique1)
++         ->  Seq Scan on onek t1
++         ->  Hash
++               ->  Seq Scan on onek t2
++   ->  Materialize
++         ->  Hash Left Join
++               Hash Cond: (t3.unique1 = t4.unique1)
++               ->  Seq Scan on onek t3
++               ->  Hash
++                     ->  Seq Scan on onek t4
++(13 rows)
++
++explain (costs off)
++select * from int4_tbl t1
++  left join (select now() from int4_tbl t2
++             left join int4_tbl t3 on t2.f1 = t3.f1
++             left join int4_tbl t4 on t3.f1 = t4.f1) s on true
++  inner join int4_tbl t5 on true;
++                         QUERY PLAN                          
++-------------------------------------------------------------
++ Nested Loop
++   ->  Nested Loop Left Join
++         ->  Seq Scan on int4_tbl t1
++         ->  Materialize
++               ->  Hash Left Join
++                     Hash Cond: (t3.f1 = t4.f1)
++                     ->  Hash Left Join
++                           Hash Cond: (t2.f1 = t3.f1)
++                           ->  Seq Scan on int4_tbl t2
++                           ->  Hash
++                                 ->  Seq Scan on int4_tbl t3
++                     ->  Hash
++                           ->  Seq Scan on int4_tbl t4
++   ->  Materialize
++         ->  Seq Scan on int4_tbl t5
++(15 rows)
++
++explain (costs off)
++select * from int4_tbl t1
++  left join int4_tbl t2 on true
++  left join int4_tbl t3 on true
++  left join int4_tbl t4 on t2.f1 = t3.f1;
++                   QUERY PLAN                    
++-------------------------------------------------
++ Nested Loop Left Join
++   Join Filter: (t2.f1 = t3.f1)
++   ->  Nested Loop Left Join
++         ->  Nested Loop Left Join
++               ->  Seq Scan on int4_tbl t1
++               ->  Materialize
++                     ->  Seq Scan on int4_tbl t2
++         ->  Materialize
++               ->  Seq Scan on int4_tbl t3
++   ->  Materialize
++         ->  Seq Scan on int4_tbl t4
++(11 rows)
++
++explain (costs off)
++select * from int4_tbl t1
++  left join int4_tbl t2 on true
++  left join int4_tbl t3 on t2.f1 = t3.f1
++  left join int4_tbl t4 on t3.f1 != t4.f1;
++                      QUERY PLAN                       
++-------------------------------------------------------
++ Nested Loop Left Join
++   ->  Seq Scan on int4_tbl t1
++   ->  Materialize
++         ->  Nested Loop Left Join
++               Join Filter: (t3.f1 <> t4.f1)
++               ->  Hash Left Join
++                     Hash Cond: (t2.f1 = t3.f1)
++                     ->  Seq Scan on int4_tbl t2
++                     ->  Hash
++                           ->  Seq Scan on int4_tbl t3
++               ->  Materialize
++                     ->  Seq Scan on int4_tbl t4
++(12 rows)
++
+ --
+ -- check a case where we formerly got confused by conflicting sort orders
+ -- in redundant merge join path keys
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index 437934e80b6d..a44234b0af74 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -441,6 +441,53 @@ select a.f1, b.f1, t.thousand, t.tenthous from
+   (select sum(f1) as f1 from int4_tbl i4b) b
+ where b.f1 = t.thousand and a.f1 = b.f1 and (a.f1+b.f1+999) = t.tenthous;
+ 
++--
++-- checks for correct handling of quals in multiway outer joins
++--
++explain (costs off)
++select t1.f1
++from int4_tbl t1, int4_tbl t2
++  left join int4_tbl t3 on t3.f1 > 0
++  left join int4_tbl t4 on t3.f1 > 1
++where t4.f1 is null;
++
++select t1.f1
++from int4_tbl t1, int4_tbl t2
++  left join int4_tbl t3 on t3.f1 > 0
++  left join int4_tbl t4 on t3.f1 > 1
++where t4.f1 is null;
++
++explain (costs off)
++select *
++from int4_tbl t1 left join int4_tbl t2 on true
++  left join int4_tbl t3 on t2.f1 > 0
++  left join int4_tbl t4 on t3.f1 > 0;
++
++explain (costs off)
++select * from onek t1
++  left join onek t2 on t1.unique1 = t2.unique1
++  left join onek t3 on t2.unique1 != t3.unique1
++  left join onek t4 on t3.unique1 = t4.unique1;
++
++explain (costs off)
++select * from int4_tbl t1
++  left join (select now() from int4_tbl t2
++             left join int4_tbl t3 on t2.f1 = t3.f1
++             left join int4_tbl t4 on t3.f1 = t4.f1) s on true
++  inner join int4_tbl t5 on true;
++
++explain (costs off)
++select * from int4_tbl t1
++  left join int4_tbl t2 on true
++  left join int4_tbl t3 on true
++  left join int4_tbl t4 on t2.f1 = t3.f1;
++
++explain (costs off)
++select * from int4_tbl t1
++  left join int4_tbl t2 on true
++  left join int4_tbl t3 on t2.f1 = t3.f1
++  left join int4_tbl t4 on t3.f1 != t4.f1;
++
+ --
+ -- check a case where we formerly got confused by conflicting sort orders
+ -- in redundant merge join path keys

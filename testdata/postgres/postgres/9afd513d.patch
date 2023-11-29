@@ -1,0 +1,703 @@
+From 9afd513df042b22b98bb9b55f27265e95d34f9e6 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 23 Feb 2018 13:47:33 -0500
+Subject: [PATCH] Fix planner failures with overlapping mergejoin clauses in an
+ outer join.
+
+Given overlapping or partially redundant join clauses, for example
+	t1 JOIN t2 ON t1.a = t2.x AND t1.b = t2.x
+the planner's EquivalenceClass machinery will ordinarily refactor the
+clauses as "t1.a = t1.b AND t1.a = t2.x", so that join processing doesn't
+see multiple references to the same EquivalenceClass in a list of join
+equality clauses.  However, if the join is outer, it's incorrect to derive
+a restriction clause on the outer side from the join conditions, so the
+clause refactoring does not happen and we end up with overlapping join
+conditions.  The code that attempted to deal with such cases had several
+subtle bugs, which could result in "left and right pathkeys do not match in
+mergejoin" or "outer pathkeys do not match mergeclauses" planner errors,
+if the selected join plan type was a mergejoin.  (It does not appear that
+any actually incorrect plan could have been emitted.)
+
+The core of the problem really was failure to recognize that the outer and
+inner relations' pathkeys have different relationships to the mergeclause
+list.  A join's mergeclause list is constructed by reference to the outer
+pathkeys, so it will always be ordered the same as the outer pathkeys, but
+this cannot be presumed true for the inner pathkeys.  If the inner sides of
+the mergeclauses contain multiple references to the same EquivalenceClass
+({t2.x} in the above example) then a simplistic rendering of the required
+inner sort order is like "ORDER BY t2.x, t2.x", but the pathkey machinery
+recognizes that the second sort column is redundant and throws it away.
+The mergejoin planning code failed to account for that behavior properly.
+One error was to try to generate cut-down versions of the mergeclause list
+from cut-down versions of the inner pathkeys in the same way as the initial
+construction of the mergeclause list from the outer pathkeys was done; this
+could lead to choosing a mergeclause list that fails to match the outer
+pathkeys.  The other problem was that the pathkey cross-checking code in
+create_mergejoin_plan treated the inner and outer pathkey lists
+identically, whereas actually the expectations for them must be different.
+That led to false "pathkeys do not match" failures in some cases, and in
+principle could have led to failure to detect bogus plans in other cases,
+though there is no indication that such bogus plans could be generated.
+
+Reported by Alexander Kuzmenkov, who also reviewed this patch.  This has
+been broken for years (back to around 8.3 according to my testing), so
+back-patch to all supported branches.
+
+Discussion: https://postgr.es/m/5dad9160-4632-0e47-e120-8e2082000c01@postgrespro.ru
+---
+ src/backend/optimizer/path/joinpath.c   |  30 +++--
+ src/backend/optimizer/path/pathkeys.c   | 150 +++++++++++++++++++-----
+ src/backend/optimizer/plan/createplan.c | 145 +++++++++++------------
+ src/include/optimizer/paths.h           |  10 +-
+ src/test/regress/expected/join.out      |  80 +++++++++++++
+ src/test/regress/sql/join.sql           |  31 +++++
+ 6 files changed, 322 insertions(+), 124 deletions(-)
+
+diff --git a/src/backend/optimizer/path/joinpath.c b/src/backend/optimizer/path/joinpath.c
+index 396ee2747ac1..688f440b92ea 100644
+--- a/src/backend/optimizer/path/joinpath.c
++++ b/src/backend/optimizer/path/joinpath.c
+@@ -1009,10 +1009,10 @@ sort_inner_and_outer(PlannerInfo *root,
+ 			outerkeys = all_pathkeys;	/* no work at first one... */
+ 
+ 		/* Sort the mergeclauses into the corresponding ordering */
+-		cur_mergeclauses = find_mergeclauses_for_pathkeys(root,
+-														  outerkeys,
+-														  true,
+-														  extra->mergeclause_list);
++		cur_mergeclauses =
++			find_mergeclauses_for_outer_pathkeys(root,
++												 outerkeys,
++												 extra->mergeclause_list);
+ 
+ 		/* Should have used them all... */
+ 		Assert(list_length(cur_mergeclauses) == list_length(extra->mergeclause_list));
+@@ -1102,10 +1102,10 @@ generate_mergejoin_paths(PlannerInfo *root,
+ 		jointype = JOIN_INNER;
+ 
+ 	/* Look for useful mergeclauses (if any) */
+-	mergeclauses = find_mergeclauses_for_pathkeys(root,
+-												  outerpath->pathkeys,
+-												  true,
+-												  extra->mergeclause_list);
++	mergeclauses =
++		find_mergeclauses_for_outer_pathkeys(root,
++											 outerpath->pathkeys,
++											 extra->mergeclause_list);
+ 
+ 	/*
+ 	 * Done with this outer path if no chance for a mergejoin.
+@@ -1228,10 +1228,9 @@ generate_mergejoin_paths(PlannerInfo *root,
+ 			if (sortkeycnt < num_sortkeys)
+ 			{
+ 				newclauses =
+-					find_mergeclauses_for_pathkeys(root,
+-												   trialsortkeys,
+-												   false,
+-												   mergeclauses);
++					trim_mergeclauses_for_inner_pathkeys(root,
++														 mergeclauses,
++														 trialsortkeys);
+ 				Assert(newclauses != NIL);
+ 			}
+ 			else
+@@ -1272,10 +1271,9 @@ generate_mergejoin_paths(PlannerInfo *root,
+ 					if (sortkeycnt < num_sortkeys)
+ 					{
+ 						newclauses =
+-							find_mergeclauses_for_pathkeys(root,
+-														   trialsortkeys,
+-														   false,
+-														   mergeclauses);
++							trim_mergeclauses_for_inner_pathkeys(root,
++																 mergeclauses,
++																 trialsortkeys);
+ 						Assert(newclauses != NIL);
+ 					}
+ 					else
+diff --git a/src/backend/optimizer/path/pathkeys.c b/src/backend/optimizer/path/pathkeys.c
+index ef58cff28d1e..6d1cc3b8a04c 100644
+--- a/src/backend/optimizer/path/pathkeys.c
++++ b/src/backend/optimizer/path/pathkeys.c
+@@ -981,16 +981,14 @@ update_mergeclause_eclasses(PlannerInfo *root, RestrictInfo *restrictinfo)
+ }
+ 
+ /*
+- * find_mergeclauses_for_pathkeys
+- *	  This routine attempts to find a set of mergeclauses that can be
+- *	  used with a specified ordering for one of the input relations.
++ * find_mergeclauses_for_outer_pathkeys
++ *	  This routine attempts to find a list of mergeclauses that can be
++ *	  used with a specified ordering for the join's outer relation.
+  *	  If successful, it returns a list of mergeclauses.
+  *
+- * 'pathkeys' is a pathkeys list showing the ordering of an input path.
+- * 'outer_keys' is true if these keys are for the outer input path,
+- *			false if for inner.
++ * 'pathkeys' is a pathkeys list showing the ordering of an outer-rel path.
+  * 'restrictinfos' is a list of mergejoinable restriction clauses for the
+- *			join relation being formed.
++ *			join relation being formed, in no particular order.
+  *
+  * The restrictinfos must be marked (via outer_is_left) to show which side
+  * of each clause is associated with the current outer path.  (See
+@@ -998,12 +996,12 @@ update_mergeclause_eclasses(PlannerInfo *root, RestrictInfo *restrictinfo)
+  *
+  * The result is NIL if no merge can be done, else a maximal list of
+  * usable mergeclauses (represented as a list of their restrictinfo nodes).
++ * The list is ordered to match the pathkeys, as required for execution.
+  */
+ List *
+-find_mergeclauses_for_pathkeys(PlannerInfo *root,
+-							   List *pathkeys,
+-							   bool outer_keys,
+-							   List *restrictinfos)
++find_mergeclauses_for_outer_pathkeys(PlannerInfo *root,
++									 List *pathkeys,
++									 List *restrictinfos)
+ {
+ 	List	   *mergeclauses = NIL;
+ 	ListCell   *i;
+@@ -1044,19 +1042,20 @@ find_mergeclauses_for_pathkeys(PlannerInfo *root,
+ 		 *
+ 		 * It's possible that multiple matching clauses might have different
+ 		 * ECs on the other side, in which case the order we put them into our
+-		 * result makes a difference in the pathkeys required for the other
+-		 * input path.  However this routine hasn't got any info about which
++		 * result makes a difference in the pathkeys required for the inner
++		 * input rel.  However this routine hasn't got any info about which
+ 		 * order would be best, so we don't worry about that.
+ 		 *
+ 		 * It's also possible that the selected mergejoin clauses produce
+-		 * a noncanonical ordering of pathkeys for the other side, ie, we
++		 * a noncanonical ordering of pathkeys for the inner side, ie, we
+ 		 * might select clauses that reference b.v1, b.v2, b.v1 in that
+ 		 * order.  This is not harmful in itself, though it suggests that
+-		 * the clauses are partially redundant.  Since it happens only with
+-		 * redundant query conditions, we don't bother to eliminate it.
+-		 * make_inner_pathkeys_for_merge() has to delete duplicates when
+-		 * it constructs the canonical pathkeys list, and we also have to
+-		 * deal with the case in create_mergejoin_plan().
++		 * the clauses are partially redundant.  Since the alternative is
++		 * to omit mergejoin clauses and thereby possibly fail to generate a
++		 * plan altogether, we live with it.  make_inner_pathkeys_for_merge()
++		 * has to delete duplicates when it constructs the inner pathkeys
++		 * list, and we also have to deal with such cases specially in
++		 * create_mergejoin_plan().
+ 		 *----------
+ 		 */
+ 		foreach(j, restrictinfos)
+@@ -1064,12 +1063,8 @@ find_mergeclauses_for_pathkeys(PlannerInfo *root,
+ 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(j);
+ 			EquivalenceClass *clause_ec;
+ 
+-			if (outer_keys)
+-				clause_ec = rinfo->outer_is_left ?
+-					rinfo->left_ec : rinfo->right_ec;
+-			else
+-				clause_ec = rinfo->outer_is_left ?
+-					rinfo->right_ec : rinfo->left_ec;
++			clause_ec = rinfo->outer_is_left ?
++				rinfo->left_ec : rinfo->right_ec;
+ 			if (clause_ec == pathkey_ec)
+ 				matched_restrictinfos = lappend(matched_restrictinfos, rinfo);
+ 		}
+@@ -1273,8 +1268,8 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
+  *	  must be applied to an inner path to make it usable with the
+  *	  given mergeclauses.
+  *
+- * 'mergeclauses' is a list of RestrictInfos for mergejoin clauses
+- *			that will be used in a merge join.
++ * 'mergeclauses' is a list of RestrictInfos for the mergejoin clauses
++ *			that will be used in a merge join, in order.
+  * 'outer_pathkeys' are the already-known canonical pathkeys for the outer
+  *			side of the join.
+  *
+@@ -1351,8 +1346,13 @@ make_inner_pathkeys_for_merge(PlannerInfo *root,
+ 											 opathkey->pk_nulls_first);
+ 
+ 		/*
+-		 * Don't generate redundant pathkeys (can happen if multiple
+-		 * mergeclauses refer to same EC).
++		 * Don't generate redundant pathkeys (which can happen if multiple
++		 * mergeclauses refer to the same EC).  Because we do this, the output
++		 * pathkey list isn't necessarily ordered like the mergeclauses, which
++		 * complicates life for create_mergejoin_plan().  But if we didn't,
++		 * we'd have a noncanonical sort key list, which would be bad; for one
++		 * reason, it certainly wouldn't match any available sort order for
++		 * the input relation.
+ 		 */
+ 		if (!pathkey_is_redundant(pathkey, pathkeys))
+ 			pathkeys = lappend(pathkeys, pathkey);
+@@ -1361,6 +1361,98 @@ make_inner_pathkeys_for_merge(PlannerInfo *root,
+ 	return pathkeys;
+ }
+ 
++/*
++ * trim_mergeclauses_for_inner_pathkeys
++ *	  This routine trims a list of mergeclauses to include just those that
++ *	  work with a specified ordering for the join's inner relation.
++ *
++ * 'mergeclauses' is a list of RestrictInfos for mergejoin clauses for the
++ *			join relation being formed, in an order known to work for the
++ *			currently-considered sort ordering of the join's outer rel.
++ * 'pathkeys' is a pathkeys list showing the ordering of an inner-rel path;
++ *			it should be equal to, or a truncation of, the result of
++ *			make_inner_pathkeys_for_merge for these mergeclauses.
++ *
++ * What we return will be a prefix of the given mergeclauses list.
++ *
++ * We need this logic because make_inner_pathkeys_for_merge's result isn't
++ * necessarily in the same order as the mergeclauses.  That means that if we
++ * consider an inner-rel pathkey list that is a truncation of that result,
++ * we might need to drop mergeclauses even though they match a surviving inner
++ * pathkey.  This happens when they are to the right of a mergeclause that
++ * matches a removed inner pathkey.
++ *
++ * The mergeclauses must be marked (via outer_is_left) to show which side
++ * of each clause is associated with the current outer path.  (See
++ * select_mergejoin_clauses())
++ */
++List *
++trim_mergeclauses_for_inner_pathkeys(PlannerInfo *root,
++									 List *mergeclauses,
++									 List *pathkeys)
++{
++	List	   *new_mergeclauses = NIL;
++	PathKey    *pathkey;
++	EquivalenceClass *pathkey_ec;
++	bool		matched_pathkey;
++	ListCell   *lip;
++	ListCell   *i;
++
++	/* No pathkeys => no mergeclauses (though we don't expect this case) */
++	if (pathkeys == NIL)
++		return NIL;
++	/* Initialize to consider first pathkey */
++	lip = list_head(pathkeys);
++	pathkey = (PathKey *) lfirst(lip);
++	pathkey_ec = pathkey->pk_eclass;
++	lip = lnext(lip);
++	matched_pathkey = false;
++
++	/* Scan mergeclauses to see how many we can use */
++	foreach(i, mergeclauses)
++	{
++		RestrictInfo *rinfo = (RestrictInfo *) lfirst(i);
++		EquivalenceClass *clause_ec;
++
++		/* Assume we needn't do update_mergeclause_eclasses again here */
++
++		/* Check clause's inner-rel EC against current pathkey */
++		clause_ec = rinfo->outer_is_left ?
++			rinfo->right_ec : rinfo->left_ec;
++
++		/* If we don't have a match, attempt to advance to next pathkey */
++		if (clause_ec != pathkey_ec)
++		{
++			/* If we had no clauses matching this inner pathkey, must stop */
++			if (!matched_pathkey)
++				break;
++
++			/* Advance to next inner pathkey, if any */
++			if (lip == NULL)
++				break;
++			pathkey = (PathKey *) lfirst(lip);
++			pathkey_ec = pathkey->pk_eclass;
++			lip = lnext(lip);
++			matched_pathkey = false;
++		}
++
++		/* If mergeclause matches current inner pathkey, we can use it */
++		if (clause_ec == pathkey_ec)
++		{
++			new_mergeclauses = lappend(new_mergeclauses, rinfo);
++			matched_pathkey = true;
++		}
++		else
++		{
++			/* Else, no hope of adding any more mergeclauses */
++			break;
++		}
++	}
++
++	return new_mergeclauses;
++}
++
++
+ /****************************************************************************
+  *		PATHKEY USEFULNESS CHECKS
+  *
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index da0cc7f266cc..9ae1bf31d5e2 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -3791,6 +3791,8 @@ create_mergejoin_plan(PlannerInfo *root,
+ 	Oid		   *mergecollations;
+ 	int		   *mergestrategies;
+ 	bool	   *mergenullsfirst;
++	PathKey    *opathkey;
++	EquivalenceClass *opeclass;
+ 	int			i;
+ 	ListCell   *lc;
+ 	ListCell   *lop;
+@@ -3909,7 +3911,8 @@ create_mergejoin_plan(PlannerInfo *root,
+ 	 * Compute the opfamily/collation/strategy/nullsfirst arrays needed by the
+ 	 * executor.  The information is in the pathkeys for the two inputs, but
+ 	 * we need to be careful about the possibility of mergeclauses sharing a
+-	 * pathkey (compare find_mergeclauses_for_pathkeys()).
++	 * pathkey, as well as the possibility that the inner pathkeys are not in
++	 * an order matching the mergeclauses.
+ 	 */
+ 	nClauses = list_length(mergeclauses);
+ 	Assert(nClauses == list_length(best_path->path_mergeclauses));
+@@ -3918,6 +3921,8 @@ create_mergejoin_plan(PlannerInfo *root,
+ 	mergestrategies = (int *) palloc(nClauses * sizeof(int));
+ 	mergenullsfirst = (bool *) palloc(nClauses * sizeof(bool));
+ 
++	opathkey = NULL;
++	opeclass = NULL;
+ 	lop = list_head(outerpathkeys);
+ 	lip = list_head(innerpathkeys);
+ 	i = 0;
+@@ -3926,11 +3931,9 @@ create_mergejoin_plan(PlannerInfo *root,
+ 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+ 		EquivalenceClass *oeclass;
+ 		EquivalenceClass *ieclass;
+-		PathKey    *opathkey;
+-		PathKey    *ipathkey;
+-		EquivalenceClass *opeclass;
+-		EquivalenceClass *ipeclass;
+-		ListCell   *l2;
++		PathKey    *ipathkey = NULL;
++		EquivalenceClass *ipeclass = NULL;
++		bool		first_inner_match = false;
+ 
+ 		/* fetch outer/inner eclass from mergeclause */
+ 		if (rinfo->outer_is_left)
+@@ -3947,104 +3950,96 @@ create_mergejoin_plan(PlannerInfo *root,
+ 		Assert(ieclass != NULL);
+ 
+ 		/*
+-		 * For debugging purposes, we check that the eclasses match the paths'
+-		 * pathkeys.  In typical cases the merge clauses are one-to-one with
+-		 * the pathkeys, but when dealing with partially redundant query
+-		 * conditions, we might have clauses that re-reference earlier path
+-		 * keys.  The case that we need to reject is where a pathkey is
+-		 * entirely skipped over.
++		 * We must identify the pathkey elements associated with this clause
++		 * by matching the eclasses (which should give a unique match, since
++		 * the pathkey lists should be canonical).  In typical cases the merge
++		 * clauses are one-to-one with the pathkeys, but when dealing with
++		 * partially redundant query conditions, things are more complicated.
+ 		 *
+-		 * lop and lip reference the first as-yet-unused pathkey elements;
+-		 * it's okay to match them, or any element before them.  If they're
+-		 * NULL then we have found all pathkey elements to be used.
++		 * lop and lip reference the first as-yet-unmatched pathkey elements.
++		 * If they're NULL then all pathkey elements have been matched.
++		 *
++		 * The ordering of the outer pathkeys should match the mergeclauses,
++		 * by construction (see find_mergeclauses_for_outer_pathkeys()). There
++		 * could be more than one mergeclause for the same outer pathkey, but
++		 * no pathkey may be entirely skipped over.
+ 		 */
+-		if (lop)
++		if (oeclass != opeclass)	/* multiple matches are not interesting */
+ 		{
++			/* doesn't match the current opathkey, so must match the next */
++			if (lop == NULL)
++				elog(ERROR, "outer pathkeys do not match mergeclauses");
+ 			opathkey = (PathKey *) lfirst(lop);
+ 			opeclass = opathkey->pk_eclass;
+-			if (oeclass == opeclass)
+-			{
+-				/* fast path for typical case */
+-				lop = lnext(lop);
+-			}
+-			else
+-			{
+-				/* redundant clauses ... must match something before lop */
+-				foreach(l2, outerpathkeys)
+-				{
+-					if (l2 == lop)
+-						break;
+-					opathkey = (PathKey *) lfirst(l2);
+-					opeclass = opathkey->pk_eclass;
+-					if (oeclass == opeclass)
+-						break;
+-				}
+-				if (oeclass != opeclass)
+-					elog(ERROR, "outer pathkeys do not match mergeclauses");
+-			}
+-		}
+-		else
+-		{
+-			/* redundant clauses ... must match some already-used pathkey */
+-			opathkey = NULL;
+-			opeclass = NULL;
+-			foreach(l2, outerpathkeys)
+-			{
+-				opathkey = (PathKey *) lfirst(l2);
+-				opeclass = opathkey->pk_eclass;
+-				if (oeclass == opeclass)
+-					break;
+-			}
+-			if (l2 == NULL)
++			lop = lnext(lop);
++			if (oeclass != opeclass)
+ 				elog(ERROR, "outer pathkeys do not match mergeclauses");
+ 		}
+ 
++		/*
++		 * The inner pathkeys likewise should not have skipped-over keys, but
++		 * it's possible for a mergeclause to reference some earlier inner
++		 * pathkey if we had redundant pathkeys.  For example we might have
++		 * mergeclauses like "o.a = i.x AND o.b = i.y AND o.c = i.x".  The
++		 * implied inner ordering is then "ORDER BY x, y, x", but the pathkey
++		 * mechanism drops the second sort by x as redundant, and this code
++		 * must cope.
++		 *
++		 * It's also possible for the implied inner-rel ordering to be like
++		 * "ORDER BY x, y, x DESC".  We still drop the second instance of x as
++		 * redundant; but this means that the sort ordering of a redundant
++		 * inner pathkey should not be considered significant.  So we must
++		 * detect whether this is the first clause matching an inner pathkey.
++		 */
+ 		if (lip)
+ 		{
+ 			ipathkey = (PathKey *) lfirst(lip);
+ 			ipeclass = ipathkey->pk_eclass;
+ 			if (ieclass == ipeclass)
+ 			{
+-				/* fast path for typical case */
++				/* successful first match to this inner pathkey */
+ 				lip = lnext(lip);
+-			}
+-			else
+-			{
+-				/* redundant clauses ... must match something before lip */
+-				foreach(l2, innerpathkeys)
+-				{
+-					if (l2 == lip)
+-						break;
+-					ipathkey = (PathKey *) lfirst(l2);
+-					ipeclass = ipathkey->pk_eclass;
+-					if (ieclass == ipeclass)
+-						break;
+-				}
+-				if (ieclass != ipeclass)
+-					elog(ERROR, "inner pathkeys do not match mergeclauses");
++				first_inner_match = true;
+ 			}
+ 		}
+-		else
++		if (!first_inner_match)
+ 		{
+-			/* redundant clauses ... must match some already-used pathkey */
+-			ipathkey = NULL;
+-			ipeclass = NULL;
++			/* redundant clause ... must match something before lip */
++			ListCell   *l2;
++
+ 			foreach(l2, innerpathkeys)
+ 			{
++				if (l2 == lip)
++					break;
+ 				ipathkey = (PathKey *) lfirst(l2);
+ 				ipeclass = ipathkey->pk_eclass;
+ 				if (ieclass == ipeclass)
+ 					break;
+ 			}
+-			if (l2 == NULL)
++			if (ieclass != ipeclass)
+ 				elog(ERROR, "inner pathkeys do not match mergeclauses");
+ 		}
+ 
+-		/* pathkeys should match each other too (more debugging) */
++		/*
++		 * The pathkeys should always match each other as to opfamily and
++		 * collation (which affect equality), but if we're considering a
++		 * redundant inner pathkey, its sort ordering might not match.  In
++		 * such cases we may ignore the inner pathkey's sort ordering and use
++		 * the outer's.  (In effect, we're lying to the executor about the
++		 * sort direction of this inner column, but it does not matter since
++		 * the run-time row comparisons would only reach this column when
++		 * there's equality for the earlier column containing the same eclass.
++		 * There could be only one value in this column for the range of inner
++		 * rows having a given value in the earlier column, so it does not
++		 * matter which way we imagine this column to be ordered.)  But a
++		 * non-redundant inner pathkey had better match outer's ordering too.
++		 */
+ 		if (opathkey->pk_opfamily != ipathkey->pk_opfamily ||
+-			opathkey->pk_eclass->ec_collation != ipathkey->pk_eclass->ec_collation ||
+-			opathkey->pk_strategy != ipathkey->pk_strategy ||
+-			opathkey->pk_nulls_first != ipathkey->pk_nulls_first)
++			opathkey->pk_eclass->ec_collation != ipathkey->pk_eclass->ec_collation)
++			elog(ERROR, "left and right pathkeys do not match in mergejoin");
++		if (first_inner_match &&
++			(opathkey->pk_strategy != ipathkey->pk_strategy ||
++			 opathkey->pk_nulls_first != ipathkey->pk_nulls_first))
+ 			elog(ERROR, "left and right pathkeys do not match in mergejoin");
+ 
+ 		/* OK, save info for executor */
+diff --git a/src/include/optimizer/paths.h b/src/include/optimizer/paths.h
+index c9e44318ad97..b2b4353eeacf 100644
+--- a/src/include/optimizer/paths.h
++++ b/src/include/optimizer/paths.h
+@@ -216,16 +216,18 @@ extern void initialize_mergeclause_eclasses(PlannerInfo *root,
+ 								RestrictInfo *restrictinfo);
+ extern void update_mergeclause_eclasses(PlannerInfo *root,
+ 							RestrictInfo *restrictinfo);
+-extern List *find_mergeclauses_for_pathkeys(PlannerInfo *root,
+-							   List *pathkeys,
+-							   bool outer_keys,
+-							   List *restrictinfos);
++extern List *find_mergeclauses_for_outer_pathkeys(PlannerInfo *root,
++									 List *pathkeys,
++									 List *restrictinfos);
+ extern List *select_outer_pathkeys_for_merge(PlannerInfo *root,
+ 								List *mergeclauses,
+ 								RelOptInfo *joinrel);
+ extern List *make_inner_pathkeys_for_merge(PlannerInfo *root,
+ 							  List *mergeclauses,
+ 							  List *outer_pathkeys);
++extern List *trim_mergeclauses_for_inner_pathkeys(PlannerInfo *root,
++									 List *mergeclauses,
++									 List *pathkeys);
+ extern List *truncate_useless_pathkeys(PlannerInfo *root,
+ 						  RelOptInfo *rel,
+ 						  List *pathkeys);
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index c50a206efb8a..4d5931d67ef7 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -2290,6 +2290,86 @@ where b.f1 = t.thousand and a.f1 = b.f1 and (a.f1+b.f1+999) = t.tenthous;
+ ----+----+----------+----------
+ (0 rows)
+ 
++--
++-- check a case where we formerly got confused by conflicting sort orders
++-- in redundant merge join path keys
++--
++explain (costs off)
++select * from
++  j1_tbl full join
++  (select * from j2_tbl order by j2_tbl.i desc, j2_tbl.k asc) j2_tbl
++  on j1_tbl.i = j2_tbl.i and j1_tbl.i = j2_tbl.k;
++                           QUERY PLAN                            
++-----------------------------------------------------------------
++ Merge Full Join
++   Merge Cond: ((j2_tbl.i = j1_tbl.i) AND (j2_tbl.k = j1_tbl.i))
++   ->  Sort
++         Sort Key: j2_tbl.i DESC, j2_tbl.k
++         ->  Seq Scan on j2_tbl
++   ->  Sort
++         Sort Key: j1_tbl.i DESC
++         ->  Seq Scan on j1_tbl
++(8 rows)
++
++select * from
++  j1_tbl full join
++  (select * from j2_tbl order by j2_tbl.i desc, j2_tbl.k asc) j2_tbl
++  on j1_tbl.i = j2_tbl.i and j1_tbl.i = j2_tbl.k;
++ i | j |   t   | i | k  
++---+---+-------+---+----
++   |   |       |   |  0
++   |   |       |   |   
++   | 0 | zero  |   |   
++   |   | null  |   |   
++ 8 | 8 | eight |   |   
++ 7 | 7 | seven |   |   
++ 6 | 6 | six   |   |   
++   |   |       | 5 | -5
++   |   |       | 5 | -5
++ 5 | 0 | five  |   |   
++ 4 | 1 | four  |   |   
++   |   |       | 3 | -3
++ 3 | 2 | three |   |   
++ 2 | 3 | two   | 2 |  2
++   |   |       | 2 |  4
++   |   |       | 1 | -1
++   |   |       | 0 |   
++ 1 | 4 | one   |   |   
++ 0 |   | zero  |   |   
++(19 rows)
++
++--
++-- a different check for handling of redundant sort keys in merge joins
++--
++explain (costs off)
++select count(*) from
++  (select * from tenk1 x order by x.thousand, x.twothousand, x.fivethous) x
++  left join
++  (select * from tenk1 y order by y.unique2) y
++  on x.thousand = y.unique2 and x.twothousand = y.hundred and x.fivethous = y.unique2;
++                                    QUERY PLAN                                    
++----------------------------------------------------------------------------------
++ Aggregate
++   ->  Merge Left Join
++         Merge Cond: (x.thousand = y.unique2)
++         Join Filter: ((x.twothousand = y.hundred) AND (x.fivethous = y.unique2))
++         ->  Sort
++               Sort Key: x.thousand, x.twothousand, x.fivethous
++               ->  Seq Scan on tenk1 x
++         ->  Materialize
++               ->  Index Scan using tenk1_unique2 on tenk1 y
++(9 rows)
++
++select count(*) from
++  (select * from tenk1 x order by x.thousand, x.twothousand, x.fivethous) x
++  left join
++  (select * from tenk1 y order by y.unique2) y
++  on x.thousand = y.unique2 and x.twothousand = y.hundred and x.fivethous = y.unique2;
++ count 
++-------
++ 10000
++(1 row)
++
+ --
+ -- Clean up
+ --
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index fc84237ce92e..30dfde223eff 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -417,6 +417,37 @@ select a.f1, b.f1, t.thousand, t.tenthous from
+   (select sum(f1) as f1 from int4_tbl i4b) b
+ where b.f1 = t.thousand and a.f1 = b.f1 and (a.f1+b.f1+999) = t.tenthous;
+ 
++--
++-- check a case where we formerly got confused by conflicting sort orders
++-- in redundant merge join path keys
++--
++explain (costs off)
++select * from
++  j1_tbl full join
++  (select * from j2_tbl order by j2_tbl.i desc, j2_tbl.k asc) j2_tbl
++  on j1_tbl.i = j2_tbl.i and j1_tbl.i = j2_tbl.k;
++
++select * from
++  j1_tbl full join
++  (select * from j2_tbl order by j2_tbl.i desc, j2_tbl.k asc) j2_tbl
++  on j1_tbl.i = j2_tbl.i and j1_tbl.i = j2_tbl.k;
++
++--
++-- a different check for handling of redundant sort keys in merge joins
++--
++explain (costs off)
++select count(*) from
++  (select * from tenk1 x order by x.thousand, x.twothousand, x.fivethous) x
++  left join
++  (select * from tenk1 y order by y.unique2) y
++  on x.thousand = y.unique2 and x.twothousand = y.hundred and x.fivethous = y.unique2;
++
++select count(*) from
++  (select * from tenk1 x order by x.thousand, x.twothousand, x.fivethous) x
++  left join
++  (select * from tenk1 y order by y.unique2) y
++  on x.thousand = y.unique2 and x.twothousand = y.hundred and x.fivethous = y.unique2;
++
+ 
+ --
+ -- Clean up

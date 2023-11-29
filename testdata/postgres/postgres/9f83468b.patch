@@ -1,0 +1,603 @@
+From 9f83468b3536caf6fb7fe8f9dcdbb108a98d1257 Mon Sep 17 00:00:00 2001
+From: Peter Geoghegan <pg@bowt.ie>
+Date: Thu, 19 Dec 2019 11:35:55 -0800
+Subject: [PATCH] Remove unneeded "pin scan" nbtree VACUUM code.
+
+The REDO routine for nbtree's xl_btree_vacuum record type hasn't
+performed a "pin scan" since commit 3e4b7d87 went in, so clearly there
+isn't any point in VACUUM WAL-logging information that won't actually be
+used.  Finish off the work of commit 3e4b7d87 (and the closely related
+preceding commit 687f2cd7) by removing the code that generates this
+unused information.  Also remove the REDO routine code disabled by
+commit 3e4b7d87.
+
+Replace the unneeded lastBlockVacuumed field in xl_btree_vacuum with a
+new "ndeleted" field.  The new field isn't actually needed right now,
+since we could continue to infer the array length from the overall
+record length.  However, an upcoming patch to add deduplication to
+nbtree needs to add an "items updated" field to xl_btree_vacuum, so we
+might as well start being explicit about the number of items now.
+(Besides, it doesn't seem like a good idea to leave the xl_btree_vacuum
+struct without any fields; the C standard says that that's undefined.)
+
+nbtree VACUUM no longer forces writing a WAL record for the last block
+in the index.  Writing out a WAL record with no items for the final
+block was supposed to force processing of a lastBlockVacuumed field by a
+pin scan.
+
+Bump XLOG_PAGE_MAGIC because xl_btree_vacuum changed.
+
+Discussion: https://postgr.es/m/CAH2-WzmY_mT7UnTzFB5LBQDBkKpdV5UxP3B5bLb7uP%3D%3D6UQJRQ%40mail.gmail.com
+---
+ src/backend/access/nbtree/README      |  63 ++++++++++-----
+ src/backend/access/nbtree/nbtpage.c   |  34 ++++----
+ src/backend/access/nbtree/nbtree.c    | 111 ++++++--------------------
+ src/backend/access/nbtree/nbtxlog.c   |  99 ++---------------------
+ src/backend/access/rmgrdesc/nbtdesc.c |   3 +-
+ src/include/access/nbtree.h           |   3 +-
+ src/include/access/nbtxlog.h          |  31 +++----
+ src/include/access/xlog_internal.h    |   2 +-
+ 8 files changed, 101 insertions(+), 245 deletions(-)
+
+diff --git a/src/backend/access/nbtree/README b/src/backend/access/nbtree/README
+index 246e7a9f027e..334ef76e89f0 100644
+--- a/src/backend/access/nbtree/README
++++ b/src/backend/access/nbtree/README
+@@ -508,7 +508,9 @@ the parent is finished and the flag in the child cleared, but can be
+ released immediately after that, before recursing up the tree if the parent
+ also needs to be split.  This ensures that incompletely split pages should
+ not be seen under normal circumstances; only if insertion to the parent
+-has failed for some reason.
++has failed for some reason. (It's also possible for a reader to observe
++a page with the incomplete split flag set during recovery; see later
++section on "Scans during Recovery" for details.)
+ 
+ We flag the left page, even though it's the right page that's missing the
+ downlink, because it's more convenient to know already when following the
+@@ -528,7 +530,7 @@ next VACUUM will find the half-dead leaf page and continue the deletion.
+ 
+ Before 9.4, we used to keep track of incomplete splits and page deletions
+ during recovery and finish them immediately at end of recovery, instead of
+-doing it lazily at the next  insertion or vacuum.  However, that made the
++doing it lazily at the next insertion or vacuum.  However, that made the
+ recovery much more complicated, and only fixed the problem when crash
+ recovery was performed.  An incomplete split can also occur if an otherwise
+ recoverable error, like out-of-memory or out-of-disk-space, happens while
+@@ -537,23 +539,41 @@ inserting the downlink to the parent.
+ Scans during Recovery
+ ---------------------
+ 
+-The btree index type can be safely used during recovery. During recovery
+-we have at most one writer and potentially many readers. In that
+-situation the locking requirements can be relaxed and we do not need
+-double locking during block splits. Each WAL record makes changes to a
+-single level of the btree using the correct locking sequence and so
+-is safe for concurrent readers. Some readers may observe a block split
+-in progress as they descend the tree, but they will simply move right
+-onto the correct page.
++nbtree indexes support read queries in Hot Standby mode. Every atomic
++action/WAL record makes isolated changes that leave the tree in a
++consistent state for readers. Readers lock pages according to the same
++rules that readers follow on the primary. (Readers may have to move
++right to recover from a "concurrent" page split or page deletion, just
++like on the primary.)
++
++However, there are a couple of differences in how pages are locked by
++replay/the startup process as compared to the original write operation
++on the primary. The exceptions involve page splits and page deletions.
++The first phase and second phase of a page split are processed
++independently during replay, since they are independent atomic actions.
++We do not attempt to recreate the coupling of parent and child page
++write locks that took place on the primary. This is safe because readers
++never care about the incomplete split flag anyway. Holding on to an
++extra write lock on the primary is only necessary so that a second
++writer cannot observe the incomplete split flag before the first writer
++finishes the split. If we let concurrent writers on the primary observe
++an incomplete split flag on the same page, each writer would attempt to
++complete the unfinished split, corrupting the parent page.  (Similarly,
++replay of page deletion records does not hold a write lock on the leaf
++page throughout; only the primary needs to blocks out concurrent writers
++that insert on to the page being deleted.)
+ 
+ During recovery all index scans start with ignore_killed_tuples = false
+ and we never set kill_prior_tuple. We do this because the oldest xmin
+ on the standby server can be older than the oldest xmin on the master
+-server, which means tuples can be marked as killed even when they are
+-still visible on the standby. We don't WAL log tuple killed bits, but
++server, which means tuples can be marked LP_DEAD even when they are
++still visible on the standby. We don't WAL log tuple LP_DEAD  bits, but
+ they can still appear in the standby because of full page writes. So
+ we must always ignore them in standby, and that means it's not worth
+-setting them either.
++setting them either.  (When LP_DEAD-marked tuples are eventually deleted
++on the primary, the deletion is WAL-logged.  Queries that run on a
++standby therefore get much of the benefit of any LP_DEAD setting that
++takes place on the primary.)
+ 
+ Note that we talk about scans that are started during recovery. We go to
+ a little trouble to allow a scan to start during recovery and end during
+@@ -562,14 +582,17 @@ because it allows running applications to continue while the standby
+ changes state into a normally running server.
+ 
+ The interlocking required to avoid returning incorrect results from
+-non-MVCC scans is not required on standby nodes. That is because
++non-MVCC scans is not required on standby nodes. We still get a
++super-exclusive lock ("cleanup lock") when replaying VACUUM records
++during recovery, but recovery does not need to lock every leaf page
++(only those leaf pages that have items to delete). That is safe because
+ HeapTupleSatisfiesUpdate(), HeapTupleSatisfiesSelf(),
+-HeapTupleSatisfiesDirty() and HeapTupleSatisfiesVacuum() are only
+-ever used during write transactions, which cannot exist on the standby.
+-MVCC scans are already protected by definition, so HeapTupleSatisfiesMVCC()
+-is not a problem.  The optimizer looks at the boundaries of value ranges
+-using HeapTupleSatisfiesNonVacuumable() with an index-only scan, which is
+-also safe.  That leaves concern only for HeapTupleSatisfiesToast().
++HeapTupleSatisfiesDirty() and HeapTupleSatisfiesVacuum() are only ever
++used during write transactions, which cannot exist on the standby. MVCC
++scans are already protected by definition, so HeapTupleSatisfiesMVCC()
++is not a problem. The optimizer looks at the boundaries of value ranges
++using HeapTupleSatisfiesNonVacuumable() with an index-only scan, which
++is also safe. That leaves concern only for HeapTupleSatisfiesToast().
+ 
+ HeapTupleSatisfiesToast() doesn't use MVCC semantics, though that's
+ because it doesn't need to - if the main heap row is visible then the
+diff --git a/src/backend/access/nbtree/nbtpage.c b/src/backend/access/nbtree/nbtpage.c
+index e1a111b1ed42..404bad7da28e 100644
+--- a/src/backend/access/nbtree/nbtpage.c
++++ b/src/backend/access/nbtree/nbtpage.c
+@@ -968,32 +968,28 @@ _bt_page_recyclable(Page page)
+  * deleting the page it points to.
+  *
+  * This routine assumes that the caller has pinned and locked the buffer.
+- * Also, the given itemnos *must* appear in increasing order in the array.
++ * Also, the given deletable array *must* be sorted in ascending order.
+  *
+- * We record VACUUMs and b-tree deletes differently in WAL. InHotStandby
+- * we need to be able to pin all of the blocks in the btree in physical
+- * order when replaying the effects of a VACUUM, just as we do for the
+- * original VACUUM itself. lastBlockVacuumed allows us to tell whether an
+- * intermediate range of blocks has had no changes at all by VACUUM,
+- * and so must be scanned anyway during replay. We always write a WAL record
+- * for the last block in the index, whether or not it contained any items
+- * to be removed. This allows us to scan right up to end of index to
+- * ensure correct locking.
++ * We record VACUUMs and b-tree deletes differently in WAL.  Deletes must
++ * generate recovery conflicts by accessing the heap inline, whereas VACUUMs
++ * can rely on the initial heap scan taking care of the problem (pruning would
++ * have generated the conflicts needed for hot standby already).
+  */
+ void
+ _bt_delitems_vacuum(Relation rel, Buffer buf,
+-					OffsetNumber *itemnos, int nitems,
+-					BlockNumber lastBlockVacuumed)
++					OffsetNumber *deletable, int ndeletable)
+ {
+ 	Page		page = BufferGetPage(buf);
+ 	BTPageOpaque opaque;
+ 
++	/* Shouldn't be called unless there's something to do */
++	Assert(ndeletable > 0);
++
+ 	/* No ereport(ERROR) until changes are logged */
+ 	START_CRIT_SECTION();
+ 
+ 	/* Fix the page */
+-	if (nitems > 0)
+-		PageIndexMultiDelete(page, itemnos, nitems);
++	PageIndexMultiDelete(page, deletable, ndeletable);
+ 
+ 	/*
+ 	 * We can clear the vacuum cycle ID since this page has certainly been
+@@ -1019,7 +1015,7 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
+ 		XLogRecPtr	recptr;
+ 		xl_btree_vacuum xlrec_vacuum;
+ 
+-		xlrec_vacuum.lastBlockVacuumed = lastBlockVacuumed;
++		xlrec_vacuum.ndeleted = ndeletable;
+ 
+ 		XLogBeginInsert();
+ 		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+@@ -1030,8 +1026,8 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
+ 		 * is.  When XLogInsert stores the whole buffer, the offsets array
+ 		 * need not be stored too.
+ 		 */
+-		if (nitems > 0)
+-			XLogRegisterBufData(0, (char *) itemnos, nitems * sizeof(OffsetNumber));
++		XLogRegisterBufData(0, (char *) deletable,
++							ndeletable * sizeof(OffsetNumber));
+ 
+ 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_VACUUM);
+ 
+@@ -1050,8 +1046,8 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
+  * Also, the given itemnos *must* appear in increasing order in the array.
+  *
+  * This is nearly the same as _bt_delitems_vacuum as far as what it does to
+- * the page, but the WAL logging considerations are quite different.  See
+- * comments for _bt_delitems_vacuum.
++ * the page, but it needs to generate its own recovery conflicts by accessing
++ * the heap.  See comments for _bt_delitems_vacuum.
+  */
+ void
+ _bt_delitems_delete(Relation rel, Buffer buf,
+diff --git a/src/backend/access/nbtree/nbtree.c b/src/backend/access/nbtree/nbtree.c
+index c67235ab8071..065b5290b0d0 100644
+--- a/src/backend/access/nbtree/nbtree.c
++++ b/src/backend/access/nbtree/nbtree.c
+@@ -46,8 +46,6 @@ typedef struct
+ 	IndexBulkDeleteCallback callback;
+ 	void	   *callback_state;
+ 	BTCycleId	cycleid;
+-	BlockNumber lastBlockVacuumed;	/* highest blkno actually vacuumed */
+-	BlockNumber lastBlockLocked;	/* highest blkno we've cleanup-locked */
+ 	BlockNumber totFreePages;	/* true total # of free pages */
+ 	TransactionId oldestBtpoXact;
+ 	MemoryContext pagedelcontext;
+@@ -978,8 +976,6 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+ 	vstate.callback = callback;
+ 	vstate.callback_state = callback_state;
+ 	vstate.cycleid = cycleid;
+-	vstate.lastBlockVacuumed = BTREE_METAPAGE;	/* Initialise at first block */
+-	vstate.lastBlockLocked = BTREE_METAPAGE;
+ 	vstate.totFreePages = 0;
+ 	vstate.oldestBtpoXact = InvalidTransactionId;
+ 
+@@ -1040,39 +1036,6 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+ 		}
+ 	}
+ 
+-	/*
+-	 * Check to see if we need to issue one final WAL record for this index,
+-	 * which may be needed for correctness on a hot standby node when non-MVCC
+-	 * index scans could take place.
+-	 *
+-	 * If the WAL is replayed in hot standby, the replay process needs to get
+-	 * cleanup locks on all index leaf pages, just as we've been doing here.
+-	 * However, we won't issue any WAL records about pages that have no items
+-	 * to be deleted.  For pages between pages we've vacuumed, the replay code
+-	 * will take locks under the direction of the lastBlockVacuumed fields in
+-	 * the XLOG_BTREE_VACUUM WAL records.  To cover pages after the last one
+-	 * we vacuum, we need to issue a dummy XLOG_BTREE_VACUUM WAL record
+-	 * against the last leaf page in the index, if that one wasn't vacuumed.
+-	 */
+-	if (XLogStandbyInfoActive() &&
+-		vstate.lastBlockVacuumed < vstate.lastBlockLocked)
+-	{
+-		Buffer		buf;
+-
+-		/*
+-		 * The page should be valid, but we can't use _bt_getbuf() because we
+-		 * want to use a nondefault buffer access strategy.  Since we aren't
+-		 * going to delete any items, getting cleanup lock again is probably
+-		 * overkill, but for consistency do that anyway.
+-		 */
+-		buf = ReadBufferExtended(rel, MAIN_FORKNUM, vstate.lastBlockLocked,
+-								 RBM_NORMAL, info->strategy);
+-		LockBufferForCleanup(buf);
+-		_bt_checkpage(rel, buf);
+-		_bt_delitems_vacuum(rel, buf, NULL, 0, vstate.lastBlockVacuumed);
+-		_bt_relbuf(rel, buf);
+-	}
+-
+ 	MemoryContextDelete(vstate.pagedelcontext);
+ 
+ 	/*
+@@ -1203,13 +1166,6 @@ btvacuumpage(BTVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
+ 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+ 		LockBufferForCleanup(buf);
+ 
+-		/*
+-		 * Remember highest leaf page number we've taken cleanup lock on; see
+-		 * notes in btvacuumscan
+-		 */
+-		if (blkno > vstate->lastBlockLocked)
+-			vstate->lastBlockLocked = blkno;
+-
+ 		/*
+ 		 * Check whether we need to recurse back to earlier pages.  What we
+ 		 * are concerned about is a page split that happened since we started
+@@ -1225,8 +1181,10 @@ btvacuumpage(BTVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
+ 			recurse_to = opaque->btpo_next;
+ 
+ 		/*
+-		 * Scan over all items to see which ones need deleted according to the
+-		 * callback function.
++		 * When each VACUUM begins, it determines an OldestXmin cutoff value.
++		 * Tuples before the cutoff are removed by VACUUM.  Scan over all
++		 * items to see which ones need to be deleted according to cutoff
++		 * point using callback.
+ 		 */
+ 		ndeletable = 0;
+ 		minoff = P_FIRSTDATAKEY(opaque);
+@@ -1245,25 +1203,24 @@ btvacuumpage(BTVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
+ 				htup = &(itup->t_tid);
+ 
+ 				/*
+-				 * During Hot Standby we currently assume that
+-				 * XLOG_BTREE_VACUUM records do not produce conflicts. That is
+-				 * only true as long as the callback function depends only
+-				 * upon whether the index tuple refers to heap tuples removed
+-				 * in the initial heap scan. When vacuum starts it derives a
+-				 * value of OldestXmin. Backends taking later snapshots could
+-				 * have a RecentGlobalXmin with a later xid than the vacuum's
+-				 * OldestXmin, so it is possible that row versions deleted
+-				 * after OldestXmin could be marked as killed by other
+-				 * backends. The callback function *could* look at the index
+-				 * tuple state in isolation and decide to delete the index
+-				 * tuple, though currently it does not. If it ever did, we
+-				 * would need to reconsider whether XLOG_BTREE_VACUUM records
+-				 * should cause conflicts. If they did cause conflicts they
+-				 * would be fairly harsh conflicts, since we haven't yet
+-				 * worked out a way to pass a useful value for
+-				 * latestRemovedXid on the XLOG_BTREE_VACUUM records. This
+-				 * applies to *any* type of index that marks index tuples as
+-				 * killed.
++				 * Hot Standby assumes that it's okay that XLOG_BTREE_VACUUM
++				 * records do not produce their own conflicts.  This is safe
++				 * as long as the callback function only considers whether the
++				 * index tuple refers to pre-cutoff heap tuples that were
++				 * certainly already pruned away during VACUUM's initial heap
++				 * scan by the time we get here. (We can rely on conflicts
++				 * produced by heap pruning, rather than producing our own
++				 * now.)
++				 *
++				 * Backends with snapshots acquired after a VACUUM starts but
++				 * before it finishes could have a RecentGlobalXmin with a
++				 * later xid than the VACUUM's OldestXmin cutoff.  These
++				 * backends might happen to opportunistically mark some index
++				 * tuples LP_DEAD before we reach them, even though they may
++				 * be after our cutoff.  We don't try to kill these "extra"
++				 * index tuples in _bt_delitems_vacuum().  This keep things
++				 * simple, and allows us to always avoid generating our own
++				 * conflicts.
+ 				 */
+ 				if (callback(htup, callback_state))
+ 					deletable[ndeletable++] = offnum;
+@@ -1276,29 +1233,7 @@ btvacuumpage(BTVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
+ 		 */
+ 		if (ndeletable > 0)
+ 		{
+-			/*
+-			 * Notice that the issued XLOG_BTREE_VACUUM WAL record includes
+-			 * all information to the replay code to allow it to get a cleanup
+-			 * lock on all pages between the previous lastBlockVacuumed and
+-			 * this page. This ensures that WAL replay locks all leaf pages at
+-			 * some point, which is important should non-MVCC scans be
+-			 * requested. This is currently unused on standby, but we record
+-			 * it anyway, so that the WAL contains the required information.
+-			 *
+-			 * Since we can visit leaf pages out-of-order when recursing,
+-			 * replay might end up locking such pages an extra time, but it
+-			 * doesn't seem worth the amount of bookkeeping it'd take to avoid
+-			 * that.
+-			 */
+-			_bt_delitems_vacuum(rel, buf, deletable, ndeletable,
+-								vstate->lastBlockVacuumed);
+-
+-			/*
+-			 * Remember highest leaf page number we've issued a
+-			 * XLOG_BTREE_VACUUM WAL record for.
+-			 */
+-			if (blkno > vstate->lastBlockVacuumed)
+-				vstate->lastBlockVacuumed = blkno;
++			_bt_delitems_vacuum(rel, buf, deletable, ndeletable);
+ 
+ 			stats->tuples_removed += ndeletable;
+ 			/* must recompute maxoff */
+diff --git a/src/backend/access/nbtree/nbtxlog.c b/src/backend/access/nbtree/nbtxlog.c
+index 4325cbee5ba5..234b0e0596c9 100644
+--- a/src/backend/access/nbtree/nbtxlog.c
++++ b/src/backend/access/nbtree/nbtxlog.c
+@@ -383,110 +383,25 @@ static void
+ btree_xlog_vacuum(XLogReaderState *record)
+ {
+ 	XLogRecPtr	lsn = record->EndRecPtr;
++	xl_btree_vacuum *xlrec = (xl_btree_vacuum *) XLogRecGetData(record);
+ 	Buffer		buffer;
+ 	Page		page;
+ 	BTPageOpaque opaque;
+-#ifdef UNUSED
+-	xl_btree_vacuum *xlrec = (xl_btree_vacuum *) XLogRecGetData(record);
+-
+-	/*
+-	 * This section of code is thought to be no longer needed, after analysis
+-	 * of the calling paths. It is retained to allow the code to be reinstated
+-	 * if a flaw is revealed in that thinking.
+-	 *
+-	 * If we are running non-MVCC scans using this index we need to do some
+-	 * additional work to ensure correctness, which is known as a "pin scan"
+-	 * described in more detail in next paragraphs. We used to do the extra
+-	 * work in all cases, whereas we now avoid that work in most cases. If
+-	 * lastBlockVacuumed is set to InvalidBlockNumber then we skip the
+-	 * additional work required for the pin scan.
+-	 *
+-	 * Avoiding this extra work is important since it requires us to touch
+-	 * every page in the index, so is an O(N) operation. Worse, it is an
+-	 * operation performed in the foreground during redo, so it delays
+-	 * replication directly.
+-	 *
+-	 * If queries might be active then we need to ensure every leaf page is
+-	 * unpinned between the lastBlockVacuumed and the current block, if there
+-	 * are any.  This prevents replay of the VACUUM from reaching the stage of
+-	 * removing heap tuples while there could still be indexscans "in flight"
+-	 * to those particular tuples for those scans which could be confused by
+-	 * finding new tuples at the old TID locations (see nbtree/README).
+-	 *
+-	 * It might be worth checking if there are actually any backends running;
+-	 * if not, we could just skip this.
+-	 *
+-	 * Since VACUUM can visit leaf pages out-of-order, it might issue records
+-	 * with lastBlockVacuumed >= block; that's not an error, it just means
+-	 * nothing to do now.
+-	 *
+-	 * Note: since we touch all pages in the range, we will lock non-leaf
+-	 * pages, and also any empty (all-zero) pages that may be in the index. It
+-	 * doesn't seem worth the complexity to avoid that.  But it's important
+-	 * that HotStandbyActiveInReplay() will not return true if the database
+-	 * isn't yet consistent; so we need not fear reading still-corrupt blocks
+-	 * here during crash recovery.
+-	 */
+-	if (HotStandbyActiveInReplay() && BlockNumberIsValid(xlrec->lastBlockVacuumed))
+-	{
+-		RelFileNode thisrnode;
+-		BlockNumber thisblkno;
+-		BlockNumber blkno;
+-
+-		XLogRecGetBlockTag(record, 0, &thisrnode, NULL, &thisblkno);
+-
+-		for (blkno = xlrec->lastBlockVacuumed + 1; blkno < thisblkno; blkno++)
+-		{
+-			/*
+-			 * We use RBM_NORMAL_NO_LOG mode because it's not an error
+-			 * condition to see all-zero pages.  The original btvacuumpage
+-			 * scan would have skipped over all-zero pages, noting them in FSM
+-			 * but not bothering to initialize them just yet; so we mustn't
+-			 * throw an error here.  (We could skip acquiring the cleanup lock
+-			 * if PageIsNew, but it's probably not worth the cycles to test.)
+-			 *
+-			 * XXX we don't actually need to read the block, we just need to
+-			 * confirm it is unpinned. If we had a special call into the
+-			 * buffer manager we could optimise this so that if the block is
+-			 * not in shared_buffers we confirm it as unpinned. Optimizing
+-			 * this is now moot, since in most cases we avoid the scan.
+-			 */
+-			buffer = XLogReadBufferExtended(thisrnode, MAIN_FORKNUM, blkno,
+-											RBM_NORMAL_NO_LOG);
+-			if (BufferIsValid(buffer))
+-			{
+-				LockBufferForCleanup(buffer);
+-				UnlockReleaseBuffer(buffer);
+-			}
+-		}
+-	}
+-#endif
+ 
+ 	/*
+-	 * Like in btvacuumpage(), we need to take a cleanup lock on every leaf
+-	 * page. See nbtree/README for details.
++	 * We need to take a cleanup lock here, just like btvacuumpage(). However,
++	 * it isn't necessary to exhaustively get a cleanup lock on every block in
++	 * the index during recovery (just getting a cleanup lock on pages with
++	 * items to kill suffices).  See nbtree/README for details.
+ 	 */
+ 	if (XLogReadBufferForRedoExtended(record, 0, RBM_NORMAL, true, &buffer)
+ 		== BLK_NEEDS_REDO)
+ 	{
+-		char	   *ptr;
+-		Size		len;
+-
+-		ptr = XLogRecGetBlockData(record, 0, &len);
++		char	   *ptr = XLogRecGetBlockData(record, 0, NULL);
+ 
+ 		page = (Page) BufferGetPage(buffer);
+ 
+-		if (len > 0)
+-		{
+-			OffsetNumber *unused;
+-			OffsetNumber *unend;
+-
+-			unused = (OffsetNumber *) ptr;
+-			unend = (OffsetNumber *) ((char *) ptr + len);
+-
+-			if ((unend - unused) > 0)
+-				PageIndexMultiDelete(page, unused, unend - unused);
+-		}
++		PageIndexMultiDelete(page, (OffsetNumber *) ptr, xlrec->ndeleted);
+ 
+ 		/*
+ 		 * Mark the page as not containing any LP_DEAD items --- see comments
+diff --git a/src/backend/access/rmgrdesc/nbtdesc.c b/src/backend/access/rmgrdesc/nbtdesc.c
+index 4ee6d04a68e5..497f8dc77e21 100644
+--- a/src/backend/access/rmgrdesc/nbtdesc.c
++++ b/src/backend/access/rmgrdesc/nbtdesc.c
+@@ -46,8 +46,7 @@ btree_desc(StringInfo buf, XLogReaderState *record)
+ 			{
+ 				xl_btree_vacuum *xlrec = (xl_btree_vacuum *) rec;
+ 
+-				appendStringInfo(buf, "lastBlockVacuumed %u",
+-								 xlrec->lastBlockVacuumed);
++				appendStringInfo(buf, "ndeleted %u", xlrec->ndeleted);
+ 				break;
+ 			}
+ 		case XLOG_BTREE_DELETE:
+diff --git a/src/include/access/nbtree.h b/src/include/access/nbtree.h
+index 780b69442efb..ef1eba060265 100644
+--- a/src/include/access/nbtree.h
++++ b/src/include/access/nbtree.h
+@@ -779,8 +779,7 @@ extern bool _bt_page_recyclable(Page page);
+ extern void _bt_delitems_delete(Relation rel, Buffer buf,
+ 								OffsetNumber *itemnos, int nitems, Relation heapRel);
+ extern void _bt_delitems_vacuum(Relation rel, Buffer buf,
+-								OffsetNumber *itemnos, int nitems,
+-								BlockNumber lastBlockVacuumed);
++								OffsetNumber *deletable, int ndeletable);
+ extern int	_bt_pagedel(Relation rel, Buffer buf);
+ 
+ /*
+diff --git a/src/include/access/nbtxlog.h b/src/include/access/nbtxlog.h
+index 91b9ee00cfc6..260d4af85cc9 100644
+--- a/src/include/access/nbtxlog.h
++++ b/src/include/access/nbtxlog.h
+@@ -134,7 +134,11 @@ typedef struct xl_btree_delete
+ #define SizeOfBtreeDelete	(offsetof(xl_btree_delete, nitems) + sizeof(int))
+ 
+ /*
+- * This is what we need to know about page reuse within btree.
++ * This is what we need to know about page reuse within btree.  This record
++ * only exists to generate a conflict point for Hot Standby.
++ *
++ * Note that we must include a RelFileNode in the record because we don't
++ * actually register the buffer with the record.
+  */
+ typedef struct xl_btree_reuse_page
+ {
+@@ -150,32 +154,17 @@ typedef struct xl_btree_reuse_page
+  * The WAL record can represent deletion of any number of index tuples on a
+  * single index page when executed by VACUUM.
+  *
+- * For MVCC scans, lastBlockVacuumed will be set to InvalidBlockNumber.
+- * For a non-MVCC index scans there is an additional correctness requirement
+- * for applying these changes during recovery, which is that we must do one
+- * of these two things for every block in the index:
+- *		* lock the block for cleanup and apply any required changes
+- *		* EnsureBlockUnpinned()
+- * The purpose of this is to ensure that no index scans started before we
+- * finish scanning the index are still running by the time we begin to remove
+- * heap tuples.
+- *
+- * Any changes to any one block are registered on just one WAL record. All
+- * blocks that we need to run EnsureBlockUnpinned() are listed as a block range
+- * starting from the last block vacuumed through until this one. Individual
+- * block numbers aren't given.
+- *
+- * Note that the *last* WAL record in any vacuum of an index is allowed to
+- * have a zero length array of offsets. Earlier records must have at least one.
++ * Note that the WAL record in any vacuum of an index must have at least one
++ * item to delete.
+  */
+ typedef struct xl_btree_vacuum
+ {
+-	BlockNumber lastBlockVacuumed;
++	uint32		ndeleted;
+ 
+-	/* TARGET OFFSET NUMBERS FOLLOW */
++	/* DELETED TARGET OFFSET NUMBERS FOLLOW */
+ } xl_btree_vacuum;
+ 
+-#define SizeOfBtreeVacuum	(offsetof(xl_btree_vacuum, lastBlockVacuumed) + sizeof(BlockNumber))
++#define SizeOfBtreeVacuum	(offsetof(xl_btree_vacuum, ndeleted) + sizeof(uint32))
+ 
+ /*
+  * This is what we need to know about marking an empty branch for deletion.
+diff --git a/src/include/access/xlog_internal.h b/src/include/access/xlog_internal.h
+index e295dc65fbee..b2772d4e4b85 100644
+--- a/src/include/access/xlog_internal.h
++++ b/src/include/access/xlog_internal.h
+@@ -31,7 +31,7 @@
+ /*
+  * Each page of XLOG file has a header like this:
+  */
+-#define XLOG_PAGE_MAGIC 0xD102	/* can be used as WAL version indicator */
++#define XLOG_PAGE_MAGIC 0xD103	/* can be used as WAL version indicator */
+ 
+ typedef struct XLogPageHeaderData
+ {

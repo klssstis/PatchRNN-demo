@@ -1,0 +1,173 @@
+From 9ffcccdb958d38db5051bf64143330ff445a26cc Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 17 Apr 2018 18:29:11 -0400
+Subject: [PATCH] Rationalize handling of array type names in bootstrap data.
+
+Formerly, Catalog.pm turned a C array type declaration in the catalog
+header files into a SQL type, e.g., 'foo[]'.  Along the way, genbki.pl
+turned this into '_foo' for the purpose of type lookups, but wrote 'foo[]'
+to postgres.bki.  During bootstrap, bootscanner.l had to have a special
+case rule to tokenize this, and then MapArrayTypeName() would turn 'foo[]'
+into '_foo' one more time.
+
+This seems unnecessarily complicated, especially since nobody cares that
+much about the readability of postgres.bki.  Instead, make Catalog.pm
+convert the C declaration into '_foo' to start with, and preserve that
+representation of the type name throughout bootstrap data processing.
+Then rip out the special-case code in bootscanner.l and bootstrap.c.
+
+This changes postgres.bki to the extent that array fields are now
+declared like
+  proconfig = _text ,
+rather than
+  proconfig = text[] ,
+
+No documentation update, since the SGML docs didn't mention any of this
+in the first place, and it's all pretty transparent to writers of
+catalog header files anyway.
+
+John Naylor
+
+Discussion: https://postgr.es/m/CAJVSVGUNao=-Q2-vAN3PYcdF5tnL5JAHwGwzZGuYHtq+Mk_9ng@mail.gmail.com
+---
+ src/backend/bootstrap/bootscanner.l |  6 ------
+ src/backend/bootstrap/bootstrap.c   | 30 -----------------------------
+ src/backend/catalog/Catalog.pm      |  8 ++++++--
+ src/backend/catalog/genbki.pl       |  8 ++------
+ src/include/bootstrap/bootstrap.h   |  2 --
+ 5 files changed, 8 insertions(+), 46 deletions(-)
+
+diff --git a/src/backend/bootstrap/bootscanner.l b/src/backend/bootstrap/bootscanner.l
+index 91d73d713f04..1799757da204 100644
+--- a/src/backend/bootstrap/bootscanner.l
++++ b/src/backend/bootstrap/bootscanner.l
+@@ -65,10 +65,8 @@ static int	yyline = 1;			/* line number for error reporting */
+ %option prefix="boot_yy"
+ 
+ 
+-D		[0-9]
+ id		[-A-Za-z0-9_]+
+ sid		\"([^\"])*\"
+-arrayid [A-Za-z0-9_]+\[{D}*\]
+ 
+ %%
+ 
+@@ -111,10 +109,6 @@ insert			{ return INSERT_TUPLE; }
+ "NOT"			{ return XNOT; }
+ "NULL"			{ return XNULL; }
+ 
+-{arrayid}		{
+-					yylval.str = MapArrayTypeName(yytext);
+-					return ID;
+-				}
+ {id}			{
+ 					yylval.str = scanstr(yytext);
+ 					return ID;
+diff --git a/src/backend/bootstrap/bootstrap.c b/src/backend/bootstrap/bootstrap.c
+index 59cd4b17f326..a148bdc9fd32 100644
+--- a/src/backend/bootstrap/bootstrap.c
++++ b/src/backend/bootstrap/bootstrap.c
+@@ -1036,36 +1036,6 @@ AllocateAttribute(void)
+ 		MemoryContextAllocZero(TopMemoryContext, ATTRIBUTE_FIXED_PART_SIZE);
+ }
+ 
+-/*
+- *		MapArrayTypeName
+- *
+- * Given a type name, produce the corresponding array type name by prepending
+- * '_' and truncating as needed to fit in NAMEDATALEN-1 bytes.  This is only
+- * used in bootstrap mode, so we can get away with assuming that the input is
+- * ASCII and we don't need multibyte-aware truncation.
+- *
+- * The given string normally ends with '[]' or '[digits]'; we discard that.
+- *
+- * The result is a palloc'd string.
+- */
+-char *
+-MapArrayTypeName(const char *s)
+-{
+-	int			i,
+-				j;
+-	char		newStr[NAMEDATALEN];
+-
+-	newStr[0] = '_';
+-	j = 1;
+-	for (i = 0; i < NAMEDATALEN - 2 && s[i] != '['; i++, j++)
+-		newStr[j] = s[i];
+-
+-	newStr[j] = '\0';
+-
+-	return pstrdup(newStr);
+-}
+-
+-
+ /*
+  *	index_register() -- record an index that has been set up for building
+  *						later.
+diff --git a/src/backend/catalog/Catalog.pm b/src/backend/catalog/Catalog.pm
+index 02bd6d43836b..0b9c05e23172 100644
+--- a/src/backend/catalog/Catalog.pm
++++ b/src/backend/catalog/Catalog.pm
+@@ -161,10 +161,14 @@ sub ParseHeader
+ 					{
+ 						$atttype = $RENAME_ATTTYPE{$atttype};
+ 					}
+-					if ($attname =~ /(.*)\[.*\]/)    # array attribute
++
++					# If the C name ends with '[]' or '[digits]', we have
++					# an array type, so we discard that from the name and
++					# prepend '_' to the type.
++					if ($attname =~ /(\w+)\[\d*\]/)
+ 					{
+ 						$attname = $1;
+-						$atttype .= '[]';
++						$atttype = '_' . $atttype;
+ 					}
+ 
+ 					$column{type} = $atttype;
+diff --git a/src/backend/catalog/genbki.pl b/src/backend/catalog/genbki.pl
+index 6597c6a21f44..b750ec9f0ac2 100644
+--- a/src/backend/catalog/genbki.pl
++++ b/src/backend/catalog/genbki.pl
+@@ -351,7 +351,7 @@
+ 
+ 			# Replace OID synonyms with OIDs per the appropriate lookup rule.
+ 			#
+-			# If the column type is oidvector or oid[], we have to replace
++			# If the column type is oidvector or _oid, we have to replace
+ 			# each element of the array as per the lookup rule.
+ 			if ($column->{lookup})
+ 			{
+@@ -369,7 +369,7 @@
+ 											  \%bki_values, @lookupnames);
+ 					$bki_values{$attname} = join(' ', @lookupoids);
+ 				}
+-				elsif ($atttype eq 'oid[]')
++				elsif ($atttype eq '_oid')
+ 				{
+ 					if ($bki_values{$attname} ne '_null_')
+ 					{
+@@ -598,10 +598,6 @@ sub morph_row_for_pgattr
+ 
+ 	$row->{attname} = $attname;
+ 
+-	# Adjust type name for arrays: foo[] becomes _foo, so we can look it up in
+-	# pg_type
+-	$atttype = '_' . $1 if $atttype =~ /(.+)\[\]$/;
+-
+ 	# Copy the type data from pg_type, and add some type-dependent items
+ 	my $type = $types{$atttype};
+ 
+diff --git a/src/include/bootstrap/bootstrap.h b/src/include/bootstrap/bootstrap.h
+index 4f4129419f28..7856669ff910 100644
+--- a/src/include/bootstrap/bootstrap.h
++++ b/src/include/bootstrap/bootstrap.h
+@@ -44,8 +44,6 @@ extern void InsertOneTuple(Oid objectid);
+ extern void InsertOneValue(char *value, int i);
+ extern void InsertOneNull(int i);
+ 
+-extern char *MapArrayTypeName(const char *s);
+-
+ extern void index_register(Oid heap, Oid ind, IndexInfo *indexInfo);
+ extern void build_indices(void);
+ 

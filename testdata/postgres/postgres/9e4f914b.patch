@@ -1,0 +1,500 @@
+From 9e4f914b5eba3f49ab99bdecdc4f96fac099571f Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Thu, 28 Jul 2022 08:40:06 +0200
+Subject: [PATCH] Fix replay of create database records on standby
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Crash recovery on standby may encounter missing directories
+when replaying database-creation WAL records.  Prior to this
+patch, the standby would fail to recover in such a case;
+however, the directories could be legitimately missing.
+Consider the following sequence of commands:
+
+    CREATE DATABASE
+    DROP DATABASE
+    DROP TABLESPACE
+
+If, after replaying the last WAL record and removing the
+tablespace directory, the standby crashes and has to replay the
+create database record again, crash recovery must be able to continue.
+
+A fix for this problem was already attempted in 49d9cfc68bf4, but it
+was reverted because of design issues.  This new version is based
+on Robert Haas' proposal: any missing tablespaces are created
+during recovery before reaching consistency.  Tablespaces
+are created as real directories, and should be deleted
+by later replay.  CheckRecoveryConsistency ensures
+they have disappeared.
+
+The problems detected by this new code are reported as PANIC,
+except when allow_in_place_tablespaces is set to ON, in which
+case they are WARNING.  Apart from making tests possible, this
+gives users an escape hatch in case things don't go as planned.
+
+Author: Kyotaro Horiguchi <horikyota.ntt@gmail.com>
+Author: Asim R Praveen <apraveen@pivotal.io>
+Author: Paul Guo <paulguo@gmail.com>
+Reviewed-by: Anastasia Lubennikova <lubennikovaav@gmail.com> (older versions)
+Reviewed-by: Fujii Masao <masao.fujii@oss.nttdata.com> (older versions)
+Reviewed-by: Michaël Paquier <michael@paquier.xyz>
+Diagnosed-by: Paul Guo <paulguo@gmail.com>
+Discussion: https://postgr.es/m/CAEET0ZGx9AvioViLf7nbR_8tH9-=27DN5xWJ2P9-ROH16e4JUA@mail.gmail.com
+---
+ src/backend/access/transam/xlogrecovery.c   |  50 ++++++
+ src/backend/commands/dbcommands.c           |  77 +++++++++
+ src/backend/commands/tablespace.c           |  40 ++---
+ src/test/recovery/t/033_replay_tsp_drops.pl | 169 ++++++++++++++++++++
+ 4 files changed, 305 insertions(+), 31 deletions(-)
+ create mode 100644 src/test/recovery/t/033_replay_tsp_drops.pl
+
+diff --git a/src/backend/access/transam/xlogrecovery.c b/src/backend/access/transam/xlogrecovery.c
+index e383c2123a3f..27e02fbfcda6 100644
+--- a/src/backend/access/transam/xlogrecovery.c
++++ b/src/backend/access/transam/xlogrecovery.c
+@@ -42,6 +42,7 @@
+ #include "access/xlogutils.h"
+ #include "catalog/pg_control.h"
+ #include "commands/tablespace.h"
++#include "common/file_utils.h"
+ #include "miscadmin.h"
+ #include "pgstat.h"
+ #include "postmaster/bgwriter.h"
+@@ -2008,6 +2009,47 @@ xlogrecovery_redo(XLogReaderState *record, TimeLineID replayTLI)
+ 	}
+ }
+ 
++/*
++ * Verify that, in non-test mode, ./pg_tblspc doesn't contain any real
++ * directories.
++ *
++ * Replay of database creation XLOG records for databases that were later
++ * dropped can create fake directories in pg_tblspc.  By the time consistency
++ * is reached these directories should have been removed; here we verify
++ * that this did indeed happen.  This is to be called at the point where
++ * consistent state is reached.
++ *
++ * allow_in_place_tablespaces turns the PANIC into a WARNING, which is
++ * useful for testing purposes, and also allows for an escape hatch in case
++ * things go south.
++ */
++static void
++CheckTablespaceDirectory(void)
++{
++	DIR		   *dir;
++	struct dirent *de;
++
++	dir = AllocateDir("pg_tblspc");
++	while ((de = ReadDir(dir, "pg_tblspc")) != NULL)
++	{
++		char		path[MAXPGPATH + 10];
++
++		/* Skip entries of non-oid names */
++		if (strspn(de->d_name, "0123456789") != strlen(de->d_name))
++			continue;
++
++		snprintf(path, sizeof(path), "pg_tblspc/%s", de->d_name);
++
++		if (get_dirent_type(path, de, false, ERROR) != PGFILETYPE_LNK)
++			ereport(allow_in_place_tablespaces ? WARNING : PANIC,
++					(errcode(ERRCODE_DATA_CORRUPTED),
++					 errmsg("unexpected directory entry \"%s\" found in %s",
++							de->d_name, "pg_tblspc/"),
++					 errdetail("All directory entries in pg_tblspc/ should be symbolic links."),
++					 errhint("Remove those directories, or set allow_in_place_tablespaces to ON transiently to let recovery complete.")));
++	}
++}
++
+ /*
+  * Checks if recovery has reached a consistent state. When consistency is
+  * reached and we have a valid starting standby snapshot, tell postmaster
+@@ -2068,6 +2110,14 @@ CheckRecoveryConsistency(void)
+ 		 */
+ 		XLogCheckInvalidPages();
+ 
++		/*
++		 * Check that pg_tblspc doesn't contain any real directories. Replay
++		 * of Database/CREATE_* records may have created ficticious tablespace
++		 * directories that should have been removed by the time consistency
++		 * was reached.
++		 */
++		CheckTablespaceDirectory();
++
+ 		reachedConsistency = true;
+ 		ereport(LOG,
+ 				(errmsg("consistent recovery state reached at %X/%X",
+diff --git a/src/backend/commands/dbcommands.c b/src/backend/commands/dbcommands.c
+index 099d369b2f4a..95844bbb6916 100644
+--- a/src/backend/commands/dbcommands.c
++++ b/src/backend/commands/dbcommands.c
+@@ -30,6 +30,7 @@
+ #include "access/tableam.h"
+ #include "access/xact.h"
+ #include "access/xloginsert.h"
++#include "access/xlogrecovery.h"
+ #include "access/xlogutils.h"
+ #include "catalog/catalog.h"
+ #include "catalog/dependency.h"
+@@ -47,6 +48,7 @@
+ #include "commands/defrem.h"
+ #include "commands/seclabel.h"
+ #include "commands/tablespace.h"
++#include "common/file_perm.h"
+ #include "mb/pg_wchar.h"
+ #include "miscadmin.h"
+ #include "pgstat.h"
+@@ -62,6 +64,7 @@
+ #include "utils/acl.h"
+ #include "utils/builtins.h"
+ #include "utils/fmgroids.h"
++#include "utils/guc.h"
+ #include "utils/pg_locale.h"
+ #include "utils/relmapper.h"
+ #include "utils/snapmgr.h"
+@@ -135,6 +138,7 @@ static void CreateDirAndVersionFile(char *dbpath, Oid dbid, Oid tsid,
+ 									bool isRedo);
+ static void CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dboid, Oid src_tsid,
+ 										Oid dst_tsid);
++static void recovery_create_dbdir(char *path, bool only_tblspc);
+ 
+ /*
+  * Create a new database using the WAL_LOG strategy.
+@@ -2995,6 +2999,45 @@ get_database_name(Oid dbid)
+ 	return result;
+ }
+ 
++/*
++ * recovery_create_dbdir()
++ *
++ * During recovery, there's a case where we validly need to recover a missing
++ * tablespace directory so that recovery can continue.  This happens when
++ * recovery wants to create a database but the holding tablespace has been
++ * removed before the server stopped.  Since we expect that the directory will
++ * be gone before reaching recovery consistency, and we have no knowledge about
++ * the tablespace other than its OID here, we create a real directory under
++ * pg_tblspc here instead of restoring the symlink.
++ *
++ * If only_tblspc is true, then the requested directory must be in pg_tblspc/
++ */
++static void
++recovery_create_dbdir(char *path, bool only_tblspc)
++{
++	struct stat st;
++
++	Assert(RecoveryInProgress());
++
++	if (stat(path, &st) == 0)
++		return;
++
++	if (only_tblspc && strstr(path, "pg_tblspc/") == NULL)
++		elog(PANIC, "requested to created invalid directory: %s", path);
++
++	if (reachedConsistency && !allow_in_place_tablespaces)
++		ereport(PANIC,
++				errmsg("missing directory \"%s\"", path));
++
++	elog(reachedConsistency ? WARNING : DEBUG1,
++		 "creating missing directory: %s", path);
++
++	if (pg_mkdir_p(path, pg_dir_create_mode) != 0)
++		ereport(PANIC,
++				errmsg("could not create missing directory \"%s\": %m", path));
++}
++
++
+ /*
+  * DATABASE resource manager's routines
+  */
+@@ -3012,6 +3055,7 @@ dbase_redo(XLogReaderState *record)
+ 		(xl_dbase_create_file_copy_rec *) XLogRecGetData(record);
+ 		char	   *src_path;
+ 		char	   *dst_path;
++		char	   *parent_path;
+ 		struct stat st;
+ 
+ 		src_path = GetDatabasePath(xlrec->src_db_id, xlrec->src_tablespace_id);
+@@ -3031,6 +3075,33 @@ dbase_redo(XLogReaderState *record)
+ 								dst_path)));
+ 		}
+ 
++		/*
++		 * If the parent of the target path doesn't exist, create it now. This
++		 * enables us to create the target underneath later.
++		 */
++		parent_path = pstrdup(dst_path);
++		get_parent_directory(parent_path);
++		if (stat(parent_path, &st) < 0)
++		{
++			if (errno != ENOENT)
++				ereport(FATAL,
++						errmsg("could not stat directory \"%s\": %m",
++							   dst_path));
++
++			/* create the parent directory if needed and valid */
++			recovery_create_dbdir(parent_path, true);
++		}
++		pfree(parent_path);
++
++		/*
++		 * There's a case where the copy source directory is missing for the
++		 * same reason above.  Create the emtpy source directory so that
++		 * copydir below doesn't fail.  The directory will be dropped soon by
++		 * recovery.
++		 */
++		if (stat(src_path, &st) < 0 && errno == ENOENT)
++			recovery_create_dbdir(src_path, false);
++
+ 		/*
+ 		 * Force dirty buffers out to disk, to ensure source database is
+ 		 * up-to-date for the copy.
+@@ -3055,9 +3126,15 @@ dbase_redo(XLogReaderState *record)
+ 		xl_dbase_create_wal_log_rec *xlrec =
+ 		(xl_dbase_create_wal_log_rec *) XLogRecGetData(record);
+ 		char	   *dbpath;
++		char	   *parent_path;
+ 
+ 		dbpath = GetDatabasePath(xlrec->db_id, xlrec->tablespace_id);
+ 
++		/* create the parent directory if needed and valid */
++		parent_path = pstrdup(dbpath);
++		get_parent_directory(parent_path);
++		recovery_create_dbdir(parent_path, true);
++
+ 		/* Create the database directory with the version file. */
+ 		CreateDirAndVersionFile(dbpath, xlrec->db_id, xlrec->tablespace_id,
+ 								true);
+diff --git a/src/backend/commands/tablespace.c b/src/backend/commands/tablespace.c
+index cb7d46089a38..570ce3dbd545 100644
+--- a/src/backend/commands/tablespace.c
++++ b/src/backend/commands/tablespace.c
+@@ -156,8 +156,6 @@ TablespaceCreateDbspace(Oid spcOid, Oid dbOid, bool isRedo)
+ 				/* Directory creation failed? */
+ 				if (MakePGDirectory(dir) < 0)
+ 				{
+-					char	   *parentdir;
+-
+ 					/* Failure other than not exists or not in WAL replay? */
+ 					if (errno != ENOENT || !isRedo)
+ 						ereport(ERROR,
+@@ -166,36 +164,16 @@ TablespaceCreateDbspace(Oid spcOid, Oid dbOid, bool isRedo)
+ 										dir)));
+ 
+ 					/*
+-					 * Parent directories are missing during WAL replay, so
+-					 * continue by creating simple parent directories rather
+-					 * than a symlink.
++					 * During WAL replay, it's conceivable that several levels
++					 * of directories are missing if tablespaces are dropped
++					 * further ahead of the WAL stream than we're currently
++					 * replaying.  An easy way forward is to create them as
++					 * plain directories and hope they are removed by further
++					 * WAL replay if necessary.  If this also fails, there is
++					 * trouble we cannot get out of, so just report that and
++					 * bail out.
+ 					 */
+-
+-					/* create two parents up if not exist */
+-					parentdir = pstrdup(dir);
+-					get_parent_directory(parentdir);
+-					get_parent_directory(parentdir);
+-					/* Can't create parent and it doesn't already exist? */
+-					if (MakePGDirectory(parentdir) < 0 && errno != EEXIST)
+-						ereport(ERROR,
+-								(errcode_for_file_access(),
+-								 errmsg("could not create directory \"%s\": %m",
+-										parentdir)));
+-					pfree(parentdir);
+-
+-					/* create one parent up if not exist */
+-					parentdir = pstrdup(dir);
+-					get_parent_directory(parentdir);
+-					/* Can't create parent and it doesn't already exist? */
+-					if (MakePGDirectory(parentdir) < 0 && errno != EEXIST)
+-						ereport(ERROR,
+-								(errcode_for_file_access(),
+-								 errmsg("could not create directory \"%s\": %m",
+-										parentdir)));
+-					pfree(parentdir);
+-
+-					/* Create database directory */
+-					if (MakePGDirectory(dir) < 0)
++					if (pg_mkdir_p(dir, pg_dir_create_mode) < 0)
+ 						ereport(ERROR,
+ 								(errcode_for_file_access(),
+ 								 errmsg("could not create directory \"%s\": %m",
+diff --git a/src/test/recovery/t/033_replay_tsp_drops.pl b/src/test/recovery/t/033_replay_tsp_drops.pl
+new file mode 100644
+index 000000000000..9b74cb09ac3f
+--- /dev/null
++++ b/src/test/recovery/t/033_replay_tsp_drops.pl
+@@ -0,0 +1,169 @@
++
++# Copyright (c) 2021-2022, PostgreSQL Global Development Group
++
++# Test replay of tablespace/database creation/drop
++
++use strict;
++use warnings;
++
++use PostgreSQL::Test::Cluster;
++use PostgreSQL::Test::Utils;
++use Test::More;
++
++sub test_tablespace
++{
++	my ($strategy) = @_;
++
++	my $node_primary = PostgreSQL::Test::Cluster->new("primary1_$strategy");
++	$node_primary->init(allows_streaming => 1);
++	$node_primary->start;
++	$node_primary->psql(
++		'postgres',
++		qq[
++			SET allow_in_place_tablespaces=on;
++			CREATE TABLESPACE dropme_ts1 LOCATION '';
++			CREATE TABLESPACE dropme_ts2 LOCATION '';
++			CREATE TABLESPACE source_ts  LOCATION '';
++			CREATE TABLESPACE target_ts  LOCATION '';
++			CREATE DATABASE template_db IS_TEMPLATE = true;
++		]);
++	my $backup_name = 'my_backup';
++	$node_primary->backup($backup_name);
++
++	my $node_standby = PostgreSQL::Test::Cluster->new("standby2_$strategy");
++	$node_standby->init_from_backup($node_primary, $backup_name,
++		has_streaming => 1);
++	$node_standby->append_conf('postgresql.conf',
++		"allow_in_place_tablespaces = on");
++	$node_standby->start;
++
++	# Make sure connection is made
++	$node_primary->poll_query_until('postgres',
++		'SELECT count(*) = 1 FROM pg_stat_replication');
++
++	$node_standby->safe_psql('postgres', 'CHECKPOINT');
++
++	# Do immediate shutdown just after a sequence of CREAT DATABASE / DROP
++	# DATABASE / DROP TABLESPACE. This causes CREATE DATABASE WAL records
++	# to be applied to already-removed directories.
++	my $query = q[
++		CREATE DATABASE dropme_db1 WITH TABLESPACE dropme_ts1 STRATEGY=<STRATEGY>;
++		CREATE TABLE t (a int) TABLESPACE dropme_ts2;
++		CREATE DATABASE dropme_db2 WITH TABLESPACE dropme_ts2 STRATEGY=<STRATEGY>;
++		CREATE DATABASE moveme_db TABLESPACE source_ts STRATEGY=<STRATEGY>;
++		ALTER DATABASE moveme_db SET TABLESPACE target_ts;
++		CREATE DATABASE newdb TEMPLATE template_db STRATEGY=<STRATEGY>;
++		ALTER DATABASE template_db IS_TEMPLATE = false;
++		DROP DATABASE dropme_db1;
++		DROP TABLE t;
++		DROP DATABASE dropme_db2; DROP TABLESPACE dropme_ts2;
++		DROP TABLESPACE source_ts;
++		DROP DATABASE template_db;
++	];
++
++	$query =~ s/<STRATEGY>/$strategy/g;
++	$node_primary->safe_psql('postgres', $query);
++	$node_primary->wait_for_catchup($node_standby, 'replay',
++		$node_primary->lsn('write'));
++
++	# show "create missing directory" log message
++	$node_standby->safe_psql('postgres',
++		"ALTER SYSTEM SET log_min_messages TO debug1;");
++	$node_standby->stop('immediate');
++	# Should restart ignoring directory creation error.
++	is($node_standby->start(fail_ok => 1),
++		1, "standby node started for $strategy");
++	$node_standby->stop('immediate');
++}
++
++test_tablespace("FILE_COPY");
++test_tablespace("WAL_LOG");
++
++# Ensure that a missing tablespace directory during create database
++# replay immediately causes panic if the standby has already reached
++# consistent state (archive recovery is in progress).  This is
++# effective only for CREATE DATABASE WITH STRATEGY=FILE_COPY.
++
++my $node_primary = PostgreSQL::Test::Cluster->new('primary2');
++$node_primary->init(allows_streaming => 1);
++$node_primary->start;
++
++# Create tablespace
++$node_primary->safe_psql(
++	'postgres', q[
++		SET allow_in_place_tablespaces=on;
++		CREATE TABLESPACE ts1 LOCATION ''
++			]);
++$node_primary->safe_psql('postgres',
++	"CREATE DATABASE db1 WITH TABLESPACE ts1 STRATEGY=FILE_COPY");
++
++# Take backup
++my $backup_name = 'my_backup';
++$node_primary->backup($backup_name);
++my $node_standby = PostgreSQL::Test::Cluster->new('standby3');
++$node_standby->init_from_backup($node_primary, $backup_name,
++	has_streaming => 1);
++$node_standby->append_conf('postgresql.conf',
++	"allow_in_place_tablespaces = on");
++$node_standby->start;
++
++# Make sure standby reached consistency and starts accepting connections
++$node_standby->poll_query_until('postgres', 'SELECT 1', '1');
++
++# Remove standby tablespace directory so it will be missing when
++# replay resumes.
++my $tspoid = $node_standby->safe_psql('postgres',
++	"SELECT oid FROM pg_tablespace WHERE spcname = 'ts1';");
++my $tspdir = $node_standby->data_dir . "/pg_tblspc/$tspoid";
++File::Path::rmtree($tspdir);
++
++my $logstart = get_log_size($node_standby);
++
++# Create a database in the tablespace and a table in default tablespace
++$node_primary->safe_psql(
++	'postgres',
++	q[
++		CREATE TABLE should_not_replay_insertion(a int);
++		CREATE DATABASE db2 WITH TABLESPACE ts1 STRATEGY=FILE_COPY;
++		INSERT INTO should_not_replay_insertion VALUES (1);
++	]);
++
++# Standby should fail and should not silently skip replaying the wal
++# In this test, PANIC turns into WARNING by allow_in_place_tablespaces.
++# Check the log messages instead of confirming standby failure.
++my $max_attempts = $PostgreSQL::Test::Utils::timeout_default;
++while ($max_attempts-- >= 0)
++{
++	last
++	  if (
++		find_in_log(
++			$node_standby, "WARNING:  creating missing directory: pg_tblspc/",
++			$logstart));
++	sleep 1;
++}
++ok($max_attempts > 0, "invalid directory creation is detected");
++
++done_testing();
++
++
++# return the size of logfile of $node in bytes
++sub get_log_size
++{
++	my ($node) = @_;
++
++	return (stat $node->logfile)[7];
++}
++
++# find $pat in logfile of $node after $off-th byte
++sub find_in_log
++{
++	my ($node, $pat, $off) = @_;
++
++	$off = 0 unless defined $off;
++	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
++	return 0 if (length($log) <= $off);
++
++	$log = substr($log, $off);
++
++	return $log =~ m/$pat/;
++}

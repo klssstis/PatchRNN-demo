@@ -1,0 +1,336 @@
+From 9a86f03b4e8c8f16eca7faebcb4a46330e431102 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 11 Sep 2019 11:43:01 -0400
+Subject: [PATCH] Rearrange postmaster's startup sequence for better syslogger
+ results.
+
+This is a second try at what commit 57431a911 tried to do, namely,
+launch the syslogger before we open postmaster sockets so that our
+messages about the sockets end up in the syslogger files.  That
+commit fell foul of a bunch of subtle issues caused by trying to
+launch a postmaster child process before creating shared memory.
+Rather than messing with that interaction, let's postpone opening
+the sockets till after we launch the syslogger.
+
+This would not have been terribly safe before commit 7de19fbc0,
+because we relied on socket opening to detect whether any competing
+postmasters were using the same port number.  But now that we choose
+IPC keys without regard to the port number, there's no interaction
+to worry about.
+
+Also delay creation of the external PID file (if requested) till after
+the sockets are open, since external code could plausibly be relying
+on that ordering of events.  And postpone most of the work of
+RemovePgTempFiles() so that that potentially-slow processing still
+happens after we make the external PID file.  We have to be a bit
+careful about that last though: as noted in the discussion subsequent to
+bug #15804, EXEC_BACKEND builds still have to clear the parameter-file
+temp dir before launching the syslogger.
+
+Patch by me; thanks to Michael Paquier for review/testing.
+
+Discussion: https://postgr.es/m/15804-3721117bf40fb654@postgresql.org
+---
+ src/backend/postmaster/postmaster.c | 202 +++++++++++++++-------------
+ src/backend/storage/file/fd.c       |  11 +-
+ src/include/storage/fd.h            |   2 +
+ src/include/utils/pidfile.h         |   3 +-
+ 4 files changed, 116 insertions(+), 102 deletions(-)
+
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index a5446d54bb5a..eb9e0221f888 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -993,7 +993,113 @@ PostmasterMain(int argc, char *argv[])
+ 	 */
+ 	InitializeMaxBackends();
+ 
+-	/* Report server startup in log */
++	/*
++	 * Set up shared memory and semaphores.
++	 */
++	reset_shared();
++
++	/*
++	 * Estimate number of openable files.  This must happen after setting up
++	 * semaphores, because on some platforms semaphores count as open files.
++	 */
++	set_max_safe_fds();
++
++	/*
++	 * Set reference point for stack-depth checking.
++	 */
++	set_stack_base();
++
++	/*
++	 * Initialize pipe (or process handle on Windows) that allows children to
++	 * wake up from sleep on postmaster death.
++	 */
++	InitPostmasterDeathWatchHandle();
++
++#ifdef WIN32
++
++	/*
++	 * Initialize I/O completion port used to deliver list of dead children.
++	 */
++	win32ChildQueue = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
++	if (win32ChildQueue == NULL)
++		ereport(FATAL,
++				(errmsg("could not create I/O completion port for child queue")));
++#endif
++
++#ifdef EXEC_BACKEND
++	/* Write out nondefault GUC settings for child processes to use */
++	write_nondefault_variables(PGC_POSTMASTER);
++
++	/*
++	 * Clean out the temp directory used to transmit parameters to child
++	 * processes (see internal_forkexec, below).  We must do this before
++	 * launching any child processes, else we have a race condition: we could
++	 * remove a parameter file before the child can read it.  It should be
++	 * safe to do so now, because we verified earlier that there are no
++	 * conflicting Postgres processes in this data directory.
++	 */
++	RemovePgTempFilesInDir(PG_TEMP_FILES_DIR, true, false);
++#endif
++
++	/*
++	 * Forcibly remove the files signaling a standby promotion request.
++	 * Otherwise, the existence of those files triggers a promotion too early,
++	 * whether a user wants that or not.
++	 *
++	 * This removal of files is usually unnecessary because they can exist
++	 * only during a few moments during a standby promotion. However there is
++	 * a race condition: if pg_ctl promote is executed and creates the files
++	 * during a promotion, the files can stay around even after the server is
++	 * brought up to new master. Then, if new standby starts by using the
++	 * backup taken from that master, the files can exist at the server
++	 * startup and should be removed in order to avoid an unexpected
++	 * promotion.
++	 *
++	 * Note that promotion signal files need to be removed before the startup
++	 * process is invoked. Because, after that, they can be used by
++	 * postmaster's SIGUSR1 signal handler.
++	 */
++	RemovePromoteSignalFiles();
++
++	/* Do the same for logrotate signal file */
++	RemoveLogrotateSignalFiles();
++
++	/* Remove any outdated file holding the current log filenames. */
++	if (unlink(LOG_METAINFO_DATAFILE) < 0 && errno != ENOENT)
++		ereport(LOG,
++				(errcode_for_file_access(),
++				 errmsg("could not remove file \"%s\": %m",
++						LOG_METAINFO_DATAFILE)));
++
++	/*
++	 * If enabled, start up syslogger collection subprocess
++	 */
++	SysLoggerPID = SysLogger_Start();
++
++	/*
++	 * Reset whereToSendOutput from DestDebug (its starting state) to
++	 * DestNone. This stops ereport from sending log messages to stderr unless
++	 * Log_destination permits.  We don't do this until the postmaster is
++	 * fully launched, since startup failures may as well be reported to
++	 * stderr.
++	 *
++	 * If we are in fact disabling logging to stderr, first emit a log message
++	 * saying so, to provide a breadcrumb trail for users who may not remember
++	 * that their logging is configured to go somewhere else.
++	 */
++	if (!(Log_destination & LOG_DESTINATION_STDERR))
++		ereport(LOG,
++				(errmsg("ending log output to stderr"),
++				 errhint("Future log output will go to log destination \"%s\".",
++						 Log_destination_string)));
++
++	whereToSendOutput = DestNone;
++
++	/*
++	 * Report server startup in log.  While we could emit this much earlier,
++	 * it seems best to do so after starting the log collector, if we intend
++	 * to use one.
++	 */
+ 	ereport(LOG,
+ 			(errmsg("starting %s", PG_VERSION_STR)));
+ 
+@@ -1172,51 +1278,13 @@ PostmasterMain(int argc, char *argv[])
+ 	if (!listen_addr_saved)
+ 		AddToDataDirLockFile(LOCK_FILE_LINE_LISTEN_ADDR, "");
+ 
+-	/*
+-	 * Set up shared memory and semaphores.
+-	 */
+-	reset_shared();
+-
+-	/*
+-	 * Estimate number of openable files.  This must happen after setting up
+-	 * semaphores, because on some platforms semaphores count as open files.
+-	 */
+-	set_max_safe_fds();
+-
+-	/*
+-	 * Set reference point for stack-depth checking.
+-	 */
+-	set_stack_base();
+-
+-	/*
+-	 * Initialize pipe (or process handle on Windows) that allows children to
+-	 * wake up from sleep on postmaster death.
+-	 */
+-	InitPostmasterDeathWatchHandle();
+-
+-#ifdef WIN32
+-
+-	/*
+-	 * Initialize I/O completion port used to deliver list of dead children.
+-	 */
+-	win32ChildQueue = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
+-	if (win32ChildQueue == NULL)
+-		ereport(FATAL,
+-				(errmsg("could not create I/O completion port for child queue")));
+-#endif
+-
+ 	/*
+ 	 * Record postmaster options.  We delay this till now to avoid recording
+-	 * bogus options (eg, NBuffers too high for available memory).
++	 * bogus options (eg, unusable port number).
+ 	 */
+ 	if (!CreateOptsFile(argc, argv, my_exec_path))
+ 		ExitPostmaster(1);
+ 
+-#ifdef EXEC_BACKEND
+-	/* Write out nondefault GUC settings for child processes to use */
+-	write_nondefault_variables(PGC_POSTMASTER);
+-#endif
+-
+ 	/*
+ 	 * Write the external PID file if requested
+ 	 */
+@@ -1247,60 +1315,6 @@ PostmasterMain(int argc, char *argv[])
+ 	 */
+ 	RemovePgTempFiles();
+ 
+-	/*
+-	 * Forcibly remove the files signaling a standby promotion request.
+-	 * Otherwise, the existence of those files triggers a promotion too early,
+-	 * whether a user wants that or not.
+-	 *
+-	 * This removal of files is usually unnecessary because they can exist
+-	 * only during a few moments during a standby promotion. However there is
+-	 * a race condition: if pg_ctl promote is executed and creates the files
+-	 * during a promotion, the files can stay around even after the server is
+-	 * brought up to new master. Then, if new standby starts by using the
+-	 * backup taken from that master, the files can exist at the server
+-	 * startup and should be removed in order to avoid an unexpected
+-	 * promotion.
+-	 *
+-	 * Note that promotion signal files need to be removed before the startup
+-	 * process is invoked. Because, after that, they can be used by
+-	 * postmaster's SIGUSR1 signal handler.
+-	 */
+-	RemovePromoteSignalFiles();
+-
+-	/* Do the same for logrotate signal file */
+-	RemoveLogrotateSignalFiles();
+-
+-	/* Remove any outdated file holding the current log filenames. */
+-	if (unlink(LOG_METAINFO_DATAFILE) < 0 && errno != ENOENT)
+-		ereport(LOG,
+-				(errcode_for_file_access(),
+-				 errmsg("could not remove file \"%s\": %m",
+-						LOG_METAINFO_DATAFILE)));
+-
+-	/*
+-	 * If enabled, start up syslogger collection subprocess
+-	 */
+-	SysLoggerPID = SysLogger_Start();
+-
+-	/*
+-	 * Reset whereToSendOutput from DestDebug (its starting state) to
+-	 * DestNone. This stops ereport from sending log messages to stderr unless
+-	 * Log_destination permits.  We don't do this until the postmaster is
+-	 * fully launched, since startup failures may as well be reported to
+-	 * stderr.
+-	 *
+-	 * If we are in fact disabling logging to stderr, first emit a log message
+-	 * saying so, to provide a breadcrumb trail for users who may not remember
+-	 * that their logging is configured to go somewhere else.
+-	 */
+-	if (!(Log_destination & LOG_DESTINATION_STDERR))
+-		ereport(LOG,
+-				(errmsg("ending log output to stderr"),
+-				 errhint("Future log output will go to log destination \"%s\".",
+-						 Log_destination_string)));
+-
+-	whereToSendOutput = DestNone;
+-
+ 	/*
+ 	 * Initialize stats collection subsystem (this does NOT start the
+ 	 * collector process!)
+diff --git a/src/backend/storage/file/fd.c b/src/backend/storage/file/fd.c
+index 2de210510522..25107e8a290e 100644
+--- a/src/backend/storage/file/fd.c
++++ b/src/backend/storage/file/fd.c
+@@ -307,8 +307,6 @@ static int	FreeDesc(AllocateDesc *desc);
+ 
+ static void AtProcExit_Files(int code, Datum arg);
+ static void CleanupTempFiles(bool isCommit, bool isProcExit);
+-static void RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok,
+-								   bool unlink_all);
+ static void RemovePgTempRelationFiles(const char *tsdirname);
+ static void RemovePgTempRelationFilesInDbspace(const char *dbspacedirname);
+ 
+@@ -2919,11 +2917,10 @@ RemovePgTempFiles(void)
+ 
+ 	/*
+ 	 * In EXEC_BACKEND case there is a pgsql_tmp directory at the top level of
+-	 * DataDir as well.
++	 * DataDir as well.  However, that is *not* cleaned here because doing so
++	 * would create a race condition.  It's done separately, earlier in
++	 * postmaster startup.
+ 	 */
+-#ifdef EXEC_BACKEND
+-	RemovePgTempFilesInDir(PG_TEMP_FILES_DIR, true, false);
+-#endif
+ }
+ 
+ /*
+@@ -2941,7 +2938,7 @@ RemovePgTempFiles(void)
+  * (These two flags could be replaced by one, but it seems clearer to keep
+  * them separate.)
+  */
+-static void
++void
+ RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok, bool unlink_all)
+ {
+ 	DIR		   *temp_dir;
+diff --git a/src/include/storage/fd.h b/src/include/storage/fd.h
+index d2a8c52044bb..625fbc386a45 100644
+--- a/src/include/storage/fd.h
++++ b/src/include/storage/fd.h
+@@ -135,6 +135,8 @@ extern void AtEOXact_Files(bool isCommit);
+ extern void AtEOSubXact_Files(bool isCommit, SubTransactionId mySubid,
+ 							  SubTransactionId parentSubid);
+ extern void RemovePgTempFiles(void);
++extern void RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok,
++								   bool unlink_all);
+ extern bool looks_like_temp_rel_name(const char *name);
+ 
+ extern int	pg_fsync(int fd);
+diff --git a/src/include/utils/pidfile.h b/src/include/utils/pidfile.h
+index b2dcca64ac82..21e7ccf92fb8 100644
+--- a/src/include/utils/pidfile.h
++++ b/src/include/utils/pidfile.h
+@@ -28,7 +28,8 @@
+  *
+  * Lines 6 and up are added via AddToDataDirLockFile() after initial file
+  * creation; also, line 5 is initially empty and is changed after the first
+- * Unix socket is opened.
++ * Unix socket is opened.  Onlookers should not assume that lines 4 and up
++ * are filled in any particular order.
+  *
+  * Socket lock file(s), if used, have the same contents as lines 1-5, with
+  * line 5 being their own directory.

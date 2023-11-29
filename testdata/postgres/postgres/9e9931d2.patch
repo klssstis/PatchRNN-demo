@@ -1,0 +1,571 @@
+From 9e9931d2bf40e2fea447d779c2e133c2c1256ef3 Mon Sep 17 00:00:00 2001
+From: Etsuro Fujita <efujita@postgresql.org>
+Date: Tue, 15 Aug 2023 16:45:00 +0900
+Subject: [PATCH] Re-allow FDWs and custom scan providers to replace joins with
+ pseudoconstant quals.
+
+This was disabled in commit 6f80a8d9c due to the lack of support for
+handling of pseudoconstant quals assigned to replaced joins in
+createplan.c.  To re-allow it, this patch adds the support by 1)
+modifying the ForeignPath and CustomPath structs so that if they
+represent foreign and custom scans replacing a join with a scan, they
+store the list of RestrictInfo nodes to apply to the join, as in
+JoinPaths, and by 2) modifying create_scan_plan() in createplan.c so
+that it uses that list in that case, instead of the baserestrictinfo
+list, to get pseudoconstant quals assigned to the join, as mentioned in
+the commit message for that commit.
+
+Important item for the release notes: this is non-backwards-compatible
+since it modifies the ForeignPath and CustomPath structs, as mentioned
+above, and changes the argument lists for FDW helper functions
+create_foreignscan_path(), create_foreign_join_path(), and
+create_foreign_upper_path().
+
+Richard Guo, with some additional changes by me, reviewed by Nishant
+Sharma, Suraj Kharage, and Richard Guo.
+
+Discussion: https://postgr.es/m/CADrsxdbcN1vejBaf8a%2BQhrZY5PXL-04mCd4GDu6qm6FigDZd6Q%40mail.gmail.com
+---
+ contrib/file_fdw/file_fdw.c                   |  1 +
+ .../postgres_fdw/expected/postgres_fdw.out    | 30 +++++++------------
+ contrib/postgres_fdw/postgres_fdw.c           | 20 +++++++++----
+ contrib/postgres_fdw/sql/postgres_fdw.sql     |  2 +-
+ doc/src/sgml/custom-scan.sgml                 | 16 ++++++++++
+ doc/src/sgml/fdwhandler.sgml                  | 11 +++++++
+ src/backend/optimizer/path/joinpath.c         | 19 ++----------
+ src/backend/optimizer/plan/createplan.c       | 21 ++++++++++++-
+ src/backend/optimizer/util/pathnode.c         | 10 +++++++
+ src/backend/optimizer/util/restrictinfo.c     | 30 -------------------
+ src/include/nodes/pathnodes.h                 | 10 +++++++
+ src/include/optimizer/pathnode.h              |  3 ++
+ src/include/optimizer/restrictinfo.h          |  2 --
+ 13 files changed, 99 insertions(+), 76 deletions(-)
+
+diff --git a/contrib/file_fdw/file_fdw.c b/contrib/file_fdw/file_fdw.c
+index 9e330b99347e..2189be8a3c03 100644
+--- a/contrib/file_fdw/file_fdw.c
++++ b/contrib/file_fdw/file_fdw.c
+@@ -581,6 +581,7 @@ fileGetForeignPaths(PlannerInfo *root,
+ 									 NIL,	/* no pathkeys */
+ 									 baserel->lateral_relids,
+ 									 NULL,	/* no extra plan */
++									 NIL,	/* no fdw_restrictinfo list */
+ 									 coptions));
+ 
+ 	/*
+diff --git a/contrib/postgres_fdw/expected/postgres_fdw.out b/contrib/postgres_fdw/expected/postgres_fdw.out
+index f6d3b8ec08ec..77df7eb8e48b 100644
+--- a/contrib/postgres_fdw/expected/postgres_fdw.out
++++ b/contrib/postgres_fdw/expected/postgres_fdw.out
+@@ -2316,31 +2316,21 @@ SELECT t1."C 1" FROM "S 1"."T 1" t1, LATERAL (SELECT DISTINCT t2.c1, t3.c1 FROM
+    1
+ (10 rows)
+ 
+--- join with pseudoconstant quals, not pushed down.
++-- join with pseudoconstant quals
+ EXPLAIN (VERBOSE, COSTS OFF)
+ SELECT t1.c1, t2.c1 FROM ft1 t1 JOIN ft2 t2 ON (t1.c1 = t2.c1 AND CURRENT_USER = SESSION_USER) ORDER BY t1.c3, t1.c1 OFFSET 100 LIMIT 10;
+-                                  QUERY PLAN                                   
+--------------------------------------------------------------------------------
++                                                                                           QUERY PLAN                                                                                           
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  Limit
+    Output: t1.c1, t2.c1, t1.c3
+-   ->  Sort
++   ->  Result
+          Output: t1.c1, t2.c1, t1.c3
+-         Sort Key: t1.c3, t1.c1
+-         ->  Result
+-               Output: t1.c1, t2.c1, t1.c3
+-               One-Time Filter: (CURRENT_USER = SESSION_USER)
+-               ->  Hash Join
+-                     Output: t1.c1, t1.c3, t2.c1
+-                     Hash Cond: (t2.c1 = t1.c1)
+-                     ->  Foreign Scan on public.ft2 t2
+-                           Output: t2.c1
+-                           Remote SQL: SELECT "C 1" FROM "S 1"."T 1"
+-                     ->  Hash
+-                           Output: t1.c1, t1.c3
+-                           ->  Foreign Scan on public.ft1 t1
+-                                 Output: t1.c1, t1.c3
+-                                 Remote SQL: SELECT "C 1", c3 FROM "S 1"."T 1"
+-(19 rows)
++         One-Time Filter: (CURRENT_USER = SESSION_USER)
++         ->  Foreign Scan
++               Output: t1.c1, t1.c3, t2.c1
++               Relations: (public.ft1 t1) INNER JOIN (public.ft2 t2)
++               Remote SQL: SELECT r1."C 1", r2."C 1", r1.c3 FROM ("S 1"."T 1" r1 INNER JOIN "S 1"."T 1" r2 ON (((r2."C 1" = r1."C 1")))) ORDER BY r1.c3 ASC NULLS LAST, r1."C 1" ASC NULLS LAST
++(9 rows)
+ 
+ -- non-Var items in targetlist of the nullable rel of a join preventing
+ -- push-down in some cases
+diff --git a/contrib/postgres_fdw/postgres_fdw.c b/contrib/postgres_fdw/postgres_fdw.c
+index c5cada55fb73..ef58b8b0ea2e 100644
+--- a/contrib/postgres_fdw/postgres_fdw.c
++++ b/contrib/postgres_fdw/postgres_fdw.c
+@@ -524,7 +524,7 @@ static List *get_useful_pathkeys_for_relation(PlannerInfo *root,
+ 											  RelOptInfo *rel);
+ static List *get_useful_ecs_for_relation(PlannerInfo *root, RelOptInfo *rel);
+ static void add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
+-											Path *epq_path);
++											Path *epq_path, List *restrictlist);
+ static void add_foreign_grouping_paths(PlannerInfo *root,
+ 									   RelOptInfo *input_rel,
+ 									   RelOptInfo *grouped_rel,
+@@ -1034,11 +1034,12 @@ postgresGetForeignPaths(PlannerInfo *root,
+ 								   NIL, /* no pathkeys */
+ 								   baserel->lateral_relids,
+ 								   NULL,	/* no extra plan */
++								   NIL, /* no fdw_restrictinfo list */
+ 								   NIL);	/* no fdw_private list */
+ 	add_path(baserel, (Path *) path);
+ 
+ 	/* Add paths with pathkeys */
+-	add_paths_with_pathkeys_for_rel(root, baserel, NULL);
++	add_paths_with_pathkeys_for_rel(root, baserel, NULL, NIL);
+ 
+ 	/*
+ 	 * If we're not using remote estimates, stop here.  We have no way to
+@@ -1206,6 +1207,7 @@ postgresGetForeignPaths(PlannerInfo *root,
+ 									   NIL, /* no pathkeys */
+ 									   param_info->ppi_req_outer,
+ 									   NULL,
++									   NIL, /* no fdw_restrictinfo list */
+ 									   NIL);	/* no fdw_private list */
+ 		add_path(baserel, (Path *) path);
+ 	}
+@@ -5991,7 +5993,7 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
+ 
+ static void
+ add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
+-								Path *epq_path)
++								Path *epq_path, List *restrictlist)
+ {
+ 	List	   *useful_pathkeys_list = NIL; /* List of all pathkeys */
+ 	ListCell   *lc;
+@@ -6085,6 +6087,7 @@ add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
+ 											 useful_pathkeys,
+ 											 rel->lateral_relids,
+ 											 sorted_epq_path,
++											 NIL,	/* no fdw_restrictinfo list */
+ 											 NIL));
+ 		else
+ 			add_path(rel, (Path *)
+@@ -6096,6 +6099,7 @@ add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
+ 											  useful_pathkeys,
+ 											  rel->lateral_relids,
+ 											  sorted_epq_path,
++											  restrictlist,
+ 											  NIL));
+ 	}
+ }
+@@ -6348,13 +6352,15 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
+ 										NIL,	/* no pathkeys */
+ 										joinrel->lateral_relids,
+ 										epq_path,
++										extra->restrictlist,
+ 										NIL);	/* no fdw_private */
+ 
+ 	/* Add generated path into joinrel by add_path(). */
+ 	add_path(joinrel, (Path *) joinpath);
+ 
+ 	/* Consider pathkeys for the join relation */
+-	add_paths_with_pathkeys_for_rel(root, joinrel, epq_path);
++	add_paths_with_pathkeys_for_rel(root, joinrel, epq_path,
++									extra->restrictlist);
+ 
+ 	/* XXX Consider parameterized paths for the join relation */
+ }
+@@ -6735,6 +6741,7 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
+ 										  total_cost,
+ 										  NIL,	/* no pathkeys */
+ 										  NULL,
++										  NIL,	/* no fdw_restrictinfo list */
+ 										  NIL); /* no fdw_private */
+ 
+ 	/* Add generated path into grouped_rel by add_path(). */
+@@ -6868,6 +6875,7 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
+ 											 total_cost,
+ 											 root->sort_pathkeys,
+ 											 NULL,	/* no extra plan */
++											 NIL,	/* no fdw_restrictinfo list */
+ 											 fdw_private);
+ 
+ 	/* and add it to the ordered_rel */
+@@ -6983,7 +6991,8 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
+ 													   path->total_cost,
+ 													   path->pathkeys,
+ 													   NULL,	/* no extra plan */
+-													   NULL);	/* no fdw_private */
++													   NIL,	/* no fdw_restrictinfo list */
++													   NIL);	/* no fdw_private */
+ 
+ 				/* and add it to the final_rel */
+ 				add_path(final_rel, (Path *) final_path);
+@@ -7103,6 +7112,7 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
+ 										   total_cost,
+ 										   pathkeys,
+ 										   NULL,	/* no extra plan */
++										   NIL,	/* no fdw_restrictinfo list */
+ 										   fdw_private);
+ 
+ 	/* and add it to the final_rel */
+diff --git a/contrib/postgres_fdw/sql/postgres_fdw.sql b/contrib/postgres_fdw/sql/postgres_fdw.sql
+index 436feee396b1..cfb1b57e3377 100644
+--- a/contrib/postgres_fdw/sql/postgres_fdw.sql
++++ b/contrib/postgres_fdw/sql/postgres_fdw.sql
+@@ -640,7 +640,7 @@ SELECT t1c1, avg(t1c1 + t2c1) FROM (SELECT t1.c1, t2.c1 FROM ft1 t1 JOIN ft2 t2
+ EXPLAIN (VERBOSE, COSTS OFF)
+ SELECT t1."C 1" FROM "S 1"."T 1" t1, LATERAL (SELECT DISTINCT t2.c1, t3.c1 FROM ft1 t2, ft2 t3 WHERE t2.c1 = t3.c1 AND t2.c2 = t1.c2) q ORDER BY t1."C 1" OFFSET 10 LIMIT 10;
+ SELECT t1."C 1" FROM "S 1"."T 1" t1, LATERAL (SELECT DISTINCT t2.c1, t3.c1 FROM ft1 t2, ft2 t3 WHERE t2.c1 = t3.c1 AND t2.c2 = t1.c2) q ORDER BY t1."C 1" OFFSET 10 LIMIT 10;
+--- join with pseudoconstant quals, not pushed down.
++-- join with pseudoconstant quals
+ EXPLAIN (VERBOSE, COSTS OFF)
+ SELECT t1.c1, t2.c1 FROM ft1 t1 JOIN ft2 t2 ON (t1.c1 = t2.c1 AND CURRENT_USER = SESSION_USER) ORDER BY t1.c3, t1.c1 OFFSET 100 LIMIT 10;
+ 
+diff --git a/doc/src/sgml/custom-scan.sgml b/doc/src/sgml/custom-scan.sgml
+index cd989e7d3c46..836776b27bd1 100644
+--- a/doc/src/sgml/custom-scan.sgml
++++ b/doc/src/sgml/custom-scan.sgml
+@@ -62,6 +62,7 @@ typedef struct CustomPath
+     Path      path;
+     uint32    flags;
+     List     *custom_paths;
++    List     *custom_restrictinfo;
+     List     *custom_private;
+     const CustomPathMethods *methods;
+ } CustomPath;
+@@ -85,6 +86,10 @@ typedef struct CustomPath
+     An optional <structfield>custom_paths</structfield> is a list of <structname>Path</structname>
+     nodes used by this custom-path node; these will be transformed into
+     <structname>Plan</structname> nodes by planner.
++    As described below, custom paths can be created for join relations as
++    well.  In such a case, <structfield>custom_restrictinfo</structfield>
++    should be used to store the set of join clauses to apply to the join the
++    custom path replaces.  Otherwise it should be NIL.
+     <structfield>custom_private</structfield> can be used to store the custom path's
+     private data.  Private data should be stored in a form that can be handled
+     by <literal>nodeToString</literal>, so that debugging routines that attempt to
+@@ -114,6 +119,17 @@ extern PGDLLIMPORT set_join_pathlist_hook_type set_join_pathlist_hook;
+    responsibility of the hook to minimize duplicated work.
+   </para>
+ 
++  <para>
++   Note also that the set of join clauses to apply to the join,
++   which is passed as <literal>extra-&gt;restrictlist</literal>, varies
++   depending on the combination of inner and outer relations.  A
++   <structname>CustomPath</structname> path generated for the
++   <literal>joinrel</literal> must contain the set of join clauses it uses,
++   which will be used by the planner to convert the
++   <structname>CustomPath</structname> path into a plan, if it is selected
++   by the planner as the best path for the <literal>joinrel</literal>.
++  </para>
++
+   <sect2 id="custom-scan-path-callbacks">
+   <title>Custom Scan Path Callbacks</title>
+ 
+diff --git a/doc/src/sgml/fdwhandler.sgml b/doc/src/sgml/fdwhandler.sgml
+index ac1717bc3c49..25832d227fbf 100644
+--- a/doc/src/sgml/fdwhandler.sgml
++++ b/doc/src/sgml/fdwhandler.sgml
+@@ -333,6 +333,17 @@ GetForeignJoinPaths(PlannerInfo *root,
+      the responsibility of the FDW to minimize duplicated work.
+     </para>
+ 
++    <para>
++     Note also that the set of join clauses to apply to the join,
++     which is passed as <literal>extra-&gt;restrictlist</literal>, varies
++     depending on the combination of inner and outer relations.  A
++     <structname>ForeignPath</structname> path generated for the
++     <literal>joinrel</literal> must contain the set of join clauses it uses,
++     which will be used by the planner to convert the
++     <structname>ForeignPath</structname> path into a plan, if it is selected
++     by the planner as the best path for the <literal>joinrel</literal>.
++    </para>
++
+     <para>
+      If a <structname>ForeignPath</structname> path is chosen for the join, it will
+      represent the entire join process; paths generated for the component
+diff --git a/src/backend/optimizer/path/joinpath.c b/src/backend/optimizer/path/joinpath.c
+index 059e605e04e4..821d282497bc 100644
+--- a/src/backend/optimizer/path/joinpath.c
++++ b/src/backend/optimizer/path/joinpath.c
+@@ -24,7 +24,6 @@
+ #include "optimizer/pathnode.h"
+ #include "optimizer/paths.h"
+ #include "optimizer/planmain.h"
+-#include "optimizer/restrictinfo.h"
+ #include "utils/typcache.h"
+ 
+ /* Hook for plugins to get control in add_paths_to_joinrel() */
+@@ -131,7 +130,6 @@ add_paths_to_joinrel(PlannerInfo *root,
+ {
+ 	JoinPathExtraData extra;
+ 	bool		mergejoin_allowed = true;
+-	bool		consider_join_pushdown = false;
+ 	ListCell   *lc;
+ 	Relids		joinrelids;
+ 
+@@ -323,25 +321,13 @@ add_paths_to_joinrel(PlannerInfo *root,
+ 		hash_inner_and_outer(root, joinrel, outerrel, innerrel,
+ 							 jointype, &extra);
+ 
+-	/*
+-	 * createplan.c does not currently support handling of pseudoconstant
+-	 * clauses assigned to joins pushed down by extensions; check if the
+-	 * restrictlist has such clauses, and if so, disallow pushing down joins.
+-	 */
+-	if ((joinrel->fdwroutine &&
+-		 joinrel->fdwroutine->GetForeignJoinPaths) ||
+-		set_join_pathlist_hook)
+-		consider_join_pushdown = !has_pseudoconstant_clauses(root,
+-															 restrictlist);
+-
+ 	/*
+ 	 * 5. If inner and outer relations are foreign tables (or joins) belonging
+ 	 * to the same server and assigned to the same user to check access
+ 	 * permissions as, give the FDW a chance to push down joins.
+ 	 */
+ 	if (joinrel->fdwroutine &&
+-		joinrel->fdwroutine->GetForeignJoinPaths &&
+-		consider_join_pushdown)
++		joinrel->fdwroutine->GetForeignJoinPaths)
+ 		joinrel->fdwroutine->GetForeignJoinPaths(root, joinrel,
+ 												 outerrel, innerrel,
+ 												 jointype, &extra);
+@@ -349,8 +335,7 @@ add_paths_to_joinrel(PlannerInfo *root,
+ 	/*
+ 	 * 6. Finally, give extensions a chance to manipulate the path list.
+ 	 */
+-	if (set_join_pathlist_hook &&
+-		consider_join_pushdown)
++	if (set_join_pathlist_hook)
+ 		set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
+ 							   jointype, &extra);
+ }
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index af48109058d3..34ca6d4ac218 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -599,8 +599,27 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
+ 	 * Detect whether we have any pseudoconstant quals to deal with.  Then, if
+ 	 * we'll need a gating Result node, it will be able to project, so there
+ 	 * are no requirements on the child's tlist.
++	 *
++	 * If this replaces a join, it must be a foreign scan or a custom scan,
++	 * and the FDW or the custom scan provider would have stored in the best
++	 * path the list of RestrictInfo nodes to apply to the join; check against
++	 * that list in that case.
+ 	 */
+-	gating_clauses = get_gating_quals(root, scan_clauses);
++	if (IS_JOIN_REL(rel))
++	{
++		List	   *join_clauses;
++
++		Assert(best_path->pathtype == T_ForeignScan ||
++			   best_path->pathtype == T_CustomScan);
++		if (best_path->pathtype == T_ForeignScan)
++			join_clauses = ((ForeignPath *) best_path)->fdw_restrictinfo;
++		else
++			join_clauses = ((CustomPath *) best_path)->custom_restrictinfo;
++
++		gating_clauses = get_gating_quals(root, join_clauses);
++	}
++	else
++		gating_clauses = get_gating_quals(root, scan_clauses);
+ 	if (gating_clauses)
+ 		flags = 0;
+ 
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index 754f0b9f34c5..211ba65389d4 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -2229,6 +2229,7 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
+ 						List *pathkeys,
+ 						Relids required_outer,
+ 						Path *fdw_outerpath,
++						List *fdw_restrictinfo,
+ 						List *fdw_private)
+ {
+ 	ForeignPath *pathnode = makeNode(ForeignPath);
+@@ -2250,6 +2251,7 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
+ 	pathnode->path.pathkeys = pathkeys;
+ 
+ 	pathnode->fdw_outerpath = fdw_outerpath;
++	pathnode->fdw_restrictinfo = fdw_restrictinfo;
+ 	pathnode->fdw_private = fdw_private;
+ 
+ 	return pathnode;
+@@ -2273,6 +2275,7 @@ create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
+ 						 List *pathkeys,
+ 						 Relids required_outer,
+ 						 Path *fdw_outerpath,
++						 List *fdw_restrictinfo,
+ 						 List *fdw_private)
+ {
+ 	ForeignPath *pathnode = makeNode(ForeignPath);
+@@ -2300,6 +2303,7 @@ create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
+ 	pathnode->path.pathkeys = pathkeys;
+ 
+ 	pathnode->fdw_outerpath = fdw_outerpath;
++	pathnode->fdw_restrictinfo = fdw_restrictinfo;
+ 	pathnode->fdw_private = fdw_private;
+ 
+ 	return pathnode;
+@@ -2322,6 +2326,7 @@ create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
+ 						  double rows, Cost startup_cost, Cost total_cost,
+ 						  List *pathkeys,
+ 						  Path *fdw_outerpath,
++						  List *fdw_restrictinfo,
+ 						  List *fdw_private)
+ {
+ 	ForeignPath *pathnode = makeNode(ForeignPath);
+@@ -2345,6 +2350,7 @@ create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
+ 	pathnode->path.pathkeys = pathkeys;
+ 
+ 	pathnode->fdw_outerpath = fdw_outerpath;
++	pathnode->fdw_restrictinfo = fdw_restrictinfo;
+ 	pathnode->fdw_private = fdw_private;
+ 
+ 	return pathnode;
+@@ -4149,6 +4155,8 @@ do { \
+ 				FLAT_COPY_PATH(fpath, path, ForeignPath);
+ 				if (fpath->fdw_outerpath)
+ 					REPARAMETERIZE_CHILD_PATH(fpath->fdw_outerpath);
++				if (fpath->fdw_restrictinfo)
++					ADJUST_CHILD_ATTRS(fpath->fdw_restrictinfo);
+ 
+ 				/* Hand over to FDW if needed. */
+ 				rfpc_func =
+@@ -4166,6 +4174,8 @@ do { \
+ 
+ 				FLAT_COPY_PATH(cpath, path, CustomPath);
+ 				REPARAMETERIZE_CHILD_PATH_LIST(cpath->custom_paths);
++				if (cpath->custom_restrictinfo)
++					ADJUST_CHILD_ATTRS(cpath->custom_restrictinfo);
+ 				if (cpath->methods &&
+ 					cpath->methods->ReparameterizeCustomPathByChild)
+ 					cpath->custom_private =
+diff --git a/src/backend/optimizer/util/restrictinfo.c b/src/backend/optimizer/util/restrictinfo.c
+index c1fbbb6bfeef..d6d26a2b515c 100644
+--- a/src/backend/optimizer/util/restrictinfo.c
++++ b/src/backend/optimizer/util/restrictinfo.c
+@@ -549,36 +549,6 @@ extract_actual_join_clauses(List *restrictinfo_list,
+ 	}
+ }
+ 
+-/*
+- * has_pseudoconstant_clauses
+- *
+- * Returns true if 'restrictinfo_list' includes pseudoconstant clauses.
+- *
+- * This is used when we determine whether to allow extensions to consider
+- * pushing down joins in add_paths_to_joinrel().
+- */
+-bool
+-has_pseudoconstant_clauses(PlannerInfo *root,
+-						   List *restrictinfo_list)
+-{
+-	ListCell   *l;
+-
+-	/* No need to look if we know there are no pseudoconstants */
+-	if (!root->hasPseudoConstantQuals)
+-		return false;
+-
+-	/* See if there are pseudoconstants in the RestrictInfo list */
+-	foreach(l, restrictinfo_list)
+-	{
+-		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
+-
+-		if (rinfo->pseudoconstant &&
+-			!rinfo_is_constant_true(rinfo))
+-			return true;
+-	}
+-	return false;
+-}
+-
+ /*
+  * join_clause_is_movable_to
+  *		Test whether a join clause is a safe candidate for parameterization
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index a1dc1d07e186..5702fbba60c3 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -1822,6 +1822,10 @@ typedef struct SubqueryScanPath
+  * ForeignPath represents a potential scan of a foreign table, foreign join
+  * or foreign upper-relation.
+  *
++ * In the case of a foreign join, fdw_restrictinfo stores the RestrictInfos to
++ * apply to the join, which are used by createplan.c to get pseudoconstant
++ * clauses evaluated as one-time quals in a gating Result plan node.
++ *
+  * fdw_private stores FDW private data about the scan.  While fdw_private is
+  * not actually touched by the core code during normal operations, it's
+  * generally a good idea to use a representation that can be dumped by
+@@ -1832,6 +1836,7 @@ typedef struct ForeignPath
+ {
+ 	Path		path;
+ 	Path	   *fdw_outerpath;
++	List	   *fdw_restrictinfo;
+ 	List	   *fdw_private;
+ } ForeignPath;
+ 
+@@ -1849,6 +1854,10 @@ typedef struct ForeignPath
+  * relation by set_rel_pathlist_hook or set_join_pathlist_hook functions,
+  * respectively.
+  *
++ * In the case of a table join, custom_restrictinfo stores the RestrictInfos
++ * to apply to the join, which are used by createplan.c to get pseudoconstant
++ * clauses evaluated as one-time quals in a gating Result plan node.
++ *
+  * Core code must avoid assuming that the CustomPath is only as large as
+  * the structure declared here; providers are allowed to make it the first
+  * element in a larger structure.  (Since the planner never copies Paths,
+@@ -1865,6 +1874,7 @@ typedef struct CustomPath
+ 	uint32		flags;			/* mask of CUSTOMPATH_* flags, see
+ 								 * nodes/extensible.h */
+ 	List	   *custom_paths;	/* list of child Path nodes, if any */
++	List	   *custom_restrictinfo;
+ 	List	   *custom_private;
+ 	const struct CustomPathMethods *methods;
+ } CustomPath;
+diff --git a/src/include/optimizer/pathnode.h b/src/include/optimizer/pathnode.h
+index 001e75b5b769..6e557bebc44c 100644
+--- a/src/include/optimizer/pathnode.h
++++ b/src/include/optimizer/pathnode.h
+@@ -128,6 +128,7 @@ extern ForeignPath *create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
+ 											List *pathkeys,
+ 											Relids required_outer,
+ 											Path *fdw_outerpath,
++											List *fdw_restrictinfo,
+ 											List *fdw_private);
+ extern ForeignPath *create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
+ 											 PathTarget *target,
+@@ -135,12 +136,14 @@ extern ForeignPath *create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
+ 											 List *pathkeys,
+ 											 Relids required_outer,
+ 											 Path *fdw_outerpath,
++											 List *fdw_restrictinfo,
+ 											 List *fdw_private);
+ extern ForeignPath *create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
+ 											  PathTarget *target,
+ 											  double rows, Cost startup_cost, Cost total_cost,
+ 											  List *pathkeys,
+ 											  Path *fdw_outerpath,
++											  List *fdw_restrictinfo,
+ 											  List *fdw_private);
+ 
+ extern Relids calc_nestloop_required_outer(Relids outerrelids,
+diff --git a/src/include/optimizer/restrictinfo.h b/src/include/optimizer/restrictinfo.h
+index 14cdce750cb7..e140e619ace7 100644
+--- a/src/include/optimizer/restrictinfo.h
++++ b/src/include/optimizer/restrictinfo.h
+@@ -43,8 +43,6 @@ extern void extract_actual_join_clauses(List *restrictinfo_list,
+ 										Relids joinrelids,
+ 										List **joinquals,
+ 										List **otherquals);
+-extern bool has_pseudoconstant_clauses(PlannerInfo *root,
+-									   List *restrictinfo_list);
+ extern bool join_clause_is_movable_to(RestrictInfo *rinfo, RelOptInfo *baserel);
+ extern bool join_clause_is_movable_into(RestrictInfo *rinfo,
+ 										Relids currentrelids,

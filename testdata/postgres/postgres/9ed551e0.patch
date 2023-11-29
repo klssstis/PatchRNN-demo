@@ -1,0 +1,366 @@
+From 9ed551e0a4fdb046d8e5ea779adfd3e184d5dc0d Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Wed, 29 Jun 2016 16:57:17 -0400
+Subject: [PATCH] Add conninfo to pg_stat_wal_receiver
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Commit b1a9bad9e744 introduced a stats view to provide insight into the
+running WAL receiver, but neglected to include the connection string in
+it, as reported by Michaël Paquier.  This commit fixes that omission.
+(Any security-sensitive information is not disclosed).
+
+While at it, close the mild security hole that we were exposing the
+password in the connection string in shared memory.  This isn't
+user-accessible, but it still looks like a good idea to avoid having the
+cleartext password in memory.
+
+Author: Michaël Paquier, Álvaro Herrera
+Review by: Vik Fearing
+
+Discussion: https://www.postgresql.org/message-id/CAB7nPqStg4M561obo7ryZ5G+fUydG4v1Ajs1xZT1ujtu+woRag@mail.gmail.com
+---
+ doc/src/sgml/monitoring.sgml                  |  8 ++
+ src/backend/catalog/system_views.sql          |  3 +-
+ .../libpqwalreceiver/libpqwalreceiver.c       | 52 ++++++++++++
+ src/backend/replication/walreceiver.c         | 85 +++++++++++--------
+ src/include/catalog/catversion.h              |  2 +-
+ src/include/catalog/pg_proc.h                 |  2 +-
+ src/include/replication/walreceiver.h         |  9 +-
+ 7 files changed, 122 insertions(+), 39 deletions(-)
+
+diff --git a/doc/src/sgml/monitoring.sgml b/doc/src/sgml/monitoring.sgml
+index bd7bb7734ebd..a8b8bb0cd959 100644
+--- a/doc/src/sgml/monitoring.sgml
++++ b/doc/src/sgml/monitoring.sgml
+@@ -1302,6 +1302,14 @@ SELECT pid, wait_event_type, wait_event FROM pg_stat_activity WHERE wait_event i
+      <entry><type>text</></entry>
+      <entry>Replication slot name used by this WAL receiver</entry>
+     </row>
++    <row>
++     <entry><structfield>conn_info</></entry>
++     <entry><type>text</></entry>
++     <entry>
++      Connection string used by this WAL receiver,
++      with security-sensitive fields obfuscated.
++     </entry>
++    </row>
+    </tbody>
+    </tgroup>
+   </table>
+diff --git a/src/backend/catalog/system_views.sql b/src/backend/catalog/system_views.sql
+index 272c02f32b7b..f52de3ae1825 100644
+--- a/src/backend/catalog/system_views.sql
++++ b/src/backend/catalog/system_views.sql
+@@ -681,7 +681,8 @@ CREATE VIEW pg_stat_wal_receiver AS
+             s.last_msg_receipt_time,
+             s.latest_end_lsn,
+             s.latest_end_time,
+-            s.slot_name
++            s.slot_name,
++            s.conn_info
+     FROM pg_stat_get_wal_receiver() s
+     WHERE s.pid IS NOT NULL;
+ 
+diff --git a/src/backend/replication/libpqwalreceiver/libpqwalreceiver.c b/src/backend/replication/libpqwalreceiver/libpqwalreceiver.c
+index b61e39d7d8a7..45dccb3e0de7 100644
+--- a/src/backend/replication/libpqwalreceiver/libpqwalreceiver.c
++++ b/src/backend/replication/libpqwalreceiver/libpqwalreceiver.c
+@@ -20,6 +20,7 @@
+ #include <sys/time.h>
+ 
+ #include "libpq-fe.h"
++#include "pqexpbuffer.h"
+ #include "access/xlog.h"
+ #include "miscadmin.h"
+ #include "replication/walreceiver.h"
+@@ -47,6 +48,7 @@ static char *recvBuf = NULL;
+ 
+ /* Prototypes for interface functions */
+ static void libpqrcv_connect(char *conninfo);
++static char *libpqrcv_get_conninfo(void);
+ static void libpqrcv_identify_system(TimeLineID *primary_tli);
+ static void libpqrcv_readtimelinehistoryfile(TimeLineID tli, char **filename, char **content, int *len);
+ static bool libpqrcv_startstreaming(TimeLineID tli, XLogRecPtr startpoint,
+@@ -74,6 +76,7 @@ _PG_init(void)
+ 		walrcv_disconnect != NULL)
+ 		elog(ERROR, "libpqwalreceiver already loaded");
+ 	walrcv_connect = libpqrcv_connect;
++	walrcv_get_conninfo = libpqrcv_get_conninfo;
+ 	walrcv_identify_system = libpqrcv_identify_system;
+ 	walrcv_readtimelinehistoryfile = libpqrcv_readtimelinehistoryfile;
+ 	walrcv_startstreaming = libpqrcv_startstreaming;
+@@ -117,6 +120,55 @@ libpqrcv_connect(char *conninfo)
+ 						PQerrorMessage(streamConn))));
+ }
+ 
++/*
++ * Return a user-displayable conninfo string.  Any security-sensitive fields
++ * are obfuscated.
++ */
++static char *
++libpqrcv_get_conninfo(void)
++{
++	PQconninfoOption *conn_opts;
++	PQconninfoOption *conn_opt;
++	PQExpBufferData	buf;
++	char	   *retval;
++
++	Assert(streamConn != NULL);
++
++	initPQExpBuffer(&buf);
++	conn_opts = PQconninfo(streamConn);
++
++	if (conn_opts == NULL)
++		ereport(ERROR,
++				(errmsg("could not parse connection string: %s",
++						_("out of memory"))));
++
++	/* build a clean connection string from pieces */
++	for (conn_opt = conn_opts; conn_opt->keyword != NULL; conn_opt++)
++	{
++		bool	obfuscate;
++
++		/* Skip debug and empty options */
++		if (strchr(conn_opt->dispchar, 'D') ||
++			conn_opt->val == NULL ||
++			conn_opt->val[0] == '\0')
++			continue;
++
++		/* Obfuscate security-sensitive options */
++		obfuscate = strchr(conn_opt->dispchar, '*') != NULL;
++
++		appendPQExpBuffer(&buf, "%s%s=%s",
++						  buf.len == 0 ? "" : " ",
++						  conn_opt->keyword,
++						  obfuscate ? "********" : conn_opt->val);
++	}
++
++	PQconninfoFree(conn_opts);
++
++	retval = PQExpBufferDataBroken(buf) ? NULL : pstrdup(buf.data);
++	termPQExpBuffer(&buf);
++	return retval;
++}
++
+ /*
+  * Check that primary's system identifier matches ours, and fetch the current
+  * timeline ID of the primary.
+diff --git a/src/backend/replication/walreceiver.c b/src/backend/replication/walreceiver.c
+index ce311cb89727..d552f04901cd 100644
+--- a/src/backend/replication/walreceiver.c
++++ b/src/backend/replication/walreceiver.c
+@@ -75,6 +75,7 @@ bool		hot_standby_feedback;
+ 
+ /* libpqreceiver hooks to these when loaded */
+ walrcv_connect_type walrcv_connect = NULL;
++walrcv_get_conninfo_type walrcv_get_conninfo = NULL;
+ walrcv_identify_system_type walrcv_identify_system = NULL;
+ walrcv_startstreaming_type walrcv_startstreaming = NULL;
+ walrcv_endstreaming_type walrcv_endstreaming = NULL;
+@@ -192,6 +193,7 @@ void
+ WalReceiverMain(void)
+ {
+ 	char		conninfo[MAXCONNINFO];
++	char	   *tmp_conninfo;
+ 	char		slotname[NAMEDATALEN];
+ 	XLogRecPtr	startpoint;
+ 	TimeLineID	startpointTLI;
+@@ -282,7 +284,9 @@ WalReceiverMain(void)
+ 
+ 	/* Load the libpq-specific functions */
+ 	load_file("libpqwalreceiver", false);
+-	if (walrcv_connect == NULL || walrcv_startstreaming == NULL ||
++	if (walrcv_connect == NULL ||
++		walrcv_get_conninfo == NULL ||
++		walrcv_startstreaming == NULL ||
+ 		walrcv_endstreaming == NULL ||
+ 		walrcv_identify_system == NULL ||
+ 		walrcv_readtimelinehistoryfile == NULL ||
+@@ -304,6 +308,21 @@ WalReceiverMain(void)
+ 	walrcv_connect(conninfo);
+ 	DisableWalRcvImmediateExit();
+ 
++	/*
++	 * Save user-visible connection string.  This clobbers the original
++	 * conninfo, for security.
++	 */
++	tmp_conninfo = walrcv_get_conninfo();
++	SpinLockAcquire(&walrcv->mutex);
++	memset(walrcv->conninfo, 0, MAXCONNINFO);
++	if (tmp_conninfo)
++	{
++		strlcpy((char *) walrcv->conninfo, tmp_conninfo, MAXCONNINFO);
++		pfree(tmp_conninfo);
++	}
++	walrcv->ready_to_display = true;
++	SpinLockRelease(&walrcv->mutex);
++
+ 	first_stream = true;
+ 	for (;;)
+ 	{
+@@ -1308,10 +1327,9 @@ WalRcvGetStateString(WalRcvState state)
+ Datum
+ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
+ {
+-#define PG_STAT_GET_WAL_RECEIVER_COLS	11
+ 	TupleDesc	tupdesc;
+-	Datum		values[PG_STAT_GET_WAL_RECEIVER_COLS];
+-	bool		nulls[PG_STAT_GET_WAL_RECEIVER_COLS];
++	Datum	   *values;
++	bool	   *nulls;
+ 	WalRcvData *walrcv = WalRcv;
+ 	WalRcvState state;
+ 	XLogRecPtr	receive_start_lsn;
+@@ -1323,41 +1341,33 @@ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
+ 	XLogRecPtr	latest_end_lsn;
+ 	TimestampTz latest_end_time;
+ 	char	   *slotname;
++	char	   *conninfo;
+ 
+ 	/* No WAL receiver, just return a tuple with NULL values */
+ 	if (walrcv->pid == 0)
+ 		PG_RETURN_NULL();
+ 
+-	/* Initialise values and NULL flags arrays */
+-	MemSet(values, 0, sizeof(values));
+-	MemSet(nulls, 0, sizeof(nulls));
+-
+-	/* Initialise attributes information in the tuple descriptor */
+-	tupdesc = CreateTemplateTupleDesc(PG_STAT_GET_WAL_RECEIVER_COLS, false);
+-	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "pid",
+-					   INT4OID, -1, 0);
+-	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "status",
+-					   TEXTOID, -1, 0);
+-	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "receive_start_lsn",
+-					   LSNOID, -1, 0);
+-	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "receive_start_tli",
+-					   INT4OID, -1, 0);
+-	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "received_lsn",
+-					   LSNOID, -1, 0);
+-	TupleDescInitEntry(tupdesc, (AttrNumber) 6, "received_tli",
+-					   INT4OID, -1, 0);
+-	TupleDescInitEntry(tupdesc, (AttrNumber) 7, "last_msg_send_time",
+-					   TIMESTAMPTZOID, -1, 0);
+-	TupleDescInitEntry(tupdesc, (AttrNumber) 8, "last_msg_receipt_time",
+-					   TIMESTAMPTZOID, -1, 0);
+-	TupleDescInitEntry(tupdesc, (AttrNumber) 9, "latest_end_lsn",
+-					   LSNOID, -1, 0);
+-	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "latest_end_time",
+-					   TIMESTAMPTZOID, -1, 0);
+-	TupleDescInitEntry(tupdesc, (AttrNumber) 11, "slot_name",
+-					   TEXTOID, -1, 0);
+-
+-	BlessTupleDesc(tupdesc);
++	/*
++	 * Users attempting to read this data mustn't be shown security sensitive
++	 * data, so sleep until everything has been properly obfuscated.
++	 */
++retry:
++	SpinLockAcquire(&walrcv->mutex);
++	if (!walrcv->ready_to_display)
++	{
++		SpinLockRelease(&walrcv->mutex);
++		CHECK_FOR_INTERRUPTS();
++		pg_usleep(1000);
++		goto retry;
++	}
++	SpinLockRelease(&walrcv->mutex);
++
++	/* determine result type */
++	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
++		elog(ERROR, "return type must be a row type");
++
++	values = palloc0(sizeof(Datum) * tupdesc->natts);
++	nulls = palloc0(sizeof(bool) * tupdesc->natts);
+ 
+ 	/* Take a lock to ensure value consistency */
+ 	SpinLockAcquire(&walrcv->mutex);
+@@ -1371,6 +1381,7 @@ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
+ 	latest_end_lsn = walrcv->latestWalEnd;
+ 	latest_end_time = walrcv->latestWalEndTime;
+ 	slotname = pstrdup(walrcv->slotname);
++	conninfo = pstrdup(walrcv->conninfo);
+ 	SpinLockRelease(&walrcv->mutex);
+ 
+ 	/* Fetch values */
+@@ -1382,7 +1393,7 @@ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
+ 		 * Only superusers can see details. Other users only get the pid value
+ 		 * to know whether it is a WAL receiver, but no details.
+ 		 */
+-		MemSet(&nulls[1], true, PG_STAT_GET_WAL_RECEIVER_COLS - 1);
++		MemSet(&nulls[1], true, sizeof(bool) * (tupdesc->natts - 1));
+ 	}
+ 	else
+ 	{
+@@ -1418,6 +1429,10 @@ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
+ 			nulls[10] = true;
+ 		else
+ 			values[10] = CStringGetTextDatum(slotname);
++		if (*conninfo == '\0')
++			nulls[11] = true;
++		else
++			values[11] = CStringGetTextDatum(conninfo);
+ 	}
+ 
+ 	/* Returns the record as Datum */
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index cca1249cddb0..b12338f5ae16 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	201606261
++#define CATALOG_VERSION_NO	201606291
+ 
+ #endif
+diff --git a/src/include/catalog/pg_proc.h b/src/include/catalog/pg_proc.h
+index f441025f58dd..d92c05e3b2ab 100644
+--- a/src/include/catalog/pg_proc.h
++++ b/src/include/catalog/pg_proc.h
+@@ -2746,7 +2746,7 @@ DATA(insert OID = 3318 (  pg_stat_get_progress_info			  PGNSP PGUID 12 1 100 0 0
+ DESCR("statistics: information about progress of backends running maintenance command");
+ DATA(insert OID = 3099 (  pg_stat_get_wal_senders	PGNSP PGUID 12 1 10 0 0 f f f f f t s r 0 0 2249 "" "{23,25,3220,3220,3220,3220,23,25}" "{o,o,o,o,o,o,o,o}" "{pid,state,sent_location,write_location,flush_location,replay_location,sync_priority,sync_state}" _null_ _null_ pg_stat_get_wal_senders _null_ _null_ _null_ ));
+ DESCR("statistics: information about currently active replication");
+-DATA(insert OID = 3317 (  pg_stat_get_wal_receiver	PGNSP PGUID 12 1 0 0 0 f f f f f f s r 0 0 2249 "" "{23,25,3220,23,3220,23,1184,1184,3220,1184,25}" "{o,o,o,o,o,o,o,o,o,o,o}" "{pid,status,receive_start_lsn,receive_start_tli,received_lsn,received_tli,last_msg_send_time,last_msg_receipt_time,latest_end_lsn,latest_end_time,slot_name}" _null_ _null_ pg_stat_get_wal_receiver _null_ _null_ _null_ ));
++DATA(insert OID = 3317 (  pg_stat_get_wal_receiver	PGNSP PGUID 12 1 0 0 0 f f f f f f s r 0 0 2249 "" "{23,25,3220,23,3220,23,1184,1184,3220,1184,25,25}" "{o,o,o,o,o,o,o,o,o,o,o,o}" "{pid,status,receive_start_lsn,receive_start_tli,received_lsn,received_tli,last_msg_send_time,last_msg_receipt_time,latest_end_lsn,latest_end_time,slot_name,conn_info}" _null_ _null_ pg_stat_get_wal_receiver _null_ _null_ _null_ ));
+ DESCR("statistics: information about WAL receiver");
+ DATA(insert OID = 2026 (  pg_backend_pid				PGNSP PGUID 12 1 0 0 0 f f f f t f s r 0 0 23 "" _null_ _null_ _null_ _null_ _null_ pg_backend_pid _null_ _null_ _null_ ));
+ DESCR("statistics: current backend PID");
+diff --git a/src/include/replication/walreceiver.h b/src/include/replication/walreceiver.h
+index c87e7a80ad19..cd787c92b3fc 100644
+--- a/src/include/replication/walreceiver.h
++++ b/src/include/replication/walreceiver.h
+@@ -100,7 +100,8 @@ typedef struct
+ 	TimestampTz latestWalEndTime;
+ 
+ 	/*
+-	 * connection string; is used for walreceiver to connect with the primary.
++	 * connection string; initially set to connect to the primary, and later
++	 * clobbered to hide security-sensitive fields.
+ 	 */
+ 	char		conninfo[MAXCONNINFO];
+ 
+@@ -118,6 +119,9 @@ typedef struct
+ 	 */
+ 	bool		force_reply;
+ 
++	/* set true once conninfo is ready to display (obfuscated pwds etc) */
++	bool		ready_to_display;
++
+ 	/*
+ 	 * Latch used by startup process to wake up walreceiver after telling it
+ 	 * where to start streaming (after setting receiveStart and
+@@ -133,6 +137,9 @@ extern WalRcvData *WalRcv;
+ typedef void (*walrcv_connect_type) (char *conninfo);
+ extern PGDLLIMPORT walrcv_connect_type walrcv_connect;
+ 
++typedef char *(*walrcv_get_conninfo_type) (void);
++extern PGDLLIMPORT walrcv_get_conninfo_type walrcv_get_conninfo;
++
+ typedef void (*walrcv_identify_system_type) (TimeLineID *primary_tli);
+ extern PGDLLIMPORT walrcv_identify_system_type walrcv_identify_system;
+ 

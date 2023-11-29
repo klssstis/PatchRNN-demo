@@ -1,0 +1,154 @@
+From 9ba37b2cb6a174b37fc51d0649ef73e56eae27fc Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Tue, 7 Feb 2023 09:03:54 +0900
+Subject: [PATCH] Include values of A_Const nodes in query jumbling
+
+Like the implementation for node copy, write and read, this node
+requires a custom implementation so as the query jumbling is able to
+consider the correct value assigned to it, depending on its type (int,
+float, bool, string, bitstring).
+
+Based on a dump of pg_stat_statements from the regression database, this
+would confuse the query jumbling of the following queries:
+- SET.
+- COPY TO with SELECT queries.
+- START TRANSACTION with different isolation levels.
+- ALTER TABLE with default expressions.
+- CREATE TABLE with partition bounds.
+
+Note that there may be a long-term argument in tracking the location of
+such nodes so as query strings holding such nodes could be normalized,
+but this is left as a separate discussion.
+
+Oversight in 3db72eb.
+
+Discussion: https://postgr.es/m/Y9+HuYslMAP6yyPb@paquier.xyz
+---
+ .../expected/pg_stat_statements.out           | 16 ++++++++-
+ .../sql/pg_stat_statements.sql                |  8 +++++
+ src/backend/nodes/queryjumblefuncs.c          | 35 +++++++++++++++++++
+ src/include/nodes/parsenodes.h                |  2 +-
+ 4 files changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/contrib/pg_stat_statements/expected/pg_stat_statements.out b/contrib/pg_stat_statements/expected/pg_stat_statements.out
+index fb9ccd920f64..8c0b2235e816 100644
+--- a/contrib/pg_stat_statements/expected/pg_stat_statements.out
++++ b/contrib/pg_stat_statements/expected/pg_stat_statements.out
+@@ -579,6 +579,14 @@ NOTICE:  table "test" does not exist, skipping
+ NOTICE:  table "test" does not exist, skipping
+ NOTICE:  function plus_one(pg_catalog.int4) does not exist, skipping
+ DROP FUNCTION PLUS_TWO(INTEGER);
++-- This SET query uses two different strings, still they count as one entry.
++SET work_mem = '1MB';
++Set work_mem = '1MB';
++SET work_mem = '2MB';
++RESET work_mem;
++SET enable_seqscan = off;
++SET enable_seqscan = on;
++RESET enable_seqscan;
+ SELECT query, calls, rows FROM pg_stat_statements ORDER BY query COLLATE "C";
+                                     query                                     | calls | rows 
+ ------------------------------------------------------------------------------+-------+------
+@@ -588,10 +596,16 @@ SELECT query, calls, rows FROM pg_stat_statements ORDER BY query COLLATE "C";
+  DROP FUNCTION PLUS_TWO(INTEGER)                                              |     1 |    0
+  DROP TABLE IF EXISTS test                                                    |     3 |    0
+  DROP TABLE test                                                              |     1 |    0
++ RESET enable_seqscan                                                         |     1 |    0
++ RESET work_mem                                                               |     1 |    0
+  SELECT $1                                                                    |     1 |    1
+  SELECT pg_stat_statements_reset()                                            |     1 |    1
+  SELECT query, calls, rows FROM pg_stat_statements ORDER BY query COLLATE "C" |     0 |    0
+-(9 rows)
++ SET enable_seqscan = off                                                     |     1 |    0
++ SET enable_seqscan = on                                                      |     1 |    0
++ SET work_mem = '1MB'                                                         |     2 |    0
++ SET work_mem = '2MB'                                                         |     1 |    0
++(15 rows)
+ 
+ --
+ -- Track the total number of rows retrieved or affected by the utility
+diff --git a/contrib/pg_stat_statements/sql/pg_stat_statements.sql b/contrib/pg_stat_statements/sql/pg_stat_statements.sql
+index b82cddf16f1f..cebde7392b1c 100644
+--- a/contrib/pg_stat_statements/sql/pg_stat_statements.sql
++++ b/contrib/pg_stat_statements/sql/pg_stat_statements.sql
+@@ -270,6 +270,14 @@ DROP TABLE IF EXISTS test \;
+ Drop Table If Exists test \;
+ DROP FUNCTION IF EXISTS PLUS_ONE(INTEGER);
+ DROP FUNCTION PLUS_TWO(INTEGER);
++-- This SET query uses two different strings, still they count as one entry.
++SET work_mem = '1MB';
++Set work_mem = '1MB';
++SET work_mem = '2MB';
++RESET work_mem;
++SET enable_seqscan = off;
++SET enable_seqscan = on;
++RESET enable_seqscan;
+ 
+ SELECT query, calls, rows FROM pg_stat_statements ORDER BY query COLLATE "C";
+ 
+diff --git a/src/backend/nodes/queryjumblefuncs.c b/src/backend/nodes/queryjumblefuncs.c
+index 223d1bc82626..d7fd72d70f20 100644
+--- a/src/backend/nodes/queryjumblefuncs.c
++++ b/src/backend/nodes/queryjumblefuncs.c
+@@ -49,6 +49,7 @@ static void AppendJumble(JumbleState *jstate,
+ 						 const unsigned char *item, Size size);
+ static void RecordConstLocation(JumbleState *jstate, int location);
+ static void _jumbleNode(JumbleState *jstate, Node *node);
++static void _jumbleA_Const(JumbleState *jstate, Node *node);
+ static void _jumbleList(JumbleState *jstate, Node *node);
+ static void _jumbleRangeTblEntry(JumbleState *jstate, Node *node);
+ 
+@@ -313,6 +314,40 @@ _jumbleList(JumbleState *jstate, Node *node)
+ 	}
+ }
+ 
++static void
++_jumbleA_Const(JumbleState *jstate, Node *node)
++{
++	A_Const    *expr = (A_Const *) node;
++
++	JUMBLE_FIELD(isnull);
++	if (!expr->isnull)
++	{
++		JUMBLE_FIELD(val.node.type);
++		switch (nodeTag(&expr->val))
++		{
++			case T_Integer:
++				JUMBLE_FIELD(val.ival.ival);
++				break;
++			case T_Float:
++				JUMBLE_STRING(val.fval.fval);
++				break;
++			case T_Boolean:
++				JUMBLE_FIELD(val.boolval.boolval);
++				break;
++			case T_String:
++				JUMBLE_STRING(val.sval.sval);
++				break;
++			case T_BitString:
++				JUMBLE_STRING(val.bsval.bsval);
++				break;
++			default:
++				elog(ERROR, "unrecognized node type: %d",
++					 (int) nodeTag(&expr->val));
++				break;
++		}
++	}
++}
++
+ static void
+ _jumbleRangeTblEntry(JumbleState *jstate, Node *node)
+ {
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index 3d67787e7af0..855da99ec02b 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -355,7 +355,7 @@ union ValUnion
+ 
+ typedef struct A_Const
+ {
+-	pg_node_attr(custom_copy_equal, custom_read_write)
++	pg_node_attr(custom_copy_equal, custom_read_write, custom_query_jumble)
+ 
+ 	NodeTag		type;
+ 	union ValUnion val;

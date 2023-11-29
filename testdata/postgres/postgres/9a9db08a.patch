@@ -1,0 +1,230 @@
+From 9a9db08ae46209edcc5ecb120328a2bf92fd6069 Mon Sep 17 00:00:00 2001
+From: Peter Geoghegan <pg@bowt.ie>
+Date: Mon, 3 Aug 2020 15:54:38 -0700
+Subject: [PATCH] Fix replica backward scan race condition.
+
+It was possible for the logic used by backward scans (which must reason
+about concurrent page splits/deletions in its own peculiar way) to
+become confused when running on a replica.  Concurrent replay of a WAL
+record that describes the second phase of page deletion could cause
+_bt_walk_left() to get confused.  btree_xlog_unlink_page() simply failed
+to adhere to the same locking protocol that we use on the primary, which
+is obviously wrong once you consider these two disparate functions
+together.  This bug is present in all stable branches.
+
+More concretely, the problem was that nothing stopped _bt_walk_left()
+from observing inconsistencies between the deletion's target page and
+its original sibling pages when running on a replica.  This is true even
+though the second phase of page deletion is supposed to work as a single
+atomic action.  Queries running on replicas raised "could not find left
+sibling of block %u in index %s" can't-happen errors when they went back
+to their scan's "original" page and observed that the page has not been
+marked deleted (even though it really was concurrently deleted).
+
+There is no evidence that this actually happened in the real world.  The
+issue came to light during unrelated feature development work.  Note
+that _bt_walk_left() is the only code that cares about the difference
+between a half-dead page and a fully deleted page that isn't also
+exclusively used by nbtree VACUUM (unless you include contrib/amcheck
+code).  It seems very likely that backward scans are the only thing that
+could become confused by the inconsistency.  Even amcheck's complex
+bt_right_page_check_scankey() dance was unaffected.
+
+To fix, teach btree_xlog_unlink_page() to lock the left sibling, target,
+and right sibling pages in that order before releasing any locks (just
+like _bt_unlink_halfdead_page()).  This is the simplest possible
+approach.  There doesn't seem to be any opportunity to be more clever
+about lock acquisition in the REDO routine, and it hardly seems worth
+the trouble in any case.
+
+This fix might enable contrib/amcheck verification of leaf page sibling
+links with only an AccessShareLock on the relation.  An amcheck patch
+from Andrey Borodin was rejected back in January because it clashed with
+btree_xlog_unlink_page()'s lax approach to locking pages.  It now seems
+likely that the real problem was with btree_xlog_unlink_page(), not the
+patch.
+
+This is a low severity, low likelihood bug, so no backpatch.
+
+Author: Michail Nikolaev
+Diagnosed-By: Michail Nikolaev
+Discussion: https://postgr.es/m/CANtu0ohkR-evAWbpzJu54V8eCOtqjJyYp3PQ_SGoBTRGXWhWRw@mail.gmail.com
+---
+ src/backend/access/nbtree/README    | 18 ++++++
+ src/backend/access/nbtree/nbtxlog.c | 88 ++++++++++++++++++-----------
+ 2 files changed, 72 insertions(+), 34 deletions(-)
+
+diff --git a/src/backend/access/nbtree/README b/src/backend/access/nbtree/README
+index 32ad9e339a29..9d5fc424a574 100644
+--- a/src/backend/access/nbtree/README
++++ b/src/backend/access/nbtree/README
+@@ -572,6 +572,24 @@ replay of page deletion records does not hold a write lock on the target
+ leaf page throughout; only the primary needs to block out concurrent
+ writers that insert on to the page being deleted.)
+ 
++There are also locking differences between the primary and WAL replay
++for the first stage of a page split (i.e. same-level differences in
++locking).  Replay of the first phase of a page split can get away with
++locking and updating the original right sibling page (which is also the
++new right sibling page's right sibling) after locks on the original page
++and its new right sibling have been released.  Again, this is okay
++because there are no writers.  Page deletion WAL replay cannot get away
++with being lax about same-level locking during replay, though -- doing
++so risks confusing concurrent backwards scans.
++
++Page deletion's second phase locks the left sibling page, target page,
++and right page in order on the standby, just like on the primary.  This
++allows backwards scans running on a standby to reason about page
++deletion on the leaf level; a page cannot appear deleted without that
++being reflected in the sibling pages.  It's probably possible to be more
++lax about how locks are acquired on the standby during the second phase
++of page deletion, but that hardly seems worth it.
++
+ During recovery all index scans start with ignore_killed_tuples = false
+ and we never set kill_prior_tuple. We do this because the oldest xmin
+ on the standby server can be older than the oldest xmin on the primary
+diff --git a/src/backend/access/nbtree/nbtxlog.c b/src/backend/access/nbtree/nbtxlog.c
+index 5d346da84fde..09d1b0e3419a 100644
+--- a/src/backend/access/nbtree/nbtxlog.c
++++ b/src/backend/access/nbtree/nbtxlog.c
+@@ -774,7 +774,9 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
+ 	xl_btree_unlink_page *xlrec = (xl_btree_unlink_page *) XLogRecGetData(record);
+ 	BlockNumber leftsib;
+ 	BlockNumber rightsib;
+-	Buffer		buffer;
++	Buffer		leftbuf;
++	Buffer		target;
++	Buffer		rightbuf;
+ 	Page		page;
+ 	BTPageOpaque pageop;
+ 
+@@ -783,46 +785,39 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
+ 
+ 	/*
+ 	 * In normal operation, we would lock all the pages this WAL record
+-	 * touches before changing any of them.  In WAL replay, it should be okay
+-	 * to lock just one page at a time, since no concurrent index updates can
+-	 * be happening, and readers should not care whether they arrive at the
+-	 * target page or not (since it's surely empty).
++	 * touches before changing any of them.  In WAL replay, we at least lock
++	 * the pages in the same standard left-to-right order (leftsib, target,
++	 * rightsib), and don't release the sibling locks until the target is
++	 * marked deleted.
++	 *
++	 * btree_xlog_split() can get away with fixing its right sibling page's
++	 * left link last of all, after dropping all other locks.  We prefer to
++	 * avoid dropping locks on same-level pages early compared to normal
++	 * operation.  This keeps things simple for backwards scans.  See
++	 * nbtree/README.
+ 	 */
+ 
+-	/* Fix left-link of right sibling */
+-	if (XLogReadBufferForRedo(record, 2, &buffer) == BLK_NEEDS_REDO)
+-	{
+-		page = (Page) BufferGetPage(buffer);
+-		pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+-		pageop->btpo_prev = leftsib;
+-
+-		PageSetLSN(page, lsn);
+-		MarkBufferDirty(buffer);
+-	}
+-	if (BufferIsValid(buffer))
+-		UnlockReleaseBuffer(buffer);
+-
+ 	/* Fix right-link of left sibling, if any */
+ 	if (leftsib != P_NONE)
+ 	{
+-		if (XLogReadBufferForRedo(record, 1, &buffer) == BLK_NEEDS_REDO)
++		if (XLogReadBufferForRedo(record, 1, &leftbuf) == BLK_NEEDS_REDO)
+ 		{
+-			page = (Page) BufferGetPage(buffer);
++			page = (Page) BufferGetPage(leftbuf);
+ 			pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+ 			pageop->btpo_next = rightsib;
+ 
+ 			PageSetLSN(page, lsn);
+-			MarkBufferDirty(buffer);
++			MarkBufferDirty(leftbuf);
+ 		}
+-		if (BufferIsValid(buffer))
+-			UnlockReleaseBuffer(buffer);
+ 	}
++	else
++		leftbuf = InvalidBuffer;
+ 
+ 	/* Rewrite target page as empty deleted page */
+-	buffer = XLogInitBufferForRedo(record, 0);
+-	page = (Page) BufferGetPage(buffer);
++	target = XLogInitBufferForRedo(record, 0);
++	page = (Page) BufferGetPage(target);
+ 
+-	_bt_pageinit(page, BufferGetPageSize(buffer));
++	_bt_pageinit(page, BufferGetPageSize(target));
+ 	pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+ 
+ 	pageop->btpo_prev = leftsib;
+@@ -832,8 +827,27 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
+ 	pageop->btpo_cycleid = 0;
+ 
+ 	PageSetLSN(page, lsn);
+-	MarkBufferDirty(buffer);
+-	UnlockReleaseBuffer(buffer);
++	MarkBufferDirty(target);
++
++	/* Fix left-link of right sibling */
++	if (XLogReadBufferForRedo(record, 2, &rightbuf) == BLK_NEEDS_REDO)
++	{
++		page = (Page) BufferGetPage(rightbuf);
++		pageop = (BTPageOpaque) PageGetSpecialPointer(page);
++		pageop->btpo_prev = leftsib;
++
++		PageSetLSN(page, lsn);
++		MarkBufferDirty(rightbuf);
++	}
++
++	/* Release siblings */
++	if (BufferIsValid(leftbuf))
++		UnlockReleaseBuffer(leftbuf);
++	if (BufferIsValid(rightbuf))
++		UnlockReleaseBuffer(rightbuf);
++
++	/* Release target */
++	UnlockReleaseBuffer(target);
+ 
+ 	/*
+ 	 * If we deleted a parent of the targeted leaf page, instead of the leaf
+@@ -845,13 +859,19 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
+ 		/*
+ 		 * There is no real data on the page, so we just re-create it from
+ 		 * scratch using the information from the WAL record.
++		 *
++		 * Note that we don't end up here when the target page is also the
++		 * leafbuf page.  There is no need to add a dummy hikey item with a
++		 * top parent link when deleting leafbuf because it's the last page
++		 * we'll delete in the subtree undergoing deletion.
+ 		 */
+-		IndexTupleData trunctuple;
++		Buffer				leafbuf;
++		IndexTupleData		trunctuple;
+ 
+-		buffer = XLogInitBufferForRedo(record, 3);
+-		page = (Page) BufferGetPage(buffer);
++		leafbuf = XLogInitBufferForRedo(record, 3);
++		page = (Page) BufferGetPage(leafbuf);
+ 
+-		_bt_pageinit(page, BufferGetPageSize(buffer));
++		_bt_pageinit(page, BufferGetPageSize(leafbuf));
+ 		pageop = (BTPageOpaque) PageGetSpecialPointer(page);
+ 
+ 		pageop->btpo_flags = BTP_HALF_DEAD | BTP_LEAF;
+@@ -870,8 +890,8 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
+ 			elog(ERROR, "could not add dummy high key to half-dead page");
+ 
+ 		PageSetLSN(page, lsn);
+-		MarkBufferDirty(buffer);
+-		UnlockReleaseBuffer(buffer);
++		MarkBufferDirty(leafbuf);
++		UnlockReleaseBuffer(leafbuf);
+ 	}
+ 
+ 	/* Update metapage if needed */

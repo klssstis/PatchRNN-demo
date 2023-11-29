@@ -1,0 +1,280 @@
+From 9a4c0e36fbd671b5e7426a5a0670bdd7ba2714a0 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 11 Jan 2021 21:09:03 -0500
+Subject: [PATCH] Dump ALTER TABLE ... ATTACH PARTITION as a separate
+ ArchiveEntry.
+
+Previously, we emitted the ATTACH PARTITION command as part of
+the child table's ArchiveEntry.  This was a poor choice since it
+complicates restoring the partition as a standalone table; you have
+to ignore the error from the ATTACH, which isn't even an option when
+restoring direct-to-database with pg_restore.  (pg_restore will issue
+the whole ArchiveEntry as one PQexec, so that any error rolls back
+the table creation as well.)  Hence, separate it out as its own
+ArchiveEntry, as indeed we already did for index ATTACH PARTITION
+commands.
+
+Justin Pryzby
+
+Discussion: https://postgr.es/m/20201023052940.GE9241@telsasoft.com
+---
+ src/bin/pg_dump/common.c       | 39 ++++++++++++++++-
+ src/bin/pg_dump/pg_dump.c      | 77 ++++++++++++++++++++++++----------
+ src/bin/pg_dump/pg_dump.h      | 10 ++++-
+ src/bin/pg_dump/pg_dump_sort.c |  7 ++++
+ 4 files changed, 109 insertions(+), 24 deletions(-)
+
+diff --git a/src/bin/pg_dump/common.c b/src/bin/pg_dump/common.c
+index f80d2d3ce8a3..255f89143263 100644
+--- a/src/bin/pg_dump/common.c
++++ b/src/bin/pg_dump/common.c
+@@ -261,7 +261,9 @@ getSchemaData(Archive *fout, int *numTablesPtr)
+ 
+ /* flagInhTables -
+  *	 Fill in parent link fields of tables for which we need that information,
+- *	 and mark parents of target tables as interesting
++ *	 mark parents of target tables as interesting, and create
++ *	 TableAttachInfo objects for partitioned tables with appropriate
++ *	 dependency links.
+  *
+  * Note that only direct ancestors of targets are marked interesting.
+  * This is sufficient; we don't much care whether they inherited their
+@@ -320,6 +322,40 @@ flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
+ 			for (j = 0; j < numParents; j++)
+ 				parents[j]->interesting = true;
+ 		}
++
++		/* Create TableAttachInfo object if needed */
++		if (tblinfo[i].dobj.dump && tblinfo[i].ispartition)
++		{
++			TableAttachInfo *attachinfo;
++
++			/* With partitions there can only be one parent */
++			if (tblinfo[i].numParents != 1)
++				fatal("invalid number of parents %d for table \"%s\"",
++					  tblinfo[i].numParents,
++					  tblinfo[i].dobj.name);
++
++			attachinfo = (TableAttachInfo *) palloc(sizeof(TableAttachInfo));
++			attachinfo->dobj.objType = DO_TABLE_ATTACH;
++			attachinfo->dobj.catId.tableoid = 0;
++			attachinfo->dobj.catId.oid = 0;
++			AssignDumpId(&attachinfo->dobj);
++			attachinfo->dobj.name = pg_strdup(tblinfo[i].dobj.name);
++			attachinfo->dobj.namespace = tblinfo[i].dobj.namespace;
++			attachinfo->parentTbl = tblinfo[i].parents[0];
++			attachinfo->partitionTbl = &tblinfo[i];
++
++			/*
++			 * We must state the DO_TABLE_ATTACH object's dependencies
++			 * explicitly, since it will not match anything in pg_depend.
++			 *
++			 * Give it dependencies on both the partition table and the parent
++			 * table, so that it will not be executed till both of those
++			 * exist.  (There's no need to care what order those are created
++			 * in.)
++			 */
++			addObjectDependency(&attachinfo->dobj, tblinfo[i].dobj.dumpId);
++			addObjectDependency(&attachinfo->dobj, tblinfo[i].parents[0]->dobj.dumpId);
++		}
+ 	}
+ }
+ 
+@@ -548,6 +584,7 @@ AssignDumpId(DumpableObject *dobj)
+ 	dobj->name = NULL;			/* must be set later */
+ 	dobj->namespace = NULL;		/* may be set later */
+ 	dobj->dump = DUMP_COMPONENT_ALL;	/* default assumption */
++	dobj->dump_contains = DUMP_COMPONENT_ALL;	/* default assumption */
+ 	dobj->ext_member = false;	/* default assumption */
+ 	dobj->depends_on_ext = false;	/* default assumption */
+ 	dobj->dependencies = NULL;
+diff --git a/src/bin/pg_dump/pg_dump.c b/src/bin/pg_dump/pg_dump.c
+index 1f70653c0267..f2c88fa6b579 100644
+--- a/src/bin/pg_dump/pg_dump.c
++++ b/src/bin/pg_dump/pg_dump.c
+@@ -202,6 +202,7 @@ static void dumpTrigger(Archive *fout, TriggerInfo *tginfo);
+ static void dumpEventTrigger(Archive *fout, EventTriggerInfo *evtinfo);
+ static void dumpTable(Archive *fout, TableInfo *tbinfo);
+ static void dumpTableSchema(Archive *fout, TableInfo *tbinfo);
++static void dumpTableAttach(Archive *fout, TableAttachInfo *tbinfo);
+ static void dumpAttrDef(Archive *fout, AttrDefInfo *adinfo);
+ static void dumpSequence(Archive *fout, TableInfo *tbinfo);
+ static void dumpSequenceData(Archive *fout, TableDataInfo *tdinfo);
+@@ -10176,6 +10177,9 @@ dumpDumpableObject(Archive *fout, DumpableObject *dobj)
+ 		case DO_TABLE:
+ 			dumpTable(fout, (TableInfo *) dobj);
+ 			break;
++		case DO_TABLE_ATTACH:
++			dumpTableAttach(fout, (TableAttachInfo *) dobj);
++			break;
+ 		case DO_ATTRDEF:
+ 			dumpAttrDef(fout, (AttrDefInfo *) dobj);
+ 			break;
+@@ -11183,7 +11187,7 @@ dumpDomain(Archive *fout, TypeInfo *tyinfo)
+ 	if (dopt->binary_upgrade)
+ 		binary_upgrade_set_type_oids_by_type_oid(fout, q,
+ 												 tyinfo->dobj.catId.oid,
+-												 true,		/* force array type */
++												 true,	/* force array type */
+ 												 false);	/* force multirange type */
+ 
+ 	qtypname = pg_strdup(fmtId(tyinfo->dobj.name));
+@@ -16133,27 +16137,6 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 			}
+ 		}
+ 
+-		/*
+-		 * For partitioned tables, emit the ATTACH PARTITION clause.  Note
+-		 * that we always want to create partitions this way instead of using
+-		 * CREATE TABLE .. PARTITION OF, mainly to preserve a possible column
+-		 * layout discrepancy with the parent, but also to ensure it gets the
+-		 * correct tablespace setting if it differs from the parent's.
+-		 */
+-		if (tbinfo->ispartition)
+-		{
+-			/* With partitions there can only be one parent */
+-			if (tbinfo->numParents != 1)
+-				fatal("invalid number of parents %d for table \"%s\"",
+-					  tbinfo->numParents, tbinfo->dobj.name);
+-
+-			/* Perform ALTER TABLE on the parent */
+-			appendPQExpBuffer(q,
+-							  "ALTER TABLE ONLY %s ATTACH PARTITION %s %s;\n",
+-							  fmtQualifiedDumpable(parents[0]),
+-							  qualrelname, tbinfo->partbound);
+-		}
+-
+ 		/*
+ 		 * In binary_upgrade mode, arrange to restore the old relfrozenxid and
+ 		 * relminmxid of all vacuumable relations.  (While vacuum.c processes
+@@ -16383,6 +16366,55 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 	free(qualrelname);
+ }
+ 
++/*
++ * dumpTableAttach
++ *	  write to fout the commands to attach a child partition
++ *
++ * Child partitions are always made by creating them separately
++ * and then using ATTACH PARTITION, rather than using
++ * CREATE TABLE ... PARTITION OF.  This is important for preserving
++ * any possible discrepancy in column layout, to allow assigning the
++ * correct tablespace if different, and so that it's possible to restore
++ * a partition without restoring its parent.  (You'll get an error from
++ * the ATTACH PARTITION command, but that can be ignored, or skipped
++ * using "pg_restore -L" if you prefer.)  The last point motivates
++ * treating ATTACH PARTITION as a completely separate ArchiveEntry
++ * rather than emitting it within the child partition's ArchiveEntry.
++ */
++static void
++dumpTableAttach(Archive *fout, TableAttachInfo *attachinfo)
++{
++	DumpOptions *dopt = fout->dopt;
++	PQExpBuffer q;
++
++	if (dopt->dataOnly)
++		return;
++
++	if (!(attachinfo->partitionTbl->dobj.dump & DUMP_COMPONENT_DEFINITION))
++		return;
++
++	q = createPQExpBuffer();
++
++	/* Perform ALTER TABLE on the parent */
++	appendPQExpBuffer(q,
++					  "ALTER TABLE ONLY %s ",
++					  fmtQualifiedDumpable(attachinfo->parentTbl));
++	appendPQExpBuffer(q,
++					  "ATTACH PARTITION %s %s;\n",
++					  fmtQualifiedDumpable(attachinfo->partitionTbl),
++					  attachinfo->partitionTbl->partbound);
++
++	ArchiveEntry(fout, attachinfo->dobj.catId, attachinfo->dobj.dumpId,
++				 ARCHIVE_OPTS(.tag = attachinfo->dobj.name,
++							  .namespace = attachinfo->dobj.namespace->dobj.name,
++							  .owner = attachinfo->partitionTbl->rolname,
++							  .description = "TABLE ATTACH",
++							  .section = SECTION_PRE_DATA,
++							  .createStmt = q->data));
++
++	destroyPQExpBuffer(q);
++}
++
+ /*
+  * dumpAttrDef --- dump an attribute's default-value declaration
+  */
+@@ -18344,6 +18376,7 @@ addBoundaryDependencies(DumpableObject **dobjs, int numObjs,
+ 			case DO_COLLATION:
+ 			case DO_CONVERSION:
+ 			case DO_TABLE:
++			case DO_TABLE_ATTACH:
+ 			case DO_ATTRDEF:
+ 			case DO_PROCLANG:
+ 			case DO_CAST:
+diff --git a/src/bin/pg_dump/pg_dump.h b/src/bin/pg_dump/pg_dump.h
+index b3ce4eefe2fa..731d0fe7ba84 100644
+--- a/src/bin/pg_dump/pg_dump.h
++++ b/src/bin/pg_dump/pg_dump.h
+@@ -50,6 +50,7 @@ typedef enum
+ 	DO_COLLATION,
+ 	DO_CONVERSION,
+ 	DO_TABLE,
++	DO_TABLE_ATTACH,
+ 	DO_ATTRDEF,
+ 	DO_INDEX,
+ 	DO_INDEX_ATTACH,
+@@ -338,6 +339,13 @@ typedef struct _tableInfo
+ 	struct _triggerInfo *triggers;	/* array of TriggerInfo structs */
+ } TableInfo;
+ 
++typedef struct _tableAttachInfo
++{
++	DumpableObject dobj;
++	TableInfo  *parentTbl;		/* link to partitioned table */
++	TableInfo  *partitionTbl;	/* link to partition */
++} TableAttachInfo;
++
+ typedef struct _attrDefInfo
+ {
+ 	DumpableObject dobj;		/* note: dobj.name is name of table */
+@@ -367,7 +375,7 @@ typedef struct _indxInfo
+ 	int			indnattrs;		/* total number of index attributes */
+ 	Oid		   *indkeys;		/* In spite of the name 'indkeys' this field
+ 								 * contains both key and nonkey attributes */
+-	char	   *inddependcollnames;	/* FQ names of depended-on collations */
++	char	   *inddependcollnames; /* FQ names of depended-on collations */
+ 	char	   *inddependcollversions;	/* versions of the above */
+ 	bool		indisclustered;
+ 	bool		indisreplident;
+diff --git a/src/bin/pg_dump/pg_dump_sort.c b/src/bin/pg_dump/pg_dump_sort.c
+index 022413812ea5..46461fb6a186 100644
+--- a/src/bin/pg_dump/pg_dump_sort.c
++++ b/src/bin/pg_dump/pg_dump_sort.c
+@@ -63,6 +63,7 @@ enum dbObjectTypePriorities
+ 	PRIO_FDW,
+ 	PRIO_FOREIGN_SERVER,
+ 	PRIO_TABLE,
++	PRIO_TABLE_ATTACH,
+ 	PRIO_DUMMY_TYPE,
+ 	PRIO_ATTRDEF,
+ 	PRIO_BLOB,
+@@ -103,6 +104,7 @@ static const int dbObjectTypePriority[] =
+ 	PRIO_COLLATION,				/* DO_COLLATION */
+ 	PRIO_CONVERSION,			/* DO_CONVERSION */
+ 	PRIO_TABLE,					/* DO_TABLE */
++	PRIO_TABLE_ATTACH,			/* DO_TABLE_ATTACH */
+ 	PRIO_ATTRDEF,				/* DO_ATTRDEF */
+ 	PRIO_INDEX,					/* DO_INDEX */
+ 	PRIO_INDEX_ATTACH,			/* DO_INDEX_ATTACH */
+@@ -1324,6 +1326,11 @@ describeDumpableObject(DumpableObject *obj, char *buf, int bufsize)
+ 					 "TABLE %s  (ID %d OID %u)",
+ 					 obj->name, obj->dumpId, obj->catId.oid);
+ 			return;
++		case DO_TABLE_ATTACH:
++			snprintf(buf, bufsize,
++					 "TABLE ATTACH %s  (ID %d)",
++					 obj->name, obj->dumpId);
++			return;
+ 		case DO_ATTRDEF:
+ 			snprintf(buf, bufsize,
+ 					 "ATTRDEF %s.%s  (ID %d OID %u)",

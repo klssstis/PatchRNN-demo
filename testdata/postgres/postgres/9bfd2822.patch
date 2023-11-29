@@ -1,0 +1,134 @@
+From 9bfd2822b3201f6b0de1e87305b11ee3885b36d9 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 16 Mar 2023 18:13:35 -0400
+Subject: [PATCH] Enable use of Memoize atop an Append that came from UNION
+ ALL.
+
+create_append_path() would only apply get_baserel_parampathinfo
+when the path is for a partitioned table, but it's also potentially
+useful for paths for UNION ALL appendrels.  Specifically, that
+supports building a Memoize path atop this one.
+
+While we're in the vicinity, delete some dead code in
+create_merge_append_plan(): there's no need for it to support
+parameterized MergeAppend paths, and it doesn't look like that
+is going to change anytime soon.  It'll be easy enough to undo
+this when/if it becomes useful.
+
+Richard Guo
+
+Discussion: https://postgr.es/m/CAMbWs4_ABSu4PWG2rE1q10tJugEXHWgru3U8dAgkoFvgrb6aEA@mail.gmail.com
+---
+ src/backend/optimizer/plan/createplan.c | 12 ++----------
+ src/backend/optimizer/util/pathnode.c   | 18 ++++++++++--------
+ src/test/regress/expected/memoize.out   | 24 ++++++++++++++++++++++++
+ src/test/regress/sql/memoize.sql        |  8 ++++++++
+ 4 files changed, 44 insertions(+), 18 deletions(-)
+
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index fa09a6103b1a..910ffbf1e138 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -1531,16 +1531,8 @@ create_merge_append_plan(PlannerInfo *root, MergeAppendPath *best_path,
+ 
+ 		prunequal = extract_actual_clauses(rel->baserestrictinfo, false);
+ 
+-		if (best_path->path.param_info)
+-		{
+-			List	   *prmquals = best_path->path.param_info->ppi_clauses;
+-
+-			prmquals = extract_actual_clauses(prmquals, false);
+-			prmquals = (List *) replace_nestloop_params(root,
+-														(Node *) prmquals);
+-
+-			prunequal = list_concat(prunequal, prmquals);
+-		}
++		/* We don't currently generate any parameterized MergeAppend paths */
++		Assert(best_path->path.param_info == NULL);
+ 
+ 		if (prunequal != NIL)
+ 			node->part_prune_index = make_partition_pruneinfo(root, rel,
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index e8e06397a9c0..65a191ebfda9 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -1256,15 +1256,17 @@ create_append_path(PlannerInfo *root,
+ 	pathnode->path.pathtarget = rel->reltarget;
+ 
+ 	/*
+-	 * When generating an Append path for a partitioned table, there may be
+-	 * parameterized quals that are useful for run-time pruning.  Hence,
+-	 * compute path.param_info the same way as for any other baserel, so that
+-	 * such quals will be available for make_partition_pruneinfo().  (This
+-	 * would not work right for a non-baserel, ie a scan on a non-leaf child
+-	 * partition, and it's not necessary anyway in that case.  Must skip it if
+-	 * we don't have "root", too.)
++	 * If this is for a baserel (not a join or non-leaf partition), we prefer
++	 * to apply get_baserel_parampathinfo to construct a full ParamPathInfo
++	 * for the path.  This supports building a Memoize path atop this path,
++	 * and if this is a partitioned table the info may be useful for run-time
++	 * pruning (cf make_partition_pruneinfo()).
++	 *
++	 * However, if we don't have "root" then that won't work and we fall back
++	 * on the simpler get_appendrel_parampathinfo.  There's no point in doing
++	 * the more expensive thing for a dummy path, either.
+ 	 */
+-	if (root && rel->reloptkind == RELOPT_BASEREL && IS_PARTITIONED_REL(rel))
++	if (rel->reloptkind == RELOPT_BASEREL && root && subpaths != NIL)
+ 		pathnode->path.param_info = get_baserel_parampathinfo(root,
+ 															  rel,
+ 															  required_outer);
+diff --git a/src/test/regress/expected/memoize.out b/src/test/regress/expected/memoize.out
+index 07c18b56de76..f5202430f807 100644
+--- a/src/test/regress/expected/memoize.out
++++ b/src/test/regress/expected/memoize.out
+@@ -236,6 +236,30 @@ SELECT * FROM prt t1 INNER JOIN prt t2 ON t1.a = t2.a;', false);
+                      Heap Fetches: N
+ (21 rows)
+ 
++-- Ensure memoize works with parameterized union-all Append path
++SET enable_partitionwise_join TO off;
++SELECT explain_memoize('
++SELECT * FROM prt_p1 t1 INNER JOIN
++(SELECT * FROM prt_p1 UNION ALL SELECT * FROM prt_p2) t2
++ON t1.a = t2.a;', false);
++                                   explain_memoize                                   
++-------------------------------------------------------------------------------------
++ Nested Loop (actual rows=16 loops=N)
++   ->  Index Only Scan using iprt_p1_a on prt_p1 t1 (actual rows=4 loops=N)
++         Heap Fetches: N
++   ->  Memoize (actual rows=4 loops=N)
++         Cache Key: t1.a
++         Cache Mode: logical
++         Hits: 3  Misses: 1  Evictions: Zero  Overflows: 0  Memory Usage: NkB
++         ->  Append (actual rows=4 loops=N)
++               ->  Index Only Scan using iprt_p1_a on prt_p1 (actual rows=4 loops=N)
++                     Index Cond: (a = t1.a)
++                     Heap Fetches: N
++               ->  Index Only Scan using iprt_p2_a on prt_p2 (actual rows=0 loops=N)
++                     Index Cond: (a = t1.a)
++                     Heap Fetches: N
++(14 rows)
++
+ DROP TABLE prt;
+ RESET enable_partitionwise_join;
+ -- Exercise Memoize code that flushes the cache when a parameter changes which
+diff --git a/src/test/regress/sql/memoize.sql b/src/test/regress/sql/memoize.sql
+index 8f72f67df9e2..29ab1ea62d39 100644
+--- a/src/test/regress/sql/memoize.sql
++++ b/src/test/regress/sql/memoize.sql
+@@ -121,6 +121,14 @@ ANALYZE prt;
+ SELECT explain_memoize('
+ SELECT * FROM prt t1 INNER JOIN prt t2 ON t1.a = t2.a;', false);
+ 
++-- Ensure memoize works with parameterized union-all Append path
++SET enable_partitionwise_join TO off;
++
++SELECT explain_memoize('
++SELECT * FROM prt_p1 t1 INNER JOIN
++(SELECT * FROM prt_p1 UNION ALL SELECT * FROM prt_p2) t2
++ON t1.a = t2.a;', false);
++
+ DROP TABLE prt;
+ 
+ RESET enable_partitionwise_join;

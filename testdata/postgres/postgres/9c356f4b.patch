@@ -1,0 +1,123 @@
+From 9c356f4b2dd8f8ff49757287e387ab1d023e4449 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 16 Dec 2021 15:36:02 -0500
+Subject: [PATCH] Ensure casting to typmod -1 generates a RelabelType.
+
+Fix the code changed by commit 5c056b0c2 so that we always generate
+RelabelType, not something else, for a cast to unspecified typmod.
+Otherwise planner optimizations might not happen.
+
+It appears we missed this point because the previous experiments were
+done on type numeric: the parser undesirably generates a call on the
+numeric() length-coercion function, but then numeric_support()
+optimizes that down to a RelabelType, so that everything seems fine.
+It misbehaves for types that have a non-optimized length coercion
+function, such as bpchar.
+
+Per report from John Naylor.  Back-patch to all supported branches,
+as the previous patch eventually was.  Unfortunately, that no longer
+includes 9.6 ... we really shouldn't put this type of change into a
+nearly-EOL branch.
+
+Discussion: https://postgr.es/m/CAFBsxsEfbFHEkouc+FSj+3K1sHipLPbEC67L0SAe-9-da8QtYg@mail.gmail.com
+---
+ src/backend/parser/parse_coerce.c         | 10 ++++++-
+ src/test/regress/expected/expressions.out | 36 +++++++++++++++++++++++
+ src/test/regress/sql/expressions.sql      | 16 ++++++++++
+ 3 files changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/parser/parse_coerce.c b/src/backend/parser/parse_coerce.c
+index 78194afedfbc..5e86f4b1e2ea 100644
+--- a/src/backend/parser/parse_coerce.c
++++ b/src/backend/parser/parse_coerce.c
+@@ -766,7 +766,15 @@ coerce_type_typmod(Node *node, Oid targetTypeId, int32 targetTypMod,
+ 	if (hideInputCoercion)
+ 		hide_coercion_node(node);
+ 
+-	pathtype = find_typmod_coercion_function(targetTypeId, &funcId);
++	/*
++	 * A negative typmod means that no actual coercion is needed, but we still
++	 * want a RelabelType to ensure that the expression exposes the intended
++	 * typmod.
++	 */
++	if (targetTypMod < 0)
++		pathtype = COERCION_PATH_NONE;
++	else
++		pathtype = find_typmod_coercion_function(targetTypeId, &funcId);
+ 
+ 	if (pathtype != COERCION_PATH_NONE)
+ 	{
+diff --git a/src/test/regress/expected/expressions.out b/src/test/regress/expected/expressions.out
+index 7b6b0bb4f99d..6406fb3a766e 100644
+--- a/src/test/regress/expected/expressions.out
++++ b/src/test/regress/expected/expressions.out
+@@ -194,6 +194,42 @@ explain (verbose, costs off) select * from numeric_view;
+    Output: numeric_tbl.f1, (numeric_tbl.f1)::numeric(16,4), (numeric_tbl.f1)::numeric, numeric_tbl.f2, (numeric_tbl.f2)::numeric(16,4), numeric_tbl.f2
+ (2 rows)
+ 
++-- bpchar, lacking planner support for its length coercion function,
++-- could behave differently
++create table bpchar_tbl (f1 character(16) unique, f2 bpchar);
++create view bpchar_view as
++  select
++    f1, f1::character(14) as f114, f1::bpchar as f1n,
++    f2, f2::character(14) as f214, f2::bpchar as f2n
++  from bpchar_tbl;
++\d+ bpchar_view
++                            View "public.bpchar_view"
++ Column |     Type      | Collation | Nullable | Default | Storage  | Description 
++--------+---------------+-----------+----------+---------+----------+-------------
++ f1     | character(16) |           |          |         | extended | 
++ f114   | character(14) |           |          |         | extended | 
++ f1n    | bpchar        |           |          |         | extended | 
++ f2     | bpchar        |           |          |         | extended | 
++ f214   | character(14) |           |          |         | extended | 
++ f2n    | bpchar        |           |          |         | extended | 
++View definition:
++ SELECT bpchar_tbl.f1,
++    bpchar_tbl.f1::character(14) AS f114,
++    bpchar_tbl.f1::bpchar AS f1n,
++    bpchar_tbl.f2,
++    bpchar_tbl.f2::character(14) AS f214,
++    bpchar_tbl.f2 AS f2n
++   FROM bpchar_tbl;
++
++explain (verbose, costs off) select * from bpchar_view
++  where f1::bpchar = 'foo';
++                                                                   QUERY PLAN                                                                   
++------------------------------------------------------------------------------------------------------------------------------------------------
++ Index Scan using bpchar_tbl_f1_key on public.bpchar_tbl
++   Output: bpchar_tbl.f1, (bpchar_tbl.f1)::character(14), (bpchar_tbl.f1)::bpchar, bpchar_tbl.f2, (bpchar_tbl.f2)::character(14), bpchar_tbl.f2
++   Index Cond: ((bpchar_tbl.f1)::bpchar = 'foo'::bpchar)
++(3 rows)
++
+ rollback;
+ --
+ -- Tests for ScalarArrayOpExpr with a hashfn
+diff --git a/src/test/regress/sql/expressions.sql b/src/test/regress/sql/expressions.sql
+index e9aa1a0b2896..03b88bde7aef 100644
+--- a/src/test/regress/sql/expressions.sql
++++ b/src/test/regress/sql/expressions.sql
+@@ -84,6 +84,22 @@ create view numeric_view as
+ 
+ explain (verbose, costs off) select * from numeric_view;
+ 
++-- bpchar, lacking planner support for its length coercion function,
++-- could behave differently
++
++create table bpchar_tbl (f1 character(16) unique, f2 bpchar);
++
++create view bpchar_view as
++  select
++    f1, f1::character(14) as f114, f1::bpchar as f1n,
++    f2, f2::character(14) as f214, f2::bpchar as f2n
++  from bpchar_tbl;
++
++\d+ bpchar_view
++
++explain (verbose, costs off) select * from bpchar_view
++  where f1::bpchar = 'foo';
++
+ rollback;
+ 
+ 

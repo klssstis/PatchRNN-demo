@@ -1,0 +1,150 @@
+From 9a2dbc614e6e47da3c49daacec106da32eba9467 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 8 Jun 2023 17:10:04 -0400
+Subject: [PATCH] Fix oversight in outer join removal.
+
+A placeholder that references the outer join's relid in ph_eval_at
+is logically "above" the join, and therefore we can't remove its
+PlaceHolderInfo: it might still be used somewhere in the query.
+
+This was not an issue pre-v16 because we failed to remove the join
+at all in such cases.  The new outer-join-aware-Var infrastructure
+permits deducing that it's okay to remove the join, but then we
+have to clean up correctly afterwards.
+
+Report and fix by Richard Guo
+
+Discussion: https://postgr.es/m/CAMbWs4_tuVn9EwwMcggGiZJWWstdXX_ci8FeEU17vs+4nLgw3w@mail.gmail.com
+---
+ src/backend/optimizer/plan/analyzejoins.c |  3 +-
+ src/test/regress/expected/join.out        | 57 +++++++++++++++++++++++
+ src/test/regress/sql/join.sql             | 34 ++++++++++++++
+ 3 files changed, 93 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/optimizer/plan/analyzejoins.c b/src/backend/optimizer/plan/analyzejoins.c
+index 6f7e657f0561..6476e55e5688 100644
+--- a/src/backend/optimizer/plan/analyzejoins.c
++++ b/src/backend/optimizer/plan/analyzejoins.c
+@@ -425,7 +425,8 @@ remove_rel_from_query(PlannerInfo *root, int relid, SpecialJoinInfo *sjinfo)
+ 
+ 		Assert(!bms_is_member(relid, phinfo->ph_lateral));
+ 		if (bms_is_subset(phinfo->ph_needed, joinrelids) &&
+-			bms_is_member(relid, phinfo->ph_eval_at))
++			bms_is_member(relid, phinfo->ph_eval_at) &&
++			!bms_is_member(ojrelid, phinfo->ph_eval_at))
+ 		{
+ 			root->placeholder_list = foreach_delete_current(root->placeholder_list,
+ 															l);
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index 4c278b2fa395..d04648df3fde 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -5842,6 +5842,63 @@ where ss.stringu2 !~* ss.case1;
+  doh!
+ (1 row)
+ 
++rollback;
++-- test cases where we can remove a join, but not a PHV computed at it
++begin;
++create temp table t (a int unique, b int);
++insert into t values (1,1), (2,2);
++explain (costs off)
++select 1
++from t t1
++  left join (select t2.a, 1 as c
++             from t t2 left join t t3 on t2.a = t3.a) s
++  on true
++  left join t t4 on true
++where s.a < s.c;
++             QUERY PLAN              
++-------------------------------------
++ Nested Loop Left Join
++   ->  Nested Loop
++         ->  Seq Scan on t t1
++         ->  Materialize
++               ->  Seq Scan on t t2
++                     Filter: (a < 1)
++   ->  Materialize
++         ->  Seq Scan on t t4
++(8 rows)
++
++explain (costs off)
++select t1.a, s.*
++from t t1
++  left join lateral (select t2.a, coalesce(t1.a, 1) as c
++                     from t t2 left join t t3 on t2.a = t3.a) s
++  on true
++  left join t t4 on true
++where s.a < s.c;
++                  QUERY PLAN                   
++-----------------------------------------------
++ Nested Loop Left Join
++   ->  Nested Loop
++         ->  Seq Scan on t t1
++         ->  Seq Scan on t t2
++               Filter: (a < COALESCE(t1.a, 1))
++   ->  Materialize
++         ->  Seq Scan on t t4
++(7 rows)
++
++select t1.a, s.*
++from t t1
++  left join lateral (select t2.a, coalesce(t1.a, 1) as c
++                     from t t2 left join t t3 on t2.a = t3.a) s
++  on true
++  left join t t4 on true
++where s.a < s.c;
++ a | a | c 
++---+---+---
++ 2 | 1 | 2
++ 2 | 1 | 2
++(2 rows)
++
+ rollback;
+ -- test case to expose miscomputation of required relid set for a PHV
+ explain (verbose, costs off)
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index 4baf5ebc138f..0308258a917e 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -2153,6 +2153,40 @@ where ss.stringu2 !~* ss.case1;
+ 
+ rollback;
+ 
++-- test cases where we can remove a join, but not a PHV computed at it
++begin;
++
++create temp table t (a int unique, b int);
++insert into t values (1,1), (2,2);
++
++explain (costs off)
++select 1
++from t t1
++  left join (select t2.a, 1 as c
++             from t t2 left join t t3 on t2.a = t3.a) s
++  on true
++  left join t t4 on true
++where s.a < s.c;
++
++explain (costs off)
++select t1.a, s.*
++from t t1
++  left join lateral (select t2.a, coalesce(t1.a, 1) as c
++                     from t t2 left join t t3 on t2.a = t3.a) s
++  on true
++  left join t t4 on true
++where s.a < s.c;
++
++select t1.a, s.*
++from t t1
++  left join lateral (select t2.a, coalesce(t1.a, 1) as c
++                     from t t2 left join t t3 on t2.a = t3.a) s
++  on true
++  left join t t4 on true
++where s.a < s.c;
++
++rollback;
++
+ -- test case to expose miscomputation of required relid set for a PHV
+ explain (verbose, costs off)
+ select i8.*, ss.v, t.unique2

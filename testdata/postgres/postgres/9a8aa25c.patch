@@ -1,0 +1,91 @@
+From 9a8aa25ccc6c285cd4f02afe4718eafd20dc34c5 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 25 May 2018 14:31:06 -0400
+Subject: [PATCH] Fix misidentification of SQL statement type in plpgsql's
+ exec_stmt_execsql.
+
+To distinguish SQL statements that are INSERT/UPDATE/DELETE from other
+ones, exec_stmt_execsql looked at the post-rewrite form of the statement
+rather than the original.  This is problematic because it did that only
+during first execution of the statement (in a session), but the correct
+answer could change later due to addition or removal of DO INSTEAD rules
+during the session.  That could lead to an Assert failure, as reported
+by Tushar Ahuja and Robert Haas.  In non-assert builds, there's a hazard
+that we would fail to enforce STRICT behavior when we'd be expected to.
+That would happen if an initially present DO INSTEAD, that replaced the
+original statement with one of a different type, were removed; after that
+the statement should act "normally", including strictness enforcement, but
+it didn't.  (The converse case of enforcing strictness when we shouldn't
+doesn't seem to be a hazard, as addition of a DO INSTEAD that changes the
+statement type would always lead to acting as though the statement returned
+zero rows, so that the strictness error could not fire.)
+
+To fix, inspect the original form of the statement not the post-rewrite
+form, making it valid to assume the answer can't change intra-session.
+This should lead to the same answer in every case except when there is a
+DO INSTEAD that changes the statement type; we will now set mod_stmt=true
+anyway, while we would not have done so before.  That breaks the Assert
+in the SPI_OK_REWRITTEN code path, which expected the latter behavior.
+It might be all right to assert mod_stmt rather than !mod_stmt there,
+but I'm not entirely convinced that that'd always hold, so just remove
+the assertion altogether.
+
+This has been broken for a long time, so back-patch to all supported
+branches.
+
+Discussion: https://postgr.es/m/CA+TgmoZUrRN4xvZe_BbBn_Xp0BDwuMEue-0OyF0fJpfvU2Yc7Q@mail.gmail.com
+---
+ src/pl/plpgsql/src/pl_exec.c | 27 ++++++++++++++-------------
+ 1 file changed, 14 insertions(+), 13 deletions(-)
+
+diff --git a/src/pl/plpgsql/src/pl_exec.c b/src/pl/plpgsql/src/pl_exec.c
+index 1eb421bcc706..ef013bcdc7ff 100644
+--- a/src/pl/plpgsql/src/pl_exec.c
++++ b/src/pl/plpgsql/src/pl_exec.c
+@@ -4031,19 +4031,20 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
+ 		foreach(l, SPI_plan_get_plan_sources(expr->plan))
+ 		{
+ 			CachedPlanSource *plansource = (CachedPlanSource *) lfirst(l);
+-			ListCell   *l2;
+ 
+-			foreach(l2, plansource->query_list)
++			/*
++			 * We could look at the raw_parse_tree, but it seems simpler to
++			 * check the command tag.  Note we should *not* look at the Query
++			 * tree(s), since those are the result of rewriting and could have
++			 * been transmogrified into something else entirely.
++			 */
++			if (plansource->commandTag &&
++				(strcmp(plansource->commandTag, "INSERT") == 0 ||
++				 strcmp(plansource->commandTag, "UPDATE") == 0 ||
++				 strcmp(plansource->commandTag, "DELETE") == 0))
+ 			{
+-				Query	   *q = lfirst_node(Query, l2);
+-
+-				if (q->canSetTag)
+-				{
+-					if (q->commandType == CMD_INSERT ||
+-						q->commandType == CMD_UPDATE ||
+-						q->commandType == CMD_DELETE)
+-						stmt->mod_stmt = true;
+-				}
++				stmt->mod_stmt = true;
++				break;
+ 			}
+ 		}
+ 	}
+@@ -4108,12 +4109,12 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
+ 			break;
+ 
+ 		case SPI_OK_REWRITTEN:
+-			Assert(!stmt->mod_stmt);
+ 
+ 			/*
+ 			 * The command was rewritten into another kind of command. It's
+ 			 * not clear what FOUND would mean in that case (and SPI doesn't
+-			 * return the row count either), so just set it to false.
++			 * return the row count either), so just set it to false.  Note
++			 * that we can't assert anything about mod_stmt here.
+ 			 */
+ 			exec_set_found(estate, false);
+ 			break;
