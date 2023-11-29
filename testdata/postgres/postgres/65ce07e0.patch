@@ -1,0 +1,653 @@
+From 65ce07e0202f2ef0953be9d085d3e5df7ad353a4 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 1 Mar 2019 17:14:07 -0500
+Subject: [PATCH] Teach optimizer's predtest.c more things about
+ ScalarArrayOpExpr.
+
+In particular, make it possible to prove/refute "x IS NULL" and
+"x IS NOT NULL" predicates from a clause involving a ScalarArrayOpExpr
+even when we are unable or unwilling to deconstruct the expression
+into an AND/OR tree.  This avoids a former unexpected degradation of
+plan quality when the size of an ARRAY[] expression or array constant
+exceeded the arbitrary MAX_SAOP_ARRAY_SIZE limit.  For IS-NULL proofs,
+we don't really care about the values of the individual array elements;
+at most, we care whether there are any, and for some common cases we
+needn't even know that.
+
+The main user-visible effect of this is to let the optimizer recognize
+applicability of partial indexes with "x IS NOT NULL" predicates to
+queries with "x IN (array)" clauses in some cases where it previously
+failed to recognize that.  The structure of predtest.c is such that a
+bunch of related proofs will now also succeed, but they're probably
+much less useful in the wild.
+
+James Coleman, reviewed by David Rowley
+
+Discussion: https://postgr.es/m/CAAaqYe8yKSvzbyu8w-dThRs9aTFMwrFxn_BkTYeXgjqe3CbNjg@mail.gmail.com
+---
+ src/backend/optimizer/util/predtest.c         | 126 +++++++--
+ .../test_predtest/expected/test_predtest.out  | 257 ++++++++++++++++++
+ .../test_predtest/sql/test_predtest.sql       | 115 ++++++++
+ 3 files changed, 478 insertions(+), 20 deletions(-)
+
+diff --git a/src/backend/optimizer/util/predtest.c b/src/backend/optimizer/util/predtest.c
+index 3c9f245e4daf..fc4fc09a8357 100644
+--- a/src/backend/optimizer/util/predtest.c
++++ b/src/backend/optimizer/util/predtest.c
+@@ -99,7 +99,7 @@ static bool predicate_refuted_by_simple_clause(Expr *predicate, Node *clause,
+ 								   bool weak);
+ static Node *extract_not_arg(Node *clause);
+ static Node *extract_strong_not_arg(Node *clause);
+-static bool clause_is_strict_for(Node *clause, Node *subexpr);
++static bool clause_is_strict_for(Node *clause, Node *subexpr, bool allow_false);
+ static bool operator_predicate_proof(Expr *predicate, Node *clause,
+ 						 bool refute_it, bool weak);
+ static bool operator_same_subexprs_proof(Oid pred_op, Oid clause_op,
+@@ -816,7 +816,7 @@ predicate_refuted_by_recurse(Node *clause, Node *predicate,
+  * This function also implements enforcement of MAX_SAOP_ARRAY_SIZE: if a
+  * ScalarArrayOpExpr's array has too many elements, we just classify it as an
+  * atom.  (This will result in its being passed as-is to the simple_clause
+- * functions, which will fail to prove anything about it.)	Note that we
++ * functions, many of which will fail to prove anything about it.) Note that we
+  * cannot just stop after considering MAX_SAOP_ARRAY_SIZE elements; in general
+  * that would result in wrong proofs, rather than failing to prove anything.
+  */
+@@ -1099,8 +1099,8 @@ arrayexpr_cleanup_fn(PredIterInfo info)
+  *
+  * If the predicate is of the form "foo IS NOT NULL", and we are considering
+  * strong implication, we can conclude that the predicate is implied if the
+- * clause is strict for "foo", i.e., it must yield NULL when "foo" is NULL.
+- * In that case truth of the clause requires that "foo" isn't NULL.
++ * clause is strict for "foo", i.e., it must yield false or NULL when "foo"
++ * is NULL.  In that case truth of the clause ensures that "foo" isn't NULL.
+  * (Again, this is a safe conclusion because "foo" must be immutable.)
+  * This doesn't work for weak implication, though.
+  *
+@@ -1131,7 +1131,7 @@ predicate_implied_by_simple_clause(Expr *predicate, Node *clause,
+ 			!ntest->argisrow)
+ 		{
+ 			/* strictness of clause for foo implies foo IS NOT NULL */
+-			if (clause_is_strict_for(clause, (Node *) ntest->arg))
++			if (clause_is_strict_for(clause, (Node *) ntest->arg, true))
+ 				return true;
+ 		}
+ 		return false;			/* we can't succeed below... */
+@@ -1160,8 +1160,8 @@ predicate_implied_by_simple_clause(Expr *predicate, Node *clause,
+  *
+  * A clause "foo IS NULL" refutes a predicate "foo IS NOT NULL" in all cases.
+  * If we are considering weak refutation, it also refutes a predicate that
+- * is strict for "foo", since then the predicate must yield NULL (and since
+- * "foo" appears in the predicate, it's known immutable).
++ * is strict for "foo", since then the predicate must yield false or NULL
++ * (and since "foo" appears in the predicate, it's known immutable).
+  *
+  * (The main motivation for covering these IS [NOT] NULL cases is to support
+  * using IS NULL/IS NOT NULL as partition-defining constraints.)
+@@ -1194,7 +1194,7 @@ predicate_refuted_by_simple_clause(Expr *predicate, Node *clause,
+ 			return false;
+ 
+ 		/* strictness of clause for foo refutes foo IS NULL */
+-		if (clause_is_strict_for(clause, (Node *) isnullarg))
++		if (clause_is_strict_for(clause, (Node *) isnullarg, true))
+ 			return true;
+ 
+ 		/* foo IS NOT NULL refutes foo IS NULL */
+@@ -1226,7 +1226,7 @@ predicate_refuted_by_simple_clause(Expr *predicate, Node *clause,
+ 
+ 		/* foo IS NULL weakly refutes any predicate that is strict for foo */
+ 		if (weak &&
+-			clause_is_strict_for((Node *) predicate, (Node *) isnullarg))
++			clause_is_strict_for((Node *) predicate, (Node *) isnullarg, true))
+ 			return true;
+ 
+ 		return false;			/* we can't succeed below... */
+@@ -1293,17 +1293,30 @@ extract_strong_not_arg(Node *clause)
+ 
+ 
+ /*
+- * Can we prove that "clause" returns NULL if "subexpr" does?
++ * Can we prove that "clause" returns NULL (or FALSE) if "subexpr" is
++ * assumed to yield NULL?
+  *
+- * The base case is that clause and subexpr are equal().  (We assume that
+- * the caller knows at least one of the input expressions is immutable,
+- * as this wouldn't hold for volatile expressions.)
++ * In most places in the planner, "strictness" refers to a guarantee that
++ * an expression yields NULL output for a NULL input, and that's mostly what
++ * we're looking for here.  However, at top level where the clause is known
++ * to yield boolean, it may be sufficient to prove that it cannot return TRUE
++ * when "subexpr" is NULL.  The caller should pass allow_false = true when
++ * this weaker property is acceptable.  (When this function recurses
++ * internally, we pass down allow_false = false since we need to prove actual
++ * nullness of the subexpression.)
++ *
++ * We assume that the caller checked that least one of the input expressions
++ * is immutable.  All of the proof rules here involve matching "subexpr" to
++ * some portion of "clause", so that this allows assuming that "subexpr" is
++ * immutable without a separate check.
++ *
++ * The base case is that clause and subexpr are equal().
+  *
+  * We can also report success if the subexpr appears as a subexpression
+  * of "clause" in a place where it'd force nullness of the overall result.
+  */
+ static bool
+-clause_is_strict_for(Node *clause, Node *subexpr)
++clause_is_strict_for(Node *clause, Node *subexpr, bool allow_false)
+ {
+ 	ListCell   *lc;
+ 
+@@ -1336,7 +1349,7 @@ clause_is_strict_for(Node *clause, Node *subexpr)
+ 	{
+ 		foreach(lc, ((OpExpr *) clause)->args)
+ 		{
+-			if (clause_is_strict_for((Node *) lfirst(lc), subexpr))
++			if (clause_is_strict_for((Node *) lfirst(lc), subexpr, false))
+ 				return true;
+ 		}
+ 		return false;
+@@ -1346,7 +1359,7 @@ clause_is_strict_for(Node *clause, Node *subexpr)
+ 	{
+ 		foreach(lc, ((FuncExpr *) clause)->args)
+ 		{
+-			if (clause_is_strict_for((Node *) lfirst(lc), subexpr))
++			if (clause_is_strict_for((Node *) lfirst(lc), subexpr, false))
+ 				return true;
+ 		}
+ 		return false;
+@@ -1362,16 +1375,89 @@ clause_is_strict_for(Node *clause, Node *subexpr)
+ 	 */
+ 	if (IsA(clause, CoerceViaIO))
+ 		return clause_is_strict_for((Node *) ((CoerceViaIO *) clause)->arg,
+-									subexpr);
++									subexpr, false);
+ 	if (IsA(clause, ArrayCoerceExpr))
+ 		return clause_is_strict_for((Node *) ((ArrayCoerceExpr *) clause)->arg,
+-									subexpr);
++									subexpr, false);
+ 	if (IsA(clause, ConvertRowtypeExpr))
+ 		return clause_is_strict_for((Node *) ((ConvertRowtypeExpr *) clause)->arg,
+-									subexpr);
++									subexpr, false);
+ 	if (IsA(clause, CoerceToDomain))
+ 		return clause_is_strict_for((Node *) ((CoerceToDomain *) clause)->arg,
+-									subexpr);
++									subexpr, false);
++
++	/*
++	 * ScalarArrayOpExpr is a special case.  Note that we'd only reach here
++	 * with a ScalarArrayOpExpr clause if we failed to deconstruct it into an
++	 * AND or OR tree, as for example if it has too many array elements.
++	 */
++	if (IsA(clause, ScalarArrayOpExpr))
++	{
++		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
++		Node	   *scalarnode = (Node *) linitial(saop->args);
++		Node	   *arraynode = (Node *) lsecond(saop->args);
++
++		/*
++		 * If we can prove the scalar input to be null, and the operator is
++		 * strict, then the SAOP result has to be null --- unless the array is
++		 * empty.  For an empty array, we'd get either false (for ANY) or true
++		 * (for ALL).  So if allow_false = true then the proof succeeds anyway
++		 * for the ANY case; otherwise we can only make the proof if we can
++		 * prove the array non-empty.
++		 */
++		if (clause_is_strict_for(scalarnode, subexpr, false) &&
++			op_strict(saop->opno))
++		{
++			int			nelems = 0;
++
++			if (allow_false && saop->useOr)
++				return true;	/* can succeed even if array is empty */
++
++			if (arraynode && IsA(arraynode, Const))
++			{
++				Const	   *arrayconst = (Const *) arraynode;
++				ArrayType  *arrval;
++
++				/*
++				 * If array is constant NULL then we can succeed, as in the
++				 * case below.
++				 */
++				if (arrayconst->constisnull)
++					return true;
++
++				/* Otherwise, we can compute the number of elements. */
++				arrval = DatumGetArrayTypeP(arrayconst->constvalue);
++				nelems = ArrayGetNItems(ARR_NDIM(arrval), ARR_DIMS(arrval));
++			}
++			else if (arraynode && IsA(arraynode, ArrayExpr) &&
++					 !((ArrayExpr *) arraynode)->multidims)
++			{
++				/*
++				 * We can also reliably count the number of array elements if
++				 * the input is a non-multidim ARRAY[] expression.
++				 */
++				nelems = list_length(((ArrayExpr *) arraynode)->elements);
++			}
++
++			/* Proof succeeds if array is definitely non-empty */
++			if (nelems > 0)
++				return true;
++		}
++
++		/*
++		 * If we can prove the array input to be null, the proof succeeds in
++		 * all cases, since ScalarArrayOpExpr will always return NULL for a
++		 * NULL array.  Otherwise, we're done here.
++		 */
++		return clause_is_strict_for(arraynode, subexpr, false);
++	}
++
++	/*
++	 * When recursing into an expression, we might find a NULL constant.
++	 * That's certainly NULL, whether it matches subexpr or not.
++	 */
++	if (IsA(clause, Const))
++		return ((Const *) clause)->constisnull;
+ 
+ 	return false;
+ }
+diff --git a/src/test/modules/test_predtest/expected/test_predtest.out b/src/test/modules/test_predtest/expected/test_predtest.out
+index 5574e03204f5..6d21bcd603ee 100644
+--- a/src/test/modules/test_predtest/expected/test_predtest.out
++++ b/src/test/modules/test_predtest/expected/test_predtest.out
+@@ -19,6 +19,9 @@ from generate_series(0, 11*11-1) i;
+ -- and a simple strict function that's opaque to the optimizer
+ create function strictf(bool, bool) returns bool
+ language plpgsql as $$begin return $1 and not $2; end$$ strict;
++-- a simple function to make arrays opaque to the optimizer
++create function opaque_array(int[]) returns int[]
++language plpgsql as $$begin return $1; end$$ strict;
+ -- Basic proof rules for single boolean variables
+ select * from test_predtest($$
+ select x, x
+@@ -837,3 +840,257 @@ w_i_holds         | f
+ s_r_holds         | f
+ w_r_holds         | f
+ 
++-- In these tests, we want to prevent predtest.c from breaking down the
++-- ScalarArrayOpExpr into an AND/OR tree, so as to exercise the logic
++-- that handles ScalarArrayOpExpr directly.  We use opaque_array() if
++-- possible, otherwise an array longer than MAX_SAOP_ARRAY_SIZE.
++-- ScalarArrayOpExpr implies scalar IS NOT NULL
++select * from test_predtest($$
++select x is not null, x = any(opaque_array(array[1]))
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | t
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | f
++s_i_holds         | t
++w_i_holds         | f
++s_r_holds         | f
++w_r_holds         | f
++
++-- but for ALL, we have to be able to prove the array nonempty
++select * from test_predtest($$
++select x is not null, x <> all(opaque_array(array[1]))
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | f
++s_i_holds         | t
++w_i_holds         | f
++s_r_holds         | f
++w_r_holds         | f
++
++select * from test_predtest($$
++select x is not null, x <> all(array[
++  1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,
++  29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,
++  54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,
++  79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101
++])
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | t
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | f
++s_i_holds         | t
++w_i_holds         | f
++s_r_holds         | f
++w_r_holds         | f
++
++select * from test_predtest($$
++select x is not null, x <> all(array[
++  1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,
++  29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,
++  54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,
++  79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,y
++])
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | t
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | f
++s_i_holds         | t
++w_i_holds         | f
++s_r_holds         | f
++w_r_holds         | f
++
++-- check empty-array cases
++select * from test_predtest($$
++select x is not null, x = any(opaque_array(array[]::int[]))
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | t
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | f
++s_i_holds         | t
++w_i_holds         | t
++s_r_holds         | t
++w_r_holds         | t
++
++select * from test_predtest($$
++select x is not null, x <> all(opaque_array(array[]::int[]))
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | f
++s_i_holds         | f
++w_i_holds         | f
++s_r_holds         | f
++w_r_holds         | f
++
++-- same thing under a strict function doesn't prove it
++select * from test_predtest($$
++select x is not null, strictf(true, x = any(opaque_array(array[]::int[])))
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | f
++s_i_holds         | f
++w_i_holds         | f
++s_r_holds         | f
++w_r_holds         | f
++
++-- ScalarArrayOpExpr refutes scalar IS NULL
++select * from test_predtest($$
++select x is null, x = any(opaque_array(array[1]))
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | t
++weak_refuted_by   | t
++s_i_holds         | f
++w_i_holds         | f
++s_r_holds         | t
++w_r_holds         | t
++
++-- but for ALL, we have to be able to prove the array nonempty
++select * from test_predtest($$
++select x is null, x <> all(opaque_array(array[1]))
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | f
++s_i_holds         | f
++w_i_holds         | f
++s_r_holds         | t
++w_r_holds         | t
++
++select * from test_predtest($$
++select x is null, x <> all(array[
++  1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,
++  29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,
++  54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,
++  79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101
++])
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | t
++weak_refuted_by   | t
++s_i_holds         | f
++w_i_holds         | f
++s_r_holds         | t
++w_r_holds         | t
++
++-- check empty-array cases
++select * from test_predtest($$
++select x is null, x = any(opaque_array(array[]::int[]))
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | t
++weak_refuted_by   | t
++s_i_holds         | t
++w_i_holds         | t
++s_r_holds         | t
++w_r_holds         | t
++
++select * from test_predtest($$
++select x is null, x <> all(opaque_array(array[]::int[]))
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | f
++s_i_holds         | f
++w_i_holds         | f
++s_r_holds         | f
++w_r_holds         | f
++
++-- same thing under a strict function doesn't prove it
++select * from test_predtest($$
++select x is null, strictf(true, x = any(opaque_array(array[]::int[])))
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | f
++s_i_holds         | f
++w_i_holds         | f
++s_r_holds         | f
++w_r_holds         | f
++
++-- Also, nullness of the scalar weakly refutes a SAOP
++select * from test_predtest($$
++select x = any(opaque_array(array[1])), x is null
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | t
++s_i_holds         | f
++w_i_holds         | t
++s_r_holds         | f
++w_r_holds         | t
++
++-- as does nullness of the array
++select * from test_predtest($$
++select x = any(opaque_array(array[y])), array[y] is null
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | t
++s_i_holds         | t
++w_i_holds         | t
++s_r_holds         | t
++w_r_holds         | t
++
++-- ... unless we need to prove array empty
++select * from test_predtest($$
++select x = all(opaque_array(array[1])), x is null
++from integers
++$$);
++-[ RECORD 1 ]-----+--
++strong_implied_by | f
++weak_implied_by   | f
++strong_refuted_by | f
++weak_refuted_by   | f
++s_i_holds         | f
++w_i_holds         | t
++s_r_holds         | f
++w_r_holds         | t
++
+diff --git a/src/test/modules/test_predtest/sql/test_predtest.sql b/src/test/modules/test_predtest/sql/test_predtest.sql
+index 27347358439c..072eb5b0d502 100644
+--- a/src/test/modules/test_predtest/sql/test_predtest.sql
++++ b/src/test/modules/test_predtest/sql/test_predtest.sql
+@@ -25,6 +25,10 @@ from generate_series(0, 11*11-1) i;
+ create function strictf(bool, bool) returns bool
+ language plpgsql as $$begin return $1 and not $2; end$$ strict;
+ 
++-- a simple function to make arrays opaque to the optimizer
++create function opaque_array(int[]) returns int[]
++language plpgsql as $$begin return $1; end$$ strict;
++
+ -- Basic proof rules for single boolean variables
+ 
+ select * from test_predtest($$
+@@ -325,3 +329,114 @@ select * from test_predtest($$
+ select x <= y, x = any(array[1,3,y])
+ from integers
+ $$);
++
++-- In these tests, we want to prevent predtest.c from breaking down the
++-- ScalarArrayOpExpr into an AND/OR tree, so as to exercise the logic
++-- that handles ScalarArrayOpExpr directly.  We use opaque_array() if
++-- possible, otherwise an array longer than MAX_SAOP_ARRAY_SIZE.
++
++-- ScalarArrayOpExpr implies scalar IS NOT NULL
++select * from test_predtest($$
++select x is not null, x = any(opaque_array(array[1]))
++from integers
++$$);
++
++-- but for ALL, we have to be able to prove the array nonempty
++select * from test_predtest($$
++select x is not null, x <> all(opaque_array(array[1]))
++from integers
++$$);
++
++select * from test_predtest($$
++select x is not null, x <> all(array[
++  1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,
++  29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,
++  54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,
++  79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101
++])
++from integers
++$$);
++
++select * from test_predtest($$
++select x is not null, x <> all(array[
++  1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,
++  29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,
++  54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,
++  79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,y
++])
++from integers
++$$);
++
++-- check empty-array cases
++select * from test_predtest($$
++select x is not null, x = any(opaque_array(array[]::int[]))
++from integers
++$$);
++
++select * from test_predtest($$
++select x is not null, x <> all(opaque_array(array[]::int[]))
++from integers
++$$);
++
++-- same thing under a strict function doesn't prove it
++select * from test_predtest($$
++select x is not null, strictf(true, x = any(opaque_array(array[]::int[])))
++from integers
++$$);
++
++-- ScalarArrayOpExpr refutes scalar IS NULL
++select * from test_predtest($$
++select x is null, x = any(opaque_array(array[1]))
++from integers
++$$);
++
++-- but for ALL, we have to be able to prove the array nonempty
++select * from test_predtest($$
++select x is null, x <> all(opaque_array(array[1]))
++from integers
++$$);
++
++select * from test_predtest($$
++select x is null, x <> all(array[
++  1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,
++  29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,
++  54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,
++  79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101
++])
++from integers
++$$);
++
++-- check empty-array cases
++select * from test_predtest($$
++select x is null, x = any(opaque_array(array[]::int[]))
++from integers
++$$);
++
++select * from test_predtest($$
++select x is null, x <> all(opaque_array(array[]::int[]))
++from integers
++$$);
++
++-- same thing under a strict function doesn't prove it
++select * from test_predtest($$
++select x is null, strictf(true, x = any(opaque_array(array[]::int[])))
++from integers
++$$);
++
++-- Also, nullness of the scalar weakly refutes a SAOP
++select * from test_predtest($$
++select x = any(opaque_array(array[1])), x is null
++from integers
++$$);
++
++-- as does nullness of the array
++select * from test_predtest($$
++select x = any(opaque_array(array[y])), array[y] is null
++from integers
++$$);
++
++-- ... unless we need to prove array empty
++select * from test_predtest($$
++select x = all(opaque_array(array[1])), x is null
++from integers
++$$);

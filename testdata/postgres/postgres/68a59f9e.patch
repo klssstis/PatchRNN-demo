@@ -1,0 +1,86 @@
+From 68a59f9e99831cf05a746928a955781503232bbb Mon Sep 17 00:00:00 2001
+From: Masahiko Sawada <msawada@postgresql.org>
+Date: Wed, 5 Jul 2023 14:49:46 +0900
+Subject: [PATCH] pgstat: fix subscription stats entry leak.
+
+Commit 7b64e4b3 taught DropSubscription() to drop stats entry of
+subscription that is not associated with a replication slot for apply
+worker at DROP SUBSCRIPTION but missed covering the case where the
+subscription is not associated with replication slots for both apply
+worker and tablesync worker.
+
+Also add a test to verify that the stats for slot-less subscription is
+removed at DROP SUBSCRIPTION time.
+
+Backpatch down to 15.
+
+Author: Masahiko Sawada
+Reviewed-by: Nathan Bossart, Hayato Kuroda, Melih Mutlu, Amit Kapila
+Discussion: https://postgr.es/m/CAD21AoB71zkP7uPT7JDPsZcvp0749ExEQnOJxeNKPDFisHar+w@mail.gmail.com
+Backpatch-through: 15
+---
+ src/backend/commands/subscriptioncmds.c | 12 ++++++------
+ src/test/subscription/t/026_stats.pl    | 20 ++++++++++++++++++++
+ 2 files changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/src/backend/commands/subscriptioncmds.c b/src/backend/commands/subscriptioncmds.c
+index 54895ba929a9..d4e798baeb14 100644
+--- a/src/backend/commands/subscriptioncmds.c
++++ b/src/backend/commands/subscriptioncmds.c
+@@ -1646,6 +1646,12 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
+ 	ReplicationOriginNameForLogicalRep(subid, InvalidOid, originname, sizeof(originname));
+ 	replorigin_drop_by_name(originname, true, false);
+ 
++	/*
++	 * Tell the cumulative stats system that the subscription is getting
++	 * dropped.
++	 */
++	pgstat_drop_subscription(subid);
++
+ 	/*
+ 	 * If there is no slot associated with the subscription, we can finish
+ 	 * here.
+@@ -1734,12 +1740,6 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
+ 	}
+ 	PG_END_TRY();
+ 
+-	/*
+-	 * Tell the cumulative stats system that the subscription is getting
+-	 * dropped.
+-	 */
+-	pgstat_drop_subscription(subid);
+-
+ 	table_close(rel, NoLock);
+ }
+ 
+diff --git a/src/test/subscription/t/026_stats.pl b/src/test/subscription/t/026_stats.pl
+index 45e51c5a52c6..0bcda006cd7e 100644
+--- a/src/test/subscription/t/026_stats.pl
++++ b/src/test/subscription/t/026_stats.pl
+@@ -267,6 +267,26 @@ sub create_sub_pub_w_errors
+ 	qq(f),
+ 	qq(Subscription stats for subscription '$sub1_name' should be removed.));
+ 
++# Get subscription 2 oid
++my $sub2_oid = $node_subscriber->safe_psql($db,
++	qq(SELECT oid FROM pg_subscription WHERE subname = '$sub2_name'));
++
++# Diassociate the subscription 2 from its replication slot and drop it
++$node_subscriber->safe_psql(
++	$db,
++	qq(
++ALTER SUBSCRIPTION $sub2_name DISABLE;
++ALTER SUBSCRIPTION $sub2_name SET (slot_name = NONE);
++DROP SUBSCRIPTION $sub2_name;
++			    ));
++
++# Subscription stats for sub2 should be gone
++is( $node_subscriber->safe_psql(
++		$db, qq(SELECT pg_stat_have_stats('subscription', 0, $sub2_oid))),
++	qq(f),
++	qq(Subscription stats for subscription '$sub2_name' should be removed.));
++$node_publisher->safe_psql($db,
++	qq(SELECT pg_drop_replication_slot('$sub2_name')));
+ 
+ $node_subscriber->stop('fast');
+ $node_publisher->stop('fast');

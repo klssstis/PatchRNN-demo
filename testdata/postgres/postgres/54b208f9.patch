@@ -1,0 +1,117 @@
+From 54b208f90963cb8b48b9794a5392b2fae4b40a98 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 16 Oct 2023 14:06:11 -0400
+Subject: [PATCH] Ensure we have a snapshot while dropping ON COMMIT DROP temp
+ tables.
+
+Dropping a temp table could entail TOAST table access to clean out
+toasted catalog entries, such as large pg_constraint.conbin strings
+for complex CHECK constraints.  If we did that via ON COMMIT DROP,
+we triggered the assertion in init_toast_snapshot(), because
+there was no provision for setting up a snapshot for the drop
+actions.  Fix that.
+
+(I assume here that the adjacent truncation actions for ON COMMIT
+DELETE ROWS don't have a similar problem: it doesn't seem like
+nontransactional truncations would need to touch any toasted fields.
+If that proves wrong, we could refactor a bit to have the same
+snapshot acquisition cover that too.)
+
+The test case added here does not fail before v15, because that
+assertion was added in 277692220 which was not back-patched.
+However, the race condition the assertion warns of surely
+exists further back, so back-patch to all supported branches.
+
+Per report from Richard Guo.
+
+Discussion: https://postgr.es/m/CAMbWs4-x26=_QxxgdJyNbiCDzvtr2WV5ZDso_v-CukKEe6cBZw@mail.gmail.com
+---
+ src/backend/commands/tablecmds.c   |  8 ++++++++
+ src/test/regress/expected/temp.out | 20 ++++++++++++++++++++
+ src/test/regress/sql/temp.sql      | 16 ++++++++++++++++
+ 3 files changed, 44 insertions(+)
+
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index 8820738d9188..fb48772fd509 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -17644,6 +17644,12 @@ PreCommit_on_commit_actions(void)
+ 			add_exact_object_address(&object, targetObjects);
+ 		}
+ 
++		/*
++		 * Object deletion might involve toast table access (to clean up
++		 * toasted catalog entries), so ensure we have a valid snapshot.
++		 */
++		PushActiveSnapshot(GetTransactionSnapshot());
++
+ 		/*
+ 		 * Since this is an automatic drop, rather than one directly initiated
+ 		 * by the user, we pass the PERFORM_DELETION_INTERNAL flag.
+@@ -17651,6 +17657,8 @@ PreCommit_on_commit_actions(void)
+ 		performMultipleDeletions(targetObjects, DROP_CASCADE,
+ 								 PERFORM_DELETION_INTERNAL | PERFORM_DELETION_QUIETLY);
+ 
++		PopActiveSnapshot();
++
+ #ifdef USE_ASSERT_CHECKING
+ 
+ 		/*
+diff --git a/src/test/regress/expected/temp.out b/src/test/regress/expected/temp.out
+index a5b3ed34a367..2a246a7e1231 100644
+--- a/src/test/regress/expected/temp.out
++++ b/src/test/regress/expected/temp.out
+@@ -108,6 +108,26 @@ SELECT * FROM temptest;
+    1
+ (1 row)
+ 
++COMMIT;
++SELECT * FROM temptest;
++ERROR:  relation "temptest" does not exist
++LINE 1: SELECT * FROM temptest;
++                      ^
++-- Test it with a CHECK condition that produces a toasted pg_constraint entry
++BEGIN;
++do $$
++begin
++  execute format($cmd$
++    CREATE TEMP TABLE temptest (col text CHECK (col < %L)) ON COMMIT DROP
++  $cmd$,
++    (SELECT string_agg(g.i::text || ':' || random()::text, '|')
++     FROM generate_series(1, 100) g(i)));
++end$$;
++SELECT * FROM temptest;
++ col 
++-----
++(0 rows)
++
+ COMMIT;
+ SELECT * FROM temptest;
+ ERROR:  relation "temptest" does not exist
+diff --git a/src/test/regress/sql/temp.sql b/src/test/regress/sql/temp.sql
+index 424d12b2833f..2a487a1ef7f4 100644
+--- a/src/test/regress/sql/temp.sql
++++ b/src/test/regress/sql/temp.sql
+@@ -101,6 +101,22 @@ COMMIT;
+ 
+ SELECT * FROM temptest;
+ 
++-- Test it with a CHECK condition that produces a toasted pg_constraint entry
++BEGIN;
++do $$
++begin
++  execute format($cmd$
++    CREATE TEMP TABLE temptest (col text CHECK (col < %L)) ON COMMIT DROP
++  $cmd$,
++    (SELECT string_agg(g.i::text || ':' || random()::text, '|')
++     FROM generate_series(1, 100) g(i)));
++end$$;
++
++SELECT * FROM temptest;
++COMMIT;
++
++SELECT * FROM temptest;
++
+ -- ON COMMIT is only allowed for TEMP
+ 
+ CREATE TABLE temptest(col int) ON COMMIT DELETE ROWS;

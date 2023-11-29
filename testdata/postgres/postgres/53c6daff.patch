@@ -1,0 +1,75 @@
+From 53c6daff4364219256119fcd79b2d71b57c13e37 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 5 Oct 2020 13:15:39 -0400
+Subject: [PATCH] Fix two latent(?) bugs in equivclass.c.
+
+get_eclass_for_sort_expr() computes expr_relids and nullable_relids
+early on, even though they won't be needed unless we make a new
+EquivalenceClass, which we often don't.  Aside from the probably-minor
+inefficiency, there's a memory management problem: these bitmapsets will
+be built in the caller's context, leading to dangling pointers if that
+is shorter-lived than root->planner_cxt.  This would be a live bug if
+get_eclass_for_sort_expr() could be called with create_it = true during
+GEQO join planning.  So far as I can find, the core code never does
+that, but it's hard to be sure that no extensions do, especially since
+the comments make it clear that that's supposed to be a supported case.
+Fix by not computing these values until we've switched into planner_cxt
+to build the new EquivalenceClass.
+
+generate_join_implied_equalities() uses inner_rel->relids to look up
+relevant eclasses, but it ought to be using nominal_inner_relids.
+This is presently harmless because a child RelOptInfo will always have
+exactly the same eclass_indexes as its topmost parent; but that might
+not be true forever, and anyway it makes the code confusing.
+
+The first of these is old (introduced by me in f3b3b8d5b), so back-patch
+to all supported branches.  The second only dates to v13, but we might
+as well back-patch it to keep the code looking similar across branches.
+
+Discussion: https://postgr.es/m/1508010.1601832581@sss.pgh.pa.us
+---
+ src/backend/optimizer/path/equivclass.c | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/optimizer/path/equivclass.c b/src/backend/optimizer/path/equivclass.c
+index b68a5a0ec717..d3d826b790e8 100644
+--- a/src/backend/optimizer/path/equivclass.c
++++ b/src/backend/optimizer/path/equivclass.c
+@@ -634,12 +634,6 @@ get_eclass_for_sort_expr(PlannerInfo *root,
+ 	 */
+ 	expr = canonicalize_ec_expression(expr, opcintype, collation);
+ 
+-	/*
+-	 * Get the precise set of nullable relids appearing in the expression.
+-	 */
+-	expr_relids = pull_varnos((Node *) expr);
+-	nullable_relids = bms_intersect(nullable_relids, expr_relids);
+-
+ 	/*
+ 	 * Scan through the existing EquivalenceClasses for a match
+ 	 */
+@@ -716,6 +710,12 @@ get_eclass_for_sort_expr(PlannerInfo *root,
+ 	if (newec->ec_has_volatile && sortref == 0) /* should not happen */
+ 		elog(ERROR, "volatile EquivalenceClass has no sortref");
+ 
++	/*
++	 * Get the precise set of nullable relids appearing in the expression.
++	 */
++	expr_relids = pull_varnos((Node *) expr);
++	nullable_relids = bms_intersect(nullable_relids, expr_relids);
++
+ 	newem = add_eq_member(newec, copyObject(expr), expr_relids,
+ 						  nullable_relids, false, opcintype);
+ 
+@@ -1171,9 +1171,9 @@ generate_join_implied_equalities(PlannerInfo *root,
+ 	}
+ 
+ 	/*
+-	 * Get all eclasses in common between inner_rel's relids and outer_relids
++	 * Get all eclasses that mention both inner and outer sides of the join
+ 	 */
+-	matching_ecs = get_common_eclass_indexes(root, inner_rel->relids,
++	matching_ecs = get_common_eclass_indexes(root, nominal_inner_relids,
+ 											 outer_relids);
+ 
+ 	i = -1;

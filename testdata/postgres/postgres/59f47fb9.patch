@@ -1,0 +1,433 @@
+From 59f47fb98dab6f4a59bdfdb8825a7560ca8f1cba Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Wed, 20 Sep 2023 12:29:36 +0900
+Subject: [PATCH] unaccent: Add support for quoted translated characters
+
+As reported in bug #18057, the extension unaccent removes in its rule
+file whitespace characters that are intentionally specified when
+building unaccent.rules from UnicodeData.txt, causing an incorrect
+translation for some characters like numeric symbols.  This is caused by
+the fact that all whitespaces before and after the origin and target
+characters are all discarded (this limitation is documented).
+
+This commit makes possible the use of quotes around target characters,
+so as whitespaces can be considered part of target characters.  Some
+target characters use a double quote, these require an extra double
+quote.
+
+The documentation is updated to show how to use quoted areas,
+generate_unaccent_rules.py is updated to generate unaccent.rules and a
+couple of tests are added for numeric symbols.  While working on this
+patch, I have implemented a fake rule file to test the parsing logic
+implemented, which is not included here as it would just consume extra
+cycles in the tests, and it requires the manipulation of an installation
+tree to be able to work correctly.
+
+As this requires a change of format in unaccent.rules, this cannot be
+backpatched, unfortunately.  The idea to use double quotes as escaped
+characters comes from Tom Lane.
+
+Reported-by: Martin Schlossarek
+Author: Michael Paquier
+Discussion: https://postgr.es/m/18057-62712cad01bd202c@postgresql.org
+---
+ contrib/unaccent/expected/unaccent.out      | 36 +++++++++
+ contrib/unaccent/generate_unaccent_rules.py |  4 +
+ contrib/unaccent/sql/unaccent.sql           |  6 ++
+ contrib/unaccent/unaccent.c                 | 86 ++++++++++++++++++---
+ contrib/unaccent/unaccent.rules             | 56 +++++++-------
+ doc/src/sgml/unaccent.sgml                  | 16 ++++
+ 6 files changed, 166 insertions(+), 38 deletions(-)
+
+diff --git a/contrib/unaccent/expected/unaccent.out b/contrib/unaccent/expected/unaccent.out
+index f080707c4acd..d03374c799a4 100644
+--- a/contrib/unaccent/expected/unaccent.out
++++ b/contrib/unaccent/expected/unaccent.out
+@@ -51,6 +51,18 @@ SELECT unaccent('℗'); -- sound recording copyright
+  (P)
+ (1 row)
+ 
++SELECT unaccent('1½'); -- math expression with whitespace
++ unaccent 
++----------
++ 1 1/2
++(1 row)
++
++SELECT unaccent('〝'); -- quote
++ unaccent 
++----------
++ "
++(1 row)
++
+ SELECT unaccent('unaccent', 'foobar');
+  unaccent 
+ ----------
+@@ -93,6 +105,18 @@ SELECT unaccent('unaccent', '℗');
+  (P)
+ (1 row)
+ 
++SELECT unaccent('unaccent', '1½');
++ unaccent 
++----------
++ 1 1/2
++(1 row)
++
++SELECT unaccent('unaccent', '〝');
++ unaccent 
++----------
++ "
++(1 row)
++
+ SELECT ts_lexize('unaccent', 'foobar');
+  ts_lexize 
+ -----------
+@@ -135,6 +159,18 @@ SELECT ts_lexize('unaccent', '℗');
+  {(P)}
+ (1 row)
+ 
++SELECT ts_lexize('unaccent', '1½');
++ ts_lexize 
++-----------
++ {"1 1/2"}
++(1 row)
++
++SELECT ts_lexize('unaccent', '〝');
++ ts_lexize 
++-----------
++ {"\""}
++(1 row)
++
+ -- Controversial case.  Black-Letter Capital H (U+210C) is translated by
+ -- Latin-ASCII.xml as 'x', but it should be 'H'.
+ SELECT unaccent('ℌ');
+diff --git a/contrib/unaccent/generate_unaccent_rules.py b/contrib/unaccent/generate_unaccent_rules.py
+index b4b4c38bebe9..cffb7db7cee1 100644
+--- a/contrib/unaccent/generate_unaccent_rules.py
++++ b/contrib/unaccent/generate_unaccent_rules.py
+@@ -58,6 +58,10 @@
+ 
+ def print_record(codepoint, letter):
+     if letter:
++        # If the letter has whitespace or double quotes, escape double
++        # quotes and apply more quotes around it.
++        if (' ' in letter) or ('"' in letter):
++            letter = '"' + letter.replace('"', '""') + '"'
+         output = chr(codepoint) + "\t" + letter
+     else:
+         output = chr(codepoint)
+diff --git a/contrib/unaccent/sql/unaccent.sql b/contrib/unaccent/sql/unaccent.sql
+index 663646c1ac43..70c7f1c0a094 100644
+--- a/contrib/unaccent/sql/unaccent.sql
++++ b/contrib/unaccent/sql/unaccent.sql
+@@ -20,6 +20,8 @@ SELECT unaccent('˃˖˗˜');
+ SELECT unaccent('À');  -- Remove combining diacritical 0x0300
+ SELECT unaccent('℃℉'); -- degree signs
+ SELECT unaccent('℗'); -- sound recording copyright
++SELECT unaccent('1½'); -- math expression with whitespace
++SELECT unaccent('〝'); -- quote
+ 
+ SELECT unaccent('unaccent', 'foobar');
+ SELECT unaccent('unaccent', 'ёлка');
+@@ -28,6 +30,8 @@ SELECT unaccent('unaccent', '˃˖˗˜');
+ SELECT unaccent('unaccent', 'À');
+ SELECT unaccent('unaccent', '℃℉');
+ SELECT unaccent('unaccent', '℗');
++SELECT unaccent('unaccent', '1½');
++SELECT unaccent('unaccent', '〝');
+ 
+ SELECT ts_lexize('unaccent', 'foobar');
+ SELECT ts_lexize('unaccent', 'ёлка');
+@@ -36,6 +40,8 @@ SELECT ts_lexize('unaccent', '˃˖˗˜');
+ SELECT ts_lexize('unaccent', 'À');
+ SELECT ts_lexize('unaccent', '℃℉');
+ SELECT ts_lexize('unaccent', '℗');
++SELECT ts_lexize('unaccent', '1½');
++SELECT ts_lexize('unaccent', '〝');
+ 
+ -- Controversial case.  Black-Letter Capital H (U+210C) is translated by
+ -- Latin-ASCII.xml as 'x', but it should be 'H'.
+diff --git a/contrib/unaccent/unaccent.c b/contrib/unaccent/unaccent.c
+index 64c879e5470f..5635f042145d 100644
+--- a/contrib/unaccent/unaccent.c
++++ b/contrib/unaccent/unaccent.c
+@@ -127,24 +127,30 @@ initTrie(const char *filename)
+ 				 * src and trg are sequences of one or more non-whitespace
+ 				 * characters, separated by whitespace.  Whitespace at start
+ 				 * or end of line is ignored.  If trg is omitted, an empty
+-				 * string is used as the replacement.
++				 * string is used as the replacement.  trg can be optionally
++				 * quoted, in which case whitespaces are included in it.
+ 				 *
+ 				 * We use a simple state machine, with states
+ 				 *	0	initial (before src)
+ 				 *	1	in src
+ 				 *	2	in whitespace after src
+-				 *	3	in trg
+-				 *	4	in whitespace after trg
+-				 *	-1	syntax error detected
++				 *	3	in trg (non-quoted)
++				 *	4	in trg (quoted)
++				 *	5	in whitespace after trg
++				 *	-1	syntax error detected (two strings)
++				 *	-2	syntax error detected (unfinished quoted string)
+ 				 *----------
+ 				 */
+ 				int			state;
+ 				char	   *ptr;
+ 				char	   *src = NULL;
+ 				char	   *trg = NULL;
++				char	   *trgstore = NULL;
+ 				int			ptrlen;
+ 				int			srclen = 0;
+ 				int			trglen = 0;
++				int			trgstorelen = 0;
++				bool		trgquoted = false;
+ 
+ 				state = 0;
+ 				for (ptr = line; *ptr; ptr += ptrlen)
+@@ -156,8 +162,10 @@ initTrie(const char *filename)
+ 						if (state == 1)
+ 							state = 2;
+ 						else if (state == 3)
+-							state = 4;
+-						continue;
++							state = 5;
++						/* whitespaces are OK in quoted area */
++						if (state != 4)
++							continue;
+ 					}
+ 					switch (state)
+ 					{
+@@ -173,13 +181,40 @@ initTrie(const char *filename)
+ 							break;
+ 						case 2:
+ 							/* start of trg */
++							if (*ptr == '"')
++							{
++								trgquoted = true;
++								state = 4;
++							}
++							else
++								state = 3;
++
+ 							trg = ptr;
+ 							trglen = ptrlen;
+-							state = 3;
+ 							break;
+ 						case 3:
+-							/* continue trg */
++							/* continue non-quoted trg */
++							trglen += ptrlen;
++							break;
++						case 4:
++							/* continue quoted trg */
+ 							trglen += ptrlen;
++
++							/*
++							 * If this is a quote, consider it as the end of
++							 * trg except if the follow-up character is itself
++							 * a quote.
++							 */
++							if (*ptr == '"')
++							{
++								if (*(ptr + 1) == '"')
++								{
++									ptr++;
++									trglen += 1;
++								}
++								else
++									state = 5;
++							}
+ 							break;
+ 						default:
+ 							/* bogus line format */
+@@ -195,15 +230,46 @@ initTrie(const char *filename)
+ 					trglen = 0;
+ 				}
+ 
++				/* If still in a quoted area, fallback to an error */
++				if (state == 4)
++					state = -2;
++
++				/* If trg was quoted, remove its quotes and unescape it */
++				if (trgquoted && state > 0)
++				{
++					/* Ignore first and end quotes */
++					trgstore = palloc0(sizeof(char *) * trglen - 2);
++					trgstorelen = 0;
++					for (int i = 1; i < trglen - 1; i++)
++					{
++						trgstore[trgstorelen] = trg[i];
++						trgstorelen++;
++						/* skip second double quotes */
++						if (trg[i] == '"' && trg[i + 1] == '"')
++							i++;
++					}
++				}
++				else
++				{
++					trgstore = palloc0(sizeof(char *) * trglen);
++					trgstorelen = trglen;
++					memcpy(trgstore, trg, trgstorelen);
++				}
++
+ 				if (state > 0)
+ 					rootTrie = placeChar(rootTrie,
+ 										 (unsigned char *) src, srclen,
+-										 trg, trglen);
+-				else if (state < 0)
++										 trgstore, trgstorelen);
++				else if (state == -1)
+ 					ereport(WARNING,
+ 							(errcode(ERRCODE_CONFIG_FILE_ERROR),
+ 							 errmsg("invalid syntax: more than two strings in unaccent rule")));
++				else if (state == -2)
++					ereport(WARNING,
++							(errcode(ERRCODE_CONFIG_FILE_ERROR),
++							 errmsg("invalid syntax: unfinished quoted string in unaccent rule")));
+ 
++				pfree(trgstore);
+ 				pfree(line);
+ 			}
+ 			skip = false;
+diff --git a/contrib/unaccent/unaccent.rules b/contrib/unaccent/unaccent.rules
+index 3030166ed67f..ca6caa51f521 100644
+--- a/contrib/unaccent/unaccent.rules
++++ b/contrib/unaccent/unaccent.rules
+@@ -5,9 +5,9 @@
+ ®	(R)
+ ±	+/-
+ »	>>
+-¼	 1/4
+-½	 1/2
+-¾	 3/4
++¼	" 1/4"
++½	" 1/2"
++¾	" 3/4"
+ ¿	?
+ À	A
+ Á	A
+@@ -403,7 +403,7 @@
+ ʪ	ls
+ ʫ	lz
+ ʹ	'
+-ʺ	"
++ʺ	""""
+ ʻ	'
+ ʼ	'
+ ʽ	'
+@@ -1058,15 +1058,15 @@
+ ’	'
+ ‚	,
+ ‛	'
+-“	"
+-”	"
++“	""""
++”	""""
+ „	,,
+-‟	"
++‟	""""
+ ․	.
+ ‥	..
+ …	...
+ ′	'
+-″	"
++″	""""
+ ‹	<
+ ›	>
+ ‼	!!
+@@ -1134,22 +1134,22 @@
+ ⅇ	e
+ ⅈ	i
+ ⅉ	j
+-⅐	 1/7
+-⅑	 1/9
+-⅒	 1/10
+-⅓	 1/3
+-⅔	 2/3
+-⅕	 1/5
+-⅖	 2/5
+-⅗	 3/5
+-⅘	 4/5
+-⅙	 1/6
+-⅚	 5/6
+-⅛	 1/8
+-⅜	 3/8
+-⅝	 5/8
+-⅞	 7/8
+-⅟	 1/
++⅐	" 1/7"
++⅑	" 1/9"
++⅒	" 1/10"
++⅓	" 1/3"
++⅔	" 2/3"
++⅕	" 1/5"
++⅖	" 2/5"
++⅗	" 3/5"
++⅘	" 4/5"
++⅙	" 1/6"
++⅚	" 5/6"
++⅛	" 1/8"
++⅜	" 3/8"
++⅝	" 5/8"
++⅞	" 7/8"
++⅟	" 1/"
+ Ⅰ	I
+ Ⅱ	II
+ Ⅲ	III
+@@ -1182,7 +1182,7 @@
+ ⅽ	c
+ ⅾ	d
+ ⅿ	m
+-↉	 0/3
++↉	" 0/3"
+ −	-
+ ∕	/
+ ∖	\
+@@ -1296,8 +1296,8 @@
+ 〙	]
+ 〚	[
+ 〛	]
+-〝	"
+-〞	"
++〝	""""
++〞	""""
+ ㍱	hPa
+ ㍲	da
+ ㍳	AU
+@@ -1512,7 +1512,7 @@
+ ﹪	%
+ ﹫	@
+ ！	!
+-＂	"
++＂	""""
+ ＃	#
+ ＄	$
+ ％	%
+diff --git a/doc/src/sgml/unaccent.sgml b/doc/src/sgml/unaccent.sgml
+index f3ddc64bbcbe..94100ed26091 100644
+--- a/doc/src/sgml/unaccent.sgml
++++ b/doc/src/sgml/unaccent.sgml
+@@ -84,6 +84,22 @@
+     </para>
+    </listitem>
+ 
++   <listitem>
++    <para>
++     Some characters, like numeric symbols, may require whitespaces in their
++     translation rule. It is possible to use double quotes around the translated
++     characters in this case. A double quote needs to be escaped with a second
++     double quote when including one in the translated character. For example:
++<programlisting>
++&frac14;      " 1/4"
++&frac12;      " 1/2"
++&frac34;      " 3/4"
++&ldquo;       """"
++&rdquo;       """"
++</programlisting>
++    </para>
++   </listitem>
++
+    <listitem>
+     <para>
+      As with other <productname>PostgreSQL</productname> text search configuration files,

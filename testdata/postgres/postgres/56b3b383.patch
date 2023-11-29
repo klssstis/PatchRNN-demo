@@ -1,0 +1,102 @@
+From 56b3b3838284f53c83556592e60688522155f57f Mon Sep 17 00:00:00 2001
+From: David Rowley <drowley@postgresql.org>
+Date: Wed, 5 Jun 2019 18:28:38 +1200
+Subject: [PATCH] Fix incorrect index behavior in COPY FROM with partitioned
+ tables
+
+86b85044e rewrote how COPY FROM works to allow multiple tuple buffers to
+exist to once thus allowing multi-inserts to be used in more cases with
+partitioned tables.  That commit neglected to update the estate's
+es_result_relation_info when flushing the insert buffer to the partition
+making it possible for the index tuples to be added into an index on the
+wrong partition.
+
+Fix this and also add an Assert in ExecInsertIndexTuples to help ensure
+that we never make this mistake again.
+
+Reported-by: Haruka Takatsuka
+Author: Ashutosh Sharma
+Discussion: https://postgr.es/m/15832-b1bf336a4ee246b5@postgresql.org
+---
+ src/backend/commands/copy.c         |  3 +++
+ src/backend/executor/execIndexing.c |  3 +++
+ src/test/regress/input/copy.source  | 13 +++++++++++++
+ src/test/regress/output/copy.source | 17 +++++++++++++++++
+ 4 files changed, 36 insertions(+)
+
+diff --git a/src/backend/commands/copy.c b/src/backend/commands/copy.c
+index eca0be1ff96d..2593732c16e1 100644
+--- a/src/backend/commands/copy.c
++++ b/src/backend/commands/copy.c
+@@ -2446,6 +2446,9 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
+ 	ResultRelInfo *resultRelInfo = buffer->resultRelInfo;
+ 	TupleTableSlot **slots = buffer->slots;
+ 
++	/* Set es_result_relation_info to the ResultRelInfo we're flushing. */
++	estate->es_result_relation_info = resultRelInfo;
++
+ 	/*
+ 	 * Print error context information correctly, if one of the operations
+ 	 * below fail.
+diff --git a/src/backend/executor/execIndexing.c b/src/backend/executor/execIndexing.c
+index c41c5f45e7e5..40bd8049f05e 100644
+--- a/src/backend/executor/execIndexing.c
++++ b/src/backend/executor/execIndexing.c
+@@ -299,6 +299,9 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
+ 	indexInfoArray = resultRelInfo->ri_IndexRelationInfo;
+ 	heapRelation = resultRelInfo->ri_RelationDesc;
+ 
++	/* Sanity check: slot must belong to the same rel as the resultRelInfo. */
++	Assert(slot->tts_tableOid == RelationGetRelid(heapRelation));
++
+ 	/*
+ 	 * We will use the EState's per-tuple context for evaluating predicates
+ 	 * and index expressions (creating it if it's not already there).
+diff --git a/src/test/regress/input/copy.source b/src/test/regress/input/copy.source
+index aefc99167afe..a1d529ad367d 100644
+--- a/src/test/regress/input/copy.source
++++ b/src/test/regress/input/copy.source
+@@ -187,4 +187,17 @@ copy parted_copytest from '@abs_builddir@/results/parted_copytest.csv';
+ select tableoid::regclass,count(*),sum(a) from parted_copytest
+ group by tableoid order by tableoid::regclass::name;
+ 
++truncate table parted_copytest;
++create index on parted_copytest (b);
++drop trigger part_ins_trig on parted_copytest_a2;
++
++copy parted_copytest from stdin;
++1	1	str1
++2	2	str2
++\.
++
++-- Ensure index entries were properly added during the copy.
++select * from parted_copytest where b = 1;
++select * from parted_copytest where b = 2;
++
+ drop table parted_copytest;
+diff --git a/src/test/regress/output/copy.source b/src/test/regress/output/copy.source
+index cf716aeccaa8..938d3551da26 100644
+--- a/src/test/regress/output/copy.source
++++ b/src/test/regress/output/copy.source
+@@ -147,4 +147,21 @@ group by tableoid order by tableoid::regclass::name;
+  parted_copytest_a2 |    10 |  10055
+ (2 rows)
+ 
++truncate table parted_copytest;
++create index on parted_copytest (b);
++drop trigger part_ins_trig on parted_copytest_a2;
++copy parted_copytest from stdin;
++-- Ensure index entries were properly added during the copy.
++select * from parted_copytest where b = 1;
++ a | b |  c   
++---+---+------
++ 1 | 1 | str1
++(1 row)
++
++select * from parted_copytest where b = 2;
++ a | b |  c   
++---+---+------
++ 2 | 2 | str2
++(1 row)
++
+ drop table parted_copytest;

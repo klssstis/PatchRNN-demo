@@ -1,0 +1,59 @@
+From 063dd37ebc7644e8db6419565b50dca019e69e86 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 22 Mar 2021 14:01:20 -0400
+Subject: [PATCH] Short-circuit slice requests that are for more than the
+ object's size.
+
+substring(), and perhaps other callers, isn't careful to pass a
+slice length that is no more than the datum's true size.  Since
+toast_decompress_datum_slice's children will palloc the requested
+slice length, this can waste memory.  Also, close study of the liblz4
+documentation suggests that it is dependent on the caller to not ask
+for more than the correct amount of decompressed data; this squares
+with observed misbehavior with liblz4 1.8.3.  Avoid these problems
+by switching to the normal full-decompression code path if the
+slice request is >= datum's decompressed size.
+
+Tom Lane and Dilip Kumar
+
+Discussion: https://postgr.es/m/507597.1616370729@sss.pgh.pa.us
+---
+ src/backend/access/common/detoast.c  | 11 +++++++++++
+ src/include/access/toast_internals.h |  2 ++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/src/backend/access/common/detoast.c b/src/backend/access/common/detoast.c
+index a7f7a4747821..545a6b8867a8 100644
+--- a/src/backend/access/common/detoast.c
++++ b/src/backend/access/common/detoast.c
+@@ -506,6 +506,17 @@ toast_decompress_datum_slice(struct varlena *attr, int32 slicelength)
+ 
+ 	Assert(VARATT_IS_COMPRESSED(attr));
+ 
++	/*
++	 * Some callers may pass a slicelength that's more than the actual
++	 * decompressed size.  If so, just decompress normally.  This avoids
++	 * possibly allocating a larger-than-necessary result object, and may be
++	 * faster and/or more robust as well.  Notably, some versions of liblz4
++	 * have been seen to give wrong results if passed an output size that is
++	 * more than the data's true decompressed size.
++	 */
++	if ((uint32) slicelength >= TOAST_COMPRESS_EXTSIZE(attr))
++		return toast_decompress_datum(attr);
++
+ 	/*
+ 	 * Fetch the compression method id stored in the compression header and
+ 	 * decompress the data slice using the appropriate decompression routine.
+diff --git a/src/include/access/toast_internals.h b/src/include/access/toast_internals.h
+index bf118f04829a..1c28b07c4ddb 100644
+--- a/src/include/access/toast_internals.h
++++ b/src/include/access/toast_internals.h
+@@ -31,6 +31,8 @@ typedef struct toast_compress_header
+  * Utilities for manipulation of header information for compressed
+  * toast entries.
+  */
++#define TOAST_COMPRESS_EXTSIZE(ptr) \
++	(((toast_compress_header *) (ptr))->tcinfo & VARLENA_EXTSIZE_MASK)
+ #define TOAST_COMPRESS_METHOD(ptr) \
+ 	(((toast_compress_header *) (ptr))->tcinfo >> VARLENA_EXTSIZE_BITS)
+ 

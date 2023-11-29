@@ -1,0 +1,313 @@
+From 55ed3defc966cf718fe1e8c0efe964580bb23351 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Wed, 26 Jun 2019 18:38:51 -0400
+Subject: [PATCH] Fix partitioned index creation with foreign partitions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a partitioned tables contains foreign tables as partitions, it is
+not possible to implement unique or primary key indexes -- but when
+regular indexes are created, there is no reason to do anything other
+than ignoring such partitions.  We were raising errors upon encountering
+the foreign partitions, which is unfriendly and doesn't protect against
+any actual problems.
+
+Relax this restriction so that index creation is allowed on partitioned
+tables containing foreign partitions, becoming a no-op on them.  (We may
+later want to redefine this so that the FDW is told to create the
+indexes on the foreign side.)  This applies to CREATE INDEX, as well as
+ALTER TABLE / ATTACH PARTITION and CREATE TABLE / PARTITION OF.
+
+Backpatch to 11, where indexes on partitioned tables were introduced.
+
+Discussion: https://postgr.es/m/15724-d5a58fa9472eef4f@postgresql.org
+Author: Álvaro Herrera
+Reviewed-by: Amit Langote
+---
+ doc/src/sgml/ref/alter_table.sgml          |  2 +-
+ doc/src/sgml/ref/create_foreign_table.sgml |  4 +-
+ src/backend/commands/indexcmds.c           | 20 ++++++++
+ src/backend/commands/tablecmds.c           | 45 +++++++++++++++++
+ src/backend/tcop/utility.c                 | 12 +++--
+ src/test/regress/expected/foreign_data.out | 56 +++++++++++++++++++++-
+ src/test/regress/sql/foreign_data.sql      | 42 +++++++++++++++-
+ 7 files changed, 172 insertions(+), 9 deletions(-)
+
+diff --git a/doc/src/sgml/ref/alter_table.sgml b/doc/src/sgml/ref/alter_table.sgml
+index f5ad7659f72d..90bf19564c68 100644
+--- a/doc/src/sgml/ref/alter_table.sgml
++++ b/doc/src/sgml/ref/alter_table.sgml
+@@ -845,7 +845,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
+       as if <command>ALTER INDEX ATTACH PARTITION</command> had been executed.
+       Note that if the existing table is a foreign table, it is currently not
+       allowed to attach the table as a partition of the target table if there
+-      are indexes on the target table.  (See also
++      are <literal>UNIQUE</literal> indexes on the target table.  (See also
+       <xref linkend="sql-createforeigntable"/>.)
+      </para>
+ 
+diff --git a/doc/src/sgml/ref/create_foreign_table.sgml b/doc/src/sgml/ref/create_foreign_table.sgml
+index 25d2f09ed20e..9d266f272a7e 100644
+--- a/doc/src/sgml/ref/create_foreign_table.sgml
++++ b/doc/src/sgml/ref/create_foreign_table.sgml
+@@ -170,8 +170,8 @@ CHECK ( <replaceable class="parameter">expression</replaceable> ) [ NO INHERIT ]
+       See the similar form of
+       <xref linkend="sql-createtable"/> for more details.
+       Note that it is currently not allowed to create the foreign table as a
+-      partition of the parent table if there are indexes on the parent table.
+-      (See also
++      partition of the parent table if there are <literal>UNIQUE</literal>
++      indexes on the parent table.  (See also
+       <link linkend="sql-altertable"><command>ALTER TABLE ATTACH PARTITION</command></link>.)
+      </para>
+     </listitem>
+diff --git a/src/backend/commands/indexcmds.c b/src/backend/commands/indexcmds.c
+index a3cbeff95008..cdbb56f1a4ab 100644
+--- a/src/backend/commands/indexcmds.c
++++ b/src/backend/commands/indexcmds.c
+@@ -1085,6 +1085,26 @@ DefineIndex(Oid relationId,
+ 				int			maplen;
+ 
+ 				childrel = table_open(childRelid, lockmode);
++
++				/*
++				 * Don't try to create indexes on foreign tables, though.
++				 * Skip those if a regular index, or fail if trying to create
++				 * a constraint index.
++				 */
++				if (childrel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
++				{
++					if (stmt->unique || stmt->primary)
++						ereport(ERROR,
++								(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++								 errmsg("cannot create unique index on partitioned table \"%s\"",
++										RelationGetRelationName(rel)),
++								 errdetail("Table \"%s\" contains partitions that are foreign tables.",
++										RelationGetRelationName(rel))));
++
++					table_close(childrel, lockmode);
++					continue;
++				}
++
+ 				childidxs = RelationGetIndexList(childrel);
+ 				attmap =
+ 					convert_tuples_by_name_map(RelationGetDescr(childrel),
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index ba59fc708a99..7dcd634a1aea 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -1069,6 +1069,22 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+ 			IndexStmt  *idxstmt;
+ 			Oid			constraintOid;
+ 
++			if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
++			{
++				if (idxRel->rd_index->indisunique)
++					ereport(ERROR,
++							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++							 errmsg("cannot create foreign partition of partitioned table \"%s\"",
++									RelationGetRelationName(parent)),
++							 errdetail("Table \"%s\" contains indexes that are unique.",
++									RelationGetRelationName(parent))));
++				else
++				{
++					index_close(idxRel, AccessShareLock);
++					continue;
++				}
++			}
++
+ 			attmap = convert_tuples_by_name_map(RelationGetDescr(rel),
+ 												RelationGetDescr(parent),
+ 												gettext_noop("could not convert row type"));
+@@ -15722,6 +15738,34 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
+ 		i++;
+ 	}
+ 
++	/*
++	 * If we're attaching a foreign table, we must fail if any of the indexes
++	 * is a constraint index; otherwise, there's nothing to do here.  Do this
++	 * before starting work, to avoid wasting the effort of building a few
++	 * non-unique indexes before coming across a unique one.
++	 */
++	if (attachrel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
++	{
++		foreach(cell, idxes)
++		{
++			Oid			idx = lfirst_oid(cell);
++			Relation	idxRel = index_open(idx, AccessShareLock);
++
++			if (idxRel->rd_index->indisunique ||
++				idxRel->rd_index->indisprimary)
++				ereport(ERROR,
++						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++						 errmsg("cannot attach foreign table \"%s\" as partition of partitioned table \"%s\"",
++								RelationGetRelationName(attachrel),
++								RelationGetRelationName(rel)),
++						 errdetail("Table \"%s\" contains unique indexes.",
++								   RelationGetRelationName(rel))));
++			index_close(idxRel, AccessShareLock);
++		}
++
++		goto out;
++	}
++
+ 	/*
+ 	 * For each index on the partitioned table, find a matching one in the
+ 	 * partition-to-be; if one is not found, create one.
+@@ -15824,6 +15868,7 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
+ 		index_close(idxRel, AccessShareLock);
+ 	}
+ 
++out:
+ 	/* Clean up. */
+ 	for (i = 0; i < list_length(attachRelIdxs); i++)
+ 		index_close(attachrelIdxRels[i], AccessShareLock);
+diff --git a/src/backend/tcop/utility.c b/src/backend/tcop/utility.c
+index 9578b5c7619b..05ec7f3ac617 100644
+--- a/src/backend/tcop/utility.c
++++ b/src/backend/tcop/utility.c
+@@ -1347,10 +1347,16 @@ ProcessUtilitySlow(ParseState *pstate,
+ 
+ 							if (relkind != RELKIND_RELATION &&
+ 								relkind != RELKIND_MATVIEW &&
+-								relkind != RELKIND_PARTITIONED_TABLE)
++								relkind != RELKIND_PARTITIONED_TABLE &&
++								relkind != RELKIND_FOREIGN_TABLE)
++								elog(ERROR, "unexpected relkind \"%c\" on partition \"%s\"",
++									 relkind, stmt->relation->relname);
++
++							if (relkind == RELKIND_FOREIGN_TABLE &&
++								(stmt->unique || stmt->primary))
+ 								ereport(ERROR,
+-										(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+-										 errmsg("cannot create index on partitioned table \"%s\"",
++										(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++										 errmsg("cannot create unique index on partitioned table \"%s\"",
+ 												stmt->relation->relname),
+ 										 errdetail("Table \"%s\" contains partitions that are foreign tables.",
+ 												   stmt->relation->relname)));
+diff --git a/src/test/regress/expected/foreign_data.out b/src/test/regress/expected/foreign_data.out
+index c81e4bda8075..b9e25820bc02 100644
+--- a/src/test/regress/expected/foreign_data.out
++++ b/src/test/regress/expected/foreign_data.out
+@@ -748,10 +748,62 @@ ERROR:  foreign-data wrapper "dummy" has no handler
+ CREATE TABLE lt1 (a INT) PARTITION BY RANGE (a);
+ CREATE FOREIGN TABLE ft_part1
+   PARTITION OF lt1 FOR VALUES FROM (0) TO (1000) SERVER s0;
+-CREATE INDEX ON lt1 (a);                                        -- ERROR
+-ERROR:  cannot create index on partitioned table "lt1"
++CREATE INDEX ON lt1 (a);                              -- skips partition
++CREATE UNIQUE INDEX ON lt1 (a);                                 -- ERROR
++ERROR:  cannot create unique index on partitioned table "lt1"
+ DETAIL:  Table "lt1" contains partitions that are foreign tables.
++ALTER TABLE lt1 ADD PRIMARY KEY (a);                            -- ERROR
++ERROR:  cannot create unique index on partitioned table "lt1"
++DETAIL:  Table "lt1" contains partitions that are foreign tables.
++DROP TABLE lt1;
++CREATE TABLE lt1 (a INT) PARTITION BY RANGE (a);
++CREATE INDEX ON lt1 (a);
++CREATE FOREIGN TABLE ft_part1
++  PARTITION OF lt1 FOR VALUES FROM (0) TO (1000) SERVER s0;
++CREATE FOREIGN TABLE ft_part2 (a INT) SERVER s0;
++ALTER TABLE lt1 ATTACH PARTITION ft_part2 FOR VALUES FROM (1000) TO (2000);
++DROP FOREIGN TABLE ft_part1, ft_part2;
++CREATE UNIQUE INDEX ON lt1 (a);
++ALTER TABLE lt1 ADD PRIMARY KEY (a);
++CREATE FOREIGN TABLE ft_part1
++  PARTITION OF lt1 FOR VALUES FROM (0) TO (1000) SERVER s0;     -- ERROR
++ERROR:  cannot create foreign partition of partitioned table "lt1"
++DETAIL:  Table "lt1" contains indexes that are unique.
++CREATE FOREIGN TABLE ft_part2 (a INT NOT NULL) SERVER s0;
++ALTER TABLE lt1 ATTACH PARTITION ft_part2
++  FOR VALUES FROM (1000) TO (2000);                             -- ERROR
++ERROR:  cannot attach foreign table "ft_part2" as partition of partitioned table "lt1"
++DETAIL:  Table "lt1" contains unique indexes.
++DROP TABLE lt1;
++DROP FOREIGN TABLE ft_part2;
++CREATE TABLE lt1 (a INT) PARTITION BY RANGE (a);
++CREATE INDEX ON lt1 (a);
++CREATE TABLE lt1_part1
++  PARTITION OF lt1 FOR VALUES FROM (0) TO (1000)
++  PARTITION BY RANGE (a);
++CREATE FOREIGN TABLE ft_part_1_1
++  PARTITION OF lt1_part1 FOR VALUES FROM (0) TO (100) SERVER s0;
++CREATE FOREIGN TABLE ft_part_1_2 (a INT) SERVER s0;
++ALTER TABLE lt1_part1 ATTACH PARTITION ft_part_1_2 FOR VALUES FROM (100) TO (200);
++CREATE UNIQUE INDEX ON lt1 (a);
++ERROR:  cannot create unique index on partitioned table "lt1"
++DETAIL:  Table "lt1" contains partitions that are foreign tables.
++ALTER TABLE lt1 ADD PRIMARY KEY (a);
++ERROR:  cannot create unique index on partitioned table "lt1_part1"
++DETAIL:  Table "lt1_part1" contains partitions that are foreign tables.
++DROP FOREIGN TABLE ft_part_1_1, ft_part_1_2;
++CREATE UNIQUE INDEX ON lt1 (a);
++ALTER TABLE lt1 ADD PRIMARY KEY (a);
++CREATE FOREIGN TABLE ft_part_1_1
++  PARTITION OF lt1_part1 FOR VALUES FROM (0) TO (100) SERVER s0;
++ERROR:  cannot create foreign partition of partitioned table "lt1_part1"
++DETAIL:  Table "lt1_part1" contains indexes that are unique.
++CREATE FOREIGN TABLE ft_part_1_2 (a INT NOT NULL) SERVER s0;
++ALTER TABLE lt1_part1 ATTACH PARTITION ft_part_1_2 FOR VALUES FROM (100) TO (200);
++ERROR:  cannot attach foreign table "ft_part_1_2" as partition of partitioned table "lt1_part1"
++DETAIL:  Table "lt1_part1" contains unique indexes.
+ DROP TABLE lt1;
++DROP FOREIGN TABLE ft_part_1_2;
+ -- ALTER FOREIGN TABLE
+ COMMENT ON FOREIGN TABLE ft1 IS 'foreign table';
+ COMMENT ON FOREIGN TABLE ft1 IS NULL;
+diff --git a/src/test/regress/sql/foreign_data.sql b/src/test/regress/sql/foreign_data.sql
+index c646ed915268..73f9f621d8ff 100644
+--- a/src/test/regress/sql/foreign_data.sql
++++ b/src/test/regress/sql/foreign_data.sql
+@@ -318,9 +318,49 @@ EXPLAIN SELECT * FROM ft1;                                      -- ERROR
+ CREATE TABLE lt1 (a INT) PARTITION BY RANGE (a);
+ CREATE FOREIGN TABLE ft_part1
+   PARTITION OF lt1 FOR VALUES FROM (0) TO (1000) SERVER s0;
+-CREATE INDEX ON lt1 (a);                                        -- ERROR
++CREATE INDEX ON lt1 (a);                              -- skips partition
++CREATE UNIQUE INDEX ON lt1 (a);                                 -- ERROR
++ALTER TABLE lt1 ADD PRIMARY KEY (a);                            -- ERROR
+ DROP TABLE lt1;
+ 
++CREATE TABLE lt1 (a INT) PARTITION BY RANGE (a);
++CREATE INDEX ON lt1 (a);
++CREATE FOREIGN TABLE ft_part1
++  PARTITION OF lt1 FOR VALUES FROM (0) TO (1000) SERVER s0;
++CREATE FOREIGN TABLE ft_part2 (a INT) SERVER s0;
++ALTER TABLE lt1 ATTACH PARTITION ft_part2 FOR VALUES FROM (1000) TO (2000);
++DROP FOREIGN TABLE ft_part1, ft_part2;
++CREATE UNIQUE INDEX ON lt1 (a);
++ALTER TABLE lt1 ADD PRIMARY KEY (a);
++CREATE FOREIGN TABLE ft_part1
++  PARTITION OF lt1 FOR VALUES FROM (0) TO (1000) SERVER s0;     -- ERROR
++CREATE FOREIGN TABLE ft_part2 (a INT NOT NULL) SERVER s0;
++ALTER TABLE lt1 ATTACH PARTITION ft_part2
++  FOR VALUES FROM (1000) TO (2000);                             -- ERROR
++DROP TABLE lt1;
++DROP FOREIGN TABLE ft_part2;
++
++CREATE TABLE lt1 (a INT) PARTITION BY RANGE (a);
++CREATE INDEX ON lt1 (a);
++CREATE TABLE lt1_part1
++  PARTITION OF lt1 FOR VALUES FROM (0) TO (1000)
++  PARTITION BY RANGE (a);
++CREATE FOREIGN TABLE ft_part_1_1
++  PARTITION OF lt1_part1 FOR VALUES FROM (0) TO (100) SERVER s0;
++CREATE FOREIGN TABLE ft_part_1_2 (a INT) SERVER s0;
++ALTER TABLE lt1_part1 ATTACH PARTITION ft_part_1_2 FOR VALUES FROM (100) TO (200);
++CREATE UNIQUE INDEX ON lt1 (a);
++ALTER TABLE lt1 ADD PRIMARY KEY (a);
++DROP FOREIGN TABLE ft_part_1_1, ft_part_1_2;
++CREATE UNIQUE INDEX ON lt1 (a);
++ALTER TABLE lt1 ADD PRIMARY KEY (a);
++CREATE FOREIGN TABLE ft_part_1_1
++  PARTITION OF lt1_part1 FOR VALUES FROM (0) TO (100) SERVER s0;
++CREATE FOREIGN TABLE ft_part_1_2 (a INT NOT NULL) SERVER s0;
++ALTER TABLE lt1_part1 ATTACH PARTITION ft_part_1_2 FOR VALUES FROM (100) TO (200);
++DROP TABLE lt1;
++DROP FOREIGN TABLE ft_part_1_2;
++
+ -- ALTER FOREIGN TABLE
+ COMMENT ON FOREIGN TABLE ft1 IS 'foreign table';
+ COMMENT ON FOREIGN TABLE ft1 IS NULL;

@@ -1,0 +1,650 @@
+From 56d0ed3b756b2e3799a7bbc0ac89bc7657ca2c33 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 22 Nov 2022 18:46:31 -0500
+Subject: [PATCH] Give better hints for ambiguous or unreferenceable columns.
+
+Examine ParseNamespaceItem flags to detect whether a column name
+is unreferenceable for lack of LATERAL, or could be referenced if
+a qualified name were used, and give better hints for such cases.
+Also, don't phrase the message to imply that there's only one
+matching column when there is really more than one.
+
+Many of the regression test output changes are not very interesting,
+but just reflect reclassifying the "There is a column ... but it
+cannot be referenced from this part of the query" messages as DETAIL
+rather than HINT.  They are details per our style guide, in the sense
+of being factual rather than offering advice; and this change provides
+room to offer actual HINTs about what to do.
+
+While here, adjust the fuzzy-name-matching code to be a shade less
+impenetrable.  It was overloading the meanings of FuzzyAttrMatchState
+fields way too much IMO, so splitting them into multiple fields seems
+to make it clearer.  It's not like we need to shave bytes in that
+struct.
+
+Per discussion of bug #17233 from Alexander Korolev.
+
+Discussion: https://postgr.es/m/17233-afb9d806aaa64b17@postgresql.org
+---
+ src/backend/parser/parse_relation.c           | 291 ++++++++++++------
+ src/test/regress/expected/insert_conflict.out |   2 +-
+ src/test/regress/expected/join.out            |  31 +-
+ src/test/regress/expected/merge.out           |   8 +-
+ src/test/regress/expected/rules.out           |   3 +-
+ src/test/regress/expected/union.out           |   2 +-
+ src/test/regress/sql/join.sql                 |   2 +
+ 7 files changed, 233 insertions(+), 106 deletions(-)
+
+diff --git a/src/backend/parser/parse_relation.c b/src/backend/parser/parse_relation.c
+index 81f9ae2f024d..4665f0b2b7cb 100644
+--- a/src/backend/parser/parse_relation.c
++++ b/src/backend/parser/parse_relation.c
+@@ -41,17 +41,35 @@
+ /*
+  * Support for fuzzily matching columns.
+  *
+- * This is for building diagnostic messages, where non-exact matching
+- * attributes are suggested to the user.  The struct's fields may be facets of
+- * a particular RTE, or of an entire range table, depending on context.
++ * This is for building diagnostic messages, where multiple or non-exact
++ * matching attributes are of interest.
++ *
++ * "distance" is the current best fuzzy-match distance if rfirst isn't NULL,
++ * otherwise it is the maximum acceptable distance plus 1.
++ *
++ * rfirst/first record the closest non-exact match so far, and distance
++ * is its distance from the target name.  If we have found a second non-exact
++ * match of exactly the same distance, rsecond/second record that.  (If
++ * we find three of the same distance, we conclude that "distance" is not
++ * a tight enough bound for a useful hint and clear rfirst/rsecond again.
++ * Only if we later find something closer will we re-populate rfirst.)
++ *
++ * rexact1/exact1 record the location of the first exactly-matching column,
++ * if any.  If we find multiple exact matches then rexact2/exact2 record
++ * another one (we don't especially care which).  Currently, these get
++ * populated independently of the fuzzy-match fields.
+  */
+ typedef struct
+ {
+-	int			distance;		/* Weighted distance (lowest so far) */
+-	RangeTblEntry *rfirst;		/* RTE of first */
+-	AttrNumber	first;			/* Closest attribute so far */
+-	RangeTblEntry *rsecond;		/* RTE of second */
+-	AttrNumber	second;			/* Second closest attribute so far */
++	int			distance;		/* Current or limit distance */
++	RangeTblEntry *rfirst;		/* RTE of closest non-exact match, or NULL */
++	AttrNumber	first;			/* Col index in rfirst */
++	RangeTblEntry *rsecond;		/* RTE of another non-exact match w/same dist */
++	AttrNumber	second;			/* Col index in rsecond */
++	RangeTblEntry *rexact1;		/* RTE of first exact match, or NULL */
++	AttrNumber	exact1;			/* Col index in rexact1 */
++	RangeTblEntry *rexact2;		/* RTE of second exact match, or NULL */
++	AttrNumber	exact2;			/* Col index in rexact2 */
+ } FuzzyAttrMatchState;
+ 
+ #define MAX_FUZZY_DISTANCE				3
+@@ -81,6 +99,8 @@ static void expandTupleDesc(TupleDesc tupdesc, Alias *eref,
+ 							int location, bool include_dropped,
+ 							List **colnames, List **colvars);
+ static int	specialAttNum(const char *attname);
++static bool rte_visible_if_lateral(ParseState *pstate, RangeTblEntry *rte);
++static bool rte_visible_if_qualified(ParseState *pstate, RangeTblEntry *rte);
+ static bool isQueryUsingTempRelation_walker(Node *node, void *context);
+ 
+ 
+@@ -610,47 +630,39 @@ updateFuzzyAttrMatchState(int fuzzy_rte_penalty,
+ 	 */
+ 	if (columndistance < fuzzystate->distance)
+ 	{
+-		/* Store new lowest observed distance for RTE */
++		/* Store new lowest observed distance as first/only match */
+ 		fuzzystate->distance = columndistance;
+ 		fuzzystate->rfirst = rte;
+ 		fuzzystate->first = attnum;
+ 		fuzzystate->rsecond = NULL;
+-		fuzzystate->second = InvalidAttrNumber;
+ 	}
+ 	else if (columndistance == fuzzystate->distance)
+ 	{
+-		/*
+-		 * This match distance may equal a prior match within this same range
+-		 * table.  When that happens, the prior match may also be given, but
+-		 * only if there is no more than two equally distant matches from the
+-		 * RTE (in turn, our caller will only accept two equally distant
+-		 * matches overall).
+-		 */
+-		if (AttributeNumberIsValid(fuzzystate->second))
++		/* If we already have a match of this distance, update state */
++		if (fuzzystate->rsecond != NULL)
+ 		{
+-			/* Too many RTE-level matches */
++			/*
++			 * Too many matches at same distance.  Clearly, this value of
++			 * distance is too low a bar, so drop these entries while keeping
++			 * the current distance value, so that only smaller distances will
++			 * be considered interesting.  Only if we find something of lower
++			 * distance will we re-populate rfirst (via the stanza above).
++			 */
+ 			fuzzystate->rfirst = NULL;
+-			fuzzystate->first = InvalidAttrNumber;
+ 			fuzzystate->rsecond = NULL;
+-			fuzzystate->second = InvalidAttrNumber;
+-			/* Clearly, distance is too low a bar (for *any* RTE) */
+-			fuzzystate->distance = columndistance - 1;
+ 		}
+-		else if (AttributeNumberIsValid(fuzzystate->first))
++		else if (fuzzystate->rfirst != NULL)
+ 		{
+-			/* Record as provisional second match for RTE */
++			/* Record as provisional second match */
+ 			fuzzystate->rsecond = rte;
+ 			fuzzystate->second = attnum;
+ 		}
+-		else if (fuzzystate->distance <= MAX_FUZZY_DISTANCE)
++		else
+ 		{
+ 			/*
+-			 * Record as provisional first match (this can occasionally occur
+-			 * because previous lowest distance was "too low a bar", rather
+-			 * than being associated with a real match)
++			 * Do nothing.  When rfirst is NULL, distance is more than what we
++			 * want to consider acceptable, so we should ignore this match.
+ 			 */
+-			fuzzystate->rfirst = rte;
+-			fuzzystate->first = attnum;
+ 		}
+ 	}
+ }
+@@ -923,21 +935,15 @@ colNameToVar(ParseState *pstate, const char *colname, bool localonly,
+  * This is different from colNameToVar in that it considers every entry in
+  * the ParseState's rangetable(s), not only those that are currently visible
+  * in the p_namespace list(s).  This behavior is invalid per the SQL spec,
+- * and it may give ambiguous results (there might be multiple equally valid
+- * matches, but only one will be returned).  This must be used ONLY as a
+- * heuristic in giving suitable error messages.  See errorMissingColumn.
++ * and it may give ambiguous results (since there might be multiple equally
++ * valid matches).  This must be used ONLY as a heuristic in giving suitable
++ * error messages.  See errorMissingColumn.
+  *
+  * This function is also different in that it will consider approximate
+  * matches -- if the user entered an alias/column pair that is only slightly
+  * different from a valid pair, we may be able to infer what they meant to
+- * type and provide a reasonable hint.
+- *
+- * The FuzzyAttrMatchState will have 'rfirst' pointing to the best RTE
+- * containing the most promising match for the alias and column name.  If
+- * the alias and column names match exactly, 'first' will be InvalidAttrNumber;
+- * otherwise, it will be the attribute number for the match.  In the latter
+- * case, 'rsecond' may point to a second, equally close approximate match,
+- * and 'second' will contain the attribute number for the second match.
++ * type and provide a reasonable hint.  We return a FuzzyAttrMatchState
++ * struct providing information about both exact and approximate matches.
+  */
+ static FuzzyAttrMatchState *
+ searchRangeTableForCol(ParseState *pstate, const char *alias, const char *colname,
+@@ -949,8 +955,8 @@ searchRangeTableForCol(ParseState *pstate, const char *alias, const char *colnam
+ 	fuzzystate->distance = MAX_FUZZY_DISTANCE + 1;
+ 	fuzzystate->rfirst = NULL;
+ 	fuzzystate->rsecond = NULL;
+-	fuzzystate->first = InvalidAttrNumber;
+-	fuzzystate->second = InvalidAttrNumber;
++	fuzzystate->rexact1 = NULL;
++	fuzzystate->rexact2 = NULL;
+ 
+ 	while (pstate != NULL)
+ 	{
+@@ -960,6 +966,7 @@ searchRangeTableForCol(ParseState *pstate, const char *alias, const char *colnam
+ 		{
+ 			RangeTblEntry *rte = (RangeTblEntry *) lfirst(l);
+ 			int			fuzzy_rte_penalty = 0;
++			int			attnum;
+ 
+ 			/*
+ 			 * Typically, it is not useful to look for matches within join
+@@ -986,18 +993,27 @@ searchRangeTableForCol(ParseState *pstate, const char *alias, const char *colnam
+ 												  true);
+ 
+ 			/*
+-			 * Scan for a matching column; if we find an exact match, we're
+-			 * done.  Otherwise, update fuzzystate.
++			 * Scan for a matching column, and update fuzzystate.  Non-exact
++			 * matches are dealt with inside scanRTEForColumn, but exact
++			 * matches are handled here.  (There won't be more than one exact
++			 * match in the same RTE, else we'd have thrown error earlier.)
+ 			 */
+-			if (scanRTEForColumn(orig_pstate, rte, rte->eref, colname, location,
+-								 fuzzy_rte_penalty, fuzzystate)
+-				&& fuzzy_rte_penalty == 0)
++			attnum = scanRTEForColumn(orig_pstate, rte, rte->eref,
++									  colname, location,
++									  fuzzy_rte_penalty, fuzzystate);
++			if (attnum != InvalidAttrNumber && fuzzy_rte_penalty == 0)
+ 			{
+-				fuzzystate->rfirst = rte;
+-				fuzzystate->first = InvalidAttrNumber;
+-				fuzzystate->rsecond = NULL;
+-				fuzzystate->second = InvalidAttrNumber;
+-				return fuzzystate;
++				if (fuzzystate->rexact1 == NULL)
++				{
++					fuzzystate->rexact1 = rte;
++					fuzzystate->exact1 = attnum;
++				}
++				else
++				{
++					/* Needn't worry about overwriting previous rexact2 */
++					fuzzystate->rexact2 = rte;
++					fuzzystate->exact2 = attnum;
++				}
+ 			}
+ 		}
+ 
+@@ -3603,17 +3619,27 @@ errorMissingRTE(ParseState *pstate, RangeVar *relation)
+ 			badAlias = rte->eref->aliasname;
+ 	}
+ 
+-	if (rte)
++	/* If it looks like the user forgot to use an alias, hint about that */
++	if (badAlias)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_UNDEFINED_TABLE),
+ 				 errmsg("invalid reference to FROM-clause entry for table \"%s\"",
+ 						relation->relname),
+-				 (badAlias ?
+-				  errhint("Perhaps you meant to reference the table alias \"%s\".",
+-						  badAlias) :
+-				  errhint("There is an entry for table \"%s\", but it cannot be referenced from this part of the query.",
+-						  rte->eref->aliasname)),
++				 errhint("Perhaps you meant to reference the table alias \"%s\".",
++						 badAlias),
+ 				 parser_errposition(pstate, relation->location)));
++	/* Hint about case where we found an (inaccessible) exact match */
++	else if (rte)
++		ereport(ERROR,
++				(errcode(ERRCODE_UNDEFINED_TABLE),
++				 errmsg("invalid reference to FROM-clause entry for table \"%s\"",
++						relation->relname),
++				 errdetail("There is an entry for table \"%s\", but it cannot be referenced from this part of the query.",
++						   rte->eref->aliasname),
++				 rte_visible_if_lateral(pstate, rte) ?
++				 errhint("To reference that table, you must mark this subquery with LATERAL.") : 0,
++				 parser_errposition(pstate, relation->location)));
++	/* Else, we have nothing to offer but the bald statement of error */
+ 	else
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_UNDEFINED_TABLE),
+@@ -3633,68 +3659,155 @@ errorMissingColumn(ParseState *pstate,
+ 				   const char *relname, const char *colname, int location)
+ {
+ 	FuzzyAttrMatchState *state;
+-	char	   *closestfirst = NULL;
+ 
+ 	/*
+ 	 * Search the entire rtable looking for possible matches.  If we find one,
+ 	 * emit a hint about it.
+-	 *
+-	 * TODO: improve this code (and also errorMissingRTE) to mention using
+-	 * LATERAL if appropriate.
+ 	 */
+ 	state = searchRangeTableForCol(pstate, relname, colname, location);
+ 
+ 	/*
+-	 * Extract closest col string for best match, if any.
+-	 *
+-	 * Infer an exact match referenced despite not being visible from the fact
+-	 * that an attribute number was not present in state passed back -- this
+-	 * is what is reported when !closestfirst.  There might also be an exact
+-	 * match that was qualified with an incorrect alias, in which case
+-	 * closestfirst will be set (so hint is the same as generic fuzzy case).
++	 * If there are exact match(es), they must be inaccessible for some
++	 * reason.
+ 	 */
+-	if (state->rfirst && AttributeNumberIsValid(state->first))
+-		closestfirst = strVal(list_nth(state->rfirst->eref->colnames,
+-									   state->first - 1));
+-
+-	if (!state->rsecond)
++	if (state->rexact1)
+ 	{
+ 		/*
+-		 * Handle case where there is zero or one column suggestions to hint,
+-		 * including exact matches referenced but not visible.
++		 * We don't try too hard when there's multiple inaccessible exact
++		 * matches, but at least be sure that we don't misleadingly suggest
++		 * that there's only one.
+ 		 */
++		if (state->rexact2)
++			ereport(ERROR,
++					(errcode(ERRCODE_UNDEFINED_COLUMN),
++					 relname ?
++					 errmsg("column %s.%s does not exist", relname, colname) :
++					 errmsg("column \"%s\" does not exist", colname),
++					 errdetail("There are columns named \"%s\", but they are in tables that cannot be referenced from this part of the query.",
++							   colname),
++					 !relname ? errhint("Try using a table-qualified name.") : 0,
++					 parser_errposition(pstate, location)));
++		/* Single exact match, so try to determine why it's inaccessible. */
++		ereport(ERROR,
++				(errcode(ERRCODE_UNDEFINED_COLUMN),
++				 relname ?
++				 errmsg("column %s.%s does not exist", relname, colname) :
++				 errmsg("column \"%s\" does not exist", colname),
++				 errdetail("There is a column named \"%s\" in table \"%s\", but it cannot be referenced from this part of the query.",
++						   colname, state->rexact1->eref->aliasname),
++				 rte_visible_if_lateral(pstate, state->rexact1) ?
++				 errhint("To reference that column, you must mark this subquery with LATERAL.") :
++				 (!relname && rte_visible_if_qualified(pstate, state->rexact1)) ?
++				 errhint("To reference that column, you must use a table-qualified name.") : 0,
++				 parser_errposition(pstate, location)));
++	}
++
++	if (!state->rsecond)
++	{
++		/* If we found no match at all, we have little to report */
++		if (!state->rfirst)
++			ereport(ERROR,
++					(errcode(ERRCODE_UNDEFINED_COLUMN),
++					 relname ?
++					 errmsg("column %s.%s does not exist", relname, colname) :
++					 errmsg("column \"%s\" does not exist", colname),
++					 parser_errposition(pstate, location)));
++		/* Handle case where we have a single alternative spelling to offer */
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_UNDEFINED_COLUMN),
+ 				 relname ?
+ 				 errmsg("column %s.%s does not exist", relname, colname) :
+ 				 errmsg("column \"%s\" does not exist", colname),
+-				 state->rfirst ? closestfirst ?
+ 				 errhint("Perhaps you meant to reference the column \"%s.%s\".",
+-						 state->rfirst->eref->aliasname, closestfirst) :
+-				 errhint("There is a column named \"%s\" in table \"%s\", but it cannot be referenced from this part of the query.",
+-						 colname, state->rfirst->eref->aliasname) : 0,
++						 state->rfirst->eref->aliasname,
++						 strVal(list_nth(state->rfirst->eref->colnames,
++										 state->first - 1))),
+ 				 parser_errposition(pstate, location)));
+ 	}
+ 	else
+ 	{
+ 		/* Handle case where there are two equally useful column hints */
+-		char	   *closestsecond;
+-
+-		closestsecond = strVal(list_nth(state->rsecond->eref->colnames,
+-										state->second - 1));
+-
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_UNDEFINED_COLUMN),
+ 				 relname ?
+ 				 errmsg("column %s.%s does not exist", relname, colname) :
+ 				 errmsg("column \"%s\" does not exist", colname),
+ 				 errhint("Perhaps you meant to reference the column \"%s.%s\" or the column \"%s.%s\".",
+-						 state->rfirst->eref->aliasname, closestfirst,
+-						 state->rsecond->eref->aliasname, closestsecond),
++						 state->rfirst->eref->aliasname,
++						 strVal(list_nth(state->rfirst->eref->colnames,
++										 state->first - 1)),
++						 state->rsecond->eref->aliasname,
++						 strVal(list_nth(state->rsecond->eref->colnames,
++										 state->second - 1))),
+ 				 parser_errposition(pstate, location)));
+ 	}
+ }
+ 
++/*
++ * Find ParseNamespaceItem for RTE, if it's visible at all.
++ * We assume an RTE couldn't appear more than once in the namespace lists.
++ */
++static ParseNamespaceItem *
++findNSItemForRTE(ParseState *pstate, RangeTblEntry *rte)
++{
++	while (pstate != NULL)
++	{
++		ListCell   *l;
++
++		foreach(l, pstate->p_namespace)
++		{
++			ParseNamespaceItem *nsitem = (ParseNamespaceItem *) lfirst(l);
++
++			if (nsitem->p_rte == rte)
++				return nsitem;
++		}
++		pstate = pstate->parentParseState;
++	}
++	return NULL;
++}
++
++/*
++ * Would this RTE be visible, if only the user had written LATERAL?
++ *
++ * This is a helper for deciding whether to issue a HINT about LATERAL.
++ * As such, it doesn't need to be 100% accurate; the HINT could be useful
++ * even if it's not quite right.  Hence, we don't delve into fine points
++ * about whether a found nsitem has the appropriate one of p_rel_visible or
++ * p_cols_visible set.
++ */
++static bool
++rte_visible_if_lateral(ParseState *pstate, RangeTblEntry *rte)
++{
++	ParseNamespaceItem *nsitem;
++
++	/* If LATERAL *is* active, we're clearly barking up the wrong tree */
++	if (pstate->p_lateral_active)
++		return false;
++	nsitem = findNSItemForRTE(pstate, rte);
++	if (nsitem)
++	{
++		/* Found it, report whether it's LATERAL-only */
++		return nsitem->p_lateral_only && nsitem->p_lateral_ok;
++	}
++	return false;
++}
++
++/*
++ * Would columns in this RTE be visible if qualified?
++ */
++static bool
++rte_visible_if_qualified(ParseState *pstate, RangeTblEntry *rte)
++{
++	ParseNamespaceItem *nsitem = findNSItemForRTE(pstate, rte);
++
++	if (nsitem)
++	{
++		/* Found it, report whether it's relation-only */
++		return nsitem->p_rel_visible && !nsitem->p_cols_visible;
++	}
++	return false;
++}
++
+ 
+ /*
+  * Examine a fully-parsed query, and return true iff any relation underlying
+diff --git a/src/test/regress/expected/insert_conflict.out b/src/test/regress/expected/insert_conflict.out
+index 66d8633e3ec5..9e9e3bd00cd1 100644
+--- a/src/test/regress/expected/insert_conflict.out
++++ b/src/test/regress/expected/insert_conflict.out
+@@ -242,7 +242,7 @@ insert into insertconflicttest values (1, 'Apple') on conflict (key) do update s
+ ERROR:  invalid reference to FROM-clause entry for table "excluded"
+ LINE 1: ...y) do update set fruit = excluded.fruit RETURNING excluded.f...
+                                                              ^
+-HINT:  There is an entry for table "excluded", but it cannot be referenced from this part of the query.
++DETAIL:  There is an entry for table "excluded", but it cannot be referenced from this part of the query.
+ -- Only suggest <table>.* column when inference element misspelled:
+ insert into insertconflicttest values (1, 'Apple') on conflict (keyy) do update set fruit = excluded.fruit;
+ ERROR:  column "keyy" does not exist
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index 80638d84a043..21ca7d04bc15 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -1638,7 +1638,7 @@ SELECT * FROM (J1_TBL JOIN J2_TBL USING (i)) AS x WHERE J1_TBL.t = 'one';  -- er
+ ERROR:  invalid reference to FROM-clause entry for table "j1_tbl"
+ LINE 1: ... * FROM (J1_TBL JOIN J2_TBL USING (i)) AS x WHERE J1_TBL.t =...
+                                                              ^
+-HINT:  There is an entry for table "j1_tbl", but it cannot be referenced from this part of the query.
++DETAIL:  There is an entry for table "j1_tbl", but it cannot be referenced from this part of the query.
+ SELECT * FROM J1_TBL JOIN J2_TBL USING (i) AS x WHERE x.i = 1;  -- ok
+  i | j |  t  | k  
+ ---+---+-----+----
+@@ -5064,7 +5064,7 @@ select * from
+ ERROR:  invalid reference to FROM-clause entry for table "y"
+ LINE 2: ...bl x join (int4_tbl x cross join int4_tbl y) j on q1 = y.f1;
+                                                                   ^
+-HINT:  There is an entry for table "y", but it cannot be referenced from this part of the query.
++DETAIL:  There is an entry for table "y", but it cannot be referenced from this part of the query.
+ select * from
+   int8_tbl x join (int4_tbl x cross join int4_tbl y(ff)) j on q1 = f1; -- ok
+  q1 | q2 | f1 | ff 
+@@ -5092,6 +5092,13 @@ ERROR:  column "uunique1" does not exist
+ LINE 1: select uunique1 from
+                ^
+ HINT:  Perhaps you meant to reference the column "t1.unique1" or the column "t2.unique1".
++select ctid from
++  tenk1 t1 join tenk2 t2 on t1.two = t2.two; -- error, need qualification
++ERROR:  column "ctid" does not exist
++LINE 1: select ctid from
++               ^
++DETAIL:  There are columns named "ctid", but they are in tables that cannot be referenced from this part of the query.
++HINT:  Try using a table-qualified name.
+ --
+ -- Take care to reference the correct RTE
+ --
+@@ -6125,22 +6132,26 @@ select f1,g from int4_tbl a, (select f1 as g) ss;
+ ERROR:  column "f1" does not exist
+ LINE 1: select f1,g from int4_tbl a, (select f1 as g) ss;
+                                              ^
+-HINT:  There is a column named "f1" in table "a", but it cannot be referenced from this part of the query.
++DETAIL:  There is a column named "f1" in table "a", but it cannot be referenced from this part of the query.
++HINT:  To reference that column, you must mark this subquery with LATERAL.
+ select f1,g from int4_tbl a, (select a.f1 as g) ss;
+ ERROR:  invalid reference to FROM-clause entry for table "a"
+ LINE 1: select f1,g from int4_tbl a, (select a.f1 as g) ss;
+                                              ^
+-HINT:  There is an entry for table "a", but it cannot be referenced from this part of the query.
++DETAIL:  There is an entry for table "a", but it cannot be referenced from this part of the query.
++HINT:  To reference that table, you must mark this subquery with LATERAL.
+ select f1,g from int4_tbl a cross join (select f1 as g) ss;
+ ERROR:  column "f1" does not exist
+ LINE 1: select f1,g from int4_tbl a cross join (select f1 as g) ss;
+                                                        ^
+-HINT:  There is a column named "f1" in table "a", but it cannot be referenced from this part of the query.
++DETAIL:  There is a column named "f1" in table "a", but it cannot be referenced from this part of the query.
++HINT:  To reference that column, you must mark this subquery with LATERAL.
+ select f1,g from int4_tbl a cross join (select a.f1 as g) ss;
+ ERROR:  invalid reference to FROM-clause entry for table "a"
+ LINE 1: select f1,g from int4_tbl a cross join (select a.f1 as g) ss...
+                                                        ^
+-HINT:  There is an entry for table "a", but it cannot be referenced from this part of the query.
++DETAIL:  There is an entry for table "a", but it cannot be referenced from this part of the query.
++HINT:  To reference that table, you must mark this subquery with LATERAL.
+ -- SQL:2008 says the left table is in scope but illegal to access here
+ select f1,g from int4_tbl a right join lateral generate_series(0, a.f1) g on true;
+ ERROR:  invalid reference to FROM-clause entry for table "a"
+@@ -6170,12 +6181,12 @@ update xx1 set x2 = f1 from (select * from int4_tbl where f1 = x1) ss;
+ ERROR:  column "x1" does not exist
+ LINE 1: ... set x2 = f1 from (select * from int4_tbl where f1 = x1) ss;
+                                                                 ^
+-HINT:  There is a column named "x1" in table "xx1", but it cannot be referenced from this part of the query.
++DETAIL:  There is a column named "x1" in table "xx1", but it cannot be referenced from this part of the query.
+ update xx1 set x2 = f1 from (select * from int4_tbl where f1 = xx1.x1) ss;
+ ERROR:  invalid reference to FROM-clause entry for table "xx1"
+ LINE 1: ...t x2 = f1 from (select * from int4_tbl where f1 = xx1.x1) ss...
+                                                              ^
+-HINT:  There is an entry for table "xx1", but it cannot be referenced from this part of the query.
++DETAIL:  There is an entry for table "xx1", but it cannot be referenced from this part of the query.
+ -- can't do it even with LATERAL:
+ update xx1 set x2 = f1 from lateral (select * from int4_tbl where f1 = x1) ss;
+ ERROR:  invalid reference to FROM-clause entry for table "xx1"
+@@ -6190,12 +6201,12 @@ delete from xx1 using (select * from int4_tbl where f1 = x1) ss;
+ ERROR:  column "x1" does not exist
+ LINE 1: ...te from xx1 using (select * from int4_tbl where f1 = x1) ss;
+                                                                 ^
+-HINT:  There is a column named "x1" in table "xx1", but it cannot be referenced from this part of the query.
++DETAIL:  There is a column named "x1" in table "xx1", but it cannot be referenced from this part of the query.
+ delete from xx1 using (select * from int4_tbl where f1 = xx1.x1) ss;
+ ERROR:  invalid reference to FROM-clause entry for table "xx1"
+ LINE 1: ...from xx1 using (select * from int4_tbl where f1 = xx1.x1) ss...
+                                                              ^
+-HINT:  There is an entry for table "xx1", but it cannot be referenced from this part of the query.
++DETAIL:  There is an entry for table "xx1", but it cannot be referenced from this part of the query.
+ delete from xx1 using lateral (select * from int4_tbl where f1 = x1) ss;
+ ERROR:  invalid reference to FROM-clause entry for table "xx1"
+ LINE 1: ...xx1 using lateral (select * from int4_tbl where f1 = x1) ss;
+diff --git a/src/test/regress/expected/merge.out b/src/test/regress/expected/merge.out
+index d2e333772720..9d4d0febeec8 100644
+--- a/src/test/regress/expected/merge.out
++++ b/src/test/regress/expected/merge.out
+@@ -197,7 +197,7 @@ WHEN NOT MATCHED THEN
+ ERROR:  invalid reference to FROM-clause entry for table "t"
+ LINE 2: USING (SELECT * FROM source WHERE t.tid > sid) s
+                                           ^
+-HINT:  There is an entry for table "t", but it cannot be referenced from this part of the query.
++DETAIL:  There is an entry for table "t", but it cannot be referenced from this part of the query.
+ --
+ -- initial tests
+ --
+@@ -618,7 +618,7 @@ WHEN NOT MATCHED THEN
+ ERROR:  invalid reference to FROM-clause entry for table "t"
+ LINE 5:  INSERT (tid, balance) VALUES (t.tid, s.delta);
+                                        ^
+-HINT:  There is an entry for table "t", but it cannot be referenced from this part of the query.
++DETAIL:  There is an entry for table "t", but it cannot be referenced from this part of the query.
+ -- and again with a constant ON clause
+ BEGIN;
+ MERGE INTO target t
+@@ -629,7 +629,7 @@ WHEN NOT MATCHED THEN
+ ERROR:  invalid reference to FROM-clause entry for table "t"
+ LINE 5:  INSERT (tid, balance) VALUES (t.tid, s.delta);
+                                        ^
+-HINT:  There is an entry for table "t", but it cannot be referenced from this part of the query.
++DETAIL:  There is an entry for table "t", but it cannot be referenced from this part of the query.
+ SELECT * FROM target ORDER BY tid;
+ ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ ROLLBACK;
+@@ -724,7 +724,7 @@ WHEN NOT MATCHED AND t.balance = 100 THEN
+ ERROR:  invalid reference to FROM-clause entry for table "t"
+ LINE 3: WHEN NOT MATCHED AND t.balance = 100 THEN
+                              ^
+-HINT:  There is an entry for table "t", but it cannot be referenced from this part of the query.
++DETAIL:  There is an entry for table "t", but it cannot be referenced from this part of the query.
+ SELECT * FROM wq_target;
+ ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ ROLLBACK;
+diff --git a/src/test/regress/expected/rules.out b/src/test/regress/expected/rules.out
+index 624d0e5aae18..7c7adbc0045a 100644
+--- a/src/test/regress/expected/rules.out
++++ b/src/test/regress/expected/rules.out
+@@ -1194,7 +1194,8 @@ do instead insert into rules_foo2 values (f1);
+ ERROR:  column "f1" does not exist
+ LINE 2: do instead insert into rules_foo2 values (f1);
+                                                   ^
+-HINT:  There is a column named "f1" in table "old", but it cannot be referenced from this part of the query.
++DETAIL:  There are columns named "f1", but they are in tables that cannot be referenced from this part of the query.
++HINT:  Try using a table-qualified name.
+ -- this is the correct way:
+ create rule rules_foorule as on insert to rules_foo where f1 < 100
+ do instead insert into rules_foo2 values (new.f1);
+diff --git a/src/test/regress/expected/union.out b/src/test/regress/expected/union.out
+index dece7310cfef..e2613d6777e3 100644
+--- a/src/test/regress/expected/union.out
++++ b/src/test/regress/expected/union.out
+@@ -910,7 +910,7 @@ SELECT q1 FROM int8_tbl EXCEPT SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1;
+ ERROR:  column "q2" does not exist
+ LINE 1: ... int8_tbl EXCEPT SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1...
+                                                              ^
+-HINT:  There is a column named "q2" in table "*SELECT* 2", but it cannot be referenced from this part of the query.
++DETAIL:  There is a column named "q2" in table "*SELECT* 2", but it cannot be referenced from this part of the query.
+ -- But this should work:
+ SELECT q1 FROM int8_tbl EXCEPT (((SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1))) ORDER BY 1;
+         q1        
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index a81c7dce7d55..50c19d822bf1 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -1841,6 +1841,8 @@ select t2.uunique1 from
+   tenk1 t1 join tenk2 t2 on t1.two = t2.two; -- error, prefer "t2" suggestion
+ select uunique1 from
+   tenk1 t1 join tenk2 t2 on t1.two = t2.two; -- error, suggest both at once
++select ctid from
++  tenk1 t1 join tenk2 t2 on t1.two = t2.two; -- error, need qualification
+ 
+ --
+ -- Take care to reference the correct RTE

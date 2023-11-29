@@ -1,0 +1,118 @@
+From 57cd2b6e6dc571cf65983d2aa86065d6d006f152 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 11 Jul 2018 15:25:28 -0400
+Subject: [PATCH] Fix create_scan_plan's handling of sortgrouprefs for physical
+ tlists.
+
+We should only run apply_pathtarget_labeling_to_tlist if CP_LABEL_TLIST
+was specified, because only in that case has use_physical_tlist checked
+that the labeling will succeed; otherwise we may get an "ORDER/GROUP BY
+expression not found in targetlist" error.  (This subsumes the previous
+test about gating_clauses, because we reset "flags" to zero earlier
+if there are gating clauses to apply.)
+
+The only known case in which a failure can occur is with a ProjectSet
+path directly atop a table scan path, although it seems likely that there
+are other cases or will be such in future.  This means that the failure
+is currently only visible in the v10 branch: 9.6 didn't have ProjectSet,
+while in v11 and HEAD, apply_scanjoin_target_to_paths for some weird
+reason is using create_projection_path not apply_projection_to_path,
+masking the problem because there's a ProjectionPath in between.
+
+Nonetheless this code is clearly wrong on its own terms, so back-patch
+to 9.6 where this logic was introduced.
+
+Per report from Regina Obe.
+
+Discussion: https://postgr.es/m/001501d40f88$75186950$5f493bf0$@pcorp.us
+---
+ src/backend/optimizer/plan/createplan.c | 10 +++++-----
+ src/test/regress/expected/tsrf.out      | 22 ++++++++++++++++++++++
+ src/test/regress/sql/tsrf.sql           |  5 +++++
+ 3 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index 4186e20d5648..165a9e9b8e7c 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -579,10 +579,10 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
+ 			tlist = copyObject(((IndexPath *) best_path)->indexinfo->indextlist);
+ 
+ 			/*
+-			 * Transfer any sortgroupref data to the replacement tlist, unless
+-			 * we don't care because the gating Result will handle it.
++			 * Transfer sortgroupref data to the replacement tlist, if
++			 * requested (use_physical_tlist checked that this will work).
+ 			 */
+-			if (!gating_clauses)
++			if (flags & CP_LABEL_TLIST)
+ 				apply_pathtarget_labeling_to_tlist(tlist, best_path->pathtarget);
+ 		}
+ 		else
+@@ -596,7 +596,7 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
+ 			else
+ 			{
+ 				/* As above, transfer sortgroupref data to replacement tlist */
+-				if (!gating_clauses)
++				if (flags & CP_LABEL_TLIST)
+ 					apply_pathtarget_labeling_to_tlist(tlist, best_path->pathtarget);
+ 			}
+ 		}
+@@ -1639,7 +1639,7 @@ create_projection_plan(PlannerInfo *root, ProjectionPath *best_path, int flags)
+ 		 */
+ 		subplan = create_plan_recurse(root, best_path->subpath, 0);
+ 		tlist = subplan->targetlist;
+-		if ((flags & CP_LABEL_TLIST) != 0)
++		if (flags & CP_LABEL_TLIST)
+ 			apply_pathtarget_labeling_to_tlist(tlist,
+ 											   best_path->path.pathtarget);
+ 	}
+diff --git a/src/test/regress/expected/tsrf.out b/src/test/regress/expected/tsrf.out
+index 6d33fbd3c8ba..25be6b9ab134 100644
+--- a/src/test/regress/expected/tsrf.out
++++ b/src/test/regress/expected/tsrf.out
+@@ -421,6 +421,28 @@ SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(d
+ (24 rows)
+ 
+ reset enable_hashagg;
++-- case with degenerate ORDER BY
++explain (verbose, costs off)
++select 'foo' as f, generate_series(1,2) as g from few order by 1;
++                  QUERY PLAN                  
++----------------------------------------------
++ ProjectSet
++   Output: 'foo'::text, generate_series(1, 2)
++   ->  Seq Scan on public.few
++         Output: id, dataa, datab
++(4 rows)
++
++select 'foo' as f, generate_series(1,2) as g from few order by 1;
++  f  | g 
++-----+---
++ foo | 1
++ foo | 2
++ foo | 1
++ foo | 2
++ foo | 1
++ foo | 2
++(6 rows)
++
+ -- data modification
+ CREATE TABLE fewmore AS SELECT generate_series(1,3) AS data;
+ INSERT INTO fewmore VALUES(generate_series(4,5));
+diff --git a/src/test/regress/sql/tsrf.sql b/src/test/regress/sql/tsrf.sql
+index ae1900bce12e..0a1e8e566604 100644
+--- a/src/test/regress/sql/tsrf.sql
++++ b/src/test/regress/sql/tsrf.sql
+@@ -88,6 +88,11 @@ SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(d
+ SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(dataa, datab, g) ORDER BY g;
+ reset enable_hashagg;
+ 
++-- case with degenerate ORDER BY
++explain (verbose, costs off)
++select 'foo' as f, generate_series(1,2) as g from few order by 1;
++select 'foo' as f, generate_series(1,2) as g from few order by 1;
++
+ -- data modification
+ CREATE TABLE fewmore AS SELECT generate_series(1,3) AS data;
+ INSERT INTO fewmore VALUES(generate_series(4,5));
