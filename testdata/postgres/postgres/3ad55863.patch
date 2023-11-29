@@ -1,0 +1,906 @@
+From 3ad55863e9392bff73377911ebbf9760027ed405 Mon Sep 17 00:00:00 2001
+From: Teodor Sigaev <teodor@sigaev.ru>
+Date: Tue, 27 Mar 2018 15:43:19 +0300
+Subject: [PATCH] Add predicate locking for GiST
+
+Add page-level predicate locking, due to gist's code organization, patch seems
+close to trivial: add check before page changing, add predicate lock before page
+scanning.  Although choosing right place to check is not simple: it should not
+be called during index build, it should support insertion of new downlink and so
+on.
+
+Author: Shubham Barai with editorization by me and Alexander Korotkov
+Reviewed by: Alexander Korotkov, Andrey Borodin, me
+Discussion: https://www.postgresql.org/message-id/flat/CALxAEPtdcANpw5ePU3LvnTP8HCENFw6wygupQAyNBgD-sG3h0g@mail.gmail.com
+---
+ src/backend/access/gist/gist.c                |  13 +-
+ src/backend/access/gist/gistget.c             |   3 +
+ src/backend/storage/lmgr/README-SSI           |   5 +-
+ .../isolation/expected/predicate-gist.out     | 659 ++++++++++++++++++
+ src/test/isolation/isolation_schedule         |   1 +
+ src/test/isolation/specs/predicate-gist.spec  | 117 ++++
+ 6 files changed, 795 insertions(+), 3 deletions(-)
+ create mode 100644 src/test/isolation/expected/predicate-gist.out
+ create mode 100644 src/test/isolation/specs/predicate-gist.spec
+
+diff --git a/src/backend/access/gist/gist.c b/src/backend/access/gist/gist.c
+index 51c32e4afeee..52c83b9cbf58 100644
+--- a/src/backend/access/gist/gist.c
++++ b/src/backend/access/gist/gist.c
+@@ -18,6 +18,8 @@
+ #include "access/gistscan.h"
+ #include "catalog/pg_collation.h"
+ #include "miscadmin.h"
++#include "storage/lmgr.h"
++#include "storage/predicate.h"
+ #include "nodes/execnodes.h"
+ #include "utils/builtins.h"
+ #include "utils/index_selfuncs.h"
+@@ -70,7 +72,7 @@ gisthandler(PG_FUNCTION_ARGS)
+ 	amroutine->amsearchnulls = true;
+ 	amroutine->amstorage = true;
+ 	amroutine->amclusterable = true;
+-	amroutine->ampredlocks = false;
++	amroutine->ampredlocks = true;
+ 	amroutine->amcanparallel = false;
+ 	amroutine->amkeytype = InvalidOid;
+ 
+@@ -337,6 +339,9 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
+ 			GISTInitBuffer(ptr->buffer, (is_leaf) ? F_LEAF : 0);
+ 			ptr->page = BufferGetPage(ptr->buffer);
+ 			ptr->block.blkno = BufferGetBlockNumber(ptr->buffer);
++			PredicateLockPageSplit(rel,
++						BufferGetBlockNumber(buffer),
++						BufferGetBlockNumber(ptr->buffer));
+ 		}
+ 
+ 		/*
+@@ -1213,6 +1218,12 @@ gistinserttuples(GISTInsertState *state, GISTInsertStack *stack,
+ 	List	   *splitinfo;
+ 	bool		is_split;
+ 
++	/*
++	 * Check for any rw conflicts (in serialisation isolation level)
++	 * just before we intend to modify the page
++	 */
++	CheckForSerializableConflictIn(state->r, NULL, stack->buffer);
++
+ 	/* Insert the tuple(s) to the page, splitting the page if necessary */
+ 	is_split = gistplacetopage(state->r, state->freespace, giststate,
+ 							   stack->buffer,
+diff --git a/src/backend/access/gist/gistget.c b/src/backend/access/gist/gistget.c
+index b30b931c3b8e..c4e8a3b91316 100644
+--- a/src/backend/access/gist/gistget.c
++++ b/src/backend/access/gist/gistget.c
+@@ -18,6 +18,8 @@
+ #include "access/relscan.h"
+ #include "catalog/pg_type.h"
+ #include "miscadmin.h"
++#include "storage/lmgr.h"
++#include "storage/predicate.h"
+ #include "pgstat.h"
+ #include "lib/pairingheap.h"
+ #include "utils/builtins.h"
+@@ -336,6 +338,7 @@ gistScanPage(IndexScanDesc scan, GISTSearchItem *pageItem, double *myDistances,
+ 
+ 	buffer = ReadBuffer(scan->indexRelation, pageItem->blkno);
+ 	LockBuffer(buffer, GIST_SHARE);
++	PredicateLockPage(r, BufferGetBlockNumber(buffer), scan->xs_snapshot);
+ 	gistcheckpage(scan->indexRelation, buffer);
+ 	page = BufferGetPage(buffer);
+ 	TestForOldSnapshot(scan->xs_snapshot, r, page);
+diff --git a/src/backend/storage/lmgr/README-SSI b/src/backend/storage/lmgr/README-SSI
+index a9dc01f237b8..e221241f9657 100644
+--- a/src/backend/storage/lmgr/README-SSI
++++ b/src/backend/storage/lmgr/README-SSI
+@@ -374,10 +374,11 @@ however, a search discovers that no root page has yet been created, a
+ predicate lock on the index relation is required.
+ 
+     * GiST searches can determine that there are no matches at any
+-level of the index, so there must be a predicate lock at each index
++level of the index, so we acquire predicate lock at each index
+ level during a GiST search. An index insert at the leaf level can
+ then be trusted to ripple up to all levels and locations where
+-conflicting predicate locks may exist.
++conflicting predicate locks may exist. In case there is a page split,
++we need to copy predicate lock from an original page to all new pages.
+ 
+     * The effects of page splits, overflows, consolidations, and
+ removals must be carefully reviewed to ensure that predicate locks
+diff --git a/src/test/isolation/expected/predicate-gist.out b/src/test/isolation/expected/predicate-gist.out
+new file mode 100644
+index 000000000000..77a27958af13
+--- /dev/null
++++ b/src/test/isolation/expected/predicate-gist.out
+@@ -0,0 +1,659 @@
++Parsed test spec with 2 sessions
++
++starting permutation: rxy1 wx1 c1 rxy2 wy2 c2
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step c1: commit;
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2233750        
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step c2: commit;
++
++starting permutation: rxy2 wy2 c2 rxy1 wx1 c1
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step c2: commit;
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++316250         
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step c1: commit;
++
++starting permutation: rxy3 wx3 c1 rxy4 wy4 c2
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c1: commit;
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c2: commit;
++
++starting permutation: rxy4 wy4 c2 rxy3 wx3 c1
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c2: commit;
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c1: commit;
++
++starting permutation: rxy1 wx1 rxy2 c1 wy2 c2
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step c1: commit;
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c2: commit;
++
++starting permutation: rxy1 wx1 rxy2 wy2 c1 c2
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 wx1 rxy2 wy2 c2 c1
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 rxy2 wx1 c1 wy2 c2
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step c1: commit;
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c2: commit;
++
++starting permutation: rxy1 rxy2 wx1 wy2 c1 c2
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 rxy2 wx1 wy2 c2 c1
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 rxy2 wy2 wx1 c1 c2
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 rxy2 wy2 wx1 c2 c1
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 rxy2 wy2 c2 wx1 c1
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step c2: commit;
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c1: commit;
++
++starting permutation: rxy2 rxy1 wx1 c1 wy2 c2
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step c1: commit;
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c2: commit;
++
++starting permutation: rxy2 rxy1 wx1 wy2 c1 c2
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 rxy1 wx1 wy2 c2 c1
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 rxy1 wy2 wx1 c1 c2
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 rxy1 wy2 wx1 c2 c1
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 rxy1 wy2 c2 wx1 c1
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step c2: commit;
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c1: commit;
++
++starting permutation: rxy2 wy2 rxy1 wx1 c1 c2
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 wy2 rxy1 wx1 c2 c1
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 wy2 rxy1 c2 wx1 c1
++step rxy2: select sum(p[0]) from gist_point_tbl where p >> point(7500,7500);
++sum            
++
++2188750        
++step wy2: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g;
++step rxy1: select sum(p[0]) from gist_point_tbl where p << point(2500, 2500);
++sum            
++
++311250         
++step c2: commit;
++step wx1: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c1: commit;
++
++starting permutation: rxy3 wx3 rxy4 c1 wy4 c2
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step c1: commit;
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c2: commit;
++
++starting permutation: rxy3 wx3 rxy4 wy4 c1 c2
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy3 wx3 rxy4 wy4 c2 c1
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy3 rxy4 wx3 c1 wy4 c2
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c1: commit;
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c2: commit;
++
++starting permutation: rxy3 rxy4 wx3 wy4 c1 c2
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy3 rxy4 wx3 wy4 c2 c1
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy3 rxy4 wy4 wx3 c1 c2
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy3 rxy4 wy4 wx3 c2 c1
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy3 rxy4 wy4 c2 wx3 c1
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c2: commit;
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c1: commit;
++
++starting permutation: rxy4 rxy3 wx3 c1 wy4 c2
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c1: commit;
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c2: commit;
++
++starting permutation: rxy4 rxy3 wx3 wy4 c1 c2
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy4 rxy3 wx3 wy4 c2 c1
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy4 rxy3 wy4 wx3 c1 c2
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy4 rxy3 wy4 wx3 c2 c1
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy4 rxy3 wy4 c2 wx3 c1
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step c2: commit;
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c1: commit;
++
++starting permutation: rxy4 wy4 rxy3 wx3 c1 c2
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy4 wy4 rxy3 wx3 c2 c1
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy4 wy4 rxy3 c2 wx3 c1
++step rxy4: select sum(p[0]) from gist_point_tbl where p << point(1000,1000);
++sum            
++
++49500          
++step wy4: insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g;
++step rxy3: select sum(p[0]) from gist_point_tbl where p >> point(6000,6000);
++sum            
++
++3202000        
++step c2: commit;
++step wx3: insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g;
++step c1: commit;
+diff --git a/src/test/isolation/isolation_schedule b/src/test/isolation/isolation_schedule
+index 74d7d59546a7..53e1f192b0bb 100644
+--- a/src/test/isolation/isolation_schedule
++++ b/src/test/isolation/isolation_schedule
+@@ -66,3 +66,4 @@ test: async-notify
+ test: vacuum-reltuples
+ test: timeouts
+ test: vacuum-concurrent-drop
++test: predicate-gist
+diff --git a/src/test/isolation/specs/predicate-gist.spec b/src/test/isolation/specs/predicate-gist.spec
+new file mode 100644
+index 000000000000..6d6021f5e4d4
+--- /dev/null
++++ b/src/test/isolation/specs/predicate-gist.spec
+@@ -0,0 +1,117 @@
++# Test for page level predicate locking in gist
++#
++# Test to verify serialization failures and to check reduced false positives
++#
++# To verify serialization failures, queries and permutations are written in such
++# a way that an index scan  (from one transaction) and an index insert (from
++# another transaction) will try to access the same part (sub-tree) of the index
++# whereas to check reduced false positives, they will try to access different
++# parts (sub-tree) of the index.
++
++setup
++{
++  create table gist_point_tbl(id int4, p point);
++  create index gist_pointidx on gist_point_tbl using gist(p);
++  insert into gist_point_tbl (id, p)
++  select g, point(g*10, g*10) from generate_series(1, 1000) g;
++}
++
++teardown
++{
++  drop table gist_point_tbl;
++}
++
++session "s1"
++setup
++{
++  begin isolation level serializable;
++  set enable_seqscan=off;
++  set enable_bitmapscan=off;
++  set enable_indexonlyscan=on;
++}
++
++step "rxy1"	{ select sum(p[0]) from gist_point_tbl where p << point(2500, 2500); }
++step "wx1"	{ insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(15, 20) g; }
++step "rxy3"	{ select sum(p[0]) from gist_point_tbl where p >> point(6000,6000); }
++step "wx3"	{ insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(12, 18) g; }
++step "c1"	{ commit; }
++
++
++session "s2"
++setup
++{
++  begin isolation level serializable;
++  set enable_seqscan=off;
++  set enable_bitmapscan=off;
++  set enable_indexonlyscan=on;
++}
++
++step "rxy2"	{ select sum(p[0]) from gist_point_tbl where p >> point(7500,7500); }
++step "wy2"	{ insert into gist_point_tbl (id, p)
++			  select g, point(g*500, g*500) from generate_series(1, 5) g; }
++step "rxy4"	{ select sum(p[0]) from gist_point_tbl where p << point(1000,1000); }
++step "wy4"	{ insert into gist_point_tbl (id, p)
++			  select g, point(g*50, g*50) from generate_series(1, 20) g; }
++step "c2"	{ commit; }
++
++# An index scan (from one transaction) and an index insert (from another
++# transaction) try to access the same part of the index but one transaction
++# commits before other transaction begins so no r-w conflict.
++
++permutation "rxy1" "wx1" "c1" "rxy2" "wy2" "c2"
++permutation "rxy2" "wy2" "c2" "rxy1" "wx1" "c1"
++
++# An index scan (from one transaction) and an index insert (from another
++# transaction) try to access different parts of the index and also one
++# transaction commits before other transaction begins, so no r-w conflict.
++
++permutation "rxy3" "wx3" "c1" "rxy4" "wy4" "c2"
++permutation "rxy4" "wy4" "c2" "rxy3" "wx3" "c1"
++
++
++# An index scan (from one transaction) and an index insert (from another
++# transaction) try to access the same part of the index and one transaction
++# begins before other transaction commits so there is a r-w conflict.
++
++permutation "rxy1" "wx1" "rxy2" "c1" "wy2" "c2"
++permutation "rxy1" "wx1" "rxy2" "wy2" "c1" "c2"
++permutation "rxy1" "wx1" "rxy2" "wy2" "c2" "c1"
++permutation "rxy1" "rxy2" "wx1" "c1" "wy2" "c2"
++permutation "rxy1" "rxy2" "wx1" "wy2" "c1" "c2"
++permutation "rxy1" "rxy2" "wx1" "wy2" "c2" "c1"
++permutation "rxy1" "rxy2" "wy2" "wx1" "c1" "c2"
++permutation "rxy1" "rxy2" "wy2" "wx1" "c2" "c1"
++permutation "rxy1" "rxy2" "wy2" "c2" "wx1" "c1"
++permutation "rxy2" "rxy1" "wx1" "c1" "wy2" "c2"
++permutation "rxy2" "rxy1" "wx1" "wy2" "c1" "c2"
++permutation "rxy2" "rxy1" "wx1" "wy2" "c2" "c1"
++permutation "rxy2" "rxy1" "wy2" "wx1" "c1" "c2"
++permutation "rxy2" "rxy1" "wy2" "wx1" "c2" "c1"
++permutation "rxy2" "rxy1" "wy2" "c2" "wx1" "c1"
++permutation "rxy2" "wy2" "rxy1" "wx1" "c1" "c2"
++permutation "rxy2" "wy2" "rxy1" "wx1" "c2" "c1"
++permutation "rxy2" "wy2" "rxy1" "c2" "wx1" "c1"
++
++# An index scan (from one transaction) and an index insert (from another
++# transaction) try to access different parts of the index so no r-w conflict.
++
++permutation "rxy3" "wx3" "rxy4" "c1" "wy4" "c2"
++permutation "rxy3" "wx3" "rxy4" "wy4" "c1" "c2"
++permutation "rxy3" "wx3" "rxy4" "wy4" "c2" "c1"
++permutation "rxy3" "rxy4" "wx3" "c1" "wy4" "c2"
++permutation "rxy3" "rxy4" "wx3" "wy4" "c1" "c2"
++permutation "rxy3" "rxy4" "wx3" "wy4" "c2" "c1"
++permutation "rxy3" "rxy4" "wy4" "wx3" "c1" "c2"
++permutation "rxy3" "rxy4" "wy4" "wx3" "c2" "c1"
++permutation "rxy3" "rxy4" "wy4" "c2" "wx3" "c1"
++permutation "rxy4" "rxy3" "wx3" "c1" "wy4" "c2"
++permutation "rxy4" "rxy3" "wx3" "wy4" "c1" "c2"
++permutation "rxy4" "rxy3" "wx3" "wy4" "c2" "c1"
++permutation "rxy4" "rxy3" "wy4" "wx3" "c1" "c2"
++permutation "rxy4" "rxy3" "wy4" "wx3" "c2" "c1"
++permutation "rxy4" "rxy3" "wy4" "c2" "wx3" "c1"
++permutation "rxy4" "wy4" "rxy3" "wx3" "c1" "c2"
++permutation "rxy4" "wy4" "rxy3" "wx3" "c2" "c1"
++permutation "rxy4" "wy4" "rxy3" "c2" "wx3" "c1"

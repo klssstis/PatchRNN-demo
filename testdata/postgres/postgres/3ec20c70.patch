@@ -1,0 +1,290 @@
+From 3ec20c7091e97a554e7447ac2b7f4ed795631395 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sun, 26 Jan 2020 16:31:48 -0500
+Subject: [PATCH] Fix EXPLAIN (SETTINGS) to follow policy about when to print
+ empty fields.
+
+In non-TEXT output formats, the "Settings" field should appear when
+requested, even if it would be empty.
+
+Also, get rid of the premature optimization of counting all the
+GUC_EXPLAIN variables at startup.  Since there was no provision for
+adjusting that count later, all it'd take would be some extension marking
+a parameter as GUC_EXPLAIN to risk an assertion failure or memory stomp.
+We could make get_explain_guc_options() count those variables on-the-fly,
+or dynamically resize its array ... but TBH I do not think that making a
+transient array of pointers a bit smaller is worth any extra complication,
+especially when you consider all the other transient space EXPLAIN eats.
+So just allocate that array at the max possible size.
+
+In HEAD, also add some regression test coverage for this feature.
+
+Because of the memory-stomp hazard, back-patch to v12 where this
+feature was added.
+
+Discussion: https://postgr.es/m/19416.1580069629@sss.pgh.pa.us
+---
+ src/backend/commands/explain.c        | 18 ++++-----
+ src/backend/utils/misc/guc.c          | 54 ++++++++-------------------
+ src/test/regress/expected/explain.out | 20 ++++++++++
+ src/test/regress/sql/explain.sql      | 12 ++++++
+ 4 files changed, 54 insertions(+), 50 deletions(-)
+
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index f523adbc7260..c367c750b19d 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -626,17 +626,11 @@ ExplainPrintSettings(ExplainState *es)
+ 	/* request an array of relevant settings */
+ 	gucs = get_explain_guc_options(&num);
+ 
+-	/* also bail out of there are no options */
+-	if (!num)
+-		return;
+-
+ 	if (es->format != EXPLAIN_FORMAT_TEXT)
+ 	{
+-		int			i;
+-
+ 		ExplainOpenGroup("Settings", "Settings", true, es);
+ 
+-		for (i = 0; i < num; i++)
++		for (int i = 0; i < num; i++)
+ 		{
+ 			char	   *setting;
+ 			struct config_generic *conf = gucs[i];
+@@ -650,12 +644,15 @@ ExplainPrintSettings(ExplainState *es)
+ 	}
+ 	else
+ 	{
+-		int			i;
+ 		StringInfoData str;
+ 
++		/* In TEXT mode, print nothing if there are no options */
++		if (num <= 0)
++			return;
++
+ 		initStringInfo(&str);
+ 
+-		for (i = 0; i < num; i++)
++		for (int i = 0; i < num; i++)
+ 		{
+ 			char	   *setting;
+ 			struct config_generic *conf = gucs[i];
+@@ -671,8 +668,7 @@ ExplainPrintSettings(ExplainState *es)
+ 				appendStringInfo(&str, "%s = NULL", conf->name);
+ 		}
+ 
+-		if (num > 0)
+-			ExplainPropertyText("Settings", str.data, es);
++		ExplainPropertyText("Settings", str.data, es);
+ 	}
+ }
+ 
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index 9f179a912957..cacbe904db7d 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -4663,9 +4663,6 @@ static struct config_generic **guc_variables;
+ /* Current number of variables contained in the vector */
+ static int	num_guc_variables;
+ 
+-/* Current number of variables marked with GUC_EXPLAIN */
+-static int	num_guc_explain_variables;
+-
+ /* Vector capacity */
+ static int	size_guc_variables;
+ 
+@@ -4929,7 +4926,6 @@ build_guc_variables(void)
+ {
+ 	int			size_vars;
+ 	int			num_vars = 0;
+-	int			num_explain_vars = 0;
+ 	struct config_generic **guc_vars;
+ 	int			i;
+ 
+@@ -4940,9 +4936,6 @@ build_guc_variables(void)
+ 		/* Rather than requiring vartype to be filled in by hand, do this: */
+ 		conf->gen.vartype = PGC_BOOL;
+ 		num_vars++;
+-
+-		if (conf->gen.flags & GUC_EXPLAIN)
+-			num_explain_vars++;
+ 	}
+ 
+ 	for (i = 0; ConfigureNamesInt[i].gen.name; i++)
+@@ -4951,9 +4944,6 @@ build_guc_variables(void)
+ 
+ 		conf->gen.vartype = PGC_INT;
+ 		num_vars++;
+-
+-		if (conf->gen.flags & GUC_EXPLAIN)
+-			num_explain_vars++;
+ 	}
+ 
+ 	for (i = 0; ConfigureNamesReal[i].gen.name; i++)
+@@ -4962,9 +4952,6 @@ build_guc_variables(void)
+ 
+ 		conf->gen.vartype = PGC_REAL;
+ 		num_vars++;
+-
+-		if (conf->gen.flags & GUC_EXPLAIN)
+-			num_explain_vars++;
+ 	}
+ 
+ 	for (i = 0; ConfigureNamesString[i].gen.name; i++)
+@@ -4973,9 +4960,6 @@ build_guc_variables(void)
+ 
+ 		conf->gen.vartype = PGC_STRING;
+ 		num_vars++;
+-
+-		if (conf->gen.flags & GUC_EXPLAIN)
+-			num_explain_vars++;
+ 	}
+ 
+ 	for (i = 0; ConfigureNamesEnum[i].gen.name; i++)
+@@ -4984,9 +4968,6 @@ build_guc_variables(void)
+ 
+ 		conf->gen.vartype = PGC_ENUM;
+ 		num_vars++;
+-
+-		if (conf->gen.flags & GUC_EXPLAIN)
+-			num_explain_vars++;
+ 	}
+ 
+ 	/*
+@@ -5018,7 +4999,6 @@ build_guc_variables(void)
+ 		free(guc_variables);
+ 	guc_variables = guc_vars;
+ 	num_guc_variables = num_vars;
+-	num_guc_explain_variables = num_explain_vars;
+ 	size_guc_variables = size_vars;
+ 	qsort((void *) guc_variables, num_guc_variables,
+ 		  sizeof(struct config_generic *), guc_var_compare);
+@@ -8967,41 +8947,40 @@ ShowAllGUCConfig(DestReceiver *dest)
+ }
+ 
+ /*
+- * Returns an array of modified GUC options to show in EXPLAIN. Only options
+- * related to query planning (marked with GUC_EXPLAIN), with values different
+- * from built-in defaults.
++ * Return an array of modified GUC options to show in EXPLAIN.
++ *
++ * We only report options related to query planning (marked with GUC_EXPLAIN),
++ * with values different from their built-in defaults.
+  */
+ struct config_generic **
+ get_explain_guc_options(int *num)
+ {
+-	int			i;
+ 	struct config_generic **result;
+ 
+ 	*num = 0;
+ 
+ 	/*
+-	 * Allocate enough space to fit all GUC_EXPLAIN options. We may not need
+-	 * all the space, but there are fairly few such options so we don't waste
+-	 * a lot of memory.
++	 * While only a fraction of all the GUC variables are marked GUC_EXPLAIN,
++	 * it doesn't seem worth dynamically resizing this array.
+ 	 */
+-	result = palloc(sizeof(struct config_generic *) * num_guc_explain_variables);
++	result = palloc(sizeof(struct config_generic *) * num_guc_variables);
+ 
+-	for (i = 0; i < num_guc_variables; i++)
++	for (int i = 0; i < num_guc_variables; i++)
+ 	{
+ 		bool		modified;
+ 		struct config_generic *conf = guc_variables[i];
+ 
+-		/* return only options visible to the user */
++		/* return only parameters marked for inclusion in explain */
++		if (!(conf->flags & GUC_EXPLAIN))
++			continue;
++
++		/* return only options visible to the current user */
+ 		if ((conf->flags & GUC_NO_SHOW_ALL) ||
+ 			((conf->flags & GUC_SUPERUSER_ONLY) &&
+ 			 !is_member_of_role(GetUserId(), DEFAULT_ROLE_READ_ALL_SETTINGS)))
+ 			continue;
+ 
+-		/* only parameters explicitly marked for inclusion in explain */
+-		if (!(conf->flags & GUC_EXPLAIN))
+-			continue;
+-
+-		/* return only options that were modified (w.r.t. config file) */
++		/* return only options that are different from their boot values */
+ 		modified = false;
+ 
+ 		switch (conf->vartype)
+@@ -9050,15 +9029,12 @@ get_explain_guc_options(int *num)
+ 				elog(ERROR, "unexpected GUC type: %d", conf->vartype);
+ 		}
+ 
+-		/* skip GUC variables that match the built-in default */
+ 		if (!modified)
+ 			continue;
+ 
+-		/* assign to the values array */
++		/* OK, report it */
+ 		result[*num] = conf;
+ 		*num = *num + 1;
+-
+-		Assert(*num <= num_guc_explain_variables);
+ 	}
+ 
+ 	return result;
+diff --git a/src/test/regress/expected/explain.out b/src/test/regress/expected/explain.out
+index 58339603c71a..8f31c308c605 100644
+--- a/src/test/regress/expected/explain.out
++++ b/src/test/regress/expected/explain.out
+@@ -181,6 +181,26 @@ select explain_filter('explain (analyze, buffers, format yaml) select * from int
+    Execution Time: N.N
+ (1 row)
+ 
++-- SETTINGS option
++-- We have to ignore other settings that might be imposed by the environment,
++-- so printing the whole Settings field unfortunately won't do.
++begin;
++set local plan_cache_mode = force_generic_plan;
++select true as "OK"
++  from explain_filter('explain (settings) select * from int8_tbl i8') ln
++  where ln ~ '^ *Settings: .*plan_cache_mode = ''force_generic_plan''';
++ OK 
++----
++ t
++(1 row)
++
++select explain_filter_to_json('explain (settings, format json) select * from int8_tbl i8') #> '{0,Settings,plan_cache_mode}';
++       ?column?       
++----------------------
++ "force_generic_plan"
++(1 row)
++
++rollback;
+ --
+ -- Test production of per-worker data
+ --
+diff --git a/src/test/regress/sql/explain.sql b/src/test/regress/sql/explain.sql
+index 1c53612cf7d9..e09371f97b8a 100644
+--- a/src/test/regress/sql/explain.sql
++++ b/src/test/regress/sql/explain.sql
+@@ -57,6 +57,18 @@ select explain_filter('explain (analyze, buffers, format json) select * from int
+ select explain_filter('explain (analyze, buffers, format xml) select * from int8_tbl i8');
+ select explain_filter('explain (analyze, buffers, format yaml) select * from int8_tbl i8');
+ 
++-- SETTINGS option
++-- We have to ignore other settings that might be imposed by the environment,
++-- so printing the whole Settings field unfortunately won't do.
++
++begin;
++set local plan_cache_mode = force_generic_plan;
++select true as "OK"
++  from explain_filter('explain (settings) select * from int8_tbl i8') ln
++  where ln ~ '^ *Settings: .*plan_cache_mode = ''force_generic_plan''';
++select explain_filter_to_json('explain (settings, format json) select * from int8_tbl i8') #> '{0,Settings,plan_cache_mode}';
++rollback;
++
+ --
+ -- Test production of per-worker data
+ --

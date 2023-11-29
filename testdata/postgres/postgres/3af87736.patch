@@ -1,0 +1,139 @@
+From 3af87736bf5d5c7bea086d962afc2bbf4f29279a Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 20 Jun 2023 11:09:56 -0400
+Subject: [PATCH] Fix another cause of "wrong varnullingrels" planner failures.
+
+I removed the delay_upper_joins mechanism in commit b448f1c8d,
+reasoning that it was only needed when we have a single-table
+(SELECT ... WHERE) as the immediate RHS child of a left join,
+and we could get rid of that by hoisting the WHERE condition into
+the parent join's quals.  However that new code missed a case:
+we could have "foo LEFT JOIN ((SELECT ... WHERE) LEFT JOIN bar)",
+and if the two left joins can be commuted then we now have the
+problematic query shape.  We can fix this too easily enough,
+by allowing the syntactically-lower left join to pass through
+its parent qual location pointer recursively.  That lets
+prepjointree.c discard the SELECT by temporarily hoisting the
+WHERE condition into the ancestor join's qual.
+
+Per bug #17978 from Zuming Jiang.
+
+Discussion: https://postgr.es/m/17978-12f3d93a55297266@postgresql.org
+---
+ src/backend/optimizer/prep/prepjointree.c | 19 +++++++++++---
+ src/test/regress/expected/join.out        | 31 ++++++++++++++++++++---
+ src/test/regress/sql/join.sql             |  8 ++++++
+ 3 files changed, 51 insertions(+), 7 deletions(-)
+
+diff --git a/src/backend/optimizer/prep/prepjointree.c b/src/backend/optimizer/prep/prepjointree.c
+index 2f589b1b99f5..73ff40721c97 100644
+--- a/src/backend/optimizer/prep/prepjointree.c
++++ b/src/backend/optimizer/prep/prepjointree.c
+@@ -3213,6 +3213,8 @@ remove_useless_result_rtes(PlannerInfo *root)
+  * jtnode is the current jointree node.  If it could be valid to merge
+  * its quals into those of the parent node, parent_quals should point to
+  * the parent's quals list; otherwise, pass NULL for parent_quals.
++ * (Note that in some cases, parent_quals points to the quals of a parent
++ * more than one level up in the tree.)
+  */
+ static Node *
+ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
+@@ -3316,13 +3318,22 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
+ 		int			varno;
+ 
+ 		/*
+-		 * First, recurse.  We can accept pushed-up FromExpr quals from either
+-		 * child if the jointype is INNER, and we can accept them from the RHS
+-		 * child if the jointype is LEFT.
++		 * First, recurse.  We can absorb pushed-up FromExpr quals from either
++		 * child into this node if the jointype is INNER, since then this is
++		 * equivalent to a FromExpr.  When the jointype is LEFT, we can absorb
++		 * quals from the RHS child into the current node, as they're
++		 * essentially degenerate quals of the outer join.  Moreover, if we've
++		 * been passed down a parent_quals pointer then we can allow quals of
++		 * the LHS child to be absorbed into the parent.  (This is important
++		 * to ensure we remove single-child FromExprs immediately below
++		 * commutable left joins.)  For other jointypes, we can't move child
++		 * quals up, or at least there's no particular reason to.
+ 		 */
+ 		j->larg = remove_useless_results_recurse(root, j->larg,
+ 												 (j->jointype == JOIN_INNER) ?
+-												 &j->quals : NULL,
++												 &j->quals :
++												 (j->jointype == JOIN_LEFT) ?
++												 parent_quals : NULL,
+ 												 dropped_outer_joins);
+ 		j->rarg = remove_useless_results_recurse(root, j->rarg,
+ 												 (j->jointype == JOIN_INNER ||
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index cd1163d039bd..6917faec1419 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -2531,20 +2531,45 @@ select * from int4_tbl t1
+     on s.f1 = t1.f1;
+                    QUERY PLAN                    
+ -------------------------------------------------
++ Hash Right Join
++   Hash Cond: (t2.f1 = t1.f1)
++   ->  Nested Loop Left Join
++         Join Filter: (t2.f1 > 1)
++         ->  Nested Loop Left Join
++               Join Filter: (t2.f1 > 0)
++               Filter: (t3.f1 IS NULL)
++               ->  Seq Scan on int4_tbl t2
++               ->  Materialize
++                     ->  Seq Scan on int4_tbl t3
++         ->  Seq Scan on tenk1 t4
++   ->  Hash
++         ->  Seq Scan on int4_tbl t1
++(13 rows)
++
++explain (costs off)
++select * from int4_tbl t1
++  left join ((select t2.f1 from int4_tbl t2
++                left join int4_tbl t3 on t2.f1 > 0
++                where t2.f1 <> coalesce(t3.f1, -1)) s
++             left join tenk1 t4 on s.f1 > 1)
++    on s.f1 = t1.f1;
++                           QUERY PLAN                            
++-----------------------------------------------------------------
+  Nested Loop Left Join
+    Join Filter: (t2.f1 > 1)
+    ->  Hash Right Join
+          Hash Cond: (t2.f1 = t1.f1)
+          ->  Nested Loop Left Join
+                Join Filter: (t2.f1 > 0)
+-               Filter: (t3.f1 IS NULL)
++               Filter: (t2.f1 <> COALESCE(t3.f1, '-1'::integer))
+                ->  Seq Scan on int4_tbl t2
+                ->  Materialize
+                      ->  Seq Scan on int4_tbl t3
+          ->  Hash
+                ->  Seq Scan on int4_tbl t1
+-   ->  Seq Scan on tenk1 t4
+-(13 rows)
++   ->  Materialize
++         ->  Seq Scan on tenk1 t4
++(14 rows)
+ 
+ explain (costs off)
+ select * from onek t1
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index 7ca737eec0fd..55080bec9af8 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -502,6 +502,14 @@ select * from int4_tbl t1
+              left join tenk1 t4 on s.f1 > 1)
+     on s.f1 = t1.f1;
+ 
++explain (costs off)
++select * from int4_tbl t1
++  left join ((select t2.f1 from int4_tbl t2
++                left join int4_tbl t3 on t2.f1 > 0
++                where t2.f1 <> coalesce(t3.f1, -1)) s
++             left join tenk1 t4 on s.f1 > 1)
++    on s.f1 = t1.f1;
++
+ explain (costs off)
+ select * from onek t1
+     left join onek t2 on t1.unique1 = t2.unique1

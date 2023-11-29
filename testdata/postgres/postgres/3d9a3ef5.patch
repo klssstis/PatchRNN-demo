@@ -1,0 +1,194 @@
+From 3d9a3ef5cbfc70bd2802c3f0da3fbc4e5abdf377 Mon Sep 17 00:00:00 2001
+From: Dean Rasheed <dean.a.rasheed@gmail.com>
+Date: Sun, 15 Sep 2019 13:13:59 +0100
+Subject: [PATCH] Fix intermittent self-test failures caused by the stats_ext
+ test.
+
+Commit d7f8d26d9 added new tests to the stats_ext regression test that
+included creating a view in the public schema, without realising that
+the stats_ext test runs in the same parallel group as the rules test,
+which makes doing that unsafe.
+
+This led to intermittent failures of the rules test on the buildfarm,
+although I wasn't able to reproduce that locally. Fix by creating the
+view in a different schema.
+
+Tomas Vondra and Dean Rasheed, report and diagnosis by Thomas Munro.
+
+Discussion: https://postgr.es/m/CA+hUKGKX9hFZrYA7rQzAMRE07L4hziCc-nO_b3taJpiuKyLLxg@mail.gmail.com
+---
+ src/test/regress/expected/stats_ext.out | 42 ++++++++++++++-----------
+ src/test/regress/sql/stats_ext.sql      | 40 ++++++++++++-----------
+ 2 files changed, 44 insertions(+), 38 deletions(-)
+
+diff --git a/src/test/regress/expected/stats_ext.out b/src/test/regress/expected/stats_ext.out
+index e56c75cd33b4..b65228fa07ac 100644
+--- a/src/test/regress/expected/stats_ext.out
++++ b/src/test/regress/expected/stats_ext.out
+@@ -752,19 +752,21 @@ SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists_bool WHERE NOT a AND
+ -- the underlying table.
+ --
+ -- Currently this is only relevant for MCV stats.
+-CREATE TABLE priv_test_tbl (
++CREATE SCHEMA tststats;
++CREATE TABLE tststats.priv_test_tbl (
+     a int,
+     b int
+ );
+-INSERT INTO priv_test_tbl
++INSERT INTO tststats.priv_test_tbl
+      SELECT mod(i,5), mod(i,10) FROM generate_series(1,100) s(i);
+-CREATE STATISTICS priv_test_stats (mcv) ON a, b
+-  FROM priv_test_tbl;
+-ANALYZE priv_test_tbl;
++CREATE STATISTICS tststats.priv_test_stats (mcv) ON a, b
++  FROM tststats.priv_test_tbl;
++ANALYZE tststats.priv_test_tbl;
+ -- User with no access
+ CREATE USER regress_stats_user1;
++GRANT USAGE ON SCHEMA tststats TO regress_stats_user1;
+ SET SESSION AUTHORIZATION regress_stats_user1;
+-SELECT * FROM priv_test_tbl; -- Permission denied
++SELECT * FROM tststats.priv_test_tbl; -- Permission denied
+ ERROR:  permission denied for table priv_test_tbl
+ -- Attempt to gain access using a leaky operator
+ CREATE FUNCTION op_leak(int, int) RETURNS bool
+@@ -772,39 +774,41 @@ CREATE FUNCTION op_leak(int, int) RETURNS bool
+     LANGUAGE plpgsql;
+ CREATE OPERATOR <<< (procedure = op_leak, leftarg = int, rightarg = int,
+                      restrict = scalarltsel);
+-SELECT * FROM priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Permission denied
++SELECT * FROM tststats.priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Permission denied
+ ERROR:  permission denied for table priv_test_tbl
+-DELETE FROM priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Permission denied
++DELETE FROM tststats.priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Permission denied
+ ERROR:  permission denied for table priv_test_tbl
+ -- Grant access via a security barrier view, but hide all data
+ RESET SESSION AUTHORIZATION;
+-CREATE VIEW priv_test_view WITH (security_barrier=true)
+-    AS SELECT * FROM priv_test_tbl WHERE false;
+-GRANT SELECT, DELETE ON priv_test_view TO regress_stats_user1;
++CREATE VIEW tststats.priv_test_view WITH (security_barrier=true)
++    AS SELECT * FROM tststats.priv_test_tbl WHERE false;
++GRANT SELECT, DELETE ON tststats.priv_test_view TO regress_stats_user1;
+ -- Should now have access via the view, but see nothing and leak nothing
+ SET SESSION AUTHORIZATION regress_stats_user1;
+-SELECT * FROM priv_test_view WHERE a <<< 0 AND b <<< 0; -- Should not leak
++SELECT * FROM tststats.priv_test_view WHERE a <<< 0 AND b <<< 0; -- Should not leak
+  a | b 
+ ---+---
+ (0 rows)
+ 
+-DELETE FROM priv_test_view WHERE a <<< 0 AND b <<< 0; -- Should not leak
++DELETE FROM tststats.priv_test_view WHERE a <<< 0 AND b <<< 0; -- Should not leak
+ -- Grant table access, but hide all data with RLS
+ RESET SESSION AUTHORIZATION;
+-ALTER TABLE priv_test_tbl ENABLE ROW LEVEL SECURITY;
+-GRANT SELECT, DELETE ON priv_test_tbl TO regress_stats_user1;
++ALTER TABLE tststats.priv_test_tbl ENABLE ROW LEVEL SECURITY;
++GRANT SELECT, DELETE ON tststats.priv_test_tbl TO regress_stats_user1;
+ -- Should now have direct table access, but see nothing and leak nothing
+ SET SESSION AUTHORIZATION regress_stats_user1;
+-SELECT * FROM priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Should not leak
++SELECT * FROM tststats.priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Should not leak
+  a | b 
+ ---+---
+ (0 rows)
+ 
+-DELETE FROM priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Should not leak
++DELETE FROM tststats.priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Should not leak
+ -- Tidy up
+ DROP OPERATOR <<< (int, int);
+ DROP FUNCTION op_leak(int, int);
+ RESET SESSION AUTHORIZATION;
+-DROP VIEW priv_test_view;
+-DROP TABLE priv_test_tbl;
++DROP SCHEMA tststats CASCADE;
++NOTICE:  drop cascades to 2 other objects
++DETAIL:  drop cascades to table tststats.priv_test_tbl
++drop cascades to view tststats.priv_test_view
+ DROP USER regress_stats_user1;
+diff --git a/src/test/regress/sql/stats_ext.sql b/src/test/regress/sql/stats_ext.sql
+index 65d1e39f0c21..040ee97a1e51 100644
+--- a/src/test/regress/sql/stats_ext.sql
++++ b/src/test/regress/sql/stats_ext.sql
+@@ -493,23 +493,26 @@ SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists_bool WHERE NOT a AND
+ -- the underlying table.
+ --
+ -- Currently this is only relevant for MCV stats.
+-CREATE TABLE priv_test_tbl (
++CREATE SCHEMA tststats;
++
++CREATE TABLE tststats.priv_test_tbl (
+     a int,
+     b int
+ );
+ 
+-INSERT INTO priv_test_tbl
++INSERT INTO tststats.priv_test_tbl
+      SELECT mod(i,5), mod(i,10) FROM generate_series(1,100) s(i);
+ 
+-CREATE STATISTICS priv_test_stats (mcv) ON a, b
+-  FROM priv_test_tbl;
++CREATE STATISTICS tststats.priv_test_stats (mcv) ON a, b
++  FROM tststats.priv_test_tbl;
+ 
+-ANALYZE priv_test_tbl;
++ANALYZE tststats.priv_test_tbl;
+ 
+ -- User with no access
+ CREATE USER regress_stats_user1;
++GRANT USAGE ON SCHEMA tststats TO regress_stats_user1;
+ SET SESSION AUTHORIZATION regress_stats_user1;
+-SELECT * FROM priv_test_tbl; -- Permission denied
++SELECT * FROM tststats.priv_test_tbl; -- Permission denied
+ 
+ -- Attempt to gain access using a leaky operator
+ CREATE FUNCTION op_leak(int, int) RETURNS bool
+@@ -517,34 +520,33 @@ CREATE FUNCTION op_leak(int, int) RETURNS bool
+     LANGUAGE plpgsql;
+ CREATE OPERATOR <<< (procedure = op_leak, leftarg = int, rightarg = int,
+                      restrict = scalarltsel);
+-SELECT * FROM priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Permission denied
+-DELETE FROM priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Permission denied
++SELECT * FROM tststats.priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Permission denied
++DELETE FROM tststats.priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Permission denied
+ 
+ -- Grant access via a security barrier view, but hide all data
+ RESET SESSION AUTHORIZATION;
+-CREATE VIEW priv_test_view WITH (security_barrier=true)
+-    AS SELECT * FROM priv_test_tbl WHERE false;
+-GRANT SELECT, DELETE ON priv_test_view TO regress_stats_user1;
++CREATE VIEW tststats.priv_test_view WITH (security_barrier=true)
++    AS SELECT * FROM tststats.priv_test_tbl WHERE false;
++GRANT SELECT, DELETE ON tststats.priv_test_view TO regress_stats_user1;
+ 
+ -- Should now have access via the view, but see nothing and leak nothing
+ SET SESSION AUTHORIZATION regress_stats_user1;
+-SELECT * FROM priv_test_view WHERE a <<< 0 AND b <<< 0; -- Should not leak
+-DELETE FROM priv_test_view WHERE a <<< 0 AND b <<< 0; -- Should not leak
++SELECT * FROM tststats.priv_test_view WHERE a <<< 0 AND b <<< 0; -- Should not leak
++DELETE FROM tststats.priv_test_view WHERE a <<< 0 AND b <<< 0; -- Should not leak
+ 
+ -- Grant table access, but hide all data with RLS
+ RESET SESSION AUTHORIZATION;
+-ALTER TABLE priv_test_tbl ENABLE ROW LEVEL SECURITY;
+-GRANT SELECT, DELETE ON priv_test_tbl TO regress_stats_user1;
++ALTER TABLE tststats.priv_test_tbl ENABLE ROW LEVEL SECURITY;
++GRANT SELECT, DELETE ON tststats.priv_test_tbl TO regress_stats_user1;
+ 
+ -- Should now have direct table access, but see nothing and leak nothing
+ SET SESSION AUTHORIZATION regress_stats_user1;
+-SELECT * FROM priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Should not leak
+-DELETE FROM priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Should not leak
++SELECT * FROM tststats.priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Should not leak
++DELETE FROM tststats.priv_test_tbl WHERE a <<< 0 AND b <<< 0; -- Should not leak
+ 
+ -- Tidy up
+ DROP OPERATOR <<< (int, int);
+ DROP FUNCTION op_leak(int, int);
+ RESET SESSION AUTHORIZATION;
+-DROP VIEW priv_test_view;
+-DROP TABLE priv_test_tbl;
++DROP SCHEMA tststats CASCADE;
+ DROP USER regress_stats_user1;

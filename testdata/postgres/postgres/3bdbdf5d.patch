@@ -1,0 +1,191 @@
+From 3bdbdf5d06f2179d4c17926d77ff734ea9e7d525 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Tue, 8 Nov 2022 12:23:46 +0900
+Subject: [PATCH] Introduce pg_pwrite_zeros() in fileutils.c
+
+This routine is designed to write zeros to a file using vectored I/O,
+for a size given by its caller, being useful when it comes to
+initializing a file with a final size already known.
+
+XLogFileInitInternal() in xlog.c is changed to use this new routine when
+initializing WAL segments with zeros (wal_init_zero enabled).  Note that
+the aligned buffers used for the vectored I/O writes have a size of
+XLOG_BLCKSZ, and not BLCKSZ anymore, as pg_pwrite_zeros() relies on
+PGAlignedBlock while xlog.c originally used PGAlignedXLogBlock.
+
+This routine will be used in a follow-up patch to do the pre-padding of
+WAL segments for pg_receivewal and pg_basebackup when these are not
+compressed.
+
+Author: Bharath Rupireddy
+Reviewed-by: Nathan Bossart, Andres Freund, Thomas Munro, Michael
+Paquier
+Discussion: https://www.postgresql.org/message-id/CALj2ACUq7nAb7%3DbJNbK3yYmp-SZhJcXFR_pLk8un6XgDzDF3OA%40mail.gmail.com
+---
+ src/backend/access/transam/xlog.c | 33 +++-----------
+ src/common/file_utils.c           | 73 +++++++++++++++++++++++++++++++
+ src/include/common/file_utils.h   |  2 +
+ 3 files changed, 80 insertions(+), 28 deletions(-)
+
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index be54c2318745..a31fbbff78da 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -2921,7 +2921,6 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
+ 					 bool *added, char *path)
+ {
+ 	char		tmppath[MAXPGPATH];
+-	PGAlignedXLogBlock zbuffer;
+ 	XLogSegNo	installed_segno;
+ 	XLogSegNo	max_segno;
+ 	int			fd;
+@@ -2965,14 +2964,11 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
+ 				(errcode_for_file_access(),
+ 				 errmsg("could not create file \"%s\": %m", tmppath)));
+ 
+-	memset(zbuffer.data, 0, XLOG_BLCKSZ);
+-
+ 	pgstat_report_wait_start(WAIT_EVENT_WAL_INIT_WRITE);
+ 	save_errno = 0;
+ 	if (wal_init_zero)
+ 	{
+-		struct iovec iov[PG_IOV_MAX];
+-		int			blocks;
++		ssize_t		rc;
+ 
+ 		/*
+ 		 * Zero-fill the file.  With this setting, we do this the hard way to
+@@ -2983,29 +2979,10 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
+ 		 * indirect blocks are down on disk.  Therefore, fdatasync(2) or
+ 		 * O_DSYNC will be sufficient to sync future writes to the log file.
+ 		 */
++		rc = pg_pwrite_zeros(fd, wal_segment_size);
+ 
+-		/* Prepare to write out a lot of copies of our zero buffer at once. */
+-		for (int i = 0; i < lengthof(iov); ++i)
+-		{
+-			iov[i].iov_base = zbuffer.data;
+-			iov[i].iov_len = XLOG_BLCKSZ;
+-		}
+-
+-		/* Loop, writing as many blocks as we can for each system call. */
+-		blocks = wal_segment_size / XLOG_BLCKSZ;
+-		for (int i = 0; i < blocks;)
+-		{
+-			int			iovcnt = Min(blocks - i, lengthof(iov));
+-			off_t		offset = i * XLOG_BLCKSZ;
+-
+-			if (pg_pwritev_with_retry(fd, iov, iovcnt, offset) < 0)
+-			{
+-				save_errno = errno;
+-				break;
+-			}
+-
+-			i += iovcnt;
+-		}
++		if (rc < 0)
++			save_errno = errno;
+ 	}
+ 	else
+ 	{
+@@ -3014,7 +2991,7 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
+ 		 * enough.
+ 		 */
+ 		errno = 0;
+-		if (pg_pwrite(fd, zbuffer.data, 1, wal_segment_size - 1) != 1)
++		if (pg_pwrite(fd, "\0", 1, wal_segment_size - 1) != 1)
+ 		{
+ 			/* if write didn't set errno, assume no disk space */
+ 			save_errno = errno ? errno : ENOSPC;
+diff --git a/src/common/file_utils.c b/src/common/file_utils.c
+index eac05a13ed52..d8507d88a52a 100644
+--- a/src/common/file_utils.c
++++ b/src/common/file_utils.c
+@@ -527,3 +527,76 @@ pg_pwritev_with_retry(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+ 
+ 	return sum;
+ }
++
++/*
++ * pg_pwrite_zeros
++ *
++ * Writes zeros to file worth "size" bytes, using vectored I/O.
++ *
++ * Returns the total amount of data written.  On failure, a negative value
++ * is returned with errno set.
++ */
++ssize_t
++pg_pwrite_zeros(int fd, size_t size)
++{
++	PGAlignedBlock zbuffer;		/* worth BLCKSZ */
++	size_t		zbuffer_sz;
++	struct iovec iov[PG_IOV_MAX];
++	int			blocks;
++	size_t		remaining_size = 0;
++	int			i;
++	ssize_t		written;
++	ssize_t		total_written = 0;
++
++	zbuffer_sz = sizeof(zbuffer.data);
++
++	/* Zero-fill the buffer. */
++	memset(zbuffer.data, 0, zbuffer_sz);
++
++	/* Prepare to write out a lot of copies of our zero buffer at once. */
++	for (i = 0; i < lengthof(iov); ++i)
++	{
++		iov[i].iov_base = zbuffer.data;
++		iov[i].iov_len = zbuffer_sz;
++	}
++
++	/* Loop, writing as many blocks as we can for each system call. */
++	blocks = size / zbuffer_sz;
++	remaining_size = size % zbuffer_sz;
++	for (i = 0; i < blocks;)
++	{
++		int			iovcnt = Min(blocks - i, lengthof(iov));
++		off_t		offset = i * zbuffer_sz;
++
++		written = pg_pwritev_with_retry(fd, iov, iovcnt, offset);
++
++		if (written < 0)
++			return written;
++
++		i += iovcnt;
++		total_written += written;
++	}
++
++	/* Now, write the remaining size, if any, of the file with zeros. */
++	if (remaining_size > 0)
++	{
++		/* We'll never write more than one block here */
++		int			iovcnt = 1;
++
++		/* Jump on to the end of previously written blocks */
++		off_t		offset = i * zbuffer_sz;
++
++		iov[0].iov_len = remaining_size;
++
++		written = pg_pwritev_with_retry(fd, iov, iovcnt, offset);
++
++		if (written < 0)
++			return written;
++
++		total_written += written;
++	}
++
++	Assert(total_written == size);
++
++	return total_written;
++}
+diff --git a/src/include/common/file_utils.h b/src/include/common/file_utils.h
+index 2c5dbcb0b1ee..d2c64c2196ce 100644
+--- a/src/include/common/file_utils.h
++++ b/src/include/common/file_utils.h
+@@ -44,4 +44,6 @@ extern ssize_t pg_pwritev_with_retry(int fd,
+ 									 int iovcnt,
+ 									 off_t offset);
+ 
++extern ssize_t pg_pwrite_zeros(int fd, size_t size);
++
+ #endif							/* FILE_UTILS_H */

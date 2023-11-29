@@ -1,0 +1,134 @@
+From 03c811a483b243952874d8e2b3f0c2e3793bc952 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 12 Aug 2019 13:15:47 -0400
+Subject: [PATCH] Fix planner's test for case-foldable characters in ILIKE with
+ ICU.
+
+As coded, the ICU-collation path in pattern_char_isalpha() failed
+to consider regular ASCII letters to be case-varying.  This led to
+like_fixed_prefix treating too much of an ILIKE pattern as being a
+fixed prefix, so that indexscans derived from an ILIKE clause might
+miss entries that they should find.
+
+Per bug #15892 from James Inform.  This is an oversight in the original
+ICU patch (commit eccfef81e), so back-patch to v10 where that came in.
+
+Discussion: https://postgr.es/m/15892-e5d2bea3e8a04a1b@postgresql.org
+---
+ src/backend/utils/adt/like_support.c          |  8 +++--
+ .../regress/expected/collate.icu.utf8.out     | 35 ++++++++++++++++++-
+ src/test/regress/sql/collate.icu.utf8.sql     | 12 ++++++-
+ 3 files changed, 50 insertions(+), 5 deletions(-)
+
+diff --git a/src/backend/utils/adt/like_support.c b/src/backend/utils/adt/like_support.c
+index 26e06348338d..c8fec7863f41 100644
+--- a/src/backend/utils/adt/like_support.c
++++ b/src/backend/utils/adt/like_support.c
+@@ -1437,8 +1437,9 @@ regex_selectivity(const char *patt, int pattlen, bool case_insensitive,
+  * Check whether char is a letter (and, hence, subject to case-folding)
+  *
+  * In multibyte character sets or with ICU, we can't use isalpha, and it does
+- * not seem worth trying to convert to wchar_t to use iswalpha.  Instead, just
+- * assume any multibyte char is potentially case-varying.
++ * not seem worth trying to convert to wchar_t to use iswalpha or u_isalpha.
++ * Instead, just assume any non-ASCII char is potentially case-varying, and
++ * hard-wire knowledge of which ASCII chars are letters.
+  */
+ static int
+ pattern_char_isalpha(char c, bool is_multibyte,
+@@ -1449,7 +1450,8 @@ pattern_char_isalpha(char c, bool is_multibyte,
+ 	else if (is_multibyte && IS_HIGHBIT_SET(c))
+ 		return true;
+ 	else if (locale && locale->provider == COLLPROVIDER_ICU)
+-		return IS_HIGHBIT_SET(c) ? true : false;
++		return IS_HIGHBIT_SET(c) ||
++			(c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+ #ifdef HAVE_LOCALE_T
+ 	else if (locale && locale->provider == COLLPROVIDER_LIBC)
+ 		return isalpha_l((unsigned char) c, locale->info.lt);
+diff --git a/src/test/regress/expected/collate.icu.utf8.out b/src/test/regress/expected/collate.icu.utf8.out
+index 51262e0bf44b..50d1e6e0cc74 100644
+--- a/src/test/regress/expected/collate.icu.utf8.out
++++ b/src/test/regress/expected/collate.icu.utf8.out
+@@ -983,6 +983,38 @@ SELECT relname, pg_get_indexdef(oid) FROM pg_class WHERE relname LIKE 'collate_t
+  collate_test1_idx4 | CREATE INDEX collate_test1_idx4 ON collate_tests.collate_test1 USING btree (((b || 'foo'::text)) COLLATE "POSIX")
+ (4 rows)
+ 
++set enable_seqscan = off;
++explain (costs off)
++select * from collate_test1 where b ilike 'abc';
++          QUERY PLAN           
++-------------------------------
++ Seq Scan on collate_test1
++   Filter: (b ~~* 'abc'::text)
++(2 rows)
++
++select * from collate_test1 where b ilike 'abc';
++ a |  b  
++---+-----
++ 1 | abc
++ 4 | ABC
++(2 rows)
++
++explain (costs off)
++select * from collate_test1 where b ilike 'ABC';
++          QUERY PLAN           
++-------------------------------
++ Seq Scan on collate_test1
++   Filter: (b ~~* 'ABC'::text)
++(2 rows)
++
++select * from collate_test1 where b ilike 'ABC';
++ a |  b  
++---+-----
++ 1 | abc
++ 4 | ABC
++(2 rows)
++
++reset enable_seqscan;
+ -- schema manipulation commands
+ CREATE ROLE regress_test_role;
+ CREATE SCHEMA test_schema;
+@@ -1867,8 +1899,9 @@ SELECT (SELECT count(*) FROM test33_0) <> (SELECT count(*) FROM test33_1);
+ (1 row)
+ 
+ -- cleanup
++RESET search_path;
+ SET client_min_messages TO warning;
+ DROP SCHEMA collate_tests CASCADE;
+-RESET search_path;
++RESET client_min_messages;
+ -- leave a collation for pg_upgrade test
+ CREATE COLLATION coll_icu_upgrade FROM "und-x-icu";
+diff --git a/src/test/regress/sql/collate.icu.utf8.sql b/src/test/regress/sql/collate.icu.utf8.sql
+index 46999fb9266f..5ed63601e0cf 100644
+--- a/src/test/regress/sql/collate.icu.utf8.sql
++++ b/src/test/regress/sql/collate.icu.utf8.sql
+@@ -341,6 +341,15 @@ CREATE INDEX collate_test1_idx6 ON collate_test1 ((a COLLATE "C")); -- fail
+ 
+ SELECT relname, pg_get_indexdef(oid) FROM pg_class WHERE relname LIKE 'collate_test%_idx%' ORDER BY 1;
+ 
++set enable_seqscan = off;
++explain (costs off)
++select * from collate_test1 where b ilike 'abc';
++select * from collate_test1 where b ilike 'abc';
++explain (costs off)
++select * from collate_test1 where b ilike 'ABC';
++select * from collate_test1 where b ilike 'ABC';
++reset enable_seqscan;
++
+ 
+ -- schema manipulation commands
+ 
+@@ -712,9 +721,10 @@ SELECT (SELECT count(*) FROM test33_0) <> (SELECT count(*) FROM test33_1);
+ 
+ 
+ -- cleanup
++RESET search_path;
+ SET client_min_messages TO warning;
+ DROP SCHEMA collate_tests CASCADE;
+-RESET search_path;
++RESET client_min_messages;
+ 
+ -- leave a collation for pg_upgrade test
+ CREATE COLLATION coll_icu_upgrade FROM "und-x-icu";

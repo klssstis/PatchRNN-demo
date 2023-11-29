@@ -1,0 +1,189 @@
+From 3e60c6f72328a9ad14d8a087411cd394752c5b23 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 5 Jun 2017 14:50:52 -0400
+Subject: [PATCH] Code review for shm_toc.h/.c.
+
+Declare the toc_nentry field as uint32 not Size.  Since shm_toc_lookup()
+reads the field without any lock, it has to be atomically readable, and
+we do not assume that for fields wider than 32 bits.  Performance would
+be impossibly bad for entry counts approaching 2^32 anyway, so there is
+no need to try to preserve maximum width here.
+
+This is probably an academic issue, because even if reading int64 isn't
+atomic, the high order half would never change in practice.  Still, it's
+a coding rule violation, so let's fix it.
+
+Adjust some other not-terribly-well-chosen data types too, and copy-edit
+some comments.  Make shm_toc_attach's Asserts consistent with
+shm_toc_create's.
+
+None of this looks to be a live bug, so no need for back-patch.
+
+Discussion: https://postgr.es/m/16984.1496679541@sss.pgh.pa.us
+---
+ src/backend/storage/ipc/shm_toc.c | 40 +++++++++++++++++--------------
+ src/include/storage/shm_toc.h     | 15 ++++++------
+ 2 files changed, 30 insertions(+), 25 deletions(-)
+
+diff --git a/src/backend/storage/ipc/shm_toc.c b/src/backend/storage/ipc/shm_toc.c
+index 5e290df3366b..50334cd79783 100644
+--- a/src/backend/storage/ipc/shm_toc.c
++++ b/src/backend/storage/ipc/shm_toc.c
+@@ -6,7 +6,7 @@
+  * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+  * Portions Copyright (c) 1994, Regents of the University of California
+  *
+- * src/include/storage/shm_toc.c
++ * src/backend/storage/ipc/shm_toc.c
+  *
+  *-------------------------------------------------------------------------
+  */
+@@ -20,16 +20,16 @@
+ typedef struct shm_toc_entry
+ {
+ 	uint64		key;			/* Arbitrary identifier */
+-	uint64		offset;			/* Bytes offset */
++	Size		offset;			/* Offset, in bytes, from TOC start */
+ } shm_toc_entry;
+ 
+ struct shm_toc
+ {
+-	uint64		toc_magic;		/* Magic number for this TOC */
++	uint64		toc_magic;		/* Magic number identifying this TOC */
+ 	slock_t		toc_mutex;		/* Spinlock for mutual exclusion */
+ 	Size		toc_total_bytes;	/* Bytes managed by this TOC */
+ 	Size		toc_allocated_bytes;	/* Bytes allocated of those managed */
+-	Size		toc_nentry;		/* Number of entries in TOC */
++	uint32		toc_nentry;		/* Number of entries in TOC */
+ 	shm_toc_entry toc_entry[FLEXIBLE_ARRAY_MEMBER];
+ };
+ 
+@@ -53,7 +53,7 @@ shm_toc_create(uint64 magic, void *address, Size nbytes)
+ 
+ /*
+  * Attach to an existing table of contents.  If the magic number found at
+- * the target address doesn't match our expectations, returns NULL.
++ * the target address doesn't match our expectations, return NULL.
+  */
+ extern shm_toc *
+ shm_toc_attach(uint64 magic, void *address)
+@@ -64,7 +64,7 @@ shm_toc_attach(uint64 magic, void *address)
+ 		return NULL;
+ 
+ 	Assert(toc->toc_total_bytes >= toc->toc_allocated_bytes);
+-	Assert(toc->toc_total_bytes >= offsetof(shm_toc, toc_entry));
++	Assert(toc->toc_total_bytes > offsetof(shm_toc, toc_entry));
+ 
+ 	return toc;
+ }
+@@ -76,7 +76,7 @@ shm_toc_attach(uint64 magic, void *address)
+  * just a way of dividing a single physical shared memory segment into logical
+  * chunks that may be used for different purposes.
+  *
+- * We allocated backwards from the end of the segment, so that the TOC entries
++ * We allocate backwards from the end of the segment, so that the TOC entries
+  * can grow forward from the start of the segment.
+  */
+ extern void *
+@@ -140,7 +140,7 @@ shm_toc_freespace(shm_toc *toc)
+ /*
+  * Insert a TOC entry.
+  *
+- * The idea here is that process setting up the shared memory segment will
++ * The idea here is that the process setting up the shared memory segment will
+  * register the addresses of data structures within the segment using this
+  * function.  Each data structure will be identified using a 64-bit key, which
+  * is assumed to be a well-known or discoverable integer.  Other processes
+@@ -155,17 +155,17 @@ shm_toc_freespace(shm_toc *toc)
+  * data structure here.  But the real idea here is just to give someone mapping
+  * a dynamic shared memory the ability to find the bare minimum number of
+  * pointers that they need to bootstrap.  If you're storing a lot of stuff in
+- * here, you're doing it wrong.
++ * the TOC, you're doing it wrong.
+  */
+ void
+ shm_toc_insert(shm_toc *toc, uint64 key, void *address)
+ {
+ 	volatile shm_toc *vtoc = toc;
+-	uint64		total_bytes;
+-	uint64		allocated_bytes;
+-	uint64		nentry;
+-	uint64		toc_bytes;
+-	uint64		offset;
++	Size		total_bytes;
++	Size		allocated_bytes;
++	Size		nentry;
++	Size		toc_bytes;
++	Size		offset;
+ 
+ 	/* Relativize pointer. */
+ 	Assert(address > (void *) toc);
+@@ -181,7 +181,8 @@ shm_toc_insert(shm_toc *toc, uint64 key, void *address)
+ 
+ 	/* Check for memory exhaustion and overflow. */
+ 	if (toc_bytes + sizeof(shm_toc_entry) > total_bytes ||
+-		toc_bytes + sizeof(shm_toc_entry) < toc_bytes)
++		toc_bytes + sizeof(shm_toc_entry) < toc_bytes ||
++		nentry >= PG_UINT32_MAX)
+ 	{
+ 		SpinLockRelease(&toc->toc_mutex);
+ 		ereport(ERROR,
+@@ -220,10 +221,13 @@ shm_toc_insert(shm_toc *toc, uint64 key, void *address)
+ void *
+ shm_toc_lookup(shm_toc *toc, uint64 key, bool noError)
+ {
+-	uint64		nentry;
+-	uint64		i;
++	uint32		nentry;
++	uint32		i;
+ 
+-	/* Read the number of entries before we examine any entry. */
++	/*
++	 * Read the number of entries before we examine any entry.  We assume that
++	 * reading a uint32 is atomic.
++	 */
+ 	nentry = toc->toc_nentry;
+ 	pg_read_barrier();
+ 
+diff --git a/src/include/storage/shm_toc.h b/src/include/storage/shm_toc.h
+index 0548e309bd0b..9175a472d88b 100644
+--- a/src/include/storage/shm_toc.h
++++ b/src/include/storage/shm_toc.h
+@@ -22,9 +22,9 @@
+ #ifndef SHM_TOC_H
+ #define SHM_TOC_H
+ 
+-#include "storage/shmem.h"
++#include "storage/shmem.h"		/* for add_size() */
+ 
+-struct shm_toc;
++/* shm_toc is an opaque type known only within shm_toc.c */
+ typedef struct shm_toc shm_toc;
+ 
+ extern shm_toc *shm_toc_create(uint64 magic, void *address, Size nbytes);
+@@ -36,7 +36,9 @@ extern void *shm_toc_lookup(shm_toc *toc, uint64 key, bool noError);
+ 
+ /*
+  * Tools for estimating how large a chunk of shared memory will be needed
+- * to store a TOC and its dependent objects.
++ * to store a TOC and its dependent objects.  Note: we don't really support
++ * large numbers of keys, but it's convenient to declare number_of_keys
++ * as a Size anyway.
+  */
+ typedef struct
+ {
+@@ -47,11 +49,10 @@ typedef struct
+ #define shm_toc_initialize_estimator(e) \
+ 	((e)->space_for_chunks = 0, (e)->number_of_keys = 0)
+ #define shm_toc_estimate_chunk(e, sz) \
+-	((e)->space_for_chunks = add_size((e)->space_for_chunks, \
+-		BUFFERALIGN((sz))))
++	((e)->space_for_chunks = add_size((e)->space_for_chunks, BUFFERALIGN(sz)))
+ #define shm_toc_estimate_keys(e, cnt) \
+-	((e)->number_of_keys = add_size((e)->number_of_keys, (cnt)))
++	((e)->number_of_keys = add_size((e)->number_of_keys, cnt))
+ 
+-extern Size shm_toc_estimate(shm_toc_estimator *);
++extern Size shm_toc_estimate(shm_toc_estimator *e);
+ 
+ #endif   /* SHM_TOC_H */

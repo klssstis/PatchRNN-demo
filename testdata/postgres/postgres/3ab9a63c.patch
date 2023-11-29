@@ -1,0 +1,439 @@
+From 3ab9a63cb638a1fd99475668e2da9c237495aeda Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 13 May 2022 11:40:01 -0400
+Subject: [PATCH] Rename JsonIsPredicate.value_type, fix JSON backend/nodes/
+ infrastructure.
+
+I started out with the intention to rename value_type to item_type to
+avoid a collision with a typedef name that appears on some platforms.
+
+Along the way, I noticed that the adjacent field "format" was not being
+correctly handled by the backend/nodes/ infrastructure functions:
+copyfuncs.c erroneously treated it as a scalar, while equalfuncs,
+outfuncs, and readfuncs omitted handling it at all.  This looks like
+it might be cosmetic at the moment because the field is always NULL
+after parse analysis; but that's likely a bug in itself, and the code's
+certainly not very future-proof.  Let's fix it while we can still do so
+without forcing an initdb on beta testers.
+
+Further study found a few other inconsistencies in the backend/nodes/
+infrastructure for the recently-added JSON node types, so fix those too.
+
+catversion bumped because of potential change in stored rules.
+
+Discussion: https://postgr.es/m/526703.1652385613@sss.pgh.pa.us
+---
+ src/backend/executor/execExprInterp.c | 12 ++++++------
+ src/backend/nodes/copyfuncs.c         |  9 +++++----
+ src/backend/nodes/equalfuncs.c        |  8 +++++---
+ src/backend/nodes/makefuncs.c         |  4 ++--
+ src/backend/nodes/outfuncs.c          | 16 +++++++++-------
+ src/backend/nodes/readfuncs.c         | 16 +++++++++-------
+ src/backend/parser/parse_expr.c       |  6 +++---
+ src/backend/utils/adt/ruleutils.c     |  4 +++-
+ src/backend/utils/misc/queryjumble.c  |  9 +++++----
+ src/include/catalog/catversion.h      |  2 +-
+ src/include/nodes/makefuncs.h         |  2 +-
+ src/include/nodes/primnodes.h         |  6 +++---
+ 12 files changed, 52 insertions(+), 42 deletions(-)
+
+diff --git a/src/backend/executor/execExprInterp.c b/src/backend/executor/execExprInterp.c
+index e024611aa543..e44ad68cda16 100644
+--- a/src/backend/executor/execExprInterp.c
++++ b/src/backend/executor/execExprInterp.c
+@@ -3952,24 +3952,24 @@ ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
+ 	{
+ 		text	   *json = DatumGetTextP(js);
+ 
+-		if (pred->value_type == JS_TYPE_ANY)
++		if (pred->item_type == JS_TYPE_ANY)
+ 			res = true;
+ 		else
+ 		{
+ 			switch (json_get_first_token(json, false))
+ 			{
+ 				case JSON_TOKEN_OBJECT_START:
+-					res = pred->value_type == JS_TYPE_OBJECT;
++					res = pred->item_type == JS_TYPE_OBJECT;
+ 					break;
+ 				case JSON_TOKEN_ARRAY_START:
+-					res = pred->value_type == JS_TYPE_ARRAY;
++					res = pred->item_type == JS_TYPE_ARRAY;
+ 					break;
+ 				case JSON_TOKEN_STRING:
+ 				case JSON_TOKEN_NUMBER:
+ 				case JSON_TOKEN_TRUE:
+ 				case JSON_TOKEN_FALSE:
+ 				case JSON_TOKEN_NULL:
+-					res = pred->value_type == JS_TYPE_SCALAR;
++					res = pred->item_type == JS_TYPE_SCALAR;
+ 					break;
+ 				default:
+ 					res = false;
+@@ -3986,13 +3986,13 @@ ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
+ 	}
+ 	else if (exprtype == JSONBOID)
+ 	{
+-		if (pred->value_type == JS_TYPE_ANY)
++		if (pred->item_type == JS_TYPE_ANY)
+ 			res = true;
+ 		else
+ 		{
+ 			Jsonb	   *jb = DatumGetJsonbP(js);
+ 
+-			switch (pred->value_type)
++			switch (pred->item_type)
+ 			{
+ 				case JS_TYPE_OBJECT:
+ 					res = JB_ROOT_IS_OBJECT(jb);
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index 205506305b04..51d630fa8925 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -2557,11 +2557,11 @@ _copyJsonExpr(const JsonExpr *from)
+ 	COPY_NODE_FIELD(result_coercion);
+ 	COPY_NODE_FIELD(format);
+ 	COPY_NODE_FIELD(path_spec);
+-	COPY_NODE_FIELD(passing_values);
+ 	COPY_NODE_FIELD(passing_names);
++	COPY_NODE_FIELD(passing_values);
+ 	COPY_NODE_FIELD(returning);
+-	COPY_NODE_FIELD(on_error);
+ 	COPY_NODE_FIELD(on_empty);
++	COPY_NODE_FIELD(on_error);
+ 	COPY_NODE_FIELD(coercions);
+ 	COPY_SCALAR_FIELD(wrapper);
+ 	COPY_SCALAR_FIELD(omit_quotes);
+@@ -2637,8 +2637,8 @@ _copyJsonIsPredicate(const JsonIsPredicate *from)
+ 	JsonIsPredicate *newnode = makeNode(JsonIsPredicate);
+ 
+ 	COPY_NODE_FIELD(expr);
+-	COPY_SCALAR_FIELD(format);
+-	COPY_SCALAR_FIELD(value_type);
++	COPY_NODE_FIELD(format);
++	COPY_SCALAR_FIELD(item_type);
+ 	COPY_SCALAR_FIELD(unique_keys);
+ 	COPY_LOCATION_FIELD(location);
+ 
+@@ -2764,6 +2764,7 @@ _copyJsonTableParent(const JsonTableParent *from)
+ 	COPY_SCALAR_FIELD(outerJoin);
+ 	COPY_SCALAR_FIELD(colMin);
+ 	COPY_SCALAR_FIELD(colMax);
++	COPY_SCALAR_FIELD(errorOnError);
+ 
+ 	return newnode;
+ }
+diff --git a/src/backend/nodes/equalfuncs.c b/src/backend/nodes/equalfuncs.c
+index 9688b22a4b99..e747e1667d01 100644
+--- a/src/backend/nodes/equalfuncs.c
++++ b/src/backend/nodes/equalfuncs.c
+@@ -186,6 +186,7 @@ _equalJsonTableParent(const JsonTableParent *a, const JsonTableParent *b)
+ 	COMPARE_SCALAR_FIELD(outerJoin);
+ 	COMPARE_SCALAR_FIELD(colMin);
+ 	COMPARE_SCALAR_FIELD(colMax);
++	COMPARE_SCALAR_FIELD(errorOnError);
+ 
+ 	return true;
+ }
+@@ -1104,7 +1105,8 @@ _equalJsonIsPredicate(const JsonIsPredicate *a,
+ 					  const JsonIsPredicate *b)
+ {
+ 	COMPARE_NODE_FIELD(expr);
+-	COMPARE_SCALAR_FIELD(value_type);
++	COMPARE_NODE_FIELD(format);
++	COMPARE_SCALAR_FIELD(item_type);
+ 	COMPARE_SCALAR_FIELD(unique_keys);
+ 	COMPARE_LOCATION_FIELD(location);
+ 
+@@ -1134,11 +1136,11 @@ _equalJsonExpr(const JsonExpr *a, const JsonExpr *b)
+ 	COMPARE_NODE_FIELD(result_coercion);
+ 	COMPARE_NODE_FIELD(format);
+ 	COMPARE_NODE_FIELD(path_spec);
+-	COMPARE_NODE_FIELD(passing_values);
+ 	COMPARE_NODE_FIELD(passing_names);
++	COMPARE_NODE_FIELD(passing_values);
+ 	COMPARE_NODE_FIELD(returning);
+-	COMPARE_NODE_FIELD(on_error);
+ 	COMPARE_NODE_FIELD(on_empty);
++	COMPARE_NODE_FIELD(on_error);
+ 	COMPARE_NODE_FIELD(coercions);
+ 	COMPARE_SCALAR_FIELD(wrapper);
+ 	COMPARE_SCALAR_FIELD(omit_quotes);
+diff --git a/src/backend/nodes/makefuncs.c b/src/backend/nodes/makefuncs.c
+index 41e26a0fe679..28288dcfc101 100644
+--- a/src/backend/nodes/makefuncs.c
++++ b/src/backend/nodes/makefuncs.c
+@@ -927,14 +927,14 @@ makeJsonKeyValue(Node *key, Node *value)
+  *	  creates a JsonIsPredicate node
+  */
+ Node *
+-makeJsonIsPredicate(Node *expr, JsonFormat *format, JsonValueType value_type,
++makeJsonIsPredicate(Node *expr, JsonFormat *format, JsonValueType item_type,
+ 					bool unique_keys, int location)
+ {
+ 	JsonIsPredicate *n = makeNode(JsonIsPredicate);
+ 
+ 	n->expr = expr;
+ 	n->format = format;
+-	n->value_type = value_type;
++	n->item_type = item_type;
+ 	n->unique_keys = unique_keys;
+ 	n->location = location;
+ 
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index 0271ea9d7869..ce1291559259 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -1801,13 +1801,13 @@ _outJsonConstructorExpr(StringInfo str, const JsonConstructorExpr *node)
+ {
+ 	WRITE_NODE_TYPE("JSONCONSTRUCTOREXPR");
+ 
++	WRITE_ENUM_FIELD(type, JsonConstructorType);
+ 	WRITE_NODE_FIELD(args);
+ 	WRITE_NODE_FIELD(func);
+ 	WRITE_NODE_FIELD(coercion);
+-	WRITE_ENUM_FIELD(type, JsonConstructorType);
+ 	WRITE_NODE_FIELD(returning);
+-	WRITE_BOOL_FIELD(unique);
+ 	WRITE_BOOL_FIELD(absent_on_null);
++	WRITE_BOOL_FIELD(unique);
+ 	WRITE_LOCATION_FIELD(location);
+ }
+ 
+@@ -1817,7 +1817,8 @@ _outJsonIsPredicate(StringInfo str, const JsonIsPredicate *node)
+ 	WRITE_NODE_TYPE("JSONISPREDICATE");
+ 
+ 	WRITE_NODE_FIELD(expr);
+-	WRITE_ENUM_FIELD(value_type, JsonValueType);
++	WRITE_NODE_FIELD(format);
++	WRITE_ENUM_FIELD(item_type, JsonValueType);
+ 	WRITE_BOOL_FIELD(unique_keys);
+ 	WRITE_LOCATION_FIELD(location);
+ }
+@@ -1841,11 +1842,11 @@ _outJsonExpr(StringInfo str, const JsonExpr *node)
+ 	WRITE_NODE_FIELD(result_coercion);
+ 	WRITE_NODE_FIELD(format);
+ 	WRITE_NODE_FIELD(path_spec);
+-	WRITE_NODE_FIELD(passing_values);
+ 	WRITE_NODE_FIELD(passing_names);
++	WRITE_NODE_FIELD(passing_values);
+ 	WRITE_NODE_FIELD(returning);
+-	WRITE_NODE_FIELD(on_error);
+ 	WRITE_NODE_FIELD(on_empty);
++	WRITE_NODE_FIELD(on_error);
+ 	WRITE_NODE_FIELD(coercions);
+ 	WRITE_ENUM_FIELD(wrapper, JsonWrapper);
+ 	WRITE_BOOL_FIELD(omit_quotes);
+@@ -1883,7 +1884,7 @@ _outJsonItemCoercions(StringInfo str, const JsonItemCoercions *node)
+ static void
+ _outJsonTableParent(StringInfo str, const JsonTableParent *node)
+ {
+-	WRITE_NODE_TYPE("JSONTABPNODE");
++	WRITE_NODE_TYPE("JSONTABLEPARENT");
+ 
+ 	WRITE_NODE_FIELD(path);
+ 	WRITE_STRING_FIELD(name);
+@@ -1891,12 +1892,13 @@ _outJsonTableParent(StringInfo str, const JsonTableParent *node)
+ 	WRITE_BOOL_FIELD(outerJoin);
+ 	WRITE_INT_FIELD(colMin);
+ 	WRITE_INT_FIELD(colMax);
++	WRITE_BOOL_FIELD(errorOnError);
+ }
+ 
+ static void
+ _outJsonTableSibling(StringInfo str, const JsonTableSibling *node)
+ {
+-	WRITE_NODE_TYPE("JSONTABSNODE");
++	WRITE_NODE_TYPE("JSONTABLESIBLING");
+ 
+ 	WRITE_NODE_FIELD(larg);
+ 	WRITE_NODE_FIELD(rarg);
+diff --git a/src/backend/nodes/readfuncs.c b/src/backend/nodes/readfuncs.c
+index ddf76ac778fd..6a05b6941524 100644
+--- a/src/backend/nodes/readfuncs.c
++++ b/src/backend/nodes/readfuncs.c
+@@ -1484,13 +1484,13 @@ _readJsonConstructorExpr(void)
+ {
+ 	READ_LOCALS(JsonConstructorExpr);
+ 
++	READ_ENUM_FIELD(type, JsonConstructorType);
+ 	READ_NODE_FIELD(args);
+ 	READ_NODE_FIELD(func);
+ 	READ_NODE_FIELD(coercion);
+-	READ_INT_FIELD(type);
+ 	READ_NODE_FIELD(returning);
+-	READ_BOOL_FIELD(unique);
+ 	READ_BOOL_FIELD(absent_on_null);
++	READ_BOOL_FIELD(unique);
+ 	READ_LOCATION_FIELD(location);
+ 
+ 	READ_DONE();
+@@ -1523,11 +1523,11 @@ _readJsonExpr(void)
+ 	READ_NODE_FIELD(result_coercion);
+ 	READ_NODE_FIELD(format);
+ 	READ_NODE_FIELD(path_spec);
+-	READ_NODE_FIELD(passing_values);
+ 	READ_NODE_FIELD(passing_names);
++	READ_NODE_FIELD(passing_values);
+ 	READ_NODE_FIELD(returning);
+-	READ_NODE_FIELD(on_error);
+ 	READ_NODE_FIELD(on_empty);
++	READ_NODE_FIELD(on_error);
+ 	READ_NODE_FIELD(coercions);
+ 	READ_ENUM_FIELD(wrapper, JsonWrapper);
+ 	READ_BOOL_FIELD(omit_quotes);
+@@ -1547,6 +1547,7 @@ _readJsonTableParent(void)
+ 	READ_BOOL_FIELD(outerJoin);
+ 	READ_INT_FIELD(colMin);
+ 	READ_INT_FIELD(colMax);
++	READ_BOOL_FIELD(errorOnError);
+ 
+ 	READ_DONE();
+ }
+@@ -1610,7 +1611,8 @@ _readJsonIsPredicate()
+ 	READ_LOCALS(JsonIsPredicate);
+ 
+ 	READ_NODE_FIELD(expr);
+-	READ_ENUM_FIELD(value_type, JsonValueType);
++	READ_NODE_FIELD(format);
++	READ_ENUM_FIELD(item_type, JsonValueType);
+ 	READ_BOOL_FIELD(unique_keys);
+ 	READ_LOCATION_FIELD(location);
+ 
+@@ -3229,9 +3231,9 @@ parseNodeString(void)
+ 		return_value = _readJsonCoercion();
+ 	else if (MATCH("JSONITEMCOERCIONS", 17))
+ 		return_value = _readJsonItemCoercions();
+-	else if (MATCH("JSONTABPNODE", 12))
++	else if (MATCH("JSONTABLEPARENT", 15))
+ 		return_value = _readJsonTableParent();
+-	else if (MATCH("JSONTABSNODE", 12))
++	else if (MATCH("JSONTABLESIBLING", 16))
+ 		return_value = _readJsonTableSibling();
+ 	else
+ 	{
+diff --git a/src/backend/parser/parse_expr.c b/src/backend/parser/parse_expr.c
+index 17709c3416bc..0dc2fc472e58 100644
+--- a/src/backend/parser/parse_expr.c
++++ b/src/backend/parser/parse_expr.c
+@@ -4018,8 +4018,7 @@ transformJsonParseArg(ParseState *pstate, Node *jsexpr, JsonFormat *format,
+ }
+ 
+ /*
+- * Transform IS JSON predicate into
+- * json[b]_is_valid(json, value_type [, check_key_uniqueness]) call.
++ * Transform IS JSON predicate.
+  */
+ static Node *
+ transformJsonIsPredicate(ParseState *pstate, JsonIsPredicate *pred)
+@@ -4035,7 +4034,8 @@ transformJsonIsPredicate(ParseState *pstate, JsonIsPredicate *pred)
+ 				 errmsg("cannot use type %s in IS JSON predicate",
+ 						format_type_be(exprtype))));
+ 
+-	return makeJsonIsPredicate(expr, NULL, pred->value_type,
++	/* This intentionally(?) drops the format clause. */
++	return makeJsonIsPredicate(expr, NULL, pred->item_type,
+ 							   pred->unique_keys, pred->location);
+ }
+ 
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index f22ecfc58323..49c4201dde6b 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -9730,7 +9730,9 @@ get_rule_expr(Node *node, deparse_context *context,
+ 
+ 				appendStringInfoString(context->buf, " IS JSON");
+ 
+-				switch (pred->value_type)
++				/* TODO: handle FORMAT clause */
++
++				switch (pred->item_type)
+ 				{
+ 					case JS_TYPE_SCALAR:
+ 						appendStringInfoString(context->buf, " SCALAR");
+diff --git a/src/backend/utils/misc/queryjumble.c b/src/backend/utils/misc/queryjumble.c
+index d35027275f17..eeaa0b31fe23 100644
+--- a/src/backend/utils/misc/queryjumble.c
++++ b/src/backend/utils/misc/queryjumble.c
+@@ -741,7 +741,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
+ 			{
+ 				JsonFormat *format = (JsonFormat *) node;
+ 
+-				APP_JUMB(format->type);
++				APP_JUMB(format->format_type);
+ 				APP_JUMB(format->encoding);
+ 			}
+ 			break;
+@@ -767,12 +767,13 @@ JumbleExpr(JumbleState *jstate, Node *node)
+ 			{
+ 				JsonConstructorExpr *ctor = (JsonConstructorExpr *) node;
+ 
++				APP_JUMB(ctor->type);
++				JumbleExpr(jstate, (Node *) ctor->args);
+ 				JumbleExpr(jstate, (Node *) ctor->func);
+ 				JumbleExpr(jstate, (Node *) ctor->coercion);
+ 				JumbleExpr(jstate, (Node *) ctor->returning);
+-				APP_JUMB(ctor->type);
+-				APP_JUMB(ctor->unique);
+ 				APP_JUMB(ctor->absent_on_null);
++				APP_JUMB(ctor->unique);
+ 			}
+ 			break;
+ 		case T_JsonIsPredicate:
+@@ -781,8 +782,8 @@ JumbleExpr(JumbleState *jstate, Node *node)
+ 
+ 				JumbleExpr(jstate, (Node *) pred->expr);
+ 				JumbleExpr(jstate, (Node *) pred->format);
++				APP_JUMB(pred->item_type);
+ 				APP_JUMB(pred->unique_keys);
+-				APP_JUMB(pred->value_type);
+ 			}
+ 			break;
+ 		case T_JsonExpr:
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 805e870842e7..2cdcfa667a80 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202205121
++#define CATALOG_VERSION_NO	202205131
+ 
+ #endif
+diff --git a/src/include/nodes/makefuncs.h b/src/include/nodes/makefuncs.h
+index c717468eb391..06e6369026a4 100644
+--- a/src/include/nodes/makefuncs.h
++++ b/src/include/nodes/makefuncs.h
+@@ -114,7 +114,7 @@ extern Node *makeJsonTableJoinedPlan(JsonTablePlanJoinType type,
+ 									 Node *plan1, Node *plan2, int location);
+ extern Node *makeJsonKeyValue(Node *key, Node *value);
+ extern Node *makeJsonIsPredicate(Node *expr, JsonFormat *format,
+-								 JsonValueType vtype, bool unique_keys,
++								 JsonValueType item_type, bool unique_keys,
+ 								 int location);
+ extern JsonEncoding makeJsonEncoding(char *name);
+ 
+diff --git a/src/include/nodes/primnodes.h b/src/include/nodes/primnodes.h
+index 66e179c43567..51505eee85df 100644
+--- a/src/include/nodes/primnodes.h
++++ b/src/include/nodes/primnodes.h
+@@ -1387,14 +1387,14 @@ typedef enum JsonValueType
+ 
+ /*
+  * JsonIsPredicate -
+- *		untransformed representation of IS JSON predicate
++ *		representation of IS JSON predicate
+  */
+ typedef struct JsonIsPredicate
+ {
+ 	NodeTag		type;
+-	Node	   *expr;			/* untransformed expression */
++	Node	   *expr;			/* subject expression */
+ 	JsonFormat *format;			/* FORMAT clause, if specified */
+-	JsonValueType value_type;	/* JSON item type */
++	JsonValueType item_type;	/* JSON item type */
+ 	bool		unique_keys;	/* check key uniqueness? */
+ 	int			location;		/* token location, or -1 if unknown */
+ } JsonIsPredicate;

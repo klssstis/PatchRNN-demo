@@ -1,0 +1,290 @@
+From 3f8c98d0b631882e3c513954df42891c1c9585c7 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Wed, 19 Jul 2023 13:41:22 +0900
+Subject: [PATCH] pg_archivecleanup: Add --clean-backup-history
+
+By default, pg_archivecleanup does not remove backup history files.
+These are just few bytes useful for debugging purposes, still keeping
+them around can bloat an archive path history files mixed with the WAL
+segments if the path has a long history.
+
+This patch adds a new option to control if backup history files are
+removed, depending on the oldest segment name to keep around.
+
+While on it, the TAP tests are refactored so as these are now able to
+handle lists of files.  Each file has a flag to track if it should still
+exist or not depending on the oldest segment defined with the command
+run.
+
+Author: Atsushi Torikoshi
+Reviewed-by: Kyotaro Horiguchi, Fujii Masao, Michael Paquier
+Discussion: https://postgr.es/m/d660ef741ce3d82f3b4283f1cafd576c@oss.nttdata.com
+---
+ doc/src/sgml/ref/pgarchivecleanup.sgml        |  12 ++
+ src/bin/pg_archivecleanup/pg_archivecleanup.c |  23 ++--
+ .../t/010_pg_archivecleanup.pl                | 118 +++++++++++++-----
+ 3 files changed, 115 insertions(+), 38 deletions(-)
+
+diff --git a/doc/src/sgml/ref/pgarchivecleanup.sgml b/doc/src/sgml/ref/pgarchivecleanup.sgml
+index 09991c2fcdd3..cd8f49b1c5bd 100644
+--- a/doc/src/sgml/ref/pgarchivecleanup.sgml
++++ b/doc/src/sgml/ref/pgarchivecleanup.sgml
+@@ -93,6 +93,18 @@ pg_archivecleanup:  removing file "archive/00000001000000370000000E"
+ 
+     <variablelist>
+ 
++     <varlistentry>
++      <term><option>-b</option></term>
++      <term><option>--clean-backup-history</option></term>
++      <listitem>
++       <para>
++         Remove backup history files as well.
++         See <xref linkend="backup-base-backup"/> for details about backup
++         history files.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry>
+       <term><option>-d</option></term>
+       <term><option>--debug</option></term>
+diff --git a/src/bin/pg_archivecleanup/pg_archivecleanup.c b/src/bin/pg_archivecleanup/pg_archivecleanup.c
+index 3533c9b1ab0c..2c3b301f3bce 100644
+--- a/src/bin/pg_archivecleanup/pg_archivecleanup.c
++++ b/src/bin/pg_archivecleanup/pg_archivecleanup.c
+@@ -23,6 +23,8 @@ const char *progname;
+ 
+ /* Options and defaults */
+ bool		dryrun = false;		/* are we performing a dry-run operation? */
++bool		cleanBackupHistory = false; /* remove files including backup
++										 * history files */
+ char	   *additional_ext = NULL;	/* Extension to remove from filenames */
+ 
+ char	   *archiveLocation;	/* where to find the archive? */
+@@ -104,18 +106,20 @@ CleanupPriorWALFiles(void)
+ 												 * archive */
+ 
+ 		/*
+-		 * Truncation is essentially harmless, because we skip names of length
+-		 * other than XLOG_FNAME_LEN.  (In principle, one could use a
+-		 * 1000-character additional_ext and get trouble.)
++		 * Truncation is essentially harmless, because we skip files whose
++		 * format is different from WAL files and backup history files. (In
++		 * principle, one could use a 1000-character additional_ext and get
++		 * trouble.)
+ 		 */
+ 		strlcpy(walfile, xlde->d_name, MAXPGPATH);
+ 		TrimExtension(walfile, additional_ext);
+ 
+ 		/*
+-		 * Ignore anything does that not look like a WAL segment or a .partial
+-		 * WAL segment.
++		 * Ignore anything does that not look like a WAL segment, a .partial
++		 * WAL segment or a backup history file (if requested).
+ 		 */
+-		if (!IsXLogFileName(walfile) && !IsPartialXLogFileName(walfile))
++		if (!IsXLogFileName(walfile) && !IsPartialXLogFileName(walfile) &&
++			!(cleanBackupHistory && IsBackupHistoryFileName(walfile)))
+ 			continue;
+ 
+ 		/*
+@@ -256,6 +260,7 @@ usage(void)
+ 	printf(_("Usage:\n"));
+ 	printf(_("  %s [OPTION]... ARCHIVELOCATION OLDESTKEPTWALFILE\n"), progname);
+ 	printf(_("\nOptions:\n"));
++	printf(_("  -b, --clean-backup-history  clean up files including backup history files\n"));
+ 	printf(_("  -d, --debug                 generate debug output (verbose mode)\n"));
+ 	printf(_("  -n, --dry-run               dry run, show the names of the files that would be\n"
+ 			 "                              removed\n"));
+@@ -281,6 +286,7 @@ int
+ main(int argc, char **argv)
+ {
+ 	static struct option long_options[] = {
++		{"clean-backup-history", no_argument, NULL, 'b'},
+ 		{"debug", no_argument, NULL, 'd'},
+ 		{"dry-run", no_argument, NULL, 'n'},
+ 		{"strip-extension", required_argument, NULL, 'x'},
+@@ -306,10 +312,13 @@ main(int argc, char **argv)
+ 		}
+ 	}
+ 
+-	while ((c = getopt_long(argc, argv, "dnx:", long_options, NULL)) != -1)
++	while ((c = getopt_long(argc, argv, "bdnx:", long_options, NULL)) != -1)
+ 	{
+ 		switch (c)
+ 		{
++			case 'b':			/* Remove backup history files as well */
++				cleanBackupHistory = true;
++				break;
+ 			case 'd':			/* Debug mode */
+ 				pg_logging_increase_verbosity();
+ 				break;
+diff --git a/src/bin/pg_archivecleanup/t/010_pg_archivecleanup.pl b/src/bin/pg_archivecleanup/t/010_pg_archivecleanup.pl
+index cc3386d1464e..18a82ff002eb 100644
+--- a/src/bin/pg_archivecleanup/t/010_pg_archivecleanup.pl
++++ b/src/bin/pg_archivecleanup/t/010_pg_archivecleanup.pl
+@@ -12,22 +12,46 @@
+ 
+ my $tempdir = PostgreSQL::Test::Utils::tempdir;
+ 
+-my @walfiles = (
+-	'00000001000000370000000C.gz', '00000001000000370000000D',
+-	'00000001000000370000000E', '00000001000000370000000F.partial',);
++# WAL file patterns created before running each sub-scenario.  "present"
++# tracks if the file with "name" still exists or not after running
++# pg_archivecleanup.
++my @walfiles_verbose = (
++	{ name => '00000001000000370000000D', present => 0 },
++	{ name => '00000001000000370000000E', present => 1 });
++my @walfiles_with_gz = (
++	{ name => '00000001000000370000000C.gz', present => 0 },
++	{ name => '00000001000000370000000D', present => 0 },
++	{ name => '00000001000000370000000D.backup', present => 1 },
++	{ name => '00000001000000370000000E', present => 1 },
++	{ name => '00000001000000370000000F.partial', present => 1 },
++	{ name => 'unrelated_file', present => 1 });
++my @walfiles_for_clean_backup_history = (
++	{ name => '00000001000000370000000D', present => 0 },
++	{ name => '00000001000000370000000D.00000028.backup', present => 0 },
++	{ name => '00000001000000370000000E', present => 1 },
++	{ name => '00000001000000370000000F.partial', present => 1 },
++	{ name => 'unrelated_file', present => 1 });
+ 
+ sub create_files
+ {
+-	foreach my $fn (@walfiles, 'unrelated_file')
++	foreach my $fn (map { $_->{name} } @_)
+ 	{
+ 		open my $file, '>', "$tempdir/$fn";
++
+ 		print $file 'CONTENT';
+ 		close $file;
+ 	}
+ 	return;
+ }
+ 
+-create_files();
++sub remove_files
++{
++	foreach my $fn (map { $_->{name} } @_)
++	{
++		unlink "$tempdir/$fn";
++	}
++	return;
++}
+ 
+ command_fails_like(
+ 	['pg_archivecleanup'],
+@@ -54,54 +78,86 @@ sub create_files
+ 	qr/invalid file name argument/,
+ 	'fails with invalid restart file name');
+ 
++# Test a dry run, no files are physically removed, but logs are generated
++# to show what would be removed.
+ {
+-	# like command_like but checking stderr
++	create_files(@walfiles_verbose);
++
+ 	my $stderr;
++	my $oldestkeptwalfile = '00000001000000370000000E';
+ 	my $result =
+ 	  IPC::Run::run [ 'pg_archivecleanup', '-d', '-n', $tempdir,
+-		$walfiles[2] ],
++		$oldestkeptwalfile ],
+ 	  '2>', \$stderr;
+ 	ok($result, "pg_archivecleanup dry run: exit code 0");
+-	like(
+-		$stderr,
+-		qr/$walfiles[1].*would be removed/,
+-		"pg_archivecleanup dry run: matches");
+-	foreach my $fn (@walfiles)
++
++	for my $walpair (@walfiles_verbose)
++	{
++		if ($walpair->{present})
++		{
++			unlike(
++				$stderr,
++				qr/$walpair->{name}.*would be removed/,
++				"pg_archivecleanup dry run for $walpair->{name}: matches");
++		}
++		else
++		{
++			like(
++				$stderr,
++				qr/$walpair->{name}.*would be removed/,
++				"pg_archivecleanup dry run for $walpair->{name}: matches");
++		}
++	}
++	foreach my $fn (map { $_->{name} } @walfiles_verbose)
+ 	{
+ 		ok(-f "$tempdir/$fn", "$fn not removed");
+ 	}
++
++	remove_files(@walfiles_verbose);
+ }
+ 
+ sub run_check
+ {
+ 	local $Test::Builder::Level = $Test::Builder::Level + 1;
+ 
+-	my ($suffix, $test_name) = @_;
++	my ($testdata, $oldestkeptwalfile, $test_name, @options) = @_;
+ 
+-	create_files();
++	create_files(@$testdata);
+ 
+ 	command_ok(
+-		[
+-			'pg_archivecleanup', '-x', '.gz', $tempdir,
+-			$walfiles[2] . $suffix
+-		],
++		[ 'pg_archivecleanup', @options, $tempdir, $oldestkeptwalfile ],
+ 		"$test_name: runs");
+ 
+-	ok(!-f "$tempdir/$walfiles[0]",
+-		"$test_name: first older WAL file was cleaned up");
+-	ok(!-f "$tempdir/$walfiles[1]",
+-		"$test_name: second older WAL file was cleaned up");
+-	ok(-f "$tempdir/$walfiles[2]",
+-		"$test_name: restartfile was not cleaned up");
+-	ok(-f "$tempdir/$walfiles[3]",
+-		"$test_name: newer WAL file was not cleaned up");
+-	ok(-f "$tempdir/unrelated_file",
+-		"$test_name: unrelated file was not cleaned up");
++	for my $walpair (@$testdata)
++	{
++		if ($walpair->{present})
++		{
++			ok(-f "$tempdir/$walpair->{name}",
++				"$test_name:$walpair->{name} was not cleaned up");
++		}
++		else
++		{
++			ok(!-f "$tempdir/$walpair->{name}",
++				"$test_name:$walpair->{name} was cleaned up");
++		}
++	}
++
++	remove_files(@$testdata);
+ 	return;
+ }
+ 
+-run_check('', 'pg_archivecleanup');
+-run_check('.partial', 'pg_archivecleanup with .partial file');
+-run_check('.00000020.backup', 'pg_archivecleanup with .backup file');
++run_check(\@walfiles_with_gz, '00000001000000370000000E',
++	'pg_archivecleanup', '-x.gz');
++run_check(
++	\@walfiles_with_gz,
++	'00000001000000370000000E.partial',
++	'pg_archivecleanup with .partial file', '-x.gz');
++run_check(
++	\@walfiles_with_gz,
++	'00000001000000370000000E.00000020.backup',
++	'pg_archivecleanup with .backup file', '-x.gz');
++run_check(\@walfiles_for_clean_backup_history,
++	'00000001000000370000000E',
++	'pg_archivecleanup with --clean-backup-history', '-b');
+ 
+ done_testing();

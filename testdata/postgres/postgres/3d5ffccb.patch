@@ -1,0 +1,166 @@
+From 3d5ffccb6df323f528cf870c26d0d0517ffe3eaa Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Sat, 18 Dec 2021 16:18:45 +0900
+Subject: [PATCH] Add option -N/--no-sync to pg_upgrade
+
+This is an option consistent with what the other tools of src/bin/
+(pg_checksums, pg_dump, pg_rewind and pg_basebackup) provide which is
+useful for leveraging the I/O effort when testing things.  This is not
+to be used in a production environment.
+
+All the regression tests of pg_upgrade are updated to use this new
+option.  This happens to cut at most a couple of seconds in environments
+constrained on I/O, by avoiding a flush of data folder for the new
+cluster upgraded.
+
+Author: Michael Paquier
+Reviewed-by: Peter Eisentraut
+Discussion: https://postgr.es/m/YbrhzuBmBxS/DkfX@paquier.xyz
+---
+ doc/src/sgml/ref/pgupgrade.sgml | 16 ++++++++++++++++
+ src/bin/pg_upgrade/option.c     |  9 ++++++++-
+ src/bin/pg_upgrade/pg_upgrade.c | 13 ++++++++-----
+ src/bin/pg_upgrade/pg_upgrade.h |  1 +
+ src/bin/pg_upgrade/test.sh      |  2 +-
+ src/tools/msvc/vcregress.pl     |  4 +++-
+ 6 files changed, 37 insertions(+), 8 deletions(-)
+
+diff --git a/doc/src/sgml/ref/pgupgrade.sgml b/doc/src/sgml/ref/pgupgrade.sgml
+index 1289123129d6..c5ce732ee983 100644
+--- a/doc/src/sgml/ref/pgupgrade.sgml
++++ b/doc/src/sgml/ref/pgupgrade.sgml
+@@ -130,6 +130,22 @@ PostgreSQL documentation
+       cluster</para></listitem>
+      </varlistentry>
+ 
++     <varlistentry>
++      <term><option>-N</option></term>
++      <term><option>--no-sync</option></term>
++      <listitem>
++       <para>
++        By default, <command>pg_upgrade</command> will wait for all files
++        of the upgraded cluster to be written safely to disk.  This option
++        causes <command>pg_upgrade</command> to return without waiting, which
++        is faster, but means that a subsequent operating system crash can leave
++        the synchronized data directory corrupt.  Generally, this option is
++        useful for testing but should not be used on a production
++        installation.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry>
+       <term><option>-o</option> <replaceable class="parameter">options</replaceable></term>
+       <term><option>--old-options</option> <replaceable class="parameter">options</replaceable></term>
+diff --git a/src/bin/pg_upgrade/option.c b/src/bin/pg_upgrade/option.c
+index 2d92294d9d35..66fe16964e6f 100644
+--- a/src/bin/pg_upgrade/option.c
++++ b/src/bin/pg_upgrade/option.c
+@@ -43,6 +43,7 @@ parseCommandLine(int argc, char *argv[])
+ 		{"new-datadir", required_argument, NULL, 'D'},
+ 		{"old-bindir", required_argument, NULL, 'b'},
+ 		{"new-bindir", required_argument, NULL, 'B'},
++		{"no-sync", no_argument, NULL, 'N'},
+ 		{"old-options", required_argument, NULL, 'o'},
+ 		{"new-options", required_argument, NULL, 'O'},
+ 		{"old-port", required_argument, NULL, 'p'},
+@@ -66,6 +67,7 @@ parseCommandLine(int argc, char *argv[])
+ 	char	  **filename;
+ 	time_t		run_time = time(NULL);
+ 
++	user_opts.do_sync = true;
+ 	user_opts.transfer_mode = TRANSFER_MODE_COPY;
+ 
+ 	os_info.progname = get_progname(argv[0]);
+@@ -101,7 +103,7 @@ parseCommandLine(int argc, char *argv[])
+ 	if (os_user_effective_id == 0)
+ 		pg_fatal("%s: cannot be run as root\n", os_info.progname);
+ 
+-	while ((option = getopt_long(argc, argv, "d:D:b:B:cj:ko:O:p:P:rs:U:v",
++	while ((option = getopt_long(argc, argv, "d:D:b:B:cj:kNo:O:p:P:rs:U:v",
+ 								 long_options, &optindex)) != -1)
+ 	{
+ 		switch (option)
+@@ -134,6 +136,10 @@ parseCommandLine(int argc, char *argv[])
+ 				user_opts.transfer_mode = TRANSFER_MODE_LINK;
+ 				break;
+ 
++			case 'N':
++				user_opts.do_sync = false;
++				break;
++
+ 			case 'o':
+ 				/* append option? */
+ 				if (!old_cluster.pgopts)
+@@ -286,6 +292,7 @@ usage(void)
+ 	printf(_("  -D, --new-datadir=DATADIR     new cluster data directory\n"));
+ 	printf(_("  -j, --jobs=NUM                number of simultaneous processes or threads to use\n"));
+ 	printf(_("  -k, --link                    link instead of copying files to new cluster\n"));
++	printf(_("  -N, --no-sync                 do not wait for changes to be written safely to disk\n"));
+ 	printf(_("  -o, --old-options=OPTIONS     old cluster options to pass to the server\n"));
+ 	printf(_("  -O, --new-options=OPTIONS     new cluster options to pass to the server\n"));
+ 	printf(_("  -p, --old-port=PORT           old cluster port number (default %d)\n"), old_cluster.port);
+diff --git a/src/bin/pg_upgrade/pg_upgrade.c b/src/bin/pg_upgrade/pg_upgrade.c
+index 3628bd74a7b2..f85cb2e26200 100644
+--- a/src/bin/pg_upgrade/pg_upgrade.c
++++ b/src/bin/pg_upgrade/pg_upgrade.c
+@@ -169,11 +169,14 @@ main(int argc, char **argv)
+ 			  new_cluster.pgdata);
+ 	check_ok();
+ 
+-	prep_status("Sync data directory to disk");
+-	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+-			  "\"%s/initdb\" --sync-only \"%s\"", new_cluster.bindir,
+-			  new_cluster.pgdata);
+-	check_ok();
++	if (user_opts.do_sync)
++	{
++		prep_status("Sync data directory to disk");
++		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
++				  "\"%s/initdb\" --sync-only \"%s\"", new_cluster.bindir,
++				  new_cluster.pgdata);
++		check_ok();
++	}
+ 
+ 	create_script_for_old_cluster_deletion(&deletion_script_file_name);
+ 
+diff --git a/src/bin/pg_upgrade/pg_upgrade.h b/src/bin/pg_upgrade/pg_upgrade.h
+index 235a7700262d..22169f100212 100644
+--- a/src/bin/pg_upgrade/pg_upgrade.h
++++ b/src/bin/pg_upgrade/pg_upgrade.h
+@@ -279,6 +279,7 @@ typedef struct
+ {
+ 	bool		check;			/* true -> ask user for permission to make
+ 								 * changes */
++	bool		do_sync;		/* flush changes to disk */
+ 	transferMode transfer_mode; /* copy files or link them? */
+ 	int			jobs;			/* number of processes/threads to use */
+ 	char	   *socketdir;		/* directory to use for Unix sockets */
+diff --git a/src/bin/pg_upgrade/test.sh b/src/bin/pg_upgrade/test.sh
+index 32d186d8974c..d6a318367ab6 100644
+--- a/src/bin/pg_upgrade/test.sh
++++ b/src/bin/pg_upgrade/test.sh
+@@ -233,7 +233,7 @@ PGDATA="$BASE_PGDATA"
+ 
+ standard_initdb 'initdb'
+ 
+-pg_upgrade $PG_UPGRADE_OPTS -d "${PGDATA}.old" -D "$PGDATA" -b "$oldbindir" -p "$PGPORT" -P "$PGPORT"
++pg_upgrade $PG_UPGRADE_OPTS --no-sync -d "${PGDATA}.old" -D "$PGDATA" -b "$oldbindir" -p "$PGPORT" -P "$PGPORT"
+ 
+ # make sure all directories and files have group permissions, on Unix hosts
+ # Windows hosts don't support Unix-y permissions.
+diff --git a/src/tools/msvc/vcregress.pl b/src/tools/msvc/vcregress.pl
+index dc5b2df7d722..29086cab5163 100644
+--- a/src/tools/msvc/vcregress.pl
++++ b/src/tools/msvc/vcregress.pl
+@@ -648,7 +648,9 @@ sub upgradecheck
+ 	print "\nSetting up new cluster\n\n";
+ 	standard_initdb() or exit 1;
+ 	print "\nRunning pg_upgrade\n\n";
+-	@args = ('pg_upgrade', '-d', "$data.old", '-D', $data, '-b', $bindir);
++	@args = (
++		'pg_upgrade', '-d', "$data.old", '-D', $data, '-b', $bindir,
++		'--no-sync');
+ 	system(@args) == 0 or exit 1;
+ 	print "\nStarting new cluster\n\n";
+ 	@args = ('pg_ctl', '-l', "$logdir/postmaster2.log", 'start');

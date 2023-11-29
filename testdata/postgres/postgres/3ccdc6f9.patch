@@ -1,0 +1,291 @@
+From 3ccdc6f9a5876d0953912fd589989387764ed9a3 Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Wed, 31 Jan 2018 15:43:11 -0500
+Subject: [PATCH] Fix list partition constraints for partition keys of array
+ type.
+
+The old code generated always generated a constraint of the form
+col = ANY(ARRAY[val1, val2, ...]), but that's invalid when col is an
+array type.  Instead, generate col = val when there's only one value,
+col = val1 OR col = val2 OR ... when there are multiple values and
+col is of array type, and the old form when there are multiple values
+and col is not of an array type.
+
+As a side benefit, this makes constraint exclusion able to prune
+a list partition declared to accept a single Boolean value, which
+didn't work before.
+
+Amit Langote, reviewed by Etsuro Fujita
+
+Discussion: http://postgr.es/m/97267195-e235-89d1-a41a-c110198dfce9@lab.ntt.co.jp
+---
+ src/backend/catalog/partition.c               | 98 +++++++++++++------
+ src/test/regress/expected/create_table.out    | 18 +++-
+ src/test/regress/expected/foreign_data.out    |  6 +-
+ src/test/regress/expected/partition_prune.out |  8 +-
+ src/test/regress/sql/create_table.sql         |  6 ++
+ 5 files changed, 93 insertions(+), 43 deletions(-)
+
+diff --git a/src/backend/catalog/partition.c b/src/backend/catalog/partition.c
+index e69bbc0345b3..45945511f078 100644
+--- a/src/backend/catalog/partition.c
++++ b/src/backend/catalog/partition.c
+@@ -1625,18 +1625,60 @@ make_partition_op_expr(PartitionKey key, int keynum,
+ 	{
+ 		case PARTITION_STRATEGY_LIST:
+ 			{
+-				ScalarArrayOpExpr *saopexpr;
+-
+-				/* Build leftop = ANY (rightop) */
+-				saopexpr = makeNode(ScalarArrayOpExpr);
+-				saopexpr->opno = operoid;
+-				saopexpr->opfuncid = get_opcode(operoid);
+-				saopexpr->useOr = true;
+-				saopexpr->inputcollid = key->partcollation[keynum];
+-				saopexpr->args = list_make2(arg1, arg2);
+-				saopexpr->location = -1;
+-
+-				result = (Expr *) saopexpr;
++				List	   *elems = (List *) arg2;
++				int			nelems = list_length(elems);
++
++				Assert(nelems >= 1);
++				Assert(keynum == 0);
++
++				if (nelems > 1 &&
++					!type_is_array(key->parttypid[keynum]))
++				{
++					ArrayExpr  *arrexpr;
++					ScalarArrayOpExpr *saopexpr;
++
++					/* Construct an ArrayExpr for the right-hand inputs */
++					arrexpr = makeNode(ArrayExpr);
++					arrexpr->array_typeid =
++									get_array_type(key->parttypid[keynum]);
++					arrexpr->array_collid = key->parttypcoll[keynum];
++					arrexpr->element_typeid = key->parttypid[keynum];
++					arrexpr->elements = elems;
++					arrexpr->multidims = false;
++					arrexpr->location = -1;
++
++					/* Build leftop = ANY (rightop) */
++					saopexpr = makeNode(ScalarArrayOpExpr);
++					saopexpr->opno = operoid;
++					saopexpr->opfuncid = get_opcode(operoid);
++					saopexpr->useOr = true;
++					saopexpr->inputcollid = key->partcollation[keynum];
++					saopexpr->args = list_make2(arg1, arrexpr);
++					saopexpr->location = -1;
++
++					result = (Expr *) saopexpr;
++				}
++				else
++				{
++					List	   *elemops = NIL;
++					ListCell   *lc;
++
++					foreach (lc, elems)
++					{
++						Expr   *elem = lfirst(lc),
++							   *elemop;
++
++						elemop = make_opclause(operoid,
++											   BOOLOID,
++											   false,
++											   arg1, elem,
++											   InvalidOid,
++											   key->partcollation[keynum]);
++						elemops = lappend(elemops, elemop);
++					}
++
++					result = nelems > 1 ? makeBoolExpr(OR_EXPR, elemops, -1) : linitial(elemops);
++				}
+ 				break;
+ 			}
+ 
+@@ -1758,11 +1800,10 @@ get_qual_for_list(Relation parent, PartitionBoundSpec *spec)
+ 	PartitionKey key = RelationGetPartitionKey(parent);
+ 	List	   *result;
+ 	Expr	   *keyCol;
+-	ArrayExpr  *arr;
+ 	Expr	   *opexpr;
+ 	NullTest   *nulltest;
+ 	ListCell   *cell;
+-	List	   *arrelems = NIL;
++	List	   *elems = NIL;
+ 	bool		list_has_null = false;
+ 
+ 	/*
+@@ -1828,7 +1869,7 @@ get_qual_for_list(Relation parent, PartitionBoundSpec *spec)
+ 							false,	/* isnull */
+ 							key->parttypbyval[0]);
+ 
+-			arrelems = lappend(arrelems, val);
++			elems = lappend(elems, val);
+ 		}
+ 	}
+ 	else
+@@ -1843,30 +1884,25 @@ get_qual_for_list(Relation parent, PartitionBoundSpec *spec)
+ 			if (val->constisnull)
+ 				list_has_null = true;
+ 			else
+-				arrelems = lappend(arrelems, copyObject(val));
++				elems = lappend(elems, copyObject(val));
+ 		}
+ 	}
+ 
+-	if (arrelems)
++	if (elems)
+ 	{
+-		/* Construct an ArrayExpr for the non-null partition values */
+-		arr = makeNode(ArrayExpr);
+-		arr->array_typeid = !type_is_array(key->parttypid[0])
+-			? get_array_type(key->parttypid[0])
+-			: key->parttypid[0];
+-		arr->array_collid = key->parttypcoll[0];
+-		arr->element_typeid = key->parttypid[0];
+-		arr->elements = arrelems;
+-		arr->multidims = false;
+-		arr->location = -1;
+-
+-		/* Generate the main expression, i.e., keyCol = ANY (arr) */
++		/*
++		 * Generate the operator expression from the non-null partition
++		 * values.
++		 */
+ 		opexpr = make_partition_op_expr(key, 0, BTEqualStrategyNumber,
+-										keyCol, (Expr *) arr);
++										keyCol, (Expr *) elems);
+ 	}
+ 	else
+ 	{
+-		/* If there are no partition values, we don't need an = ANY expr */
++		/*
++		 * If there are no partition values, we don't need an operator
++		 * expression.
++		 */
+ 		opexpr = NULL;
+ 	}
+ 
+diff --git a/src/test/regress/expected/create_table.out b/src/test/regress/expected/create_table.out
+index ef0906776e83..e554ec484449 100644
+--- a/src/test/regress/expected/create_table.out
++++ b/src/test/regress/expected/create_table.out
+@@ -742,7 +742,7 @@ CREATE TABLE part_c_1_10 PARTITION OF part_c FOR VALUES FROM (1) TO (10);
+  a      | text    |           |          |         | extended |              | 
+  b      | integer |           | not null | 1       | plain    |              | 
+ Partition of: parted FOR VALUES IN ('b')
+-Partition constraint: ((a IS NOT NULL) AND (a = ANY (ARRAY['b'::text])))
++Partition constraint: ((a IS NOT NULL) AND (a = 'b'::text))
+ Check constraints:
+     "check_a" CHECK (length(a) > 0)
+     "part_b_b_check" CHECK (b >= 0)
+@@ -755,7 +755,7 @@ Check constraints:
+  a      | text    |           |          |         | extended |              | 
+  b      | integer |           | not null | 0       | plain    |              | 
+ Partition of: parted FOR VALUES IN ('c')
+-Partition constraint: ((a IS NOT NULL) AND (a = ANY (ARRAY['c'::text])))
++Partition constraint: ((a IS NOT NULL) AND (a = 'c'::text))
+ Partition key: RANGE (b)
+ Check constraints:
+     "check_a" CHECK (length(a) > 0)
+@@ -769,7 +769,7 @@ Partitions: part_c_1_10 FOR VALUES FROM (1) TO (10)
+  a      | text    |           |          |         | extended |              | 
+  b      | integer |           | not null | 0       | plain    |              | 
+ Partition of: part_c FOR VALUES FROM (1) TO (10)
+-Partition constraint: ((a IS NOT NULL) AND (a = ANY (ARRAY['c'::text])) AND (b IS NOT NULL) AND (b >= 1) AND (b < 10))
++Partition constraint: ((a IS NOT NULL) AND (a = 'c'::text) AND (b IS NOT NULL) AND (b >= 1) AND (b < 10))
+ Check constraints:
+     "check_a" CHECK (length(a) > 0)
+ 
+@@ -868,3 +868,15 @@ Partition key: LIST (a)
+ Number of partitions: 0
+ 
+ DROP TABLE parted_col_comment;
++-- list partitioning on array type column
++CREATE TABLE arrlp (a int[]) PARTITION BY LIST (a);
++CREATE TABLE arrlp12 PARTITION OF arrlp FOR VALUES IN ('{1}', '{2}');
++\d+ arrlp12
++                                   Table "public.arrlp12"
++ Column |   Type    | Collation | Nullable | Default | Storage  | Stats target | Description 
++--------+-----------+-----------+----------+---------+----------+--------------+-------------
++ a      | integer[] |           |          |         | extended |              | 
++Partition of: arrlp FOR VALUES IN ('{1}', '{2}')
++Partition constraint: ((a IS NOT NULL) AND (((a)::anyarray OPERATOR(pg_catalog.=) '{1}'::integer[]) OR ((a)::anyarray OPERATOR(pg_catalog.=) '{2}'::integer[])))
++
++DROP TABLE arrlp;
+diff --git a/src/test/regress/expected/foreign_data.out b/src/test/regress/expected/foreign_data.out
+index d2c184f2cfe7..6a1b278e5a62 100644
+--- a/src/test/regress/expected/foreign_data.out
++++ b/src/test/regress/expected/foreign_data.out
+@@ -1863,7 +1863,7 @@ Partitions: pt2_1 FOR VALUES IN (1)
+  c2     | text    |           |          |         |             | extended |              | 
+  c3     | date    |           |          |         |             | plain    |              | 
+ Partition of: pt2 FOR VALUES IN (1)
+-Partition constraint: ((c1 IS NOT NULL) AND (c1 = ANY (ARRAY[1])))
++Partition constraint: ((c1 IS NOT NULL) AND (c1 = 1))
+ Server: s0
+ FDW options: (delimiter ',', quote '"', "be quoted" 'value')
+ 
+@@ -1935,7 +1935,7 @@ Partitions: pt2_1 FOR VALUES IN (1)
+  c2     | text    |           |          |         |             | extended |              | 
+  c3     | date    |           |          |         |             | plain    |              | 
+ Partition of: pt2 FOR VALUES IN (1)
+-Partition constraint: ((c1 IS NOT NULL) AND (c1 = ANY (ARRAY[1])))
++Partition constraint: ((c1 IS NOT NULL) AND (c1 = 1))
+ Server: s0
+ FDW options: (delimiter ',', quote '"', "be quoted" 'value')
+ 
+@@ -1963,7 +1963,7 @@ Partitions: pt2_1 FOR VALUES IN (1)
+  c2     | text    |           |          |         |             | extended |              | 
+  c3     | date    |           | not null |         |             | plain    |              | 
+ Partition of: pt2 FOR VALUES IN (1)
+-Partition constraint: ((c1 IS NOT NULL) AND (c1 = ANY (ARRAY[1])))
++Partition constraint: ((c1 IS NOT NULL) AND (c1 = 1))
+ Check constraints:
+     "p21chk" CHECK (c2 <> ''::text)
+ Server: s0
+diff --git a/src/test/regress/expected/partition_prune.out b/src/test/regress/expected/partition_prune.out
+index aabb0240a92f..348719bd6253 100644
+--- a/src/test/regress/expected/partition_prune.out
++++ b/src/test/regress/expected/partition_prune.out
+@@ -1014,23 +1014,19 @@ explain (costs off) select * from boolpart where a = false;
+  Append
+    ->  Seq Scan on boolpart_f
+          Filter: (NOT a)
+-   ->  Seq Scan on boolpart_t
+-         Filter: (NOT a)
+    ->  Seq Scan on boolpart_default
+          Filter: (NOT a)
+-(7 rows)
++(5 rows)
+ 
+ explain (costs off) select * from boolpart where not a = false;
+              QUERY PLAN             
+ ------------------------------------
+  Append
+-   ->  Seq Scan on boolpart_f
+-         Filter: a
+    ->  Seq Scan on boolpart_t
+          Filter: a
+    ->  Seq Scan on boolpart_default
+          Filter: a
+-(7 rows)
++(5 rows)
+ 
+ explain (costs off) select * from boolpart where a is true or a is not true;
+                     QUERY PLAN                    
+diff --git a/src/test/regress/sql/create_table.sql b/src/test/regress/sql/create_table.sql
+index 10e5d49e8e5f..a71d9ae7abc3 100644
+--- a/src/test/regress/sql/create_table.sql
++++ b/src/test/regress/sql/create_table.sql
+@@ -711,3 +711,9 @@ COMMENT ON COLUMN parted_col_comment.a IS 'Partition key';
+ SELECT obj_description('parted_col_comment'::regclass);
+ \d+ parted_col_comment
+ DROP TABLE parted_col_comment;
++
++-- list partitioning on array type column
++CREATE TABLE arrlp (a int[]) PARTITION BY LIST (a);
++CREATE TABLE arrlp12 PARTITION OF arrlp FOR VALUES IN ('{1}', '{2}');
++\d+ arrlp12
++DROP TABLE arrlp;

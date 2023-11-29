@@ -1,0 +1,399 @@
+From 3fd40b628c7db4c4bcf03b548f9a55f85e327e25 Mon Sep 17 00:00:00 2001
+From: Peter Eisentraut <peter@eisentraut.org>
+Date: Sat, 4 Jan 2020 11:56:58 +0100
+Subject: [PATCH] Make better use of ParseState in ProcessUtility
+
+Pass ParseState into the functions called from
+standard_ProcessUtility() instead passing the query string and query
+environment separately.  No functionality change, but it makes the
+notation consistent.  We had already started moving things into
+that direction piece by piece, and this completes it.
+
+Reviewed-by: Pavel Stehule <pavel.stehule@gmail.com>
+Discussion: https://www.postgresql.org/message-id/flat/6e7aa4a1-be6a-1a75-b1f9-83a678e5184a@2ndquadrant.com
+---
+ src/backend/commands/createas.c   |  6 ++--
+ src/backend/commands/explain.c    |  7 ++---
+ src/backend/commands/portalcmds.c |  9 +++---
+ src/backend/commands/prepare.c    | 52 ++++++++++++-------------------
+ src/backend/tcop/utility.c        | 20 ++++++------
+ src/include/commands/createas.h   |  2 +-
+ src/include/commands/explain.h    |  4 +--
+ src/include/commands/portalcmds.h |  5 +--
+ src/include/commands/prepare.h    |  7 +++--
+ 9 files changed, 51 insertions(+), 61 deletions(-)
+
+diff --git a/src/backend/commands/createas.c b/src/backend/commands/createas.c
+index 49f4b5bebcac..9f387b5f5f1f 100644
+--- a/src/backend/commands/createas.c
++++ b/src/backend/commands/createas.c
+@@ -223,7 +223,7 @@ create_ctas_nodata(List *tlist, IntoClause *into)
+  * ExecCreateTableAs -- execute a CREATE TABLE AS command
+  */
+ ObjectAddress
+-ExecCreateTableAs(CreateTableAsStmt *stmt, const char *queryString,
++ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
+ 				  ParamListInfo params, QueryEnvironment *queryEnv,
+ 				  char *completionTag)
+ {
+@@ -270,7 +270,7 @@ ExecCreateTableAs(CreateTableAsStmt *stmt, const char *queryString,
+ 		ExecuteStmt *estmt = castNode(ExecuteStmt, query->utilityStmt);
+ 
+ 		Assert(!is_matview);	/* excluded by syntax */
+-		ExecuteQuery(estmt, into, queryString, params, dest, completionTag);
++		ExecuteQuery(pstate, estmt, into, params, dest, completionTag);
+ 
+ 		/* get object address that intorel_startup saved for us */
+ 		address = ((DR_intorel *) dest)->reladdr;
+@@ -342,7 +342,7 @@ ExecCreateTableAs(CreateTableAsStmt *stmt, const char *queryString,
+ 		UpdateActiveSnapshotCommandId();
+ 
+ 		/* Create a QueryDesc, redirecting output to our tuple receiver */
+-		queryDesc = CreateQueryDesc(plan, queryString,
++		queryDesc = CreateQueryDesc(plan, pstate->p_sourcetext,
+ 									GetActiveSnapshot(), InvalidSnapshot,
+ 									dest, params, queryEnv, 0);
+ 
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index 497a3bd757ee..d189b8d573a9 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -139,9 +139,8 @@ static void escape_yaml(StringInfo buf, const char *str);
+  *	  execute an EXPLAIN command
+  */
+ void
+-ExplainQuery(ParseState *pstate, ExplainStmt *stmt, const char *queryString,
+-			 ParamListInfo params, QueryEnvironment *queryEnv,
+-			 DestReceiver *dest)
++ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
++			 ParamListInfo params, DestReceiver *dest)
+ {
+ 	ExplainState *es = NewExplainState();
+ 	TupOutputState *tstate;
+@@ -254,7 +253,7 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt, const char *queryString,
+ 		{
+ 			ExplainOneQuery(lfirst_node(Query, l),
+ 							CURSOR_OPT_PARALLEL_OK, NULL, es,
+-							queryString, params, queryEnv);
++							pstate->p_sourcetext, params, pstate->p_queryEnv);
+ 
+ 			/* Separate plans with an appropriate separator */
+ 			if (lnext(rewritten, l) != NULL)
+diff --git a/src/backend/commands/portalcmds.c b/src/backend/commands/portalcmds.c
+index ed0b2afb377d..7e5c805a1e30 100644
+--- a/src/backend/commands/portalcmds.c
++++ b/src/backend/commands/portalcmds.c
+@@ -39,14 +39,15 @@
+  *		Execute SQL DECLARE CURSOR command.
+  */
+ void
+-PerformCursorOpen(DeclareCursorStmt *cstmt, ParamListInfo params,
+-				  const char *queryString, bool isTopLevel)
++PerformCursorOpen(ParseState *pstate, DeclareCursorStmt *cstmt, ParamListInfo params,
++				  bool isTopLevel)
+ {
+ 	Query	   *query = castNode(Query, cstmt->query);
+ 	List	   *rewritten;
+ 	PlannedStmt *plan;
+ 	Portal		portal;
+ 	MemoryContext oldContext;
++	char	   *queryString;
+ 
+ 	/*
+ 	 * Disallow empty-string cursor name (conflicts with protocol-level
+@@ -92,7 +93,7 @@ PerformCursorOpen(DeclareCursorStmt *cstmt, ParamListInfo params,
+ 	plan = pg_plan_query(query, cstmt->options, params);
+ 
+ 	/*
+-	 * Create a portal and copy the plan and queryString into its memory.
++	 * Create a portal and copy the plan and query string into its memory.
+ 	 */
+ 	portal = CreatePortal(cstmt->portalname, false, false);
+ 
+@@ -100,7 +101,7 @@ PerformCursorOpen(DeclareCursorStmt *cstmt, ParamListInfo params,
+ 
+ 	plan = copyObject(plan);
+ 
+-	queryString = pstrdup(queryString);
++	queryString = pstrdup(pstate->p_sourcetext);
+ 
+ 	PortalDefineQuery(portal,
+ 					  NULL,
+diff --git a/src/backend/commands/prepare.c b/src/backend/commands/prepare.c
+index 377139c4d8ac..c4e4b6eaec6a 100644
+--- a/src/backend/commands/prepare.c
++++ b/src/backend/commands/prepare.c
+@@ -46,15 +46,16 @@
+ static HTAB *prepared_queries = NULL;
+ 
+ static void InitQueryHashTable(void);
+-static ParamListInfo EvaluateParams(PreparedStatement *pstmt, List *params,
+-									const char *queryString, EState *estate);
++static ParamListInfo EvaluateParams(ParseState *pstate,
++									PreparedStatement *pstmt, List *params,
++									EState *estate);
+ static Datum build_regtype_array(Oid *param_types, int num_params);
+ 
+ /*
+  * Implements the 'PREPARE' utility statement.
+  */
+ void
+-PrepareQuery(PrepareStmt *stmt, const char *queryString,
++PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
+ 			 int stmt_location, int stmt_len)
+ {
+ 	RawStmt    *rawstmt;
+@@ -90,7 +91,7 @@ PrepareQuery(PrepareStmt *stmt, const char *queryString,
+ 	 * Create the CachedPlanSource before we do parse analysis, since it needs
+ 	 * to see the unmodified raw parse tree.
+ 	 */
+-	plansource = CreateCachedPlan(rawstmt, queryString,
++	plansource = CreateCachedPlan(rawstmt, pstate->p_sourcetext,
+ 								  CreateCommandTag(stmt->query));
+ 
+ 	/* Transform list of TypeNames to array of type OIDs */
+@@ -98,16 +99,8 @@ PrepareQuery(PrepareStmt *stmt, const char *queryString,
+ 
+ 	if (nargs)
+ 	{
+-		ParseState *pstate;
+ 		ListCell   *l;
+ 
+-		/*
+-		 * typenameTypeId wants a ParseState to carry the source query string.
+-		 * Is it worth refactoring its API to avoid this?
+-		 */
+-		pstate = make_parsestate(NULL);
+-		pstate->p_sourcetext = queryString;
+-
+ 		argtypes = (Oid *) palloc(nargs * sizeof(Oid));
+ 		i = 0;
+ 
+@@ -125,7 +118,7 @@ PrepareQuery(PrepareStmt *stmt, const char *queryString,
+ 	 * passed in from above us will not be visible to it), allowing
+ 	 * information about unknown parameters to be deduced from context.
+ 	 */
+-	query = parse_analyze_varparams(rawstmt, queryString,
++	query = parse_analyze_varparams(rawstmt, pstate->p_sourcetext,
+ 									&argtypes, &nargs);
+ 
+ 	/*
+@@ -189,16 +182,11 @@ PrepareQuery(PrepareStmt *stmt, const char *queryString,
+  * indicated by passing a non-null intoClause.  The DestReceiver is already
+  * set up correctly for CREATE TABLE AS, but we still have to make a few
+  * other adjustments here.
+- *
+- * Note: this is one of very few places in the code that needs to deal with
+- * two query strings at once.  The passed-in queryString is that of the
+- * EXECUTE, which we might need for error reporting while processing the
+- * parameter expressions.  The query_string that we copy from the plan
+- * source is that of the original PREPARE.
+  */
+ void
+-ExecuteQuery(ExecuteStmt *stmt, IntoClause *intoClause,
+-			 const char *queryString, ParamListInfo params,
++ExecuteQuery(ParseState *pstate,
++			 ExecuteStmt *stmt, IntoClause *intoClause,
++			 ParamListInfo params,
+ 			 DestReceiver *dest, char *completionTag)
+ {
+ 	PreparedStatement *entry;
+@@ -229,8 +217,7 @@ ExecuteQuery(ExecuteStmt *stmt, IntoClause *intoClause,
+ 		 */
+ 		estate = CreateExecutorState();
+ 		estate->es_param_list_info = params;
+-		paramLI = EvaluateParams(entry, stmt->params,
+-								 queryString, estate);
++		paramLI = EvaluateParams(pstate, entry, stmt->params, estate);
+ 	}
+ 
+ 	/* Create a new portal to run the query in */
+@@ -314,9 +301,9 @@ ExecuteQuery(ExecuteStmt *stmt, IntoClause *intoClause,
+ /*
+  * EvaluateParams: evaluate a list of parameters.
+  *
++ * pstate: parse state
+  * pstmt: statement we are getting parameters for.
+  * params: list of given parameter expressions (raw parser output!)
+- * queryString: source text for error messages.
+  * estate: executor state to use.
+  *
+  * Returns a filled-in ParamListInfo -- this can later be passed to
+@@ -324,13 +311,12 @@ ExecuteQuery(ExecuteStmt *stmt, IntoClause *intoClause,
+  * during query execution.
+  */
+ static ParamListInfo
+-EvaluateParams(PreparedStatement *pstmt, List *params,
+-			   const char *queryString, EState *estate)
++EvaluateParams(ParseState *pstate, PreparedStatement *pstmt, List *params,
++			   EState *estate)
+ {
+ 	Oid		   *param_types = pstmt->plansource->param_types;
+ 	int			num_params = pstmt->plansource->num_params;
+ 	int			nparams = list_length(params);
+-	ParseState *pstate;
+ 	ParamListInfo paramLI;
+ 	List	   *exprstates;
+ 	ListCell   *l;
+@@ -354,9 +340,6 @@ EvaluateParams(PreparedStatement *pstmt, List *params,
+ 	 */
+ 	params = copyObject(params);
+ 
+-	pstate = make_parsestate(NULL);
+-	pstate->p_sourcetext = queryString;
+-
+ 	i = 0;
+ 	foreach(l, params)
+ 	{
+@@ -648,6 +631,11 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
+ 	/* Evaluate parameters, if any */
+ 	if (entry->plansource->num_params)
+ 	{
++		ParseState *pstate;
++
++		pstate = make_parsestate(NULL);
++		pstate->p_sourcetext = queryString;
++
+ 		/*
+ 		 * Need an EState to evaluate parameters; must not delete it till end
+ 		 * of query, in case parameters are pass-by-reference.  Note that the
+@@ -656,8 +644,8 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
+ 		 */
+ 		estate = CreateExecutorState();
+ 		estate->es_param_list_info = params;
+-		paramLI = EvaluateParams(entry, execstmt->params,
+-								 queryString, estate);
++
++		paramLI = EvaluateParams(pstate, entry, execstmt->params, estate);
+ 	}
+ 
+ 	/* Replan if needed, and acquire a transient refcount */
+diff --git a/src/backend/tcop/utility.c b/src/backend/tcop/utility.c
+index 4474658ddf46..b2c58bf86225 100644
+--- a/src/backend/tcop/utility.c
++++ b/src/backend/tcop/utility.c
+@@ -396,6 +396,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
+ 
+ 	pstate = make_parsestate(NULL);
+ 	pstate->p_sourcetext = queryString;
++	pstate->p_queryEnv = queryEnv;
+ 
+ 	switch (nodeTag(parsetree))
+ 	{
+@@ -500,8 +501,8 @@ standard_ProcessUtility(PlannedStmt *pstmt,
+ 			 * Portal (cursor) manipulation
+ 			 */
+ 		case T_DeclareCursorStmt:
+-			PerformCursorOpen((DeclareCursorStmt *) parsetree, params,
+-							  queryString, isTopLevel);
++			PerformCursorOpen(pstate, (DeclareCursorStmt *) parsetree, params,
++							  isTopLevel);
+ 			break;
+ 
+ 		case T_ClosePortalStmt:
+@@ -558,13 +559,14 @@ standard_ProcessUtility(PlannedStmt *pstmt,
+ 
+ 		case T_PrepareStmt:
+ 			CheckRestrictedOperation("PREPARE");
+-			PrepareQuery((PrepareStmt *) parsetree, queryString,
++			PrepareQuery(pstate, (PrepareStmt *) parsetree,
+ 						 pstmt->stmt_location, pstmt->stmt_len);
+ 			break;
+ 
+ 		case T_ExecuteStmt:
+-			ExecuteQuery((ExecuteStmt *) parsetree, NULL,
+-						 queryString, params,
++			ExecuteQuery(pstate,
++						 (ExecuteStmt *) parsetree, NULL,
++						 params,
+ 						 dest, completionTag);
+ 			break;
+ 
+@@ -667,8 +669,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
+ 			break;
+ 
+ 		case T_ExplainStmt:
+-			ExplainQuery(pstate, (ExplainStmt *) parsetree, queryString, params,
+-						 queryEnv, dest);
++			ExplainQuery(pstate, (ExplainStmt *) parsetree, params, dest);
+ 			break;
+ 
+ 		case T_AlterSystemStmt:
+@@ -1490,9 +1491,8 @@ ProcessUtilitySlow(ParseState *pstate,
+ 				break;
+ 
+ 			case T_CreateTableAsStmt:
+-				address = ExecCreateTableAs((CreateTableAsStmt *) parsetree,
+-											queryString, params, queryEnv,
+-											completionTag);
++				address = ExecCreateTableAs(pstate, (CreateTableAsStmt *) parsetree,
++											params, queryEnv, completionTag);
+ 				break;
+ 
+ 			case T_RefreshMatViewStmt:
+diff --git a/src/include/commands/createas.h b/src/include/commands/createas.h
+index 72c97702e40e..7743851a380b 100644
+--- a/src/include/commands/createas.h
++++ b/src/include/commands/createas.h
+@@ -21,7 +21,7 @@
+ #include "utils/queryenvironment.h"
+ 
+ 
+-extern ObjectAddress ExecCreateTableAs(CreateTableAsStmt *stmt, const char *queryString,
++extern ObjectAddress ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
+ 									   ParamListInfo params, QueryEnvironment *queryEnv, char *completionTag);
+ 
+ extern int	GetIntoRelEFlags(IntoClause *intoClause);
+diff --git a/src/include/commands/explain.h b/src/include/commands/explain.h
+index c727da5fe158..45027a7c471c 100644
+--- a/src/include/commands/explain.h
++++ b/src/include/commands/explain.h
+@@ -64,8 +64,8 @@ typedef const char *(*explain_get_index_name_hook_type) (Oid indexId);
+ extern PGDLLIMPORT explain_get_index_name_hook_type explain_get_index_name_hook;
+ 
+ 
+-extern void ExplainQuery(ParseState *pstate, ExplainStmt *stmt, const char *queryString,
+-						 ParamListInfo params, QueryEnvironment *queryEnv, DestReceiver *dest);
++extern void ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
++						 ParamListInfo params, DestReceiver *dest);
+ 
+ extern ExplainState *NewExplainState(void);
+ 
+diff --git a/src/include/commands/portalcmds.h b/src/include/commands/portalcmds.h
+index 8fef0302b5d5..4ecc1a2ecd37 100644
+--- a/src/include/commands/portalcmds.h
++++ b/src/include/commands/portalcmds.h
+@@ -15,11 +15,12 @@
+ #define PORTALCMDS_H
+ 
+ #include "nodes/parsenodes.h"
++#include "parser/parse_node.h"
+ #include "utils/portal.h"
+ 
+ 
+-extern void PerformCursorOpen(DeclareCursorStmt *cstmt, ParamListInfo params,
+-							  const char *queryString, bool isTopLevel);
++extern void PerformCursorOpen(ParseState *pstate, DeclareCursorStmt *cstmt, ParamListInfo params,
++							  bool isTopLevel);
+ 
+ extern void PerformPortalFetch(FetchStmt *stmt, DestReceiver *dest,
+ 							   char *completionTag);
+diff --git a/src/include/commands/prepare.h b/src/include/commands/prepare.h
+index 9d09fb2b122b..a0509e1f33f0 100644
+--- a/src/include/commands/prepare.h
++++ b/src/include/commands/prepare.h
+@@ -35,10 +35,11 @@ typedef struct
+ 
+ 
+ /* Utility statements PREPARE, EXECUTE, DEALLOCATE, EXPLAIN EXECUTE */
+-extern void PrepareQuery(PrepareStmt *stmt, const char *queryString,
++extern void PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
+ 						 int stmt_location, int stmt_len);
+-extern void ExecuteQuery(ExecuteStmt *stmt, IntoClause *intoClause,
+-						 const char *queryString, ParamListInfo params,
++extern void ExecuteQuery(ParseState *pstate,
++						 ExecuteStmt *stmt, IntoClause *intoClause,
++						 ParamListInfo params,
+ 						 DestReceiver *dest, char *completionTag);
+ extern void DeallocateQuery(DeallocateStmt *stmt);
+ extern void ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into,

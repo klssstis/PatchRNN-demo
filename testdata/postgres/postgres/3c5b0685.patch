@@ -1,0 +1,185 @@
+From 3c5b0685b921533f37622345beb0f8dd49200c01 Mon Sep 17 00:00:00 2001
+From: Andrew Dunstan <andrew@dunslane.net>
+Date: Fri, 16 Apr 2021 16:54:04 -0400
+Subject: [PATCH] Allow TestLib::slurp_file to skip contents, and use as needed
+
+In order to avoid getting old logfile contents certain functions in
+PostgresNode were doing one of two things. On Windows it rotated the
+logfile and restarted the server, while elsewhere it truncated the log
+file. Both of these are unnecessary. We borrow from the buildfarm which
+does this instead: note the size of the logfile before we start, and
+then when fetching the logfile skip to that position before accumulating
+contents. This is spelled differently on Windows but the effect is the
+same. This is largely centralized in TestLib's slurp_file function,
+which has a new optional parameter, the offset to skip to before
+starting to reading the file. Code in the client becomes much neater.
+
+Backpatch to all live branches.
+
+Michael Paquier, slightly modified by me.
+
+Discussion: https://postgr.es/m/YHajnhcMAI3++pJL@paquier.xyz
+---
+ src/test/perl/PostgresNode.pm | 46 +++++++----------------------------
+ src/test/perl/TestLib.pm      | 21 ++++++++++++----
+ 2 files changed, 25 insertions(+), 42 deletions(-)
+
+diff --git a/src/test/perl/PostgresNode.pm b/src/test/perl/PostgresNode.pm
+index e26b2b3f30e3..e209ea71632e 100644
+--- a/src/test/perl/PostgresNode.pm
++++ b/src/test/perl/PostgresNode.pm
+@@ -1917,21 +1917,7 @@ sub connect_ok
+ 		@log_unlike = @{ $params{log_unlike} };
+ 	}
+ 
+-	if (@log_like or @log_unlike)
+-	{
+-		# Don't let previous log entries match for this connection.
+-		# On Windows, the truncation would not work, so rotate the log
+-		# file before restarting the server afresh.
+-		if ($TestLib::windows_os)
+-		{
+-			$self->rotate_logfile;
+-			$self->restart;
+-		}
+-		else
+-		{
+-			truncate $self->logfile, 0;
+-		}
+-	}
++	my $log_location = -s $self->logfile;
+ 
+ 	# Never prompt for a password, any callers of this routine should
+ 	# have set up things properly, and this should not block.
+@@ -1950,7 +1936,8 @@ sub connect_ok
+ 	}
+ 	if (@log_like or @log_unlike)
+ 	{
+-		my $log_contents = TestLib::slurp_file($self->logfile);
++		my $log_contents = TestLib::slurp_file($self->logfile,
++						       $log_location);
+ 
+ 		while (my $regex = shift @log_like)
+ 		{
+@@ -2001,21 +1988,7 @@ sub connect_fails
+ 		@log_unlike = @{ $params{log_unlike} };
+ 	}
+ 
+-	if (@log_like or @log_unlike)
+-	{
+-		# Don't let previous log entries match for this connection.
+-		# On Windows, the truncation would not work, so rotate the log
+-		# file before restarting the server afresh.
+-		if ($TestLib::windows_os)
+-		{
+-			$self->rotate_logfile;
+-			$self->restart;
+-		}
+-		else
+-		{
+-			truncate $self->logfile, 0;
+-		}
+-	}
++	my $log_location = -s $self->logfile;
+ 
+ 	# Never prompt for a password, any callers of this routine should
+ 	# have set up things properly, and this should not block.
+@@ -2034,7 +2007,8 @@ sub connect_fails
+ 
+ 	if (@log_like or @log_unlike)
+ 	{
+-		my $log_contents = TestLib::slurp_file($self->logfile);
++		my $log_contents = TestLib::slurp_file($self->logfile,
++						       $log_location);
+ 
+ 		while (my $regex = shift @log_like)
+ 		{
+@@ -2194,9 +2168,6 @@ sub command_checks_all
+ Run a command on the node, then verify that $expected_sql appears in the
+ server log file.
+ 
+-Reads the whole log file so be careful when working with large log outputs.
+-The log file is truncated prior to running the command, however.
+-
+ =cut
+ 
+ sub issues_sql_like
+@@ -2207,10 +2178,11 @@ sub issues_sql_like
+ 
+ 	local %ENV = $self->_get_env();
+ 
+-	truncate $self->logfile, 0;
++	my $log_location = -s $self->logfile;
++
+ 	my $result = TestLib::run_log($cmd);
+ 	ok($result, "@$cmd exit code 0");
+-	my $log = TestLib::slurp_file($self->logfile);
++	my $log = TestLib::slurp_file($self->logfile, $log_location);
+ 	like($log, $expected_sql, "$test_name: SQL found in server log");
+ 	return;
+ }
+diff --git a/src/test/perl/TestLib.pm b/src/test/perl/TestLib.pm
+index 1baf6bd00173..6bdedc2cfaf6 100644
+--- a/src/test/perl/TestLib.pm
++++ b/src/test/perl/TestLib.pm
+@@ -47,7 +47,7 @@ use Carp;
+ use Config;
+ use Cwd;
+ use Exporter 'import';
+-use Fcntl qw(:mode);
++use Fcntl qw(:mode :seek);
+ use File::Basename;
+ use File::Find;
+ use File::Spec;
+@@ -124,7 +124,7 @@ BEGIN
+ 	if ($windows_os)
+ 	{
+ 		require Win32API::File;
+-		Win32API::File->import(qw(createFile OsFHandleOpen CloseHandle));
++		Win32API::File->import(qw(createFile OsFHandleOpen CloseHandle setFilePointer));
+ 	}
+ 
+ 	# Specifies whether to use Unix sockets for test setups.  On
+@@ -430,21 +430,27 @@ sub slurp_dir
+ 
+ =pod
+ 
+-=item slurp_file(filename)
++=item slurp_file(filename [, $offset])
+ 
+-Return the full contents of the specified file.
++Return the full contents of the specified file, beginning from an
++offset position if specified.
+ 
+ =cut
+ 
+ sub slurp_file
+ {
+-	my ($filename) = @_;
++	my ($filename, $offset) = @_;
+ 	local $/;
+ 	my $contents;
+ 	if ($Config{osname} ne 'MSWin32')
+ 	{
+ 		open(my $in, '<', $filename)
+ 		  or croak "could not read \"$filename\": $!";
++		if (defined($offset))
++		{
++			seek($in, $offset, SEEK_SET)
++			  or croak "could not seek \"$filename\": $!";
++		}
+ 		$contents = <$in>;
+ 		close $in;
+ 	}
+@@ -454,6 +460,11 @@ sub slurp_file
+ 		  or croak "could not open \"$filename\": $^E";
+ 		OsFHandleOpen(my $fh = IO::Handle->new(), $fHandle, 'r')
+ 		  or croak "could not read \"$filename\": $^E\n";
++		if (defined($offset))
++		{
++			setFilePointer($fh, $offset, qw(FILE_BEGIN))
++			  or croak "could not seek \"$filename\": $^E\n";
++		}
+ 		$contents = <$fh>;
+ 		CloseHandle($fHandle)
+ 		  or croak "could not close \"$filename\": $^E\n";

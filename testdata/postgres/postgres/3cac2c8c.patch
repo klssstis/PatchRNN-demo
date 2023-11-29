@@ -1,0 +1,165 @@
+From 3cac2c8caaefc642332e6994ce80032cc7d4cfdf Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 17 Nov 2021 13:08:25 -0500
+Subject: [PATCH] Handle close() failures more robustly in pg_dump and
+ pg_basebackup.
+
+Coverity complained that applying get_gz_error after a failed gzclose,
+as we did in one place in pg_basebackup, is unsafe.  I think it's
+right: it's entirely likely that the call is touching freed memory.
+Change that to inspect errno, as we do for other gzclose calls.
+
+Also, be careful to initialize errno to zero immediately before any
+gzclose() call where we care about the error status.  (There are
+some calls where we don't, because we already failed at some previous
+step.)  This ensures that we don't get a misleadingly irrelevant
+error code if gzclose() fails in a way that doesn't set errno.
+We could work harder at that, but it looks to me like all such cases
+are basically can't-happen if we're not misusing zlib, so it's
+not worth the extra notational cruft that would be required.
+
+Also, fix several places that simply failed to check for close-time
+errors at all, mostly at some remove from the close or gzclose itself;
+and one place that did check but didn't bother to report the errno.
+
+Back-patch to v12.  These mistakes are older than that, but between
+the frontend logging API changes that happened in v12 and the fact
+that frontend code can't rely on %m before that, the patch would need
+substantial revision to work in older branches.  It doesn't quite
+seem worth the trouble given the lack of related field complaints.
+
+Patch by me; thanks to Michael Paquier for review.
+
+Discussion: https://postgr.es/m/1343113.1636489231@sss.pgh.pa.us
+---
+ src/bin/pg_basebackup/bbstreamer_file.c | 6 +++---
+ src/bin/pg_basebackup/receivelog.c      | 7 ++++++-
+ src/bin/pg_basebackup/walmethods.c      | 3 +++
+ src/bin/pg_dump/pg_backup_archiver.c    | 2 ++
+ src/bin/pg_dump/pg_backup_directory.c   | 9 ++++++---
+ src/bin/pg_dump/pg_backup_tar.c         | 5 ++++-
+ 6 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/src/bin/pg_basebackup/bbstreamer_file.c b/src/bin/pg_basebackup/bbstreamer_file.c
+index eba173f68898..5dc828f742b9 100644
+--- a/src/bin/pg_basebackup/bbstreamer_file.c
++++ b/src/bin/pg_basebackup/bbstreamer_file.c
+@@ -303,11 +303,11 @@ bbstreamer_gzip_writer_finalize(bbstreamer *streamer)
+ 
+ 	mystreamer = (bbstreamer_gzip_writer *) streamer;
+ 
++	errno = 0;					/* in case gzclose() doesn't set it */
+ 	if (gzclose(mystreamer->gzfile) != 0)
+ 	{
+-		pg_log_error("could not close compressed file \"%s\": %s",
+-					 mystreamer->pathname,
+-					 get_gz_error(mystreamer->gzfile));
++		pg_log_error("could not close compressed file \"%s\": %m",
++					 mystreamer->pathname);
+ 		exit(1);
+ 	}
+ 
+diff --git a/src/bin/pg_basebackup/receivelog.c b/src/bin/pg_basebackup/receivelog.c
+index e9489f7dcbdc..d0ca1f2a7f23 100644
+--- a/src/bin/pg_basebackup/receivelog.c
++++ b/src/bin/pg_basebackup/receivelog.c
+@@ -70,7 +70,12 @@ mark_file_as_archived(StreamCtl *stream, const char *fname)
+ 		return false;
+ 	}
+ 
+-	stream->walmethod->close(f, CLOSE_NORMAL);
++	if (stream->walmethod->close(f, CLOSE_NORMAL) != 0)
++	{
++		pg_log_error("could not close archive status file \"%s\": %s",
++					 tmppath, stream->walmethod->getlasterror());
++		return false;
++	}
+ 
+ 	return true;
+ }
+diff --git a/src/bin/pg_basebackup/walmethods.c b/src/bin/pg_basebackup/walmethods.c
+index f1ba2a828a04..5cc10c6eba03 100644
+--- a/src/bin/pg_basebackup/walmethods.c
++++ b/src/bin/pg_basebackup/walmethods.c
+@@ -355,7 +355,10 @@ dir_close(Walfile f, WalCloseMethod method)
+ 
+ #ifdef HAVE_LIBZ
+ 	if (dir_data->compression_method == COMPRESSION_GZIP)
++	{
++		errno = 0;				/* in case gzclose() doesn't set it */
+ 		r = gzclose(df->gzfp);
++	}
+ 	else
+ #endif
+ #ifdef HAVE_LIBLZ4
+diff --git a/src/bin/pg_dump/pg_backup_archiver.c b/src/bin/pg_dump/pg_backup_archiver.c
+index 2c4cfb9457e0..59f4fbb2cc15 100644
+--- a/src/bin/pg_dump/pg_backup_archiver.c
++++ b/src/bin/pg_dump/pg_backup_archiver.c
+@@ -268,6 +268,7 @@ CloseArchive(Archive *AHX)
+ 	AH->ClosePtr(AH);
+ 
+ 	/* Close the output */
++	errno = 0;					/* in case gzclose() doesn't set it */
+ 	if (AH->gzOut)
+ 		res = GZCLOSE(AH->OF);
+ 	else if (AH->OF != stdout)
+@@ -1567,6 +1568,7 @@ RestoreOutput(ArchiveHandle *AH, OutputContext savedContext)
+ {
+ 	int			res;
+ 
++	errno = 0;					/* in case gzclose() doesn't set it */
+ 	if (AH->gzOut)
+ 		res = GZCLOSE(AH->OF);
+ 	else
+diff --git a/src/bin/pg_dump/pg_backup_directory.c b/src/bin/pg_dump/pg_backup_directory.c
+index 8aff6bce3879..4e0fb7d2d361 100644
+--- a/src/bin/pg_dump/pg_backup_directory.c
++++ b/src/bin/pg_dump/pg_backup_directory.c
+@@ -369,7 +369,8 @@ _EndData(ArchiveHandle *AH, TocEntry *te)
+ 	lclContext *ctx = (lclContext *) AH->formatData;
+ 
+ 	/* Close the file */
+-	cfclose(ctx->dataFH);
++	if (cfclose(ctx->dataFH) != 0)
++		fatal("could not close data file: %m");
+ 
+ 	ctx->dataFH = NULL;
+ }
+@@ -680,7 +681,8 @@ _EndBlob(ArchiveHandle *AH, TocEntry *te, Oid oid)
+ 	int			len;
+ 
+ 	/* Close the BLOB data file itself */
+-	cfclose(ctx->dataFH);
++	if (cfclose(ctx->dataFH) != 0)
++		fatal("could not close blob data file: %m");
+ 	ctx->dataFH = NULL;
+ 
+ 	/* register the blob in blobs.toc */
+@@ -699,7 +701,8 @@ _EndBlobs(ArchiveHandle *AH, TocEntry *te)
+ {
+ 	lclContext *ctx = (lclContext *) AH->formatData;
+ 
+-	cfclose(ctx->blobsTocFH);
++	if (cfclose(ctx->blobsTocFH) != 0)
++		fatal("could not close blobs TOC file: %m");
+ 	ctx->blobsTocFH = NULL;
+ }
+ 
+diff --git a/src/bin/pg_dump/pg_backup_tar.c b/src/bin/pg_dump/pg_backup_tar.c
+index 65bcb41a2f86..5c351acda010 100644
+--- a/src/bin/pg_dump/pg_backup_tar.c
++++ b/src/bin/pg_dump/pg_backup_tar.c
+@@ -438,8 +438,11 @@ tarClose(ArchiveHandle *AH, TAR_MEMBER *th)
+ 	 * Close the GZ file since we dup'd. This will flush the buffers.
+ 	 */
+ 	if (AH->compression != 0)
++	{
++		errno = 0;				/* in case gzclose() doesn't set it */
+ 		if (GZCLOSE(th->zFH) != 0)
+-			fatal("could not close tar member");
++			fatal("could not close tar member: %m");
++	}
+ 
+ 	if (th->mode == 'w')
+ 		_tarAddFile(AH, th);	/* This will close the temp file */

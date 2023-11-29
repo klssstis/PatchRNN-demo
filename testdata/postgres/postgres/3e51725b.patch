@@ -1,0 +1,149 @@
+From 3e51725b3854e80b84347774516e988fce12f46d Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 21 Apr 2017 15:55:56 -0400
+Subject: [PATCH] Avoid depending on non-POSIX behavior of fcntl(2).
+
+The POSIX standard does not say that the success return value for
+fcntl(F_SETFD) and fcntl(F_SETFL) is zero; it says only that it's not -1.
+We had several calls that were making the stronger assumption.  Adjust
+them to test specifically for -1 for strict spec compliance.
+
+The standard further leaves open the possibility that the O_NONBLOCK
+flag bit is not the only active one in F_SETFL's argument.  Formally,
+therefore, one ought to get the current flags with F_GETFL and store
+them back with only the O_NONBLOCK bit changed when trying to change
+the nonblock state.  In port/noblock.c, we were doing the full pushup
+in pg_set_block but not in pg_set_noblock, which is just weird.  Make
+both of them do it properly, since they have little business making
+any assumptions about the socket they're handed.  The other places
+where we're issuing F_SETFL are working with FDs we just got from
+pipe(2), so it's reasonable to assume the FDs' properties are all
+default, so I didn't bother adding F_GETFL steps there.
+
+Also, while pg_set_block deserves some points for trying to do things
+right, somebody had decided that it'd be even better to cast fcntl's
+third argument to "long".  Which is completely loony, because POSIX
+clearly says the third argument for an F_SETFL call is "int".
+
+Given the lack of field complaints, these missteps apparently are not
+of significance on any common platforms.  But they're still wrong,
+so back-patch to all supported branches.
+
+Discussion: https://postgr.es/m/30882.1492800880@sss.pgh.pa.us
+---
+ src/backend/postmaster/postmaster.c   |  4 ++--
+ src/backend/storage/ipc/latch.c       |  4 ++--
+ src/bin/pg_test_fsync/pg_test_fsync.c |  1 +
+ src/port/noblock.c                    | 24 ++++++++++++++++++++----
+ 4 files changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index 68313424ee26..c38234527ffa 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -6263,7 +6263,7 @@ InitPostmasterDeathWatchHandle(void)
+ 	 * write fd. That is taken care of in ClosePostmasterPorts().
+ 	 */
+ 	Assert(MyProcPid == PostmasterPid);
+-	if (pipe(postmaster_alive_fds))
++	if (pipe(postmaster_alive_fds) < 0)
+ 		ereport(FATAL,
+ 				(errcode_for_file_access(),
+ 				 errmsg_internal("could not create pipe to monitor postmaster death: %m")));
+@@ -6272,7 +6272,7 @@ InitPostmasterDeathWatchHandle(void)
+ 	 * Set O_NONBLOCK to allow testing for the fd's presence with a read()
+ 	 * call.
+ 	 */
+-	if (fcntl(postmaster_alive_fds[POSTMASTER_FD_WATCH], F_SETFL, O_NONBLOCK))
++	if (fcntl(postmaster_alive_fds[POSTMASTER_FD_WATCH], F_SETFL, O_NONBLOCK) == -1)
+ 		ereport(FATAL,
+ 				(errcode_for_socket_access(),
+ 				 errmsg_internal("could not set postmaster death monitoring pipe to nonblocking mode: %m")));
+diff --git a/src/backend/storage/ipc/latch.c b/src/backend/storage/ipc/latch.c
+index 47983704d7ed..67162fdd4a60 100644
+--- a/src/backend/storage/ipc/latch.c
++++ b/src/backend/storage/ipc/latch.c
+@@ -169,9 +169,9 @@ InitializeLatchSupport(void)
+ 	 */
+ 	if (pipe(pipefd) < 0)
+ 		elog(FATAL, "pipe() failed: %m");
+-	if (fcntl(pipefd[0], F_SETFL, O_NONBLOCK) < 0)
++	if (fcntl(pipefd[0], F_SETFL, O_NONBLOCK) == -1)
+ 		elog(FATAL, "fcntl() failed on read-end of self-pipe: %m");
+-	if (fcntl(pipefd[1], F_SETFL, O_NONBLOCK) < 0)
++	if (fcntl(pipefd[1], F_SETFL, O_NONBLOCK) == -1)
+ 		elog(FATAL, "fcntl() failed on write-end of self-pipe: %m");
+ 
+ 	selfpipe_readfd = pipefd[0];
+diff --git a/src/bin/pg_test_fsync/pg_test_fsync.c b/src/bin/pg_test_fsync/pg_test_fsync.c
+index d65c0ab110a5..266b2b6e4171 100644
+--- a/src/bin/pg_test_fsync/pg_test_fsync.c
++++ b/src/bin/pg_test_fsync/pg_test_fsync.c
+@@ -7,6 +7,7 @@
+ 
+ #include <sys/stat.h>
+ #include <sys/time.h>
++#include <fcntl.h>
+ #include <time.h>
+ #include <unistd.h>
+ #include <signal.h>
+diff --git a/src/port/noblock.c b/src/port/noblock.c
+index 7e70319bd4e4..673fa8aa3cea 100644
+--- a/src/port/noblock.c
++++ b/src/port/noblock.c
+@@ -1,7 +1,7 @@
+ /*-------------------------------------------------------------------------
+  *
+  * noblock.c
+- *	  set a file descriptor as non-blocking
++ *	  set a file descriptor as blocking or non-blocking
+  *
+  * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+  * Portions Copyright (c) 1994, Regents of the University of California
+@@ -17,11 +17,22 @@
+ #include <fcntl.h>
+ 
+ 
++/*
++ * Put socket into nonblock mode.
++ * Returns true on success, false on failure.
++ */
+ bool
+ pg_set_noblock(pgsocket sock)
+ {
+ #if !defined(WIN32)
+-	return (fcntl(sock, F_SETFL, O_NONBLOCK) != -1);
++	int			flags;
++
++	flags = fcntl(sock, F_GETFL);
++	if (flags < 0)
++		return false;
++	if (fcntl(sock, F_SETFL, (flags | O_NONBLOCK)) == -1)
++		return false;
++	return true;
+ #else
+ 	unsigned long ioctlsocket_ret = 1;
+ 
+@@ -30,7 +41,10 @@ pg_set_noblock(pgsocket sock)
+ #endif
+ }
+ 
+-
++/*
++ * Put socket into blocking mode.
++ * Returns true on success, false on failure.
++ */
+ bool
+ pg_set_block(pgsocket sock)
+ {
+@@ -38,7 +52,9 @@ pg_set_block(pgsocket sock)
+ 	int			flags;
+ 
+ 	flags = fcntl(sock, F_GETFL);
+-	if (flags < 0 || fcntl(sock, F_SETFL, (long) (flags & ~O_NONBLOCK)))
++	if (flags < 0)
++		return false;
++	if (fcntl(sock, F_SETFL, (flags & ~O_NONBLOCK)) == -1)
+ 		return false;
+ 	return true;
+ #else

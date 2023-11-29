@@ -1,0 +1,98 @@
+From 3e1683d37e1d751eb2df9a5cb0507bebc6cf7d05 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 18 Sep 2017 11:39:44 -0400
+Subject: [PATCH] Fix, or at least ameliorate, bugs in
+ logicalrep_worker_launch().
+
+If we failed to get a background worker slot, the code just walked
+away from the logicalrep-worker slot it already had, leaving that
+looking like the worker is still starting up.  This led to an indefinite
+hang in subscription startup, as reported by Thomas Munro.  We must
+release the slot on failure.
+
+Also fix a thinko: we must capture the worker slot's generation before
+releasing LogicalRepWorkerLock the first time, else testing to see if
+it's changed is pretty meaningless.
+
+BTW, the CHECK_FOR_INTERRUPTS() in WaitForReplicationWorkerAttach is a
+ticking time bomb, even without considering the possibility of elog(ERROR)
+in one of the other functions it calls.  Really, this entire business needs
+a redesign with some actual thought about error recovery.  But for now
+I'm just band-aiding the case observed in testing.
+
+Back-patch to v10 where this code was added.
+
+Discussion: https://postgr.es/m/CAEepm=2bP3TBMFBArP6o20AZaRduWjMnjCjt22hSdnA-EvrtCw@mail.gmail.com
+---
+ src/backend/replication/logical/launcher.c | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/src/backend/replication/logical/launcher.c b/src/backend/replication/logical/launcher.c
+index 6c894421a396..44bdcab3b979 100644
+--- a/src/backend/replication/logical/launcher.c
++++ b/src/backend/replication/logical/launcher.c
+@@ -168,14 +168,11 @@ get_subscription_list(void)
+  */
+ static void
+ WaitForReplicationWorkerAttach(LogicalRepWorker *worker,
++							   uint16 generation,
+ 							   BackgroundWorkerHandle *handle)
+ {
+ 	BgwHandleStatus status;
+ 	int			rc;
+-	uint16		generation;
+-
+-	/* Remember generation for future identification. */
+-	generation = worker->generation;
+ 
+ 	for (;;)
+ 	{
+@@ -282,7 +279,7 @@ logicalrep_workers_find(Oid subid, bool only_running)
+ }
+ 
+ /*
+- * Start new apply background worker.
++ * Start new apply background worker, if possible.
+  */
+ void
+ logicalrep_worker_launch(Oid dbid, Oid subid, const char *subname, Oid userid,
+@@ -290,6 +287,7 @@ logicalrep_worker_launch(Oid dbid, Oid subid, const char *subname, Oid userid,
+ {
+ 	BackgroundWorker bgw;
+ 	BackgroundWorkerHandle *bgw_handle;
++	uint16		generation;
+ 	int			i;
+ 	int			slot = 0;
+ 	LogicalRepWorker *worker = NULL;
+@@ -406,6 +404,9 @@ logicalrep_worker_launch(Oid dbid, Oid subid, const char *subname, Oid userid,
+ 	worker->reply_lsn = InvalidXLogRecPtr;
+ 	TIMESTAMP_NOBEGIN(worker->reply_time);
+ 
++	/* Before releasing lock, remember generation for future identification. */
++	generation = worker->generation;
++
+ 	LWLockRelease(LogicalRepWorkerLock);
+ 
+ 	/* Register the new dynamic worker. */
+@@ -428,6 +429,12 @@ logicalrep_worker_launch(Oid dbid, Oid subid, const char *subname, Oid userid,
+ 
+ 	if (!RegisterDynamicBackgroundWorker(&bgw, &bgw_handle))
+ 	{
++		/* Failed to start worker, so clean up the worker slot. */
++		LWLockAcquire(LogicalRepWorkerLock, LW_EXCLUSIVE);
++		Assert(generation == worker->generation);
++		logicalrep_worker_cleanup(worker);
++		LWLockRelease(LogicalRepWorkerLock);
++
+ 		ereport(WARNING,
+ 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+ 				 errmsg("out of background worker slots"),
+@@ -436,7 +443,7 @@ logicalrep_worker_launch(Oid dbid, Oid subid, const char *subname, Oid userid,
+ 	}
+ 
+ 	/* Now wait until it attaches. */
+-	WaitForReplicationWorkerAttach(worker, bgw_handle);
++	WaitForReplicationWorkerAttach(worker, generation, bgw_handle);
+ }
+ 
+ /*

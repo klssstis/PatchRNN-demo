@@ -1,0 +1,252 @@
+From 3dbb317d32f4f084ef7badaed8ef36f5c9b85fe6 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Mon, 29 Apr 2019 19:42:04 -0700
+Subject: [PATCH] Fix potential assertion failure when reindexing a pg_class
+ index.
+
+When reindexing individual indexes on pg_class it was possible to
+either trigger an assertion failure:
+TRAP: FailedAssertion("!(!ReindexIsProcessingIndex(((index)->rd_id)))
+
+That's because reindex_index() called SetReindexProcessing() - which
+enables an asserts ensuring no index insertions happen into the index
+- before calling RelationSetNewRelfilenode(). That not correct for
+indexes on pg_class, because RelationSetNewRelfilenode() updates the
+relevant pg_class row, which needs to update the indexes.
+
+The are two reasons this wasn't noticed earlier. Firstly the bug
+doesn't trigger when reindexing all of pg_class, as reindex_relation
+has code "hiding" all yet-to-be-reindexed indexes. Secondly, the bug
+only triggers when the the update to pg_class doesn't turn out to be a
+HOT update - otherwise there's no index insertion to trigger the
+bug. Most of the time there's enough space, making this bug hard to
+trigger.
+
+To fix, move RelationSetNewRelfilenode() to before the
+SetReindexProcessing() (and, together with some other code, to outside
+of the PG_TRY()).
+
+To make sure the error checking intended by SetReindexProcessing() is
+more robust, modify CatalogIndexInsert() to check
+ReindexIsProcessingIndex() even when the update is a HOT update.
+
+Also add a few regression tests for REINDEXing of system catalogs.
+
+The last two improvements would have prevented some of the issues
+fixed in 5c1560606dc4c from being introduced in the first place.
+
+Reported-By: Michael Paquier
+Diagnosed-By: Tom Lane and Andres Freund
+Author: Andres Freund
+Reviewed-By: Tom Lane
+Discussion: https://postgr.es/m/20190418011430.GA19133@paquier.xyz
+Backpatch: 9.4-, the bug is present in all branches
+---
+ contrib/test_decoding/expected/rewrite.out |  4 +++
+ contrib/test_decoding/sql/rewrite.sql      |  5 +++
+ src/backend/catalog/index.c                | 40 +++++++++++++---------
+ src/backend/catalog/indexing.c             | 21 ++++++++++--
+ src/test/regress/expected/create_index.out | 18 ++++++++++
+ src/test/regress/sql/create_index.sql      | 21 ++++++++++++
+ 6 files changed, 90 insertions(+), 19 deletions(-)
+
+diff --git a/contrib/test_decoding/expected/rewrite.out b/contrib/test_decoding/expected/rewrite.out
+index 3bf2afa9315f..28998b86f9e9 100644
+--- a/contrib/test_decoding/expected/rewrite.out
++++ b/contrib/test_decoding/expected/rewrite.out
+@@ -103,6 +103,10 @@ COMMIT;
+  -- repeated rewrites in different transactions
+ VACUUM FULL pg_class;
+ VACUUM FULL pg_class;
++-- reindexing of important relations / indexes
++REINDEX TABLE pg_class;
++REINDEX INDEX pg_class_oid_index;
++REINDEX INDEX pg_class_tblspc_relfilenode_index;
+ INSERT INTO replication_example(somedata, testcolumn1) VALUES (5, 3);
+ BEGIN;
+ INSERT INTO replication_example(somedata, testcolumn1) VALUES (6, 4);
+diff --git a/contrib/test_decoding/sql/rewrite.sql b/contrib/test_decoding/sql/rewrite.sql
+index 4271b82bead4..c9503a0da59b 100644
+--- a/contrib/test_decoding/sql/rewrite.sql
++++ b/contrib/test_decoding/sql/rewrite.sql
+@@ -74,6 +74,11 @@ COMMIT;
+ VACUUM FULL pg_class;
+ VACUUM FULL pg_class;
+ 
++-- reindexing of important relations / indexes
++REINDEX TABLE pg_class;
++REINDEX INDEX pg_class_oid_index;
++REINDEX INDEX pg_class_tblspc_relfilenode_index;
++
+ INSERT INTO replication_example(somedata, testcolumn1) VALUES (5, 3);
+ 
+ BEGIN;
+diff --git a/src/backend/catalog/index.c b/src/backend/catalog/index.c
+index 331f90528cdd..ce024101fc9b 100644
+--- a/src/backend/catalog/index.c
++++ b/src/backend/catalog/index.c
+@@ -3316,28 +3316,34 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
+ 	 */
+ 	TransferPredicateLocksToHeapRelation(iRel);
+ 
++	/* Fetch info needed for index_build */
++	indexInfo = BuildIndexInfo(iRel);
++
++	/* If requested, skip checking uniqueness/exclusion constraints */
++	if (skip_constraint_checks)
++	{
++		if (indexInfo->ii_Unique || indexInfo->ii_ExclusionOps != NULL)
++			skipped_constraint = true;
++		indexInfo->ii_Unique = false;
++		indexInfo->ii_ExclusionOps = NULL;
++		indexInfo->ii_ExclusionProcs = NULL;
++		indexInfo->ii_ExclusionStrats = NULL;
++	}
++
++	/*
++	 * Build a new physical relation for the index. Need to do that before
++	 * "officially" starting the reindexing with SetReindexProcessing -
++	 * otherwise the necessary pg_class changes cannot be made with
++	 * encountering assertions.
++	 */
++	RelationSetNewRelfilenode(iRel, persistence);
++
++	/* ensure SetReindexProcessing state isn't leaked */
+ 	PG_TRY();
+ 	{
+ 		/* Suppress use of the target index while rebuilding it */
+ 		SetReindexProcessing(heapId, indexId);
+ 
+-		/* Fetch info needed for index_build */
+-		indexInfo = BuildIndexInfo(iRel);
+-
+-		/* If requested, skip checking uniqueness/exclusion constraints */
+-		if (skip_constraint_checks)
+-		{
+-			if (indexInfo->ii_Unique || indexInfo->ii_ExclusionOps != NULL)
+-				skipped_constraint = true;
+-			indexInfo->ii_Unique = false;
+-			indexInfo->ii_ExclusionOps = NULL;
+-			indexInfo->ii_ExclusionProcs = NULL;
+-			indexInfo->ii_ExclusionStrats = NULL;
+-		}
+-
+-		/* We'll build a new physical relation for the index */
+-		RelationSetNewRelfilenode(iRel, persistence);
+-
+ 		/* Initialize the index and rebuild */
+ 		/* Note: we do not need to re-establish pkey setting */
+ 		index_build(heapRelation, iRel, indexInfo, true, true);
+diff --git a/src/backend/catalog/indexing.c b/src/backend/catalog/indexing.c
+index 0c994122d858..507879ecaf06 100644
+--- a/src/backend/catalog/indexing.c
++++ b/src/backend/catalog/indexing.c
+@@ -82,9 +82,15 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple)
+ 	Datum		values[INDEX_MAX_KEYS];
+ 	bool		isnull[INDEX_MAX_KEYS];
+ 
+-	/* HOT update does not require index inserts */
++	/*
++	 * HOT update does not require index inserts. But with asserts enabled we
++	 * want to check that it'd be legal to currently insert into the
++	 * table/index.
++	 */
++#ifndef USE_ASSERT_CHECKING
+ 	if (HeapTupleIsHeapOnly(heapTuple))
+ 		return;
++#endif
+ 
+ 	/*
+ 	 * Get information from the state structure.  Fall out if nothing to do.
+@@ -107,8 +113,10 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple)
+ 	for (i = 0; i < numIndexes; i++)
+ 	{
+ 		IndexInfo  *indexInfo;
++		Relation	index;
+ 
+ 		indexInfo = indexInfoArray[i];
++		index = relationDescs[i];
+ 
+ 		/* If the index is marked as read-only, ignore it */
+ 		if (!indexInfo->ii_ReadyForInserts)
+@@ -121,9 +129,18 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple)
+ 		Assert(indexInfo->ii_Expressions == NIL);
+ 		Assert(indexInfo->ii_Predicate == NIL);
+ 		Assert(indexInfo->ii_ExclusionOps == NULL);
+-		Assert(relationDescs[i]->rd_index->indimmediate);
++		Assert(index->rd_index->indimmediate);
+ 		Assert(indexInfo->ii_NumIndexKeyAttrs != 0);
+ 
++		/* see earlier check above */
++#ifdef USE_ASSERT_CHECKING
++		if (HeapTupleIsHeapOnly(heapTuple))
++		{
++			Assert(!ReindexIsProcessingIndex(RelationGetRelid(index)));
++			continue;
++		}
++#endif /* USE_ASSERT_CHECKING */
++
+ 		/*
+ 		 * FormIndexDatum fills in its values and isnull parameters with the
+ 		 * appropriate values for the column(s) of the index.
+diff --git a/src/test/regress/expected/create_index.out b/src/test/regress/expected/create_index.out
+index 326dc4417768..ef8c8cd654d1 100644
+--- a/src/test/regress/expected/create_index.out
++++ b/src/test/regress/expected/create_index.out
+@@ -1939,6 +1939,24 @@ INFO:  index "reindex_verbose_pkey" was reindexed
+ \set VERBOSITY default
+ DROP TABLE reindex_verbose;
+ --
++-- check that system tables can be reindexed
++--
++-- whole tables
++REINDEX TABLE pg_class; -- mapped, non-shared, critical
++REINDEX TABLE pg_index; -- non-mapped, non-shared, critical
++REINDEX TABLE pg_operator; -- non-mapped, non-shared, critical
++REINDEX TABLE pg_database; -- mapped, shared, critical
++REINDEX TABLE pg_shdescription; -- mapped, shared non-critical
++-- Check that individual system indexes can be reindexed. That's a bit
++-- different from the entire-table case because reindex_relation
++-- treats e.g. pg_class special.
++REINDEX INDEX pg_class_oid_index; -- mapped, non-shared, critical
++REINDEX INDEX pg_class_relname_nsp_index; -- mapped, non-shared, non-critical
++REINDEX INDEX pg_index_indexrelid_index; -- non-mapped, non-shared, critical
++REINDEX INDEX pg_index_indrelid_index; -- non-mapped, non-shared, non-critical
++REINDEX INDEX pg_database_oid_index; -- mapped, shared, critical
++REINDEX INDEX pg_shdescription_o_c_index; -- mapped, shared, non-critical
++--
+ -- REINDEX CONCURRENTLY
+ --
+ CREATE TABLE concur_reindex_tab (c1 int);
+diff --git a/src/test/regress/sql/create_index.sql b/src/test/regress/sql/create_index.sql
+index f29b8ca826fa..f6f2d7c14bb1 100644
+--- a/src/test/regress/sql/create_index.sql
++++ b/src/test/regress/sql/create_index.sql
+@@ -747,6 +747,27 @@ REINDEX (VERBOSE) TABLE reindex_verbose;
+ \set VERBOSITY default
+ DROP TABLE reindex_verbose;
+ 
++--
++-- check that system tables can be reindexed
++--
++
++-- whole tables
++REINDEX TABLE pg_class; -- mapped, non-shared, critical
++REINDEX TABLE pg_index; -- non-mapped, non-shared, critical
++REINDEX TABLE pg_operator; -- non-mapped, non-shared, critical
++REINDEX TABLE pg_database; -- mapped, shared, critical
++REINDEX TABLE pg_shdescription; -- mapped, shared non-critical
++
++-- Check that individual system indexes can be reindexed. That's a bit
++-- different from the entire-table case because reindex_relation
++-- treats e.g. pg_class special.
++REINDEX INDEX pg_class_oid_index; -- mapped, non-shared, critical
++REINDEX INDEX pg_class_relname_nsp_index; -- mapped, non-shared, non-critical
++REINDEX INDEX pg_index_indexrelid_index; -- non-mapped, non-shared, critical
++REINDEX INDEX pg_index_indrelid_index; -- non-mapped, non-shared, non-critical
++REINDEX INDEX pg_database_oid_index; -- mapped, shared, critical
++REINDEX INDEX pg_shdescription_o_c_index; -- mapped, shared, non-critical
++
+ --
+ -- REINDEX CONCURRENTLY
+ --

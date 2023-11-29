@@ -1,0 +1,156 @@
+From 3acd0599bd8e18ae831d1cc86b687453fdbd424a Mon Sep 17 00:00:00 2001
+From: Thomas Munro <tmunro@postgresql.org>
+Date: Wed, 13 Sep 2023 14:32:24 +1200
+Subject: [PATCH] Fix exception safety bug in typcache.c.
+
+If an out-of-memory error was thrown at an unfortunate time,
+ensure_record_cache_typmod_slot_exists() could leak memory and leave
+behind a global state that produced an infinite loop on the next call.
+
+Fix by merging RecordCacheArray and RecordIdentifierArray into a single
+array.  With only one allocation or re-allocation, there is no
+intermediate state.
+
+Back-patch to all supported releases.
+
+Reported-by: "James Pang (chaolpan)" <chaolpan@cisco.com>
+Reviewed-by: Michael Paquier <michael@paquier.xyz>
+Discussion: https://postgr.es/m/PH0PR11MB519113E738814BDDA702EDADD6EFA%40PH0PR11MB5191.namprd11.prod.outlook.com
+---
+ src/backend/utils/cache/typcache.c | 48 +++++++++++++++++-------------
+ src/tools/pgindent/typedefs.list   |  1 +
+ 2 files changed, 28 insertions(+), 21 deletions(-)
+
+diff --git a/src/backend/utils/cache/typcache.c b/src/backend/utils/cache/typcache.c
+index ed6360ce2b94..608cd5e8e43a 100644
+--- a/src/backend/utils/cache/typcache.c
++++ b/src/backend/utils/cache/typcache.c
+@@ -273,10 +273,15 @@ static const dshash_parameters srtr_typmod_table_params = {
+ /* hashtable for recognizing registered record types */
+ static HTAB *RecordCacheHash = NULL;
+ 
+-/* arrays of info about registered record types, indexed by assigned typmod */
+-static TupleDesc *RecordCacheArray = NULL;
+-static uint64 *RecordIdentifierArray = NULL;
+-static int32 RecordCacheArrayLen = 0;	/* allocated length of above arrays */
++typedef struct RecordCacheArrayEntry
++{
++	uint64		id;
++	TupleDesc	tupdesc;
++} RecordCacheArrayEntry;
++
++/* array of info about registered record types, indexed by assigned typmod */
++static RecordCacheArrayEntry *RecordCacheArray = NULL;
++static int32 RecordCacheArrayLen = 0;	/* allocated length of above array */
+ static int32 NextRecordTypmod = 0;	/* number of entries used */
+ 
+ /*
+@@ -1703,10 +1708,9 @@ ensure_record_cache_typmod_slot_exists(int32 typmod)
+ {
+ 	if (RecordCacheArray == NULL)
+ 	{
+-		RecordCacheArray = (TupleDesc *)
+-			MemoryContextAllocZero(CacheMemoryContext, 64 * sizeof(TupleDesc));
+-		RecordIdentifierArray = (uint64 *)
+-			MemoryContextAllocZero(CacheMemoryContext, 64 * sizeof(uint64));
++		RecordCacheArray = (RecordCacheArrayEntry *)
++			MemoryContextAllocZero(CacheMemoryContext,
++								   64 * sizeof(RecordCacheArrayEntry));
+ 		RecordCacheArrayLen = 64;
+ 	}
+ 
+@@ -1714,8 +1718,10 @@ ensure_record_cache_typmod_slot_exists(int32 typmod)
+ 	{
+ 		int32		newlen = pg_nextpower2_32(typmod + 1);
+ 
+-		RecordCacheArray = repalloc0_array(RecordCacheArray, TupleDesc, RecordCacheArrayLen, newlen);
+-		RecordIdentifierArray = repalloc0_array(RecordIdentifierArray, uint64, RecordCacheArrayLen, newlen);
++		RecordCacheArray = repalloc0_array(RecordCacheArray,
++										   RecordCacheArrayEntry,
++										   RecordCacheArrayLen,
++										   newlen);
+ 		RecordCacheArrayLen = newlen;
+ 	}
+ }
+@@ -1753,8 +1759,8 @@ lookup_rowtype_tupdesc_internal(Oid type_id, int32 typmod, bool noError)
+ 		{
+ 			/* It is already in our local cache? */
+ 			if (typmod < RecordCacheArrayLen &&
+-				RecordCacheArray[typmod] != NULL)
+-				return RecordCacheArray[typmod];
++				RecordCacheArray[typmod].tupdesc != NULL)
++				return RecordCacheArray[typmod].tupdesc;
+ 
+ 			/* Are we attached to a shared record typmod registry? */
+ 			if (CurrentSession->shared_typmod_registry != NULL)
+@@ -1780,19 +1786,19 @@ lookup_rowtype_tupdesc_internal(Oid type_id, int32 typmod, bool noError)
+ 					 * Our local array can now point directly to the TupleDesc
+ 					 * in shared memory, which is non-reference-counted.
+ 					 */
+-					RecordCacheArray[typmod] = tupdesc;
++					RecordCacheArray[typmod].tupdesc = tupdesc;
+ 					Assert(tupdesc->tdrefcount == -1);
+ 
+ 					/*
+ 					 * We don't share tupdesc identifiers across processes, so
+ 					 * assign one locally.
+ 					 */
+-					RecordIdentifierArray[typmod] = ++tupledesc_id_counter;
++					RecordCacheArray[typmod].id = ++tupledesc_id_counter;
+ 
+ 					dshash_release_lock(CurrentSession->shared_typmod_table,
+ 										entry);
+ 
+-					return RecordCacheArray[typmod];
++					return RecordCacheArray[typmod].tupdesc;
+ 				}
+ 			}
+ 		}
+@@ -2005,10 +2011,10 @@ assign_record_type_typmod(TupleDesc tupDesc)
+ 		ensure_record_cache_typmod_slot_exists(entDesc->tdtypmod);
+ 	}
+ 
+-	RecordCacheArray[entDesc->tdtypmod] = entDesc;
++	RecordCacheArray[entDesc->tdtypmod].tupdesc = entDesc;
+ 
+ 	/* Assign a unique tupdesc identifier, too. */
+-	RecordIdentifierArray[entDesc->tdtypmod] = ++tupledesc_id_counter;
++	RecordCacheArray[entDesc->tdtypmod].id = ++tupledesc_id_counter;
+ 
+ 	/* Fully initialized; create the hash table entry */
+ 	recentry = (RecordCacheEntry *) hash_search(RecordCacheHash,
+@@ -2057,10 +2063,10 @@ assign_record_type_identifier(Oid type_id, int32 typmod)
+ 		 * It's a transient record type, so look in our record-type table.
+ 		 */
+ 		if (typmod >= 0 && typmod < RecordCacheArrayLen &&
+-			RecordCacheArray[typmod] != NULL)
++			RecordCacheArray[typmod].tupdesc != NULL)
+ 		{
+-			Assert(RecordIdentifierArray[typmod] != 0);
+-			return RecordIdentifierArray[typmod];
++			Assert(RecordCacheArray[typmod].id != 0);
++			return RecordCacheArray[typmod].id;
+ 		}
+ 
+ 		/* For anonymous or unrecognized record type, generate a new ID */
+@@ -2140,7 +2146,7 @@ SharedRecordTypmodRegistryInit(SharedRecordTypmodRegistry *registry,
+ 		TupleDesc	tupdesc;
+ 		bool		found;
+ 
+-		tupdesc = RecordCacheArray[typmod];
++		tupdesc = RecordCacheArray[typmod].tupdesc;
+ 		if (tupdesc == NULL)
+ 			continue;
+ 
+diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list
+index f2af84d7ca22..f3d8a2a855ce 100644
+--- a/src/tools/pgindent/typedefs.list
++++ b/src/tools/pgindent/typedefs.list
+@@ -2251,6 +2251,7 @@ ReadLocalXLogPageNoWaitPrivate
+ ReadReplicationSlotCmd
+ ReassignOwnedStmt
+ RecheckForeignScan_function
++RecordCacheArrayEntry
+ RecordCacheEntry
+ RecordCompareData
+ RecordIOData

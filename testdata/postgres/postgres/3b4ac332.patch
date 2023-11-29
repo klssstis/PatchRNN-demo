@@ -1,0 +1,155 @@
+From 3b4ac33254e1291f0b3c94f1cb770137c418ce2e Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 25 Jan 2023 11:48:38 -0500
+Subject: [PATCH] Avoid type cheats for invalid dsa_handles and
+ dshash_table_handles.
+
+Invent separate macros for "invalid" values of these types, so that
+we needn't embed knowledge of their representations into calling code.
+These are all zeroes anyway ATM, so this is not fixing any live bug,
+but it makes the code cleaner and more future-proof.
+
+I (tgl) also chose to move DSM_HANDLE_INVALID into dsm_impl.h,
+since it seems like it should live beside the typedef for dsm_handle.
+
+Hou Zhijie, Nathan Bossart, Kyotaro Horiguchi, Tom Lane
+
+Discussion: https://postgr.es/m/OS0PR01MB5716860B1454C34E5B179B6694C99@OS0PR01MB5716.jpnprd01.prod.outlook.com
+---
+ src/backend/replication/logical/launcher.c | 8 ++++----
+ src/backend/storage/ipc/dsm.c              | 5 ++---
+ src/backend/utils/mmgr/dsa.c               | 4 ++--
+ src/include/lib/dshash.h                   | 3 +++
+ src/include/storage/dsm.h                  | 3 ---
+ src/include/storage/dsm_impl.h             | 3 +++
+ src/include/utils/dsa.h                    | 4 ++++
+ 7 files changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/src/backend/replication/logical/launcher.c b/src/backend/replication/logical/launcher.c
+index 564bffe5caf2..970d170e73aa 100644
+--- a/src/backend/replication/logical/launcher.c
++++ b/src/backend/replication/logical/launcher.c
+@@ -922,8 +922,8 @@ ApplyLauncherShmemInit(void)
+ 
+ 		memset(LogicalRepCtx, 0, ApplyLauncherShmemSize());
+ 
+-		LogicalRepCtx->last_start_dsa = DSM_HANDLE_INVALID;
+-		LogicalRepCtx->last_start_dsh = DSM_HANDLE_INVALID;
++		LogicalRepCtx->last_start_dsa = DSA_HANDLE_INVALID;
++		LogicalRepCtx->last_start_dsh = DSHASH_HANDLE_INVALID;
+ 
+ 		/* Initialize memory and spin locks for each worker slot. */
+ 		for (slot = 0; slot < max_logical_replication_workers; slot++)
+@@ -947,7 +947,7 @@ logicalrep_launcher_attach_dshmem(void)
+ 	MemoryContext oldcontext;
+ 
+ 	/* Quick exit if we already did this. */
+-	if (LogicalRepCtx->last_start_dsh != DSM_HANDLE_INVALID &&
++	if (LogicalRepCtx->last_start_dsh != DSHASH_HANDLE_INVALID &&
+ 		last_start_times != NULL)
+ 		return;
+ 
+@@ -957,7 +957,7 @@ logicalrep_launcher_attach_dshmem(void)
+ 	/* Be sure any local memory allocated by DSA routines is persistent. */
+ 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+ 
+-	if (LogicalRepCtx->last_start_dsh == DSM_HANDLE_INVALID)
++	if (LogicalRepCtx->last_start_dsh == DSHASH_HANDLE_INVALID)
+ 	{
+ 		/* Initialize dynamic shared hash table for last-start times. */
+ 		last_start_times_dsa = dsa_create(LWTRANCHE_LAUNCHER_DSA);
+diff --git a/src/backend/storage/ipc/dsm.c b/src/backend/storage/ipc/dsm.c
+index ba3ceb8153ed..10b029bb162a 100644
+--- a/src/backend/storage/ipc/dsm.c
++++ b/src/backend/storage/ipc/dsm.c
+@@ -173,9 +173,8 @@ dsm_postmaster_startup(PGShmemHeader *shim)
+ 
+ 	/*
+ 	 * Loop until we find an unused identifier for the new control segment. We
+-	 * sometimes use 0 as a sentinel value indicating that no control segment
+-	 * is known to exist, so avoid using that value for a real control
+-	 * segment.
++	 * sometimes use DSM_HANDLE_INVALID as a sentinel value indicating "no
++	 * control segment", so avoid generating that value for a real handle.
+ 	 */
+ 	for (;;)
+ 	{
+diff --git a/src/backend/utils/mmgr/dsa.c b/src/backend/utils/mmgr/dsa.c
+index 604b702a91fc..f5a62061a3e9 100644
+--- a/src/backend/utils/mmgr/dsa.c
++++ b/src/backend/utils/mmgr/dsa.c
+@@ -505,7 +505,7 @@ dsa_create_in_place(void *place, size_t size,
+ dsa_handle
+ dsa_get_handle(dsa_area *area)
+ {
+-	Assert(area->control->handle != DSM_HANDLE_INVALID);
++	Assert(area->control->handle != DSA_HANDLE_INVALID);
+ 	return area->control->handle;
+ }
+ 
+@@ -554,7 +554,7 @@ dsa_attach_in_place(void *place, dsm_segment *segment)
+ {
+ 	dsa_area   *area;
+ 
+-	area = attach_internal(place, NULL, DSM_HANDLE_INVALID);
++	area = attach_internal(place, NULL, DSA_HANDLE_INVALID);
+ 
+ 	/*
+ 	 * Clean up when the control segment detaches, if a containing DSM segment
+diff --git a/src/include/lib/dshash.h b/src/include/lib/dshash.h
+index 152927742e8b..ece555212268 100644
+--- a/src/include/lib/dshash.h
++++ b/src/include/lib/dshash.h
+@@ -23,6 +23,9 @@ typedef struct dshash_table dshash_table;
+ /* A handle for a dshash_table which can be shared with other processes. */
+ typedef dsa_pointer dshash_table_handle;
+ 
++/* Sentinel value to use for invalid dshash_table handles. */
++#define DSHASH_HANDLE_INVALID ((dshash_table_handle) InvalidDsaPointer)
++
+ /* The type for hash values. */
+ typedef uint32 dshash_hash;
+ 
+diff --git a/src/include/storage/dsm.h b/src/include/storage/dsm.h
+index d84d835d843f..858bbf61c28d 100644
+--- a/src/include/storage/dsm.h
++++ b/src/include/storage/dsm.h
+@@ -19,9 +19,6 @@ typedef struct dsm_segment dsm_segment;
+ 
+ #define DSM_CREATE_NULL_IF_MAXSEGMENTS			0x0001
+ 
+-/* A sentinel value for an invalid DSM handle. */
+-#define DSM_HANDLE_INVALID 0
+-
+ /* Startup and shutdown functions. */
+ struct PGShmemHeader;			/* avoid including pg_shmem.h */
+ extern void dsm_cleanup_using_control_segment(dsm_handle old_control_handle);
+diff --git a/src/include/storage/dsm_impl.h b/src/include/storage/dsm_impl.h
+index fade3a366878..daf07bd19cd6 100644
+--- a/src/include/storage/dsm_impl.h
++++ b/src/include/storage/dsm_impl.h
+@@ -54,6 +54,9 @@ extern PGDLLIMPORT int min_dynamic_shared_memory;
+ /* A "name" for a dynamic shared memory segment. */
+ typedef uint32 dsm_handle;
+ 
++/* Sentinel value to use for invalid DSM handles. */
++#define DSM_HANDLE_INVALID ((dsm_handle) 0)
++
+ /* All the shared-memory operations we know about. */
+ typedef enum
+ {
+diff --git a/src/include/utils/dsa.h b/src/include/utils/dsa.h
+index 104386e6740a..3ce4ee300a56 100644
+--- a/src/include/utils/dsa.h
++++ b/src/include/utils/dsa.h
+@@ -99,6 +99,10 @@ typedef pg_atomic_uint64 dsa_pointer_atomic;
+  */
+ typedef dsm_handle dsa_handle;
+ 
++/* Sentinel value to use for invalid dsa_handles. */
++#define DSA_HANDLE_INVALID ((dsa_handle) DSM_HANDLE_INVALID)
++
++
+ extern dsa_area *dsa_create(int tranche_id);
+ extern dsa_area *dsa_create_in_place(void *place, size_t size,
+ 									 int tranche_id, dsm_segment *segment);

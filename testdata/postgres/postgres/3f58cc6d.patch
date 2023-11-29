@@ -1,0 +1,111 @@
+From 3f58cc6dd8fc821992da7ed8099d283b014fc2dc Mon Sep 17 00:00:00 2001
+From: Peter Geoghegan <pg@bowt.ie>
+Date: Thu, 16 May 2019 15:11:58 -0700
+Subject: [PATCH] Remove extra nbtree half-dead internal page check.
+
+It's not safe for nbtree VACUUM to attempt to delete a target page whose
+right sibling is already half-dead, since that would fail the
+cross-check when VACUUM attempts to re-find a downlink to the right
+sibling in the parent page.  Logic to prevent this from happening was
+added by commit 8da31837803, which addressed a bug in the overhaul of
+page deletion that went into PostgreSQL 9.4 (commit efada2b8e92).
+VACUUM was made to check the right sibling page, and back off when it
+happened to be half-dead already.
+
+However, it is only truly necessary to do the right sibling check on the
+leaf level, since that transitively determines if the deletion target's
+parent's right sibling page is itself undergoing deletion.  Remove the
+internal page level check, and add a comment explaining why the leaf
+level check alone suffices.
+
+The extra check is also unnecessary due to the fact that internal pages
+that are marked half-dead are generally considered corrupt.  Commit
+efada2b8e92 established the principle that there should never be
+half-dead internal pages (internal pages pending deletion are possible,
+but that status is never directly represented in the internal page).
+VACUUM will complain about corruption when it encounters half-dead
+internal pages, so VACUUM is bound to raise an error one way or another
+when an nbtree index has a half-dead internal page (contrib/amcheck will
+also report that the page is corrupt).
+
+It's possible that a pg_upgrade'd 9.3 database will still have half-dead
+internal pages, so it may seem like there is an argument for leaving the
+check in place to reliably get a cleaner error message that advises the
+user to REINDEX.  However, leaf pages are also deleted in the first
+phase of deletion prior to PostgreSQL 9.4, so I believe we won't even
+attempt to re-find the parent page anyway (we won't have the fully
+deleted leaf page as the right sibling of our target page, so we won't
+even try to find a downlink for it).
+
+Discussion: https://postgr.es/m/CAH2-Wzm_ntmqJjWLRyKzimFmFvk+BnVAvUpaA4s1h9Ja58woaQ@mail.gmail.com
+---
+ src/backend/access/nbtree/README    | 14 +++++++++-----
+ src/backend/access/nbtree/nbtpage.c | 23 +++++++++++------------
+ 2 files changed, 20 insertions(+), 17 deletions(-)
+
+diff --git a/src/backend/access/nbtree/README b/src/backend/access/nbtree/README
+index 266c1cd4cd9f..c5b0a30e4ebd 100644
+--- a/src/backend/access/nbtree/README
++++ b/src/backend/access/nbtree/README
+@@ -262,11 +262,15 @@ long as we're keeping the leaf locked.  The internal pages in the chain
+ cannot acquire new children afterwards either, because the leaf page is
+ marked as half-dead and won't be split.
+ 
+-Removing the downlink to the top of the to-be-deleted chain effectively
+-transfers the key space to the right sibling for all the intermediate levels
+-too, in one atomic operation.  A concurrent search might still visit the
+-intermediate pages, but it will move right when it reaches the half-dead page
+-at the leaf level.
++Removing the downlink to the top of the to-be-deleted subtree/chain
++effectively transfers the key space to the right sibling for all the
++intermediate levels too, in one atomic operation.  A concurrent search might
++still visit the intermediate pages, but it will move right when it reaches
++the half-dead page at the leaf level.  In particular, the search will move to
++the subtree to the right of the half-dead leaf page/to-be-deleted subtree,
++since the half-dead leaf page's right sibling must be a "cousin" page, not a
++"true" sibling page (or a second cousin page when the to-be-deleted chain
++starts at leaf page's grandparent page, and so on).
+ 
+ In the second stage, the topmost page in the chain is unlinked from its
+ siblings, and the half-dead leaf page is updated to point to the next page
+diff --git a/src/backend/access/nbtree/nbtpage.c b/src/backend/access/nbtree/nbtpage.c
+index 8ade165f7a4b..e7c40cba973d 100644
+--- a/src/backend/access/nbtree/nbtpage.c
++++ b/src/backend/access/nbtree/nbtpage.c
+@@ -1301,17 +1301,6 @@ _bt_lock_branch_parent(Relation rel, BlockNumber child, BTStack stack,
+ 				_bt_relbuf(rel, lbuf);
+ 			}
+ 
+-			/*
+-			 * Perform the same check on this internal level that
+-			 * _bt_mark_page_halfdead performed on the leaf level.
+-			 */
+-			if (_bt_is_page_halfdead(rel, *rightsib))
+-			{
+-				elog(DEBUG1, "could not delete page %u because its right sibling %u is half-dead",
+-					 parent, *rightsib);
+-				return false;
+-			}
+-
+ 			return _bt_lock_branch_parent(rel, parent, stack->bts_parent,
+ 										  topparent, topoff, target, rightsib);
+ 		}
+@@ -1621,7 +1610,17 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
+ 	 * parent, unless it is the only child --- in which case the parent has to
+ 	 * be deleted too, and the same condition applies recursively to it. We
+ 	 * have to check this condition all the way up before trying to delete,
+-	 * and lock the final parent of the to-be-deleted branch.
++	 * and lock the final parent of the to-be-deleted subtree.
++	 *
++	 * However, we won't need to repeat the above _bt_is_page_halfdead() check
++	 * for parent/ancestor pages because of the rightmost restriction. The
++	 * leaf check will apply to a right "cousin" leaf page rather than a
++	 * simple right sibling leaf page in cases where we actually go on to
++	 * perform internal page deletion. The right cousin leaf page is
++	 * representative of the left edge of the subtree to the right of the
++	 * to-be-deleted subtree as a whole.  (Besides, internal pages are never
++	 * marked half-dead, so it isn't even possible to directly assess if an
++	 * internal page is part of some other to-be-deleted subtree.)
+ 	 */
+ 	rightsib = leafrightsib;
+ 	target = leafblkno;

@@ -1,0 +1,940 @@
+From 3aa0395d4ed36f040f20da304c122b956529dd14 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 12 Mar 2019 12:30:35 -0400
+Subject: [PATCH] Remove remaining hard-wired OID references in the initial
+ catalog data.
+
+In the v11-era commits that taught genbki.pl to resolve symbolic
+OID references in the initial catalog data, we didn't bother to
+make every last reference symbolic; some of the catalogs have so
+few initial rows that it didn't seem worthwhile.
+
+However, the new project policy that OIDs assigned by new patches
+should be automatically renumberable changes this calculus.
+A patch that wants to add a row in one of these catalogs would have
+a problem when the OID it assigns gets renumbered.  Hence, do the
+mop-up work needed to make all OID references in initial data be
+symbolic, and establish an associated project policy that we'll
+never again write a hard-wired OID reference there.
+
+No catversion bump since the contents of postgres.bki aren't
+actually changed by this commit.
+
+Discussion: https://postgr.es/m/CAH2-WzmMTGMcPuph4OvsO7Ykut0AOCF_i-=eaochT0dd2BN9CQ@mail.gmail.com
+---
+ doc/src/sgml/bki.sgml                    |  73 +++++++-----
+ src/backend/catalog/genbki.pl            |  80 +++++++++++---
+ src/include/catalog/pg_class.dat         |  68 ++++++------
+ src/include/catalog/pg_class.h           | 135 ++++++++++++++++-------
+ src/include/catalog/pg_database.dat      |   9 +-
+ src/include/catalog/pg_database.h        |  54 ++++++---
+ src/include/catalog/pg_proc.dat          |   7 +-
+ src/include/catalog/pg_ts_config.dat     |   3 +-
+ src/include/catalog/pg_ts_config.h       |  19 +++-
+ src/include/catalog/pg_ts_config_map.dat |  57 ++++++----
+ src/include/catalog/pg_ts_config_map.h   |  15 ++-
+ src/include/catalog/pg_ts_dict.dat       |   3 +-
+ src/include/catalog/pg_ts_dict.h         |  22 +++-
+ src/include/catalog/pg_type.dat          |  22 ++--
+ src/include/catalog/pg_type.h            |   4 +-
+ 15 files changed, 381 insertions(+), 190 deletions(-)
+
+diff --git a/doc/src/sgml/bki.sgml b/doc/src/sgml/bki.sgml
+index 5f80f9ed24d8..0dd753bc6f54 100644
+--- a/doc/src/sgml/bki.sgml
++++ b/doc/src/sgml/bki.sgml
+@@ -187,11 +187,10 @@
+ # A comment could appear here.
+ { oid =&gt; '1', oid_symbol =&gt; 'TemplateDbOid',
+   descr =&gt; 'database\'s default template',
+-  datname =&gt; 'template1', datdba =&gt; 'PGUID', encoding =&gt; 'ENCODING',
+-  datcollate =&gt; 'LC_COLLATE', datctype =&gt; 'LC_CTYPE', datistemplate =&gt; 't',
+-  datallowconn =&gt; 't', datconnlimit =&gt; '-1', datlastsysoid =&gt; '0',
+-  datfrozenxid =&gt; '0', datminmxid =&gt; '1', dattablespace =&gt; '1663',
+-  datacl =&gt; '_null_' },
++  datname =&gt; 'template1', encoding =&gt; 'ENCODING', datcollate =&gt; 'LC_COLLATE',
++  datctype =&gt; 'LC_CTYPE', datistemplate =&gt; 't', datallowconn =&gt; 't',
++  datconnlimit =&gt; '-1', datlastsysoid =&gt; '0', datfrozenxid =&gt; '0',
++  datminmxid =&gt; '1', dattablespace =&gt; 'pg_default', datacl =&gt; '_null_' },
+ 
+ ]
+ </programlisting>
+@@ -229,6 +228,9 @@
+       While the metadata keys are optional, the catalog's defined columns
+       must all be provided, except when the catalog's <literal>.h</literal>
+       file specifies a default value for the column.
++      (In the example above, the <structfield>datdba</structfield> field has
++      been omitted because <filename>pg_database.h</filename> supplies a
++      suitable default value for it.)
+      </para>
+     </listitem>
+ 
+@@ -264,8 +266,10 @@
+ 
+     <listitem>
+      <para>
+-      To aid readability, field values that are OIDs of other catalog
+-      entries can be represented by names rather than numeric OIDs.
++      Field values that are OIDs of other catalog entries should be
++      represented by symbolic names rather than actual numeric OIDs.
++      (In the example above, <structfield>dattablespace</structfield>
++      contains such a reference.)
+       This is described in <xref linkend="system-catalog-oid-references"/>
+       below.
+      </para>
+@@ -438,13 +442,13 @@
+    <title>OID Reference Lookup</title>
+ 
+    <para>
+-    Cross-references from one initial catalog row to another can be written
+-    by just writing the preassigned OID of the referenced row.  But
+-    that's error-prone and hard to understand, so for frequently-referenced
+-    catalogs, <filename>genbki.pl</filename> provides mechanisms to write
+-    symbolic references instead.  Currently this is possible for references
+-    to access methods, functions, languages,
+-    operators, opclasses, opfamilies, types, and encodings.
++    In principle, cross-references from one initial catalog row to another
++    could be written just by writing the preassigned OID of the referenced
++    row in the referencing field.  However, that is against project
++    policy, because it is error-prone, hard to read, and subject to
++    breakage if a newly-assigned OID is renumbered.  Therefore
++    <filename>genbki.pl</filename> provides mechanisms to write
++    symbolic references instead.
+     The rules are as follows:
+    </para>
+ 
+@@ -455,19 +459,20 @@
+       Use of symbolic references is enabled in a particular catalog column
+       by attaching <literal>BKI_LOOKUP(<replaceable>lookuprule</replaceable>)</literal>
+       to the column's definition, where <replaceable>lookuprule</replaceable>
+-      is <literal>pg_am</literal>, <literal>pg_proc</literal>,
+-      <literal>pg_language</literal>,
+-      <literal>pg_operator</literal>, <literal>pg_opclass</literal>,
+-      <literal>pg_opfamily</literal>,
+-      <literal>pg_type</literal>,
+-      or <literal>encoding</literal>.
++      is the name of the referenced catalog, e.g. <literal>pg_proc</literal>.
+       <literal>BKI_LOOKUP</literal> can be attached to columns of
+       type <type>Oid</type>, <type>regproc</type>, <type>oidvector</type>,
+       or <type>Oid[]</type>; in the latter two cases it implies performing a
+       lookup on each element of the array.
+-      It's also permissible to attach <literal>BKI_LOOKUP</literal>
+-      to integer columns; this should be done only for encodings,
+-      which are not currently represented as catalog OIDs.
++     </para>
++    </listitem>
++
++    <listitem>
++     <para>
++      It's also permissible to attach <literal>BKI_LOOKUP(encoding)</literal>
++      to integer columns to reference character set encodings, which are
++      not currently represented as catalog OIDs, but have a set of values
++      known to <filename>genbki.pl</filename>.
+      </para>
+     </listitem>
+ 
+@@ -483,10 +488,11 @@
+ 
+     <listitem>
+      <para>
+-      Access methods are just represented by their names, as are types.
+-      Type names must match the referenced <structname>pg_type</structname>
+-      entry's <structfield>typname</structfield>; you do not get to use any
+-      aliases such as <literal>integer</literal>
++      Most kinds of catalog objects are simply referenced by their names.
++      Note that type names must exactly match the
++      referenced <structname>pg_type</structname>
++      entry's <structfield>typname</structfield>; you do not get to use
++      any aliases such as <literal>integer</literal>
+       for <literal>int4</literal>.
+      </para>
+     </listitem>
+@@ -530,7 +536,18 @@
+      <para>
+       In none of these cases is there any provision for
+       schema-qualification; all objects created during bootstrap are
+-      expected to be in the pg_catalog schema.
++      expected to be in the <literal>pg_catalog</literal> schema.
++     </para>
++    </listitem>
++
++    <listitem>
++     <para>
++      In addition to the generic lookup mechanisms, there is a special
++      convention that <literal>PGNSP</literal> is replaced by the OID of
++      the <literal>pg_catalog</literal> schema,
++      and <literal>PGUID</literal> is replaced by the OID of the bootstrap
++      superuser role.  These usages are somewhat historical but so far
++      there hasn't been a need to generalize them.
+      </para>
+     </listitem>
+    </itemizedlist>
+diff --git a/src/backend/catalog/genbki.pl b/src/backend/catalog/genbki.pl
+index 10c2b24bcf5c..cdda2c29e45c 100644
+--- a/src/backend/catalog/genbki.pl
++++ b/src/backend/catalog/genbki.pl
+@@ -160,9 +160,6 @@
+ my $PG_CATALOG_NAMESPACE =
+   Catalog::FindDefinedSymbolFromData($catalog_data{pg_namespace},
+ 	'PG_CATALOG_NAMESPACE');
+-my $PG_HEAP_AM =
+-  Catalog::FindDefinedSymbolFromData($catalog_data{pg_am},
+-	'HEAP_TABLE_AM_OID');
+ 
+ 
+ # Build lookup tables.
+@@ -174,6 +171,20 @@
+ 	$amoids{ $row->{amname} } = $row->{oid};
+ }
+ 
++# class (relation) OID lookup (note this only covers bootstrap catalogs!)
++my %classoids;
++foreach my $row (@{ $catalog_data{pg_class} })
++{
++	$classoids{ $row->{relname} } = $row->{oid};
++}
++
++# collation OID lookup
++my %collationoids;
++foreach my $row (@{ $catalog_data{pg_collation} })
++{
++	$collationoids{ $row->{collname} } = $row->{oid};
++}
++
+ # language OID lookup
+ my %langoids;
+ foreach my $row (@{ $catalog_data{pg_language} })
+@@ -243,6 +254,41 @@
+ 	}
+ }
+ 
++# tablespace OID lookup
++my %tablespaceoids;
++foreach my $row (@{ $catalog_data{pg_tablespace} })
++{
++	$tablespaceoids{ $row->{spcname} } = $row->{oid};
++}
++
++# text search configuration OID lookup
++my %tsconfigoids;
++foreach my $row (@{ $catalog_data{pg_ts_config} })
++{
++	$tsconfigoids{ $row->{cfgname} } = $row->{oid};
++}
++
++# text search dictionary OID lookup
++my %tsdictoids;
++foreach my $row (@{ $catalog_data{pg_ts_dict} })
++{
++	$tsdictoids{ $row->{dictname} } = $row->{oid};
++}
++
++# text search parser OID lookup
++my %tsparseroids;
++foreach my $row (@{ $catalog_data{pg_ts_parser} })
++{
++	$tsparseroids{ $row->{prsname} } = $row->{oid};
++}
++
++# text search template OID lookup
++my %tstemplateoids;
++foreach my $row (@{ $catalog_data{pg_ts_template} })
++{
++	$tstemplateoids{ $row->{tmplname} } = $row->{oid};
++}
++
+ # type lookups
+ my %typeoids;
+ my %types;
+@@ -287,14 +333,21 @@
+ 
+ # Map lookup name to the corresponding hash table.
+ my %lookup_kind = (
+-	pg_am       => \%amoids,
+-	pg_language => \%langoids,
+-	pg_opclass  => \%opcoids,
+-	pg_operator => \%operoids,
+-	pg_opfamily => \%opfoids,
+-	pg_proc     => \%procoids,
+-	pg_type     => \%typeoids,
+-	encoding    => \%encids);
++	pg_am          => \%amoids,
++	pg_class       => \%classoids,
++	pg_collation   => \%collationoids,
++	pg_language    => \%langoids,
++	pg_opclass     => \%opcoids,
++	pg_operator    => \%operoids,
++	pg_opfamily    => \%opfoids,
++	pg_proc        => \%procoids,
++	pg_tablespace  => \%tablespaceoids,
++	pg_ts_config   => \%tsconfigoids,
++	pg_ts_dict     => \%tsdictoids,
++	pg_ts_parser   => \%tsparseroids,
++	pg_ts_template => \%tstemplateoids,
++	pg_type        => \%typeoids,
++	encoding       => \%encids);
+ 
+ 
+ # Open temp files
+@@ -467,7 +520,6 @@
+ 			# (It's intentional that this can apply to parts of a field).
+ 			$bki_values{$attname} =~ s/\bPGUID\b/$BOOTSTRAP_SUPERUSERID/g;
+ 			$bki_values{$attname} =~ s/\bPGNSP\b/$PG_CATALOG_NAMESPACE/g;
+-			$bki_values{$attname} =~ s/\bPGHEAPAM\b/$PG_HEAP_AM/g;
+ 
+ 			# Replace OID synonyms with OIDs per the appropriate lookup rule.
+ 			#
+@@ -730,8 +782,8 @@ sub morph_row_for_pgattr
+ 	$row->{attndims} = $type->{typcategory} eq 'A' ? '1' : '0';
+ 
+ 	# collation-aware catalog columns must use C collation
+-	$row->{attcollation} = $type->{typcollation} != 0 ?
+-	    $C_COLLATION_OID : 0;
++	$row->{attcollation} =
++	  $type->{typcollation} ne '0' ? $C_COLLATION_OID : 0;
+ 
+ 	if (defined $attr->{forcenotnull})
+ 	{
+diff --git a/src/include/catalog/pg_class.dat b/src/include/catalog/pg_class.dat
+index 5a1f3aa26d92..59d6159dc30a 100644
+--- a/src/include/catalog/pg_class.dat
++++ b/src/include/catalog/pg_class.dat
+@@ -21,48 +21,44 @@
+ # similarly, "1" in relminmxid stands for FirstMultiXactId
+ 
+ { oid => '1247',
+-  relname => 'pg_type', relnamespace => 'PGNSP', reltype => '71',
+-  reloftype => '0', relowner => 'PGUID', relam => 'PGHEAPAM',
+-  relfilenode => '0', reltablespace => '0', relpages => '0', reltuples => '0',
+-  relallvisible => '0', reltoastrelid => '0', relhasindex => 'f',
+-  relisshared => 'f', relpersistence => 'p', relkind => 'r', relnatts => '31',
+-  relchecks => '0', relhasrules => 'f', relhastriggers => 'f',
+-  relhassubclass => 'f', relrowsecurity => 'f', relforcerowsecurity => 'f',
+-  relispopulated => 't', relreplident => 'n', relispartition => 'f',
+-  relrewrite => '0', relfrozenxid => '3', relminmxid => '1', relacl => '_null_',
++  relname => 'pg_type', reltype => 'pg_type', relam => 'heap',
++  relfilenode => '0', relpages => '0', reltuples => '0', relallvisible => '0',
++  reltoastrelid => '0', relhasindex => 'f', relisshared => 'f',
++  relpersistence => 'p', relkind => 'r', relnatts => '31', relchecks => '0',
++  relhasrules => 'f', relhastriggers => 'f', relhassubclass => 'f',
++  relrowsecurity => 'f', relforcerowsecurity => 'f', relispopulated => 't',
++  relreplident => 'n', relispartition => 'f', relrewrite => '0',
++  relfrozenxid => '3', relminmxid => '1', relacl => '_null_',
+   reloptions => '_null_', relpartbound => '_null_' },
+ { oid => '1249',
+-  relname => 'pg_attribute', relnamespace => 'PGNSP', reltype => '75',
+-  reloftype => '0', relowner => 'PGUID', relam => 'PGHEAPAM',
+-  relfilenode => '0', reltablespace => '0', relpages => '0', reltuples => '0',
+-  relallvisible => '0', reltoastrelid => '0', relhasindex => 'f',
+-  relisshared => 'f', relpersistence => 'p', relkind => 'r', relnatts => '24',
+-  relchecks => '0', relhasrules => 'f', relhastriggers => 'f',
+-  relhassubclass => 'f', relrowsecurity => 'f', relforcerowsecurity => 'f',
+-  relispopulated => 't', relreplident => 'n', relispartition => 'f',
+-  relrewrite => '0', relfrozenxid => '3', relminmxid => '1', relacl => '_null_',
++  relname => 'pg_attribute', reltype => 'pg_attribute', relam => 'heap',
++  relfilenode => '0', relpages => '0', reltuples => '0', relallvisible => '0',
++  reltoastrelid => '0', relhasindex => 'f', relisshared => 'f',
++  relpersistence => 'p', relkind => 'r', relnatts => '24', relchecks => '0',
++  relhasrules => 'f', relhastriggers => 'f', relhassubclass => 'f',
++  relrowsecurity => 'f', relforcerowsecurity => 'f', relispopulated => 't',
++  relreplident => 'n', relispartition => 'f', relrewrite => '0',
++  relfrozenxid => '3', relminmxid => '1', relacl => '_null_',
+   reloptions => '_null_', relpartbound => '_null_' },
+ { oid => '1255',
+-  relname => 'pg_proc', relnamespace => 'PGNSP', reltype => '81',
+-  reloftype => '0', relowner => 'PGUID', relam => 'PGHEAPAM',
+-  relfilenode => '0', reltablespace => '0', relpages => '0', reltuples => '0',
+-  relallvisible => '0', reltoastrelid => '0', relhasindex => 'f',
+-  relisshared => 'f', relpersistence => 'p', relkind => 'r', relnatts => '29',
+-  relchecks => '0', relhasrules => 'f', relhastriggers => 'f',
+-  relhassubclass => 'f', relrowsecurity => 'f', relforcerowsecurity => 'f',
+-  relispopulated => 't', relreplident => 'n', relispartition => 'f',
+-  relrewrite => '0', relfrozenxid => '3', relminmxid => '1', relacl => '_null_',
++  relname => 'pg_proc', reltype => 'pg_proc', relam => 'heap',
++  relfilenode => '0', relpages => '0', reltuples => '0', relallvisible => '0',
++  reltoastrelid => '0', relhasindex => 'f', relisshared => 'f',
++  relpersistence => 'p', relkind => 'r', relnatts => '29', relchecks => '0',
++  relhasrules => 'f', relhastriggers => 'f', relhassubclass => 'f',
++  relrowsecurity => 'f', relforcerowsecurity => 'f', relispopulated => 't',
++  relreplident => 'n', relispartition => 'f', relrewrite => '0',
++  relfrozenxid => '3', relminmxid => '1', relacl => '_null_',
+   reloptions => '_null_', relpartbound => '_null_' },
+ { oid => '1259',
+-  relname => 'pg_class', relnamespace => 'PGNSP', reltype => '83',
+-  reloftype => '0', relowner => 'PGUID', relam => 'PGHEAPAM',
+-  relfilenode => '0', reltablespace => '0', relpages => '0', reltuples => '0',
+-  relallvisible => '0', reltoastrelid => '0', relhasindex => 'f',
+-  relisshared => 'f', relpersistence => 'p', relkind => 'r', relnatts => '33',
+-  relchecks => '0', relhasrules => 'f', relhastriggers => 'f',
+-  relhassubclass => 'f', relrowsecurity => 'f', relforcerowsecurity => 'f',
+-  relispopulated => 't', relreplident => 'n', relispartition => 'f',
+-  relrewrite => '0', relfrozenxid => '3', relminmxid => '1', relacl => '_null_',
++  relname => 'pg_class', reltype => 'pg_class', relam => 'heap',
++  relfilenode => '0', relpages => '0', reltuples => '0', relallvisible => '0',
++  reltoastrelid => '0', relhasindex => 'f', relisshared => 'f',
++  relpersistence => 'p', relkind => 'r', relnatts => '33', relchecks => '0',
++  relhasrules => 'f', relhastriggers => 'f', relhassubclass => 'f',
++  relrowsecurity => 'f', relforcerowsecurity => 'f', relispopulated => 't',
++  relreplident => 'n', relispartition => 'f', relrewrite => '0',
++  relfrozenxid => '3', relminmxid => '1', relacl => '_null_',
+   reloptions => '_null_', relpartbound => '_null_' },
+ 
+ ]
+diff --git a/src/include/catalog/pg_class.h b/src/include/catalog/pg_class.h
+index ad698c9e84cb..c32cb858a452 100644
+--- a/src/include/catalog/pg_class.h
++++ b/src/include/catalog/pg_class.h
+@@ -28,56 +28,113 @@
+  */
+ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,RelationRelation_Rowtype_Id) BKI_SCHEMA_MACRO
+ {
+-	Oid			oid;			/* oid */
+-	NameData	relname;		/* class name */
+-	Oid			relnamespace;	/* OID of namespace containing this class */
+-	Oid			reltype;		/* OID of entry in pg_type for table's
+-								 * implicit row type */
+-	Oid			reloftype;		/* OID of entry in pg_type for underlying
+-								 * composite type */
+-	Oid			relowner;		/* class owner */
+-	Oid			relam;			/* access method; 0 if not a table / index */
+-	Oid			relfilenode;	/* identifier of physical storage file */
++	/* oid */
++	Oid			oid;
+ 
++	/* class name */
++	NameData	relname;
++
++	/* OID of namespace containing this class */
++	Oid			relnamespace BKI_DEFAULT(PGNSP);
++
++	/* OID of entry in pg_type for table's implicit row type */
++	Oid			reltype BKI_LOOKUP(pg_type);
++
++	/* OID of entry in pg_type for underlying composite type */
++	Oid			reloftype BKI_DEFAULT(0) BKI_LOOKUP(pg_type);
++
++	/* class owner */
++	Oid			relowner BKI_DEFAULT(PGUID);
++
++	/* access method; 0 if not a table / index */
++	Oid			relam BKI_LOOKUP(pg_am);
++
++	/* identifier of physical storage file */
+ 	/* relfilenode == 0 means it is a "mapped" relation, see relmapper.c */
+-	Oid			reltablespace;	/* identifier of table space for relation */
+-	int32		relpages;		/* # of blocks (not always up-to-date) */
+-	float4		reltuples;		/* # of tuples (not always up-to-date) */
+-	int32		relallvisible;	/* # of all-visible blocks (not always
+-								 * up-to-date) */
+-	Oid			reltoastrelid;	/* OID of toast table; 0 if none */
+-	bool		relhasindex;	/* T if has (or has had) any indexes */
+-	bool		relisshared;	/* T if shared across databases */
+-	char		relpersistence; /* see RELPERSISTENCE_xxx constants below */
+-	char		relkind;		/* see RELKIND_xxx constants below */
+-	int16		relnatts;		/* number of user attributes */
++	Oid			relfilenode;
++
++	/* identifier of table space for relation (0 means default for database) */
++	Oid			reltablespace BKI_DEFAULT(0) BKI_LOOKUP(pg_tablespace);
++
++	/* # of blocks (not always up-to-date) */
++	int32		relpages;
++
++	/* # of tuples (not always up-to-date) */
++	float4		reltuples;
++
++	/* # of all-visible blocks (not always up-to-date) */
++	int32		relallvisible;
++
++	/* OID of toast table; 0 if none */
++	Oid			reltoastrelid;
++
++	/* T if has (or has had) any indexes */
++	bool		relhasindex;
++
++	/* T if shared across databases */
++	bool		relisshared;
++
++	/* see RELPERSISTENCE_xxx constants below */
++	char		relpersistence;
++
++	/* see RELKIND_xxx constants below */
++	char		relkind;
++
++	/* number of user attributes */
++	int16		relnatts;
+ 
+ 	/*
+ 	 * Class pg_attribute must contain exactly "relnatts" user attributes
+ 	 * (with attnums ranging from 1 to relnatts) for this class.  It may also
+ 	 * contain entries with negative attnums for system attributes.
+ 	 */
+-	int16		relchecks;		/* # of CHECK constraints for class */
+-	bool		relhasrules;	/* has (or has had) any rules */
+-	bool		relhastriggers; /* has (or has had) any TRIGGERs */
+-	bool		relhassubclass; /* has (or has had) child tables or indexes */
+-	bool		relrowsecurity; /* row security is enabled or not */
+-	bool		relforcerowsecurity;	/* row security forced for owners or
+-										 * not */
+-	bool		relispopulated; /* matview currently holds query results */
+-	char		relreplident;	/* see REPLICA_IDENTITY_xxx constants  */
+-	bool		relispartition; /* is relation a partition? */
+-	Oid			relrewrite;		/* heap for rewrite during DDL, link to
+-								 * original rel */
+-	TransactionId relfrozenxid; /* all Xids < this are frozen in this rel */
+-	TransactionId relminmxid;	/* all multixacts in this rel are >= this.
+-								 * this is really a MultiXactId */
++
++	/* # of CHECK constraints for class */
++	int16		relchecks;
++
++	/* has (or has had) any rules */
++	bool		relhasrules;
++
++	/* has (or has had) any TRIGGERs */
++	bool		relhastriggers;
++
++	/* has (or has had) child tables or indexes */
++	bool		relhassubclass;
++
++	/* row security is enabled or not */
++	bool		relrowsecurity;
++
++	/* row security forced for owners or not */
++	bool		relforcerowsecurity;
++
++	/* matview currently holds query results */
++	bool		relispopulated;
++
++	/* see REPLICA_IDENTITY_xxx constants */
++	char		relreplident;
++
++	/* is relation a partition? */
++	bool		relispartition;
++
++	/* heap for rewrite during DDL, link to original rel */
++	Oid			relrewrite;
++
++	/* all Xids < this are frozen in this rel */
++	TransactionId relfrozenxid;
++
++	/* all multixacts in this rel are >= this; it is really a MultiXactId */
++	TransactionId relminmxid;
+ 
+ #ifdef CATALOG_VARLEN			/* variable-length fields start here */
+ 	/* NOTE: These fields are not present in a relcache entry's rd_rel field. */
+-	aclitem		relacl[1];		/* access permissions */
+-	text		reloptions[1];	/* access-method-specific options */
+-	pg_node_tree relpartbound;	/* partition bound node tree */
++	/* access permissions */
++	aclitem		relacl[1];
++
++	/* access-method-specific options */
++	text		reloptions[1];
++
++	/* partition bound node tree */
++	pg_node_tree relpartbound;
+ #endif
+ } FormData_pg_class;
+ 
+diff --git a/src/include/catalog/pg_database.dat b/src/include/catalog/pg_database.dat
+index cbd91bce58fc..89bd75d02430 100644
+--- a/src/include/catalog/pg_database.dat
++++ b/src/include/catalog/pg_database.dat
+@@ -14,10 +14,9 @@
+ 
+ { oid => '1', oid_symbol => 'TemplateDbOid',
+   descr => 'default template for new databases',
+-  datname => 'template1', datdba => 'PGUID', encoding => 'ENCODING',
+-  datcollate => 'LC_COLLATE', datctype => 'LC_CTYPE', datistemplate => 't',
+-  datallowconn => 't', datconnlimit => '-1', datlastsysoid => '0',
+-  datfrozenxid => '0', datminmxid => '1', dattablespace => '1663',
+-  datacl => '_null_' },
++  datname => 'template1', encoding => 'ENCODING', datcollate => 'LC_COLLATE',
++  datctype => 'LC_CTYPE', datistemplate => 't', datallowconn => 't',
++  datconnlimit => '-1', datlastsysoid => '0', datfrozenxid => '0',
++  datminmxid => '1', dattablespace => 'pg_default', datacl => '_null_' },
+ 
+ ]
+diff --git a/src/include/catalog/pg_database.h b/src/include/catalog/pg_database.h
+index 63e8efacd628..06fea45f53a4 100644
+--- a/src/include/catalog/pg_database.h
++++ b/src/include/catalog/pg_database.h
+@@ -28,22 +28,48 @@
+  */
+ CATALOG(pg_database,1262,DatabaseRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID(1248,DatabaseRelation_Rowtype_Id) BKI_SCHEMA_MACRO
+ {
+-	Oid			oid;			/* oid */
+-	NameData	datname;		/* database name */
+-	Oid			datdba;			/* owner of database */
+-	int32		encoding;		/* character encoding */
+-	NameData	datcollate;		/* LC_COLLATE setting */
+-	NameData	datctype;		/* LC_CTYPE setting */
+-	bool		datistemplate;	/* allowed as CREATE DATABASE template? */
+-	bool		datallowconn;	/* new connections allowed? */
+-	int32		datconnlimit;	/* max connections allowed (-1=no limit) */
+-	Oid			datlastsysoid;	/* highest OID to consider a system OID */
+-	TransactionId datfrozenxid; /* all Xids < this are frozen in this DB */
+-	TransactionId datminmxid;	/* all multixacts in the DB are >= this */
+-	Oid			dattablespace;	/* default table space for this DB */
++	/* oid */
++	Oid			oid;
++
++	/* database name */
++	NameData	datname;
++
++	/* owner of database */
++	Oid			datdba BKI_DEFAULT(PGUID);
++
++	/* character encoding */
++	int32		encoding;
++
++	/* LC_COLLATE setting */
++	NameData	datcollate;
++
++	/* LC_CTYPE setting */
++	NameData	datctype;
++
++	/* allowed as CREATE DATABASE template? */
++	bool		datistemplate;
++
++	/* new connections allowed? */
++	bool		datallowconn;
++
++	/* max connections allowed (-1=no limit) */
++	int32		datconnlimit;
++
++	/* highest OID to consider a system OID */
++	Oid			datlastsysoid;
++
++	/* all Xids < this are frozen in this DB */
++	TransactionId datfrozenxid;
++
++	/* all multixacts in the DB are >= this */
++	TransactionId datminmxid;
++
++	/* default table space for this DB */
++	Oid			dattablespace BKI_LOOKUP(pg_tablespace);
+ 
+ #ifdef CATALOG_VARLEN			/* variable-length fields start here */
+-	aclitem		datacl[1];		/* access permissions */
++	/* access permissions */
++	aclitem		datacl[1];
+ #endif
+ } FormData_pg_database;
+ 
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index 562c5408f84d..b47ac0b9926f 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -5227,9 +5227,10 @@
+   proname => 'pg_stat_get_db_deadlocks', provolatile => 's', proparallel => 'r',
+   prorettype => 'int8', proargtypes => 'oid',
+   prosrc => 'pg_stat_get_db_deadlocks' },
+-{ oid => '3426', descr => 'statistics: checksum failures detected in database',
+-  proname => 'pg_stat_get_db_checksum_failures', provolatile => 's', proparallel => 'r',
+-  prorettype => 'int8', proargtypes => 'oid',
++{ oid => '3426',
++  descr => 'statistics: checksum failures detected in database',
++  proname => 'pg_stat_get_db_checksum_failures', provolatile => 's',
++  proparallel => 'r', prorettype => 'int8', proargtypes => 'oid',
+   prosrc => 'pg_stat_get_db_checksum_failures' },
+ { oid => '3074', descr => 'statistics: last reset for a database',
+   proname => 'pg_stat_get_db_stat_reset_time', provolatile => 's',
+diff --git a/src/include/catalog/pg_ts_config.dat b/src/include/catalog/pg_ts_config.dat
+index 47d23421cc42..bddaa8192fbf 100644
+--- a/src/include/catalog/pg_ts_config.dat
++++ b/src/include/catalog/pg_ts_config.dat
+@@ -13,7 +13,6 @@
+ [
+ 
+ { oid => '3748', descr => 'simple configuration',
+-  cfgname => 'simple', cfgnamespace => 'PGNSP', cfgowner => 'PGUID',
+-  cfgparser => '3722' },
++  cfgname => 'simple', cfgparser => 'default' },
+ 
+ ]
+diff --git a/src/include/catalog/pg_ts_config.h b/src/include/catalog/pg_ts_config.h
+index 4531c3e16b48..7ab97a8aa364 100644
+--- a/src/include/catalog/pg_ts_config.h
++++ b/src/include/catalog/pg_ts_config.h
+@@ -29,11 +29,20 @@
+  */
+ CATALOG(pg_ts_config,3602,TSConfigRelationId)
+ {
+-	Oid			oid;			/* oid */
+-	NameData	cfgname;		/* name of configuration */
+-	Oid			cfgnamespace;	/* name space */
+-	Oid			cfgowner;		/* owner */
+-	Oid			cfgparser;		/* OID of parser (in pg_ts_parser) */
++	/* oid */
++	Oid			oid;
++
++	/* name of configuration */
++	NameData	cfgname;
++
++	/* name space */
++	Oid			cfgnamespace BKI_DEFAULT(PGNSP);
++
++	/* owner */
++	Oid			cfgowner BKI_DEFAULT(PGUID);
++
++	/* OID of parser */
++	Oid			cfgparser BKI_LOOKUP(pg_ts_parser);
+ } FormData_pg_ts_config;
+ 
+ typedef FormData_pg_ts_config *Form_pg_ts_config;
+diff --git a/src/include/catalog/pg_ts_config_map.dat b/src/include/catalog/pg_ts_config_map.dat
+index 3ce4e1630378..43a8bd4cdcdb 100644
+--- a/src/include/catalog/pg_ts_config_map.dat
++++ b/src/include/catalog/pg_ts_config_map.dat
+@@ -12,24 +12,43 @@
+ 
+ [
+ 
+-{ mapcfg => '3748', maptokentype => '1', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '2', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '3', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '4', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '5', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '6', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '7', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '8', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '9', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '10', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '11', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '15', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '16', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '17', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '18', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '19', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '20', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '21', mapseqno => '1', mapdict => '3765' },
+-{ mapcfg => '3748', maptokentype => '22', mapseqno => '1', mapdict => '3765' },
++{ mapcfg => 'simple', maptokentype => '1', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '2', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '3', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '4', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '5', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '6', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '7', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '8', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '9', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '10', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '11', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '15', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '16', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '17', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '18', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '19', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '20', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '21', mapseqno => '1',
++  mapdict => 'simple' },
++{ mapcfg => 'simple', maptokentype => '22', mapseqno => '1',
++  mapdict => 'simple' },
+ 
+ ]
+diff --git a/src/include/catalog/pg_ts_config_map.h b/src/include/catalog/pg_ts_config_map.h
+index dd2de48e73df..7892e17d71c9 100644
+--- a/src/include/catalog/pg_ts_config_map.h
++++ b/src/include/catalog/pg_ts_config_map.h
+@@ -29,10 +29,17 @@
+  */
+ CATALOG(pg_ts_config_map,3603,TSConfigMapRelationId)
+ {
+-	Oid			mapcfg;			/* OID of configuration owning this entry */
+-	int32		maptokentype;	/* token type from parser */
+-	int32		mapseqno;		/* order in which to consult dictionaries */
+-	Oid			mapdict;		/* dictionary to consult */
++	/* OID of configuration owning this entry */
++	Oid			mapcfg BKI_LOOKUP(pg_ts_config);
++
++	/* token type from parser */
++	int32		maptokentype;
++
++	/* order in which to consult dictionaries */
++	int32		mapseqno;
++
++	/* dictionary to consult */
++	Oid			mapdict BKI_LOOKUP(pg_ts_dict);
+ } FormData_pg_ts_config_map;
+ 
+ typedef FormData_pg_ts_config_map *Form_pg_ts_config_map;
+diff --git a/src/include/catalog/pg_ts_dict.dat b/src/include/catalog/pg_ts_dict.dat
+index cda413a0dccb..f9d50da1c978 100644
+--- a/src/include/catalog/pg_ts_dict.dat
++++ b/src/include/catalog/pg_ts_dict.dat
+@@ -14,7 +14,6 @@
+ 
+ { oid => '3765',
+   descr => 'simple dictionary: just lower case and check for stopword',
+-  dictname => 'simple', dictnamespace => 'PGNSP', dictowner => 'PGUID',
+-  dicttemplate => '3727', dictinitoption => '_null_' },
++  dictname => 'simple', dicttemplate => 'simple', dictinitoption => '_null_' },
+ 
+ ]
+diff --git a/src/include/catalog/pg_ts_dict.h b/src/include/catalog/pg_ts_dict.h
+index b77c4225e33e..be7f016c1160 100644
+--- a/src/include/catalog/pg_ts_dict.h
++++ b/src/include/catalog/pg_ts_dict.h
+@@ -28,14 +28,24 @@
+  */
+ CATALOG(pg_ts_dict,3600,TSDictionaryRelationId)
+ {
+-	Oid			oid;			/* oid */
+-	NameData	dictname;		/* dictionary name */
+-	Oid			dictnamespace;	/* name space */
+-	Oid			dictowner;		/* owner */
+-	Oid			dicttemplate;	/* dictionary's template */
++	/* oid */
++	Oid			oid;
++
++	/* dictionary name */
++	NameData	dictname;
++
++	/* name space */
++	Oid			dictnamespace BKI_DEFAULT(PGNSP);
++
++	/* owner */
++	Oid			dictowner BKI_DEFAULT(PGUID);
++
++	/* dictionary's template */
++	Oid			dicttemplate BKI_LOOKUP(pg_ts_template);
+ 
+ #ifdef CATALOG_VARLEN			/* variable-length fields start here */
+-	text		dictinitoption; /* options passed to dict_init() */
++	/* options passed to dict_init() */
++	text		dictinitoption;
+ #endif
+ } FormData_pg_ts_dict;
+ 
+diff --git a/src/include/catalog/pg_type.dat b/src/include/catalog/pg_type.dat
+index d1295835e2d7..2495ed6b1794 100644
+--- a/src/include/catalog/pg_type.dat
++++ b/src/include/catalog/pg_type.dat
+@@ -54,7 +54,7 @@
+   typname => 'name', typlen => 'NAMEDATALEN', typbyval => 'f',
+   typcategory => 'S', typelem => 'char', typinput => 'namein',
+   typoutput => 'nameout', typreceive => 'namerecv', typsend => 'namesend',
+-  typalign => 'c', typcollation => '950' },
++  typalign => 'c', typcollation => 'C' },
+ { oid => '20', array_type_oid => '1016',
+   descr => '~18 digit integer, 8-byte storage',
+   typname => 'int8', typlen => '8', typbyval => 'FLOAT8PASSBYVAL',
+@@ -85,7 +85,7 @@
+   typname => 'text', typlen => '-1', typbyval => 'f', typcategory => 'S',
+   typispreferred => 't', typinput => 'textin', typoutput => 'textout',
+   typreceive => 'textrecv', typsend => 'textsend', typalign => 'i',
+-  typstorage => 'x', typcollation => '100' },
++  typstorage => 'x', typcollation => 'default' },
+ { oid => '26', array_type_oid => '1028',
+   descr => 'object identifier(oid), maximum 4 billion',
+   typname => 'oid', typlen => '4', typbyval => 't', typcategory => 'N',
+@@ -115,22 +115,22 @@
+ # NB: OIDs assigned here must match the BKI_ROWTYPE_OID declarations
+ { oid => '71',
+   typname => 'pg_type', typlen => '-1', typbyval => 'f', typtype => 'c',
+-  typcategory => 'C', typrelid => '1247', typinput => 'record_in',
++  typcategory => 'C', typrelid => 'pg_type', typinput => 'record_in',
+   typoutput => 'record_out', typreceive => 'record_recv',
+   typsend => 'record_send', typalign => 'd', typstorage => 'x' },
+ { oid => '75',
+   typname => 'pg_attribute', typlen => '-1', typbyval => 'f', typtype => 'c',
+-  typcategory => 'C', typrelid => '1249', typinput => 'record_in',
++  typcategory => 'C', typrelid => 'pg_attribute', typinput => 'record_in',
+   typoutput => 'record_out', typreceive => 'record_recv',
+   typsend => 'record_send', typalign => 'd', typstorage => 'x' },
+ { oid => '81',
+   typname => 'pg_proc', typlen => '-1', typbyval => 'f', typtype => 'c',
+-  typcategory => 'C', typrelid => '1255', typinput => 'record_in',
++  typcategory => 'C', typrelid => 'pg_proc', typinput => 'record_in',
+   typoutput => 'record_out', typreceive => 'record_recv',
+   typsend => 'record_send', typalign => 'd', typstorage => 'x' },
+ { oid => '83',
+   typname => 'pg_class', typlen => '-1', typbyval => 'f', typtype => 'c',
+-  typcategory => 'C', typrelid => '1259', typinput => 'record_in',
++  typcategory => 'C', typrelid => 'pg_class', typinput => 'record_in',
+   typoutput => 'record_out', typreceive => 'record_recv',
+   typsend => 'record_send', typalign => 'd', typstorage => 'x' },
+ 
+@@ -150,21 +150,21 @@
+   typcategory => 'S', typinput => 'pg_node_tree_in',
+   typoutput => 'pg_node_tree_out', typreceive => 'pg_node_tree_recv',
+   typsend => 'pg_node_tree_send', typalign => 'i', typstorage => 'x',
+-  typcollation => '100' },
++  typcollation => 'default' },
+ { oid => '3361', oid_symbol => 'PGNDISTINCTOID',
+   descr => 'multivariate ndistinct coefficients',
+   typname => 'pg_ndistinct', typlen => '-1', typbyval => 'f',
+   typcategory => 'S', typinput => 'pg_ndistinct_in',
+   typoutput => 'pg_ndistinct_out', typreceive => 'pg_ndistinct_recv',
+   typsend => 'pg_ndistinct_send', typalign => 'i', typstorage => 'x',
+-  typcollation => '100' },
++  typcollation => 'default' },
+ { oid => '3402', oid_symbol => 'PGDEPENDENCIESOID',
+   descr => 'multivariate dependencies',
+   typname => 'pg_dependencies', typlen => '-1', typbyval => 'f',
+   typcategory => 'S', typinput => 'pg_dependencies_in',
+   typoutput => 'pg_dependencies_out', typreceive => 'pg_dependencies_recv',
+   typsend => 'pg_dependencies_send', typalign => 'i', typstorage => 'x',
+-  typcollation => '100' },
++  typcollation => 'default' },
+ { oid => '32', oid_symbol => 'PGDDLCOMMANDOID',
+   descr => 'internal type for passing CollectedCommand',
+   typname => 'pg_ddl_command', typlen => 'SIZEOF_POINTER', typbyval => 't',
+@@ -269,14 +269,14 @@
+   typinput => 'bpcharin', typoutput => 'bpcharout', typreceive => 'bpcharrecv',
+   typsend => 'bpcharsend', typmodin => 'bpchartypmodin',
+   typmodout => 'bpchartypmodout', typalign => 'i', typstorage => 'x',
+-  typcollation => '100' },
++  typcollation => 'default' },
+ { oid => '1043', array_type_oid => '1015',
+   descr => 'varchar(length), non-blank-padded string, variable storage length',
+   typname => 'varchar', typlen => '-1', typbyval => 'f', typcategory => 'S',
+   typinput => 'varcharin', typoutput => 'varcharout',
+   typreceive => 'varcharrecv', typsend => 'varcharsend',
+   typmodin => 'varchartypmodin', typmodout => 'varchartypmodout',
+-  typalign => 'i', typstorage => 'x', typcollation => '100' },
++  typalign => 'i', typstorage => 'x', typcollation => 'default' },
+ { oid => '1082', array_type_oid => '1182', descr => 'date',
+   typname => 'date', typlen => '4', typbyval => 't', typcategory => 'D',
+   typinput => 'date_in', typoutput => 'date_out', typreceive => 'date_recv',
+diff --git a/src/include/catalog/pg_type.h b/src/include/catalog/pg_type.h
+index 24d114b5757d..4a2473942e9d 100644
+--- a/src/include/catalog/pg_type.h
++++ b/src/include/catalog/pg_type.h
+@@ -99,7 +99,7 @@ CATALOG(pg_type,1247,TypeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(71,TypeRelati
+ 	char		typdelim BKI_DEFAULT(',');
+ 
+ 	/* associated pg_class OID if a composite type, else 0 */
+-	Oid			typrelid BKI_DEFAULT(0) BKI_ARRAY_DEFAULT(0);
++	Oid			typrelid BKI_DEFAULT(0) BKI_ARRAY_DEFAULT(0) BKI_LOOKUP(pg_class);
+ 
+ 	/*
+ 	 * If typelem is not 0 then it identifies another row in pg_type. The
+@@ -215,7 +215,7 @@ CATALOG(pg_type,1247,TypeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(71,TypeRelati
+ 	 * DEFAULT_COLLATION_OID) for collatable base types, possibly some other
+ 	 * OID for domains over collatable types
+ 	 */
+-	Oid			typcollation BKI_DEFAULT(0);
++	Oid			typcollation BKI_DEFAULT(0) BKI_LOOKUP(pg_collation);
+ 
+ #ifdef CATALOG_VARLEN			/* variable-length fields start here */
+ 
