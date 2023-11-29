@@ -1,0 +1,367 @@
+From 4dadd660f0719206ce3914d4ad9b6aad69d6db6e Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Fri, 28 Apr 2023 19:29:12 +0900
+Subject: [PATCH] Fix crashes with CREATE SCHEMA AUTHORIZATION and schema
+ elements
+
+CREATE SCHEMA AUTHORIZATION with appended schema elements can lead to
+crashes when comparing the schema name of the query with the schemas
+used in the qualification of some clauses in the elements' queries.
+
+The origin of the problem is that the transformation routine for the
+elements listed in a CREATE SCHEMA query uses as new, expected, schema
+name the one listed in CreateSchemaStmt itself.  However, depending on
+the query, CreateSchemaStmt.schemaname may be NULL, being computed
+instead from the role specification of the query given by the
+AUTHORIZATION clause, that could be either:
+- A user name string, with the new schema name being set to the same
+value as the role given.
+- Guessed from CURRENT_ROLE, SESSION_ROLE or CURRENT_ROLE, with a new
+schema name computed from the security context where CREATE SCHEMA is
+running.
+
+Regression tests are added for CREATE SCHEMA with some appended elements
+(some of them with schema qualifications), covering also some role
+specification patterns.
+
+While on it, this simplifies the context structure used during the
+transformation of the elements listed in a CREATE SCHEMA query by
+removing the fields for the role specification and the role type.  They
+were not used, and for the role specification this could be confusing as
+the schema name may by extracted from that at the beginning of
+CreateSchemaCommand().
+
+This issue exists for a long time, so backpatch down to all the versions
+supported.
+
+Reported-by: Song Hongyu
+Author: Michael Paquier
+Reviewed-by: Richard Guo
+Discussion: https://postgr.es/m/17909-f65c12dfc5f0451d@postgresql.org
+Backpatch-through: 11
+---
+ src/backend/commands/schemacmds.c           |  3 +-
+ src/backend/parser/parse_utilcmd.c          | 38 ++++----
+ src/include/parser/parse_utilcmd.h          |  3 +-
+ src/test/regress/expected/create_schema.out | 98 +++++++++++++++++++++
+ src/test/regress/parallel_schedule          |  2 +-
+ src/test/regress/sql/create_schema.sql      | 70 +++++++++++++++
+ 6 files changed, 192 insertions(+), 22 deletions(-)
+ create mode 100644 src/test/regress/expected/create_schema.out
+ create mode 100644 src/test/regress/sql/create_schema.sql
+
+diff --git a/src/backend/commands/schemacmds.c b/src/backend/commands/schemacmds.c
+index 90de935267cc..48590247f803 100644
+--- a/src/backend/commands/schemacmds.c
++++ b/src/backend/commands/schemacmds.c
+@@ -179,7 +179,8 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
+ 	 * we cannot, in general, run parse analysis on one statement until we
+ 	 * have actually executed the prior ones.
+ 	 */
+-	parsetree_list = transformCreateSchemaStmt(stmt);
++	parsetree_list = transformCreateSchemaStmtElements(stmt->schemaElts,
++													   schemaName);
+ 
+ 	/*
+ 	 * Execute each command contained in the CREATE SCHEMA.  Since the grammar
+diff --git a/src/backend/parser/parse_utilcmd.c b/src/backend/parser/parse_utilcmd.c
+index b0f6fe4fa615..b1255e3b709f 100644
+--- a/src/backend/parser/parse_utilcmd.c
++++ b/src/backend/parser/parse_utilcmd.c
+@@ -95,12 +95,10 @@ typedef struct
+ 	bool		ofType;			/* true if statement contains OF typename */
+ } CreateStmtContext;
+ 
+-/* State shared by transformCreateSchemaStmt and its subroutines */
++/* State shared by transformCreateSchemaStmtElements and its subroutines */
+ typedef struct
+ {
+-	const char *stmtType;		/* "CREATE SCHEMA" or "ALTER SCHEMA" */
+-	char	   *schemaname;		/* name of schema */
+-	RoleSpec   *authrole;		/* owner of schema */
++	const char *schemaname;		/* name of schema */
+ 	List	   *sequences;		/* CREATE SEQUENCE items */
+ 	List	   *tables;			/* CREATE TABLE items */
+ 	List	   *views;			/* CREATE VIEW items */
+@@ -134,7 +132,7 @@ static void transformCheckConstraints(CreateStmtContext *cxt,
+ static void transformConstraintAttrs(CreateStmtContext *cxt,
+ 									 List *constraintList);
+ static void transformColumnType(CreateStmtContext *cxt, ColumnDef *column);
+-static void setSchemaName(char *context_schema, char **stmt_schema_name);
++static void setSchemaName(const char *context_schema, char **stmt_schema_name);
+ static void transformPartitionCmd(CreateStmtContext *cxt, PartitionCmd *cmd);
+ static List *transformPartitionRangeBounds(ParseState *pstate, List *blist,
+ 										   Relation parent);
+@@ -3784,14 +3782,18 @@ transformColumnType(CreateStmtContext *cxt, ColumnDef *column)
+ 
+ 
+ /*
+- * transformCreateSchemaStmt -
+- *	  analyzes the CREATE SCHEMA statement
++ * transformCreateSchemaStmtElements -
++ *	  analyzes the elements of a CREATE SCHEMA statement
+  *
+- * Split the schema element list into individual commands and place
+- * them in the result list in an order such that there are no forward
+- * references (e.g. GRANT to a table created later in the list). Note
+- * that the logic we use for determining forward references is
+- * presently quite incomplete.
++ * Split the schema element list from a CREATE SCHEMA statement into
++ * individual commands and place them in the result list in an order
++ * such that there are no forward references (e.g. GRANT to a table
++ * created later in the list). Note that the logic we use for determining
++ * forward references is presently quite incomplete.
++ *
++ * "schemaName" is the name of the schema that will be used for the creation
++ * of the objects listed, that may be compiled from the schema name defined
++ * in the statement or a role specification.
+  *
+  * SQL also allows constraints to make forward references, so thumb through
+  * the table columns and move forward references to a posterior alter-table
+@@ -3807,15 +3809,13 @@ transformColumnType(CreateStmtContext *cxt, ColumnDef *column)
+  * extent.
+  */
+ List *
+-transformCreateSchemaStmt(CreateSchemaStmt *stmt)
++transformCreateSchemaStmtElements(List *schemaElts, const char *schemaName)
+ {
+ 	CreateSchemaStmtContext cxt;
+ 	List	   *result;
+ 	ListCell   *elements;
+ 
+-	cxt.stmtType = "CREATE SCHEMA";
+-	cxt.schemaname = stmt->schemaname;
+-	cxt.authrole = (RoleSpec *) stmt->authrole;
++	cxt.schemaname = schemaName;
+ 	cxt.sequences = NIL;
+ 	cxt.tables = NIL;
+ 	cxt.views = NIL;
+@@ -3827,7 +3827,7 @@ transformCreateSchemaStmt(CreateSchemaStmt *stmt)
+ 	 * Run through each schema element in the schema element list. Separate
+ 	 * statements by type, and do preliminary analysis.
+ 	 */
+-	foreach(elements, stmt->schemaElts)
++	foreach(elements, schemaElts)
+ 	{
+ 		Node	   *element = lfirst(elements);
+ 
+@@ -3912,10 +3912,10 @@ transformCreateSchemaStmt(CreateSchemaStmt *stmt)
+  *		Set or check schema name in an element of a CREATE SCHEMA command
+  */
+ static void
+-setSchemaName(char *context_schema, char **stmt_schema_name)
++setSchemaName(const char *context_schema, char **stmt_schema_name)
+ {
+ 	if (*stmt_schema_name == NULL)
+-		*stmt_schema_name = context_schema;
++		*stmt_schema_name = unconstify(char *, context_schema);
+ 	else if (strcmp(context_schema, *stmt_schema_name) != 0)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INVALID_SCHEMA_DEFINITION),
+diff --git a/src/include/parser/parse_utilcmd.h b/src/include/parser/parse_utilcmd.h
+index ea4e4f44c1e7..2b40a0b5b19d 100644
+--- a/src/include/parser/parse_utilcmd.h
++++ b/src/include/parser/parse_utilcmd.h
+@@ -30,7 +30,8 @@ extern CreateStatsStmt *transformStatsStmt(Oid relid, CreateStatsStmt *stmt,
+ 										   const char *queryString);
+ extern void transformRuleStmt(RuleStmt *stmt, const char *queryString,
+ 							  List **actions, Node **whereClause);
+-extern List *transformCreateSchemaStmt(CreateSchemaStmt *stmt);
++extern List *transformCreateSchemaStmtElements(List *schemaElts,
++											   const char *schemaName);
+ extern PartitionBoundSpec *transformPartitionBound(ParseState *pstate, Relation parent,
+ 												   PartitionBoundSpec *spec);
+ extern List *expandTableLikeClause(RangeVar *heapRel,
+diff --git a/src/test/regress/expected/create_schema.out b/src/test/regress/expected/create_schema.out
+new file mode 100644
+index 000000000000..93302a07efc3
+--- /dev/null
++++ b/src/test/regress/expected/create_schema.out
+@@ -0,0 +1,98 @@
++--
++-- CREATE_SCHEMA
++--
++-- Schema creation with elements.
++CREATE ROLE regress_create_schema_role SUPERUSER;
++-- Cases where schema creation fails as objects are qualified with a schema
++-- that does not match with what's expected.
++-- This checks all the object types that include schema qualifications.
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE SEQUENCE schema_not_existing.seq;
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_create_schema_role)
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE TABLE schema_not_existing.tab (id int);
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_create_schema_role)
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE VIEW schema_not_existing.view AS SELECT 1;
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_create_schema_role)
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE INDEX ON schema_not_existing.tab (id);
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_create_schema_role)
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE TRIGGER schema_trig BEFORE INSERT ON schema_not_existing.tab
++  EXECUTE FUNCTION schema_trig.no_func();
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_create_schema_role)
++-- Again, with a role specification and no schema names.
++SET ROLE regress_create_schema_role;
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE SEQUENCE schema_not_existing.seq;
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_create_schema_role)
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE TABLE schema_not_existing.tab (id int);
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_create_schema_role)
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE VIEW schema_not_existing.view AS SELECT 1;
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_create_schema_role)
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE INDEX ON schema_not_existing.tab (id);
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_create_schema_role)
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE TRIGGER schema_trig BEFORE INSERT ON schema_not_existing.tab
++  EXECUTE FUNCTION schema_trig.no_func();
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_create_schema_role)
++-- Again, with a schema name and a role specification.
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE SEQUENCE schema_not_existing.seq;
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_schema_1)
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE TABLE schema_not_existing.tab (id int);
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_schema_1)
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE VIEW schema_not_existing.view AS SELECT 1;
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_schema_1)
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE INDEX ON schema_not_existing.tab (id);
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_schema_1)
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE TRIGGER schema_trig BEFORE INSERT ON schema_not_existing.tab
++  EXECUTE FUNCTION schema_trig.no_func();
++ERROR:  CREATE specifies a schema (schema_not_existing) different from the one being created (regress_schema_1)
++RESET ROLE;
++-- Cases where the schema creation succeeds.
++-- The schema created matches the role name.
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE TABLE regress_create_schema_role.tab (id int);
++\d regress_create_schema_role.tab
++      Table "regress_create_schema_role.tab"
++ Column |  Type   | Collation | Nullable | Default 
++--------+---------+-----------+----------+---------
++ id     | integer |           |          | 
++
++DROP SCHEMA regress_create_schema_role CASCADE;
++NOTICE:  drop cascades to table regress_create_schema_role.tab
++-- Again, with a different role specification and no schema names.
++SET ROLE regress_create_schema_role;
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE TABLE regress_create_schema_role.tab (id int);
++\d regress_create_schema_role.tab
++      Table "regress_create_schema_role.tab"
++ Column |  Type   | Collation | Nullable | Default 
++--------+---------+-----------+----------+---------
++ id     | integer |           |          | 
++
++DROP SCHEMA regress_create_schema_role CASCADE;
++NOTICE:  drop cascades to table tab
++-- Again, with a schema name and a role specification.
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE TABLE regress_schema_1.tab (id int);
++\d regress_schema_1.tab
++           Table "regress_schema_1.tab"
++ Column |  Type   | Collation | Nullable | Default 
++--------+---------+-----------+----------+---------
++ id     | integer |           |          | 
++
++DROP SCHEMA regress_schema_1 CASCADE;
++NOTICE:  drop cascades to table regress_schema_1.tab
++RESET ROLE;
++-- Clean up
++DROP ROLE regress_create_schema_role;
+diff --git a/src/test/regress/parallel_schedule b/src/test/regress/parallel_schedule
+index 362403563931..cf46fa335932 100644
+--- a/src/test/regress/parallel_schedule
++++ b/src/test/regress/parallel_schedule
+@@ -42,7 +42,7 @@ test: copy copyselect copydml insert insert_conflict
+ # More groups of parallel tests
+ # Note: many of the tests in later groups depend on create_index
+ # ----------
+-test: create_function_c create_misc create_operator create_procedure create_table create_type
++test: create_function_c create_misc create_operator create_procedure create_table create_type create_schema
+ test: create_index create_index_spgist create_view index_including index_including_gist
+ 
+ # ----------
+diff --git a/src/test/regress/sql/create_schema.sql b/src/test/regress/sql/create_schema.sql
+new file mode 100644
+index 000000000000..1b7064247a1c
+--- /dev/null
++++ b/src/test/regress/sql/create_schema.sql
+@@ -0,0 +1,70 @@
++--
++-- CREATE_SCHEMA
++--
++
++-- Schema creation with elements.
++
++CREATE ROLE regress_create_schema_role SUPERUSER;
++
++-- Cases where schema creation fails as objects are qualified with a schema
++-- that does not match with what's expected.
++-- This checks all the object types that include schema qualifications.
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE SEQUENCE schema_not_existing.seq;
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE TABLE schema_not_existing.tab (id int);
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE VIEW schema_not_existing.view AS SELECT 1;
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE INDEX ON schema_not_existing.tab (id);
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE TRIGGER schema_trig BEFORE INSERT ON schema_not_existing.tab
++  EXECUTE FUNCTION schema_trig.no_func();
++-- Again, with a role specification and no schema names.
++SET ROLE regress_create_schema_role;
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE SEQUENCE schema_not_existing.seq;
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE TABLE schema_not_existing.tab (id int);
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE VIEW schema_not_existing.view AS SELECT 1;
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE INDEX ON schema_not_existing.tab (id);
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE TRIGGER schema_trig BEFORE INSERT ON schema_not_existing.tab
++  EXECUTE FUNCTION schema_trig.no_func();
++-- Again, with a schema name and a role specification.
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE SEQUENCE schema_not_existing.seq;
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE TABLE schema_not_existing.tab (id int);
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE VIEW schema_not_existing.view AS SELECT 1;
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE INDEX ON schema_not_existing.tab (id);
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE TRIGGER schema_trig BEFORE INSERT ON schema_not_existing.tab
++  EXECUTE FUNCTION schema_trig.no_func();
++RESET ROLE;
++
++-- Cases where the schema creation succeeds.
++-- The schema created matches the role name.
++CREATE SCHEMA AUTHORIZATION regress_create_schema_role
++  CREATE TABLE regress_create_schema_role.tab (id int);
++\d regress_create_schema_role.tab
++DROP SCHEMA regress_create_schema_role CASCADE;
++-- Again, with a different role specification and no schema names.
++SET ROLE regress_create_schema_role;
++CREATE SCHEMA AUTHORIZATION CURRENT_ROLE
++  CREATE TABLE regress_create_schema_role.tab (id int);
++\d regress_create_schema_role.tab
++DROP SCHEMA regress_create_schema_role CASCADE;
++-- Again, with a schema name and a role specification.
++CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
++  CREATE TABLE regress_schema_1.tab (id int);
++\d regress_schema_1.tab
++DROP SCHEMA regress_schema_1 CASCADE;
++RESET ROLE;
++
++-- Clean up
++DROP ROLE regress_create_schema_role;

@@ -1,0 +1,414 @@
+From 4e514c6180fbf71cf7a0171867c828c63afd1c37 Mon Sep 17 00:00:00 2001
+From: Amit Kapila <akapila@postgresql.org>
+Date: Mon, 13 Jan 2020 07:59:44 +0530
+Subject: [PATCH] Delete empty pages in each pass during GIST VACUUM.
+
+Earlier, we use to postpone deleting empty pages till the second stage of
+vacuum to amortize the cost of scanning internal pages.  However, that can
+sometimes (say vacuum is canceled or errored between first and second
+stage) delay the pages to be recycled.
+
+Another thing is that to facilitate deleting empty pages in the second
+stage, we need to share the information about internal and empty pages
+between different stages of vacuum.  It will be quite tricky to share this
+information via DSM which is required for the upcoming parallel vacuum
+patch.
+
+Also, it will bring the logic to reclaim deleted pages closer to nbtree
+where we delete empty pages in each pass.
+
+Overall, the advantages of deleting empty pages in each pass outweigh the
+advantages of postponing the same.
+
+Author: Dilip Kumar, with changes by Amit Kapila
+Reviewed-by: Sawada Masahiko and Amit Kapila
+Discussion: https://postgr.es/m/CAA4eK1LGr+MN0xHZpJ2dfS8QNQ1a_aROKowZB+MPNep8FVtwAA@mail.gmail.com
+---
+ src/backend/access/gist/README       |  23 ++--
+ src/backend/access/gist/gistvacuum.c | 160 +++++++++++----------------
+ 2 files changed, 78 insertions(+), 105 deletions(-)
+
+diff --git a/src/backend/access/gist/README b/src/backend/access/gist/README
+index 8cbca6929675..fffdfff6e17a 100644
+--- a/src/backend/access/gist/README
++++ b/src/backend/access/gist/README
+@@ -429,18 +429,17 @@ splits during searches, we don't need a "vacuum cycle ID" concept for that
+ like B-tree does.
+ 
+ While we scan all the pages, we also make note of any completely empty leaf
+-pages. We will try to unlink them from the tree in the second stage. We also
+-record the block numbers of all internal pages; they are needed in the second
+-stage, to locate parents of the empty pages.
+-
+-In the second stage, we try to unlink any empty leaf pages from the tree, so
+-that their space can be reused. In order to delete an empty page, its
+-downlink must be removed from the parent. We scan all the internal pages,
+-whose block numbers we memorized in the first stage, and look for downlinks
+-to pages that we have memorized as being empty. Whenever we find one, we
+-acquire a lock on the parent and child page, re-check that the child page is
+-still empty. Then, we remove the downlink and mark the child as deleted, and
+-release the locks.
++pages. We will try to unlink them from the tree after the scan. We also record
++the block numbers of all internal pages; they are needed to locate parents of
++the empty pages while unlinking them.
++
++We try to unlink any empty leaf pages from the tree, so that their space can
++be reused. In order to delete an empty page, its downlink must be removed from
++the parent. We scan all the internal pages, whose block numbers we memorized
++in the first stage, and look for downlinks to pages that we have memorized as
++being empty. Whenever we find one, we acquire a lock on the parent and child
++page, re-check that the child page is still empty. Then, we remove the
++downlink and mark the child as deleted, and release the locks.
+ 
+ The insertion algorithm would get confused, if an internal page was completely
+ empty. So we never delete the last child of an internal page, even if it's
+diff --git a/src/backend/access/gist/gistvacuum.c b/src/backend/access/gist/gistvacuum.c
+index def74fdaa37f..a9c616c77245 100644
+--- a/src/backend/access/gist/gistvacuum.c
++++ b/src/backend/access/gist/gistvacuum.c
+@@ -24,58 +24,34 @@
+ #include "storage/lmgr.h"
+ #include "utils/memutils.h"
+ 
+-/*
+- * State kept across vacuum stages.
+- */
++/* Working state needed by gistbulkdelete */
+ typedef struct
+ {
+-	IndexBulkDeleteResult stats;	/* must be first */
++	IndexVacuumInfo *info;
++	IndexBulkDeleteResult *stats;
++	IndexBulkDeleteCallback callback;
++	void	   *callback_state;
++	GistNSN		startNSN;
+ 
+ 	/*
+-	 * These are used to memorize all internal and empty leaf pages in the 1st
+-	 * vacuum stage.  They are used in the 2nd stage, to delete all the empty
+-	 * pages.
++	 * These are used to memorize all internal and empty leaf pages.  They are
++	 * used for deleting all the empty pages.
+ 	 */
+ 	IntegerSet *internal_page_set;
+ 	IntegerSet *empty_leaf_set;
+ 	MemoryContext page_set_context;
+-} GistBulkDeleteResult;
+-
+-/* Working state needed by gistbulkdelete */
+-typedef struct
+-{
+-	IndexVacuumInfo *info;
+-	GistBulkDeleteResult *stats;
+-	IndexBulkDeleteCallback callback;
+-	void	   *callback_state;
+-	GistNSN		startNSN;
+ } GistVacState;
+ 
+-static void gistvacuumscan(IndexVacuumInfo *info, GistBulkDeleteResult *stats,
++static void gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+ 						   IndexBulkDeleteCallback callback, void *callback_state);
+ static void gistvacuumpage(GistVacState *vstate, BlockNumber blkno,
+ 						   BlockNumber orig_blkno);
+ static void gistvacuum_delete_empty_pages(IndexVacuumInfo *info,
+-										  GistBulkDeleteResult *stats);
+-static bool gistdeletepage(IndexVacuumInfo *info, GistBulkDeleteResult *stats,
++										  GistVacState *vstate);
++static bool gistdeletepage(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+ 						   Buffer buffer, OffsetNumber downlink,
+ 						   Buffer leafBuffer);
+ 
+-/* allocate the 'stats' struct that's kept over vacuum stages */
+-static GistBulkDeleteResult *
+-create_GistBulkDeleteResult(void)
+-{
+-	GistBulkDeleteResult *gist_stats;
+-
+-	gist_stats = (GistBulkDeleteResult *) palloc0(sizeof(GistBulkDeleteResult));
+-	gist_stats->page_set_context =
+-		GenerationContextCreate(CurrentMemoryContext,
+-								"GiST VACUUM page set context",
+-								16 * 1024);
+-
+-	return gist_stats;
+-}
+-
+ /*
+  * VACUUM bulkdelete stage: remove index entries.
+  */
+@@ -83,15 +59,13 @@ IndexBulkDeleteResult *
+ gistbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+ 			   IndexBulkDeleteCallback callback, void *callback_state)
+ {
+-	GistBulkDeleteResult *gist_stats = (GistBulkDeleteResult *) stats;
+-
+ 	/* allocate stats if first time through, else re-use existing struct */
+-	if (gist_stats == NULL)
+-		gist_stats = create_GistBulkDeleteResult();
++	if (stats == NULL)
++		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+ 
+-	gistvacuumscan(info, gist_stats, callback, callback_state);
++	gistvacuumscan(info, stats, callback, callback_state);
+ 
+-	return (IndexBulkDeleteResult *) gist_stats;
++	return stats;
+ }
+ 
+ /*
+@@ -100,8 +74,6 @@ gistbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+ IndexBulkDeleteResult *
+ gistvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+ {
+-	GistBulkDeleteResult *gist_stats = (GistBulkDeleteResult *) stats;
+-
+ 	/* No-op in ANALYZE ONLY mode */
+ 	if (info->analyze_only)
+ 		return stats;
+@@ -111,24 +83,12 @@ gistvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+ 	 * stats from the latest gistbulkdelete call.  If it wasn't called, we
+ 	 * still need to do a pass over the index, to obtain index statistics.
+ 	 */
+-	if (gist_stats == NULL)
++	if (stats == NULL)
+ 	{
+-		gist_stats = create_GistBulkDeleteResult();
+-		gistvacuumscan(info, gist_stats, NULL, NULL);
++		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
++		gistvacuumscan(info, stats, NULL, NULL);
+ 	}
+ 
+-	/*
+-	 * If we saw any empty pages, try to unlink them from the tree so that
+-	 * they can be reused.
+-	 */
+-	gistvacuum_delete_empty_pages(info, gist_stats);
+-
+-	/* we don't need the internal and empty page sets anymore */
+-	MemoryContextDelete(gist_stats->page_set_context);
+-	gist_stats->page_set_context = NULL;
+-	gist_stats->internal_page_set = NULL;
+-	gist_stats->empty_leaf_set = NULL;
+-
+ 	/*
+ 	 * It's quite possible for us to be fooled by concurrent page splits into
+ 	 * double-counting some index tuples, so disbelieve any total that exceeds
+@@ -137,11 +97,11 @@ gistvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+ 	 */
+ 	if (!info->estimated_count)
+ 	{
+-		if (gist_stats->stats.num_index_tuples > info->num_heap_tuples)
+-			gist_stats->stats.num_index_tuples = info->num_heap_tuples;
++		if (stats->num_index_tuples > info->num_heap_tuples)
++			stats->num_index_tuples = info->num_heap_tuples;
+ 	}
+ 
+-	return (IndexBulkDeleteResult *) gist_stats;
++	return stats;
+ }
+ 
+ /*
+@@ -153,15 +113,16 @@ gistvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+  * occurred).
+  *
+  * This also makes note of any empty leaf pages, as well as all internal
+- * pages.  The second stage, gistvacuum_delete_empty_pages(), needs that
+- * information.  Any deleted pages are added directly to the free space map.
+- * (They should've been added there when they were originally deleted, already,
+- * but it's possible that the FSM was lost at a crash, for example.)
++ * pages while looping over all index pages.  After scanning all the pages, we
++ * remove the empty pages so that they can be reused.  Any deleted pages are
++ * added directly to the free space map.  (They should've been added there
++ * when they were originally deleted, already, but it's possible that the FSM
++ * was lost at a crash, for example.)
+  *
+  * The caller is responsible for initially allocating/zeroing a stats struct.
+  */
+ static void
+-gistvacuumscan(IndexVacuumInfo *info, GistBulkDeleteResult *stats,
++gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+ 			   IndexBulkDeleteCallback callback, void *callback_state)
+ {
+ 	Relation	rel = info->index;
+@@ -175,11 +136,10 @@ gistvacuumscan(IndexVacuumInfo *info, GistBulkDeleteResult *stats,
+ 	 * Reset counts that will be incremented during the scan; needed in case
+ 	 * of multiple scans during a single VACUUM command.
+ 	 */
+-	stats->stats.estimated_count = false;
+-	stats->stats.num_index_tuples = 0;
+-	stats->stats.pages_deleted = 0;
+-	stats->stats.pages_free = 0;
+-	MemoryContextReset(stats->page_set_context);
++	stats->estimated_count = false;
++	stats->num_index_tuples = 0;
++	stats->pages_deleted = 0;
++	stats->pages_free = 0;
+ 
+ 	/*
+ 	 * Create the integer sets to remember all the internal and the empty leaf
+@@ -187,9 +147,12 @@ gistvacuumscan(IndexVacuumInfo *info, GistBulkDeleteResult *stats,
+ 	 * this context so that the subsequent allocations for these integer sets
+ 	 * will be done from the same context.
+ 	 */
+-	oldctx = MemoryContextSwitchTo(stats->page_set_context);
+-	stats->internal_page_set = intset_create();
+-	stats->empty_leaf_set = intset_create();
++	vstate.page_set_context = GenerationContextCreate(CurrentMemoryContext,
++													  "GiST VACUUM page set context",
++													  16 * 1024);
++	oldctx = MemoryContextSwitchTo(vstate.page_set_context);
++	vstate.internal_page_set = intset_create();
++	vstate.empty_leaf_set = intset_create();
+ 	MemoryContextSwitchTo(oldctx);
+ 
+ 	/* Set up info to pass down to gistvacuumpage */
+@@ -257,11 +220,23 @@ gistvacuumscan(IndexVacuumInfo *info, GistBulkDeleteResult *stats,
+ 	 * Note that if no recyclable pages exist, we don't bother vacuuming the
+ 	 * FSM at all.
+ 	 */
+-	if (stats->stats.pages_free > 0)
++	if (stats->pages_free > 0)
+ 		IndexFreeSpaceMapVacuum(rel);
+ 
+ 	/* update statistics */
+-	stats->stats.num_pages = num_pages;
++	stats->num_pages = num_pages;
++
++	/*
++	 * If we saw any empty pages, try to unlink them from the tree so that
++	 * they can be reused.
++	 */
++	gistvacuum_delete_empty_pages(info, &vstate);
++
++	/* we don't need the internal and empty page sets anymore */
++	MemoryContextDelete(vstate.page_set_context);
++	vstate.page_set_context = NULL;
++	vstate.internal_page_set = NULL;
++	vstate.empty_leaf_set = NULL;
+ }
+ 
+ /*
+@@ -278,7 +253,6 @@ gistvacuumscan(IndexVacuumInfo *info, GistBulkDeleteResult *stats,
+ static void
+ gistvacuumpage(GistVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
+ {
+-	GistBulkDeleteResult *stats = vstate->stats;
+ 	IndexVacuumInfo *info = vstate->info;
+ 	IndexBulkDeleteCallback callback = vstate->callback;
+ 	void	   *callback_state = vstate->callback_state;
+@@ -307,13 +281,13 @@ gistvacuumpage(GistVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
+ 	{
+ 		/* Okay to recycle this page */
+ 		RecordFreeIndexPage(rel, blkno);
+-		stats->stats.pages_free++;
+-		stats->stats.pages_deleted++;
++		vstate->stats->pages_free++;
++		vstate->stats->pages_deleted++;
+ 	}
+ 	else if (GistPageIsDeleted(page))
+ 	{
+ 		/* Already deleted, but can't recycle yet */
+-		stats->stats.pages_deleted++;
++		vstate->stats->pages_deleted++;
+ 	}
+ 	else if (GistPageIsLeaf(page))
+ 	{
+@@ -388,7 +362,7 @@ gistvacuumpage(GistVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
+ 
+ 			END_CRIT_SECTION();
+ 
+-			stats->stats.tuples_removed += ntodelete;
++			vstate->stats->tuples_removed += ntodelete;
+ 			/* must recompute maxoff */
+ 			maxoff = PageGetMaxOffsetNumber(page);
+ 		}
+@@ -405,10 +379,10 @@ gistvacuumpage(GistVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
+ 			 * it up.
+ 			 */
+ 			if (blkno == orig_blkno)
+-				intset_add_member(stats->empty_leaf_set, blkno);
++				intset_add_member(vstate->empty_leaf_set, blkno);
+ 		}
+ 		else
+-			stats->stats.num_index_tuples += nremain;
++			vstate->stats->num_index_tuples += nremain;
+ 	}
+ 	else
+ 	{
+@@ -443,7 +417,7 @@ gistvacuumpage(GistVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
+ 		 * parents of empty leaf pages.
+ 		 */
+ 		if (blkno == orig_blkno)
+-			intset_add_member(stats->internal_page_set, blkno);
++			intset_add_member(vstate->internal_page_set, blkno);
+ 	}
+ 
+ 	UnlockReleaseBuffer(buffer);
+@@ -466,7 +440,7 @@ gistvacuumpage(GistVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
+  * Scan all internal pages, and try to delete their empty child pages.
+  */
+ static void
+-gistvacuum_delete_empty_pages(IndexVacuumInfo *info, GistBulkDeleteResult *stats)
++gistvacuum_delete_empty_pages(IndexVacuumInfo *info, GistVacState *vstate)
+ {
+ 	Relation	rel = info->index;
+ 	BlockNumber empty_pages_remaining;
+@@ -475,10 +449,10 @@ gistvacuum_delete_empty_pages(IndexVacuumInfo *info, GistBulkDeleteResult *stats
+ 	/*
+ 	 * Rescan all inner pages to find those that have empty child pages.
+ 	 */
+-	empty_pages_remaining = intset_num_entries(stats->empty_leaf_set);
+-	intset_begin_iterate(stats->internal_page_set);
++	empty_pages_remaining = intset_num_entries(vstate->empty_leaf_set);
++	intset_begin_iterate(vstate->internal_page_set);
+ 	while (empty_pages_remaining > 0 &&
+-		   intset_iterate_next(stats->internal_page_set, &blkno))
++		   intset_iterate_next(vstate->internal_page_set, &blkno))
+ 	{
+ 		Buffer		buffer;
+ 		Page		page;
+@@ -521,7 +495,7 @@ gistvacuum_delete_empty_pages(IndexVacuumInfo *info, GistBulkDeleteResult *stats
+ 			BlockNumber leafblk;
+ 
+ 			leafblk = ItemPointerGetBlockNumber(&(idxtuple->t_tid));
+-			if (intset_is_member(stats->empty_leaf_set, leafblk))
++			if (intset_is_member(vstate->empty_leaf_set, leafblk))
+ 			{
+ 				leafs_to_delete[ntodelete] = leafblk;
+ 				todelete[ntodelete++] = off;
+@@ -561,7 +535,7 @@ gistvacuum_delete_empty_pages(IndexVacuumInfo *info, GistBulkDeleteResult *stats
+ 			gistcheckpage(rel, leafbuf);
+ 
+ 			LockBuffer(buffer, GIST_EXCLUSIVE);
+-			if (gistdeletepage(info, stats,
++			if (gistdeletepage(info, vstate->stats,
+ 							   buffer, todelete[i] - deleted,
+ 							   leafbuf))
+ 				deleted++;
+@@ -573,7 +547,7 @@ gistvacuum_delete_empty_pages(IndexVacuumInfo *info, GistBulkDeleteResult *stats
+ 		ReleaseBuffer(buffer);
+ 
+ 		/* update stats */
+-		stats->stats.pages_removed += deleted;
++		vstate->stats->pages_removed += deleted;
+ 
+ 		/*
+ 		 * We can stop the scan as soon as we have seen the downlinks, even if
+@@ -596,7 +570,7 @@ gistvacuum_delete_empty_pages(IndexVacuumInfo *info, GistBulkDeleteResult *stats
+  * prevented it.
+  */
+ static bool
+-gistdeletepage(IndexVacuumInfo *info, GistBulkDeleteResult *stats,
++gistdeletepage(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+ 			   Buffer parentBuffer, OffsetNumber downlink,
+ 			   Buffer leafBuffer)
+ {
+@@ -665,7 +639,7 @@ gistdeletepage(IndexVacuumInfo *info, GistBulkDeleteResult *stats,
+ 	/* mark the page as deleted */
+ 	MarkBufferDirty(leafBuffer);
+ 	GistPageSetDeleted(leafPage, txid);
+-	stats->stats.pages_deleted++;
++	stats->pages_deleted++;
+ 
+ 	/* remove the downlink from the parent */
+ 	MarkBufferDirty(parentBuffer);

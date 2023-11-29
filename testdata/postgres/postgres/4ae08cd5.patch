@@ -1,0 +1,98 @@
+From 4ae08cd5fd19d566538005c15e7bf992ebae4c72 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Fri, 26 Jun 2020 20:41:29 -0400
+Subject: [PATCH] Persist slot invalidation correctly
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We failed to save slot to disk after invalidating it, so the state was
+lost in case of server restart or crash.  Fix by marking it dirty and
+flushing.
+
+Also, if the slot is known invalidated we don't need to reason about the
+LSN at all -- it's known invalidated.  Only test the LSN if the slot is
+known not invalidated.
+
+Author: Fujii Masao <masao.fujii@oss.nttdata.com>
+Author: Kyotaro Horiguchi <horikyota.ntt@gmail.com>
+Reviewed-by: Álvaro Herrera <alvherre@alvh.no-ip.org>
+Discussion: https://postgr.es/m/17a69cfe-f1c1-a416-ee25-ae15427c69eb@oss.nttdata.com
+---
+ src/backend/replication/slot.c      |  9 +++++----
+ src/backend/replication/slotfuncs.c | 16 ++++++++--------
+ 2 files changed, 13 insertions(+), 12 deletions(-)
+
+diff --git a/src/backend/replication/slot.c b/src/backend/replication/slot.c
+index e8761f3a1809..57bbb6288c68 100644
+--- a/src/backend/replication/slot.c
++++ b/src/backend/replication/slot.c
+@@ -1157,6 +1157,7 @@ InvalidateObsoleteReplicationSlots(XLogSegNo oldestSegno)
+ 		if (XLogRecPtrIsInvalid(restart_lsn) || restart_lsn >= oldestLSN)
+ 			continue;
+ 		LWLockRelease(ReplicationSlotControlLock);
++		CHECK_FOR_INTERRUPTS();
+ 
+ 		/* Get ready to sleep on the slot in case it is active */
+ 		ConditionVariablePrepareToSleep(&s->active_cv);
+@@ -1214,10 +1215,7 @@ InvalidateObsoleteReplicationSlots(XLogSegNo oldestSegno)
+ 		 * already been dropped.
+ 		 */
+ 		if (wspid == -1)
+-		{
+-			CHECK_FOR_INTERRUPTS();
+ 			goto restart;
+-		}
+ 
+ 		ereport(LOG,
+ 				(errmsg("invalidating slot \"%s\" because its restart_lsn %X/%X exceeds max_slot_wal_keep_size",
+@@ -1229,10 +1227,13 @@ InvalidateObsoleteReplicationSlots(XLogSegNo oldestSegno)
+ 		s->data.invalidated_at = s->data.restart_lsn;
+ 		s->data.restart_lsn = InvalidXLogRecPtr;
+ 		SpinLockRelease(&s->mutex);
++
++		/* Make sure the invalidated state persists across server restart */
++		ReplicationSlotMarkDirty();
++		ReplicationSlotSave();
+ 		ReplicationSlotRelease();
+ 
+ 		/* if we did anything, start from scratch */
+-		CHECK_FOR_INTERRUPTS();
+ 		goto restart;
+ 	}
+ 	LWLockRelease(ReplicationSlotControlLock);
+diff --git a/src/backend/replication/slotfuncs.c b/src/backend/replication/slotfuncs.c
+index fca18ffae534..88033a79b21b 100644
+--- a/src/backend/replication/slotfuncs.c
++++ b/src/backend/replication/slotfuncs.c
+@@ -283,7 +283,6 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
+ 		bool		nulls[PG_GET_REPLICATION_SLOTS_COLS];
+ 		WALAvailability walstate;
+ 		XLogSegNo	last_removed_seg;
+-		XLogRecPtr	targetLSN;
+ 		int			i;
+ 
+ 		if (!slot->in_use)
+@@ -344,14 +343,15 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
+ 			nulls[i++] = true;
+ 
+ 		/*
+-		 * Report availability from invalidated_at when the slot has been
+-		 * invalidated; otherwise slots would appear as invalid without any
+-		 * more clues as to what happened.
++		 * If invalidated_at is valid and restart_lsn is invalid, we know for
++		 * certain that the slot has been invalidated.  Otherwise, test
++		 * availability from restart_lsn.
+ 		 */
+-		targetLSN = XLogRecPtrIsInvalid(slot_contents.data.restart_lsn) ?
+-			slot_contents.data.invalidated_at :
+-			slot_contents.data.restart_lsn;
+-		walstate = GetWALAvailability(targetLSN);
++		if (XLogRecPtrIsInvalid(slot_contents.data.restart_lsn) &&
++			!XLogRecPtrIsInvalid(slot_contents.data.invalidated_at))
++			walstate = WALAVAIL_REMOVED;
++		else
++			walstate = GetWALAvailability(slot_contents.data.restart_lsn);
+ 
+ 		switch (walstate)
+ 		{

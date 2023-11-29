@@ -1,0 +1,269 @@
+From 4d0e994eed83c845a05da6e9a417b4efec67efaf Mon Sep 17 00:00:00 2001
+From: Stephen Frost <sfrost@snowman.net>
+Date: Tue, 2 Apr 2019 12:35:32 -0400
+Subject: [PATCH] Add support for partial TOAST decompression
+
+When asked for a slice of a TOAST entry, decompress enough to return the
+slice instead of decompressing the entire object.
+
+For use cases where the slice is at, or near, the beginning of the entry,
+this avoids a lot of unnecessary decompression work.
+
+This changes the signature of pglz_decompress() by adding a boolean to
+indicate if it's ok for the call to finish before consuming all of the
+source or destination buffers.
+
+Author: Paul Ramsey
+Reviewed-By: Rafia Sabih, Darafei Praliaskouski, Regina Obe
+Discussion: https://postgr.es/m/CACowWR07EDm7Y4m2kbhN_jnys%3DBBf9A6768RyQdKm_%3DNpkcaWg%40mail.gmail.com
+---
+ src/backend/access/heap/tuptoaster.c    | 38 ++++++++++++++++++++--
+ src/backend/access/transam/xlogreader.c |  2 +-
+ src/backend/utils/adt/varlena.c         | 22 +++++++------
+ src/common/pg_lzcompress.c              | 42 +++++++++++--------------
+ src/include/common/pg_lzcompress.h      |  2 +-
+ 5 files changed, 70 insertions(+), 36 deletions(-)
+
+diff --git a/src/backend/access/heap/tuptoaster.c b/src/backend/access/heap/tuptoaster.c
+index a40cfcf1954b..74e957abb72b 100644
+--- a/src/backend/access/heap/tuptoaster.c
++++ b/src/backend/access/heap/tuptoaster.c
+@@ -75,6 +75,7 @@ static struct varlena *toast_fetch_datum(struct varlena *attr);
+ static struct varlena *toast_fetch_datum_slice(struct varlena *attr,
+ 						int32 sliceoffset, int32 length);
+ static struct varlena *toast_decompress_datum(struct varlena *attr);
++static struct varlena *toast_decompress_datum_slice(struct varlena *attr, int32 slicelength);
+ static int toast_open_indexes(Relation toastrel,
+ 				   LOCKMODE lock,
+ 				   Relation **toastidxs,
+@@ -301,7 +302,11 @@ heap_tuple_untoast_attr_slice(struct varlena *attr,
+ 	{
+ 		struct varlena *tmp = preslice;
+ 
+-		preslice = toast_decompress_datum(tmp);
++		/* Decompress enough to encompass the slice and the offset */
++		if (slicelength > 0 && sliceoffset >= 0)
++			preslice = toast_decompress_datum_slice(tmp, slicelength + sliceoffset);
++		else
++			preslice = toast_decompress_datum(tmp);
+ 
+ 		if (tmp != attr)
+ 			pfree(tmp);
+@@ -2272,9 +2277,38 @@ toast_decompress_datum(struct varlena *attr)
+ 	if (pglz_decompress(TOAST_COMPRESS_RAWDATA(attr),
+ 						VARSIZE(attr) - TOAST_COMPRESS_HDRSZ,
+ 						VARDATA(result),
+-						TOAST_COMPRESS_RAWSIZE(attr)) < 0)
++						TOAST_COMPRESS_RAWSIZE(attr), true) < 0)
++		elog(ERROR, "compressed data is corrupted");
++
++	return result;
++}
++
++
++/* ----------
++ * toast_decompress_datum_slice -
++ *
++ * Decompress the front of a compressed version of a varlena datum.
++ * offset handling happens in heap_tuple_untoast_attr_slice.
++ * Here we just decompress a slice from the front.
++ */
++static struct varlena *
++toast_decompress_datum_slice(struct varlena *attr, int32 slicelength)
++{
++	struct varlena *result;
++	int32 rawsize;
++
++	Assert(VARATT_IS_COMPRESSED(attr));
++
++	result = (struct varlena *) palloc(slicelength + VARHDRSZ);
++
++	rawsize = pglz_decompress(TOAST_COMPRESS_RAWDATA(attr),
++						VARSIZE(attr) - TOAST_COMPRESS_HDRSZ,
++						VARDATA(result),
++						slicelength, false);
++	if (rawsize < 0)
+ 		elog(ERROR, "compressed data is corrupted");
+ 
++	SET_VARSIZE(result, rawsize + VARHDRSZ);
+ 	return result;
+ }
+ 
+diff --git a/src/backend/access/transam/xlogreader.c b/src/backend/access/transam/xlogreader.c
+index cbc7e4e7eadc..9196aa3aaefa 100644
+--- a/src/backend/access/transam/xlogreader.c
++++ b/src/backend/access/transam/xlogreader.c
+@@ -1425,7 +1425,7 @@ RestoreBlockImage(XLogReaderState *record, uint8 block_id, char *page)
+ 	{
+ 		/* If a backup block image is compressed, decompress it */
+ 		if (pglz_decompress(ptr, bkpb->bimg_len, tmp.data,
+-							BLCKSZ - bkpb->hole_length) < 0)
++							BLCKSZ - bkpb->hole_length, true) < 0)
+ 		{
+ 			report_invalid_record(record, "invalid compressed image at %X/%X, block %d",
+ 								  (uint32) (record->ReadRecPtr >> 32),
+diff --git a/src/backend/utils/adt/varlena.c b/src/backend/utils/adt/varlena.c
+index 68a6e49aeb40..f82ce92ce3da 100644
+--- a/src/backend/utils/adt/varlena.c
++++ b/src/backend/utils/adt/varlena.c
+@@ -1894,7 +1894,7 @@ text_starts_with(PG_FUNCTION_ARGS)
+ 		result = false;
+ 	else
+ 	{
+-		text	   *targ1 = DatumGetTextPP(arg1);
++		text	   *targ1 = text_substring(arg1, 1, len2, false);
+ 		text	   *targ2 = DatumGetTextPP(arg2);
+ 
+ 		result = (memcmp(VARDATA_ANY(targ1), VARDATA_ANY(targ2),
+@@ -5346,17 +5346,21 @@ text_concat_ws(PG_FUNCTION_ARGS)
+ Datum
+ text_left(PG_FUNCTION_ARGS)
+ {
+-	text	   *str = PG_GETARG_TEXT_PP(0);
+-	const char *p = VARDATA_ANY(str);
+-	int			len = VARSIZE_ANY_EXHDR(str);
+-	int			n = PG_GETARG_INT32(1);
+-	int			rlen;
++	int		n = PG_GETARG_INT32(1);
+ 
+ 	if (n < 0)
+-		n = pg_mbstrlen_with_len(p, len) + n;
+-	rlen = pg_mbcharcliplen(p, len, n);
++	{
++		text	   *str = PG_GETARG_TEXT_PP(0);
++		const char *p = VARDATA_ANY(str);
++		int			len = VARSIZE_ANY_EXHDR(str);
++		int			rlen;
+ 
+-	PG_RETURN_TEXT_P(cstring_to_text_with_len(p, rlen));
++		n = pg_mbstrlen_with_len(p, len) + n;
++		rlen = pg_mbcharcliplen(p, len, n);
++		PG_RETURN_TEXT_P(cstring_to_text_with_len(p, rlen));
++	}
++	else
++		PG_RETURN_TEXT_P(text_substring(PG_GETARG_DATUM(0), 1, n, false));
+ }
+ 
+ /*
+diff --git a/src/common/pg_lzcompress.c b/src/common/pg_lzcompress.c
+index f15725a57c09..97b0e40e403d 100644
+--- a/src/common/pg_lzcompress.c
++++ b/src/common/pg_lzcompress.c
+@@ -29,7 +29,7 @@
+  *
+  *			int32
+  *			pglz_decompress(const char *source, int32 slen, char *dest,
+- *							int32 rawsize)
++ *							int32 rawsize, bool check_complete)
+  *
+  *				source is the compressed input.
+  *
+@@ -44,6 +44,12 @@
+  *
+  *				rawsize is the length of the uncompressed data.
+  *
++ *				check_complete is a flag to let us know if -1 should be
++ *					returned in cases where we don't reach the end of the
++ *					source or dest buffers, or not.  This should be false
++ *					if the caller is asking for only a partial result and
++ *					true otherwise.
++ *
+  *				The return value is the number of bytes written in the
+  *				buffer dest, or -1 if decompression fails.
+  *
+@@ -674,13 +680,14 @@ pglz_compress(const char *source, int32 slen, char *dest,
+  * pglz_decompress -
+  *
+  *		Decompresses source into dest. Returns the number of bytes
+- *		decompressed in the destination buffer, or -1 if decompression
+- *		fails.
++ *		decompressed in the destination buffer, and *optionally*
++ *		checks that both the source and dest buffers have been
++ *		fully read and written to, respectively.
+  * ----------
+  */
+ int32
+ pglz_decompress(const char *source, int32 slen, char *dest,
+-				int32 rawsize)
++						 int32 rawsize, bool check_complete)
+ {
+ 	const unsigned char *sp;
+ 	const unsigned char *srcend;
+@@ -701,8 +708,9 @@ pglz_decompress(const char *source, int32 slen, char *dest,
+ 		unsigned char ctrl = *sp++;
+ 		int			ctrlc;
+ 
+-		for (ctrlc = 0; ctrlc < 8 && sp < srcend; ctrlc++)
++		for (ctrlc = 0; ctrlc < 8 && sp < srcend && dp < destend; ctrlc++)
+ 		{
++
+ 			if (ctrl & 1)
+ 			{
+ 				/*
+@@ -721,25 +729,13 @@ pglz_decompress(const char *source, int32 slen, char *dest,
+ 				if (len == 18)
+ 					len += *sp++;
+ 
+-				/*
+-				 * Check for output buffer overrun, to ensure we don't clobber
+-				 * memory in case of corrupt input.  Note: we must advance dp
+-				 * here to ensure the error is detected below the loop.  We
+-				 * don't simply put the elog inside the loop since that will
+-				 * probably interfere with optimization.
+-				 */
+-				if (dp + len > destend)
+-				{
+-					dp += len;
+-					break;
+-				}
+-
+ 				/*
+ 				 * Now we copy the bytes specified by the tag from OUTPUT to
+ 				 * OUTPUT. It is dangerous and platform dependent to use
+ 				 * memcpy() here, because the copied areas could overlap
+ 				 * extremely!
+ 				 */
++				len = Min(len, destend - dp);
+ 				while (len--)
+ 				{
+ 					*dp = dp[-off];
+@@ -752,9 +748,6 @@ pglz_decompress(const char *source, int32 slen, char *dest,
+ 				 * An unset control bit means LITERAL BYTE. So we just copy
+ 				 * one from INPUT to OUTPUT.
+ 				 */
+-				if (dp >= destend)	/* check for buffer overrun */
+-					break;		/* do not clobber memory */
+-
+ 				*dp++ = *sp++;
+ 			}
+ 
+@@ -767,12 +760,15 @@ pglz_decompress(const char *source, int32 slen, char *dest,
+ 
+ 	/*
+ 	 * Check we decompressed the right amount.
++	 * If we are slicing, then we won't necessarily
++	 * be at the end of the source or dest buffers
++	 * when we hit a stop, so we don't test them.
+ 	 */
+-	if (dp != destend || sp != srcend)
++	if (check_complete && (dp != destend || sp != srcend))
+ 		return -1;
+ 
+ 	/*
+ 	 * That's it.
+ 	 */
+-	return rawsize;
++	return (char*)dp - dest;
+ }
+diff --git a/src/include/common/pg_lzcompress.h b/src/include/common/pg_lzcompress.h
+index d4b2e8a53c65..279b66ec7c39 100644
+--- a/src/include/common/pg_lzcompress.h
++++ b/src/include/common/pg_lzcompress.h
+@@ -86,6 +86,6 @@ extern const PGLZ_Strategy *const PGLZ_strategy_always;
+ extern int32 pglz_compress(const char *source, int32 slen, char *dest,
+ 			  const PGLZ_Strategy *strategy);
+ extern int32 pglz_decompress(const char *source, int32 slen, char *dest,
+-				int32 rawsize);
++				int32 rawsize, bool check_complete);
+ 
+ #endif							/* _PG_LZCOMPRESS_H_ */

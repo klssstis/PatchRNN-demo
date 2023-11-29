@@ -1,0 +1,153 @@
+From 4d4c66addfd4da51b0e4be456d6109bea4539fac Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sun, 18 Aug 2019 17:11:57 -0400
+Subject: [PATCH] Disallow changing an inherited column's type if not all
+ parents changed.
+
+If a table inherits from multiple unrelated parents, we must disallow
+changing the type of a column inherited from multiple such parents, else
+it would be out of step with the other parents.  However, it's possible
+for the column to ultimately be inherited from just one common ancestor,
+in which case a change starting from that ancestor should still be
+allowed.  (I would not be excited about preserving that option, were
+it not that we have regression test cases exercising it already ...)
+
+It's slightly annoying that this patch looks different from the logic
+with the same end goal in renameatt(), and more annoying that it
+requires an extra syscache lookup to make the test.  However, the
+recursion logic is quite different in the two functions, and a
+back-patched bug fix is no place to be trying to unify them.
+
+Per report from Manuel Rigger.  Back-patch to 9.5.  The bug exists in
+9.4 too (and doubtless much further back); but the way the recursion
+is done in 9.4 is a good bit different, so that substantial refactoring
+would be needed to fix it in 9.4.  I'm disinclined to do that, or risk
+introducing new bugs, for a bug that has escaped notice for this long.
+
+Discussion: https://postgr.es/m/CA+u7OA4qogDv9rz1HAb-ADxttXYPqQdUdPY_yd4kCzywNxRQXA@mail.gmail.com
+---
+ src/backend/commands/tablecmds.c      | 45 +++++++++++++++++++++++----
+ src/test/regress/expected/inherit.out | 10 ++++++
+ src/test/regress/sql/inherit.sql      |  9 ++++++
+ 3 files changed, 58 insertions(+), 6 deletions(-)
+
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index fb2be10794b4..cceefbdd49fa 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -10279,7 +10279,11 @@ ATPrepAlterColumnType(List **wqueue,
+ 				 errmsg("cannot alter system column \"%s\"",
+ 						colName)));
+ 
+-	/* Don't alter inherited columns */
++	/*
++	 * Don't alter inherited columns.  At outer level, there had better not be
++	 * any inherited definition; when recursing, we assume this was checked at
++	 * the parent level (see below).
++	 */
+ 	if (attTup->attinhcount > 0 && !recursing)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+@@ -10405,20 +10409,26 @@ ATPrepAlterColumnType(List **wqueue,
+ 	if (recurse)
+ 	{
+ 		Oid			relid = RelationGetRelid(rel);
+-		ListCell   *child;
+-		List	   *children;
++		List	   *child_oids,
++				   *child_numparents;
++		ListCell   *lo,
++				   *li;
+ 
+-		children = find_all_inheritors(relid, lockmode, NULL);
++		child_oids = find_all_inheritors(relid, lockmode,
++										 &child_numparents);
+ 
+ 		/*
+ 		 * find_all_inheritors does the recursive search of the inheritance
+ 		 * hierarchy, so all we have to do is process all of the relids in the
+ 		 * list that it returns.
+ 		 */
+-		foreach(child, children)
++		forboth(lo, child_oids, li, child_numparents)
+ 		{
+-			Oid			childrelid = lfirst_oid(child);
++			Oid			childrelid = lfirst_oid(lo);
++			int			numparents = lfirst_int(li);
+ 			Relation	childrel;
++			HeapTuple	childtuple;
++			Form_pg_attribute childattTup;
+ 
+ 			if (childrelid == relid)
+ 				continue;
+@@ -10427,6 +10437,29 @@ ATPrepAlterColumnType(List **wqueue,
+ 			childrel = relation_open(childrelid, NoLock);
+ 			CheckTableNotInUse(childrel, "ALTER TABLE");
+ 
++			/*
++			 * Verify that the child doesn't have any inherited definitions of
++			 * this column that came from outside this inheritance hierarchy.
++			 * (renameatt makes a similar test, though in a different way
++			 * because of its different recursion mechanism.)
++			 */
++			childtuple = SearchSysCacheAttName(RelationGetRelid(childrel),
++											   colName);
++			if (!HeapTupleIsValid(childtuple))
++				ereport(ERROR,
++						(errcode(ERRCODE_UNDEFINED_COLUMN),
++						 errmsg("column \"%s\" of relation \"%s\" does not exist",
++								colName, RelationGetRelationName(childrel))));
++			childattTup = (Form_pg_attribute) GETSTRUCT(childtuple);
++
++			if (childattTup->attinhcount > numparents)
++				ereport(ERROR,
++						(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
++						 errmsg("cannot alter inherited column \"%s\" of relation \"%s\"",
++								colName, RelationGetRelationName(childrel))));
++
++			ReleaseSysCache(childtuple);
++
+ 			/*
+ 			 * Remap the attribute numbers.  If no USING expression was
+ 			 * specified, there is no need for this step.
+diff --git a/src/test/regress/expected/inherit.out b/src/test/regress/expected/inherit.out
+index c6abcfc3cb10..44d51ed71102 100644
+--- a/src/test/regress/expected/inherit.out
++++ b/src/test/regress/expected/inherit.out
+@@ -723,6 +723,16 @@ select * from d;
+  32 | one | two | three
+ (1 row)
+ 
++-- The above verified that we can change the type of a multiply-inherited
++-- column; but we should reject that if any definition was inherited from
++-- an unrelated parent.
++create temp table parent1(f1 int, f2 int);
++create temp table parent2(f1 int, f3 bigint);
++create temp table childtab(f4 int) inherits(parent1, parent2);
++NOTICE:  merging multiple inherited definitions of column "f1"
++alter table parent1 alter column f1 type bigint;  -- fail, conflict w/parent2
++ERROR:  cannot alter inherited column "f1" of relation "childtab"
++alter table parent1 alter column f2 type bigint;  -- ok
+ -- Test non-inheritable parent constraints
+ create table p1(ff1 int);
+ alter table p1 add constraint p1chk check (ff1 > 0) no inherit;
+diff --git a/src/test/regress/sql/inherit.sql b/src/test/regress/sql/inherit.sql
+index ae4358588c37..3af1bf30a79b 100644
+--- a/src/test/regress/sql/inherit.sql
++++ b/src/test/regress/sql/inherit.sql
+@@ -208,6 +208,15 @@ insert into d values('test','one','two','three');
+ alter table a alter column aa type integer using bit_length(aa);
+ select * from d;
+ 
++-- The above verified that we can change the type of a multiply-inherited
++-- column; but we should reject that if any definition was inherited from
++-- an unrelated parent.
++create temp table parent1(f1 int, f2 int);
++create temp table parent2(f1 int, f3 bigint);
++create temp table childtab(f4 int) inherits(parent1, parent2);
++alter table parent1 alter column f1 type bigint;  -- fail, conflict w/parent2
++alter table parent1 alter column f2 type bigint;  -- ok
++
+ -- Test non-inheritable parent constraints
+ create table p1(ff1 int);
+ alter table p1 add constraint p1chk check (ff1 > 0) no inherit;

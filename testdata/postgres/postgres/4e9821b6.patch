@@ -1,0 +1,154 @@
+From 4e9821b6fac5042e872d5397f711a67984b165f8 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Wed, 14 Oct 2020 20:12:26 -0300
+Subject: [PATCH] Restore replication protocol's duplicate command tags
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+I removed the duplicate command tags for START_REPLICATION inadvertently
+in commit 07082b08cc5d, but the replication protocol requires them.  The
+fact that the replication protocol was broken was not noticed because
+all our test cases use an optimized code path that exits early, failing
+to verify that the behavior is correct for non-optimized cases.  Put
+them back.
+
+Also document this protocol quirk.
+
+Add a test case that shows the failure.  It might still succeed even
+without the patch when run on a fast enough server, but it suffices to
+show the bug in enough cases that it would be noticed in buildfarm.
+
+Author: Álvaro Herrera <alvherre@alvh.no-ip.org>
+Reported-by: Henry Hinze <henry.hinze@gmail.com>
+Reviewed-by: Petr Jelínek <petr.jelinek@2ndquadrant.com>
+Discussion: https://postgr.es/m/16643-eaadeb2a1a58d28c@postgresql.org
+---
+ doc/src/sgml/protocol.sgml               |  8 ++--
+ src/backend/replication/logical/worker.c |  1 -
+ src/backend/replication/walsender.c      |  3 +-
+ src/test/subscription/t/100_bugs.pl      | 55 +++++++++++++++++++++++-
+ 4 files changed, 61 insertions(+), 6 deletions(-)
+
+diff --git a/doc/src/sgml/protocol.sgml b/doc/src/sgml/protocol.sgml
+index f5e33181061b..5e06c7523d8e 100644
+--- a/doc/src/sgml/protocol.sgml
++++ b/doc/src/sgml/protocol.sgml
+@@ -2059,8 +2059,9 @@ The commands accepted in replication mode are:
+       the switch position is the end of the WAL that was streamed, but there
+       are corner cases where the server can send some WAL from the old
+       timeline that it has not itself replayed before promoting. Finally, the
+-      server sends CommandComplete message, and is ready to accept a new
+-      command.
++      server sends two CommandComplete messages (one that ends the CopyData
++      and the other ends the <literal>START_REPLICATION</literal> itself), and
++      is ready to accept a new command.
+      </para>
+ 
+      <para>
+@@ -2382,7 +2383,8 @@ The commands accepted in replication mode are:
+ 
+      <para>
+       The messages inside the CopyBothResponse messages are of the same format
+-      documented for <literal>START_REPLICATION ... PHYSICAL</literal>.
++      documented for <literal>START_REPLICATION ... PHYSICAL</literal>, including
++      two CommandComplete messages.
+      </para>
+ 
+      <para>
+diff --git a/src/backend/replication/logical/worker.c b/src/backend/replication/logical/worker.c
+index 4f32dc74c867..640409b757f8 100644
+--- a/src/backend/replication/logical/worker.c
++++ b/src/backend/replication/logical/worker.c
+@@ -3071,7 +3071,6 @@ ApplyWorkerMain(Datum main_arg)
+ 		 * does some initializations on the upstream so let's still call it.
+ 		 */
+ 		(void) walrcv_identify_system(wrconn, &startpointTLI);
+-
+ 	}
+ 
+ 	/*
+diff --git a/src/backend/replication/walsender.c b/src/backend/replication/walsender.c
+index 7c9d1b67dfbd..df27e8476175 100644
+--- a/src/backend/replication/walsender.c
++++ b/src/backend/replication/walsender.c
+@@ -1656,7 +1656,8 @@ exec_replication_command(const char *cmd_string)
+ 				else
+ 					StartLogicalReplication(cmd);
+ 
+-				/* callees already sent their own completion message */
++				/* dupe, but necessary per libpqrcv_endstreaming */
++				EndReplicationCommand(cmdtag);
+ 
+ 				Assert(xlogreader != NULL);
+ 				break;
+diff --git a/src/test/subscription/t/100_bugs.pl b/src/test/subscription/t/100_bugs.pl
+index 366a7a94350a..7dc8983d6aee 100644
+--- a/src/test/subscription/t/100_bugs.pl
++++ b/src/test/subscription/t/100_bugs.pl
+@@ -3,7 +3,7 @@
+ use warnings;
+ use PostgresNode;
+ use TestLib;
+-use Test::More tests => 3;
++use Test::More tests => 5;
+ 
+ # Bug #15114
+ 
+@@ -100,3 +100,56 @@
+ );
+ 
+ $node_publisher->stop('fast');
++
++# Bug #16643 - https://postgr.es/m/16643-eaadeb2a1a58d28c@postgresql.org
++#
++# Initial sync doesn't complete; the protocol was not being followed per
++# expectations after commit 07082b08cc5d.
++my $node_twoways = get_new_node('twoways');
++$node_twoways->init(allows_streaming => 'logical');
++$node_twoways->start;
++for my $db (qw(d1 d2))
++{
++	$node_twoways->safe_psql('postgres', "CREATE DATABASE $db");
++	$node_twoways->safe_psql($db,        "CREATE TABLE t (f int)");
++	$node_twoways->safe_psql($db,        "CREATE TABLE t2 (f int)");
++}
++
++my $rows = 3000;
++$node_twoways->safe_psql(
++	'd1', qq{
++	INSERT INTO t SELECT * FROM generate_series(1, $rows);
++	INSERT INTO t2 SELECT * FROM generate_series(1, $rows);
++	CREATE PUBLICATION testpub FOR TABLE t;
++	SELECT pg_create_logical_replication_slot('testslot', 'pgoutput');
++	});
++
++$node_twoways->safe_psql('d2',
++	    "CREATE SUBSCRIPTION testsub CONNECTION \$\$"
++	  . $node_twoways->connstr('d1')
++	  . "\$\$ PUBLICATION testpub WITH (create_slot=false, "
++	  . "slot_name='testslot')");
++$node_twoways->safe_psql(
++	'd1', qq{
++	INSERT INTO t SELECT * FROM generate_series(1, $rows);
++	INSERT INTO t2 SELECT * FROM generate_series(1, $rows);
++	});
++$node_twoways->safe_psql(
++	'd1', 'ALTER PUBLICATION testpub ADD TABLE t2');
++$node_twoways->safe_psql(
++	'd2', 'ALTER SUBSCRIPTION testsub REFRESH PUBLICATION');
++
++# We cannot rely solely on wait_for_catchup() here; it isn't sufficient
++# when tablesync workers might still be running. So in addition to that,
++# we verify that no tablesync workers appear for the subscription.
++# XXX maybe this should be integrated in wait_for_catchup() itself.
++$node_twoways->wait_for_catchup('testsub');
++$node_twoways->poll_query_until(
++	'd2',
++	"SELECT count(*) FROM pg_stat_subscription WHERE subname = 'testsub' AND relid <> 0",
++	"0");
++
++is($node_twoways->safe_psql('d2', "SELECT count(f) FROM t"),
++	$rows * 2, "2x$rows rows in t");
++is($node_twoways->safe_psql('d2', "SELECT count(f) FROM t2"),
++	$rows * 2, "2x$rows rows in t2");

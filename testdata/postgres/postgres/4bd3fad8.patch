@@ -1,0 +1,514 @@
+From 4bd3fad80e5c3bd107583dd9d32d4a47c045a3ec Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 4 Jan 2021 18:32:40 -0500
+Subject: [PATCH] Fix integer-overflow corner cases in substring() functions.
+
+If the substring start index and length overflow when added together,
+substring() misbehaved, either throwing a bogus "negative substring
+length" error on a case that should succeed, or failing to complain that
+a negative length is negative (and instead returning the whole string,
+in most cases).  Unsurprisingly, the text, bytea, and bit variants of
+the function all had this issue.  Rearrange the logic to ensure that
+negative lengths are always rejected, and add an overflow check to
+handle the other case.
+
+Also install similar guards into detoast_attr_slice() (nee
+heap_tuple_untoast_attr_slice()), since it's far from clear that
+no other code paths leading to that function could pass it values
+that would overflow.
+
+Patch by myself and Pavel Stehule, per bug #16804 from Rafi Shamim.
+
+Back-patch to v11.  While these bugs are old, the common/int.h
+infrastructure for overflow-detecting arithmetic didn't exist before
+commit 4d6ad3125, and it doesn't seem like these misbehaviors are bad
+enough to justify developing a standalone fix for the older branches.
+
+Discussion: https://postgr.es/m/16804-f4eeeb6c11ba71d4@postgresql.org
+---
+ src/backend/access/common/detoast.c   |  33 ++++++--
+ src/backend/utils/adt/varbit.c        |  26 +++---
+ src/backend/utils/adt/varlena.c       | 110 +++++++++++++++-----------
+ src/test/regress/expected/bit.out     |  29 +++++++
+ src/test/regress/expected/strings.out |  41 ++++++++++
+ src/test/regress/sql/bit.sql          |   8 ++
+ src/test/regress/sql/strings.sql      |  11 +++
+ 7 files changed, 195 insertions(+), 63 deletions(-)
+
+diff --git a/src/backend/access/common/detoast.c b/src/backend/access/common/detoast.c
+index b118f4a7146b..d1cdbaf64861 100644
+--- a/src/backend/access/common/detoast.c
++++ b/src/backend/access/common/detoast.c
+@@ -17,6 +17,7 @@
+ #include "access/table.h"
+ #include "access/tableam.h"
+ #include "access/toast_internals.h"
++#include "common/int.h"
+ #include "common/pg_lzcompress.h"
+ #include "utils/expandeddatum.h"
+ #include "utils/rel.h"
+@@ -196,7 +197,8 @@ detoast_attr(struct varlena *attr)
+  *		Public entry point to get back part of a toasted value
+  *		from compression or external storage.
+  *
+- * Note: When slicelength is negative, return suffix of the value.
++ * sliceoffset is where to start (zero or more)
++ * If slicelength < 0, return everything beyond sliceoffset
+  * ----------
+  */
+ struct varlena *
+@@ -206,8 +208,21 @@ detoast_attr_slice(struct varlena *attr,
+ 	struct varlena *preslice;
+ 	struct varlena *result;
+ 	char	   *attrdata;
++	int32		slicelimit;
+ 	int32		attrsize;
+ 
++	if (sliceoffset < 0)
++		elog(ERROR, "invalid sliceoffset: %d", sliceoffset);
++
++	/*
++	 * Compute slicelimit = offset + length, or -1 if we must fetch all of the
++	 * value.  In case of integer overflow, we must fetch all.
++	 */
++	if (slicelength < 0)
++		slicelimit = -1;
++	else if (pg_add_s32_overflow(sliceoffset, slicelength, &slicelimit))
++		slicelength = slicelimit = -1;
++
+ 	if (VARATT_IS_EXTERNAL_ONDISK(attr))
+ 	{
+ 		struct varatt_external toast_pointer;
+@@ -223,7 +238,7 @@ detoast_attr_slice(struct varlena *attr,
+ 		 * at least the requested part (when a prefix is requested).
+ 		 * Otherwise, just fetch all slices.
+ 		 */
+-		if (slicelength > 0 && sliceoffset >= 0)
++		if (slicelimit >= 0)
+ 		{
+ 			int32		max_size;
+ 
+@@ -231,7 +246,7 @@ detoast_attr_slice(struct varlena *attr,
+ 			 * Determine maximum amount of compressed data needed for a prefix
+ 			 * of a given length (after decompression).
+ 			 */
+-			max_size = pglz_maximum_compressed_size(sliceoffset + slicelength,
++			max_size = pglz_maximum_compressed_size(slicelimit,
+ 													toast_pointer.va_extsize);
+ 
+ 			/*
+@@ -270,8 +285,8 @@ detoast_attr_slice(struct varlena *attr,
+ 		struct varlena *tmp = preslice;
+ 
+ 		/* Decompress enough to encompass the slice and the offset */
+-		if (slicelength > 0 && sliceoffset >= 0)
+-			preslice = toast_decompress_datum_slice(tmp, slicelength + sliceoffset);
++		if (slicelimit >= 0)
++			preslice = toast_decompress_datum_slice(tmp, slicelimit);
+ 		else
+ 			preslice = toast_decompress_datum(tmp);
+ 
+@@ -297,8 +312,7 @@ detoast_attr_slice(struct varlena *attr,
+ 		sliceoffset = 0;
+ 		slicelength = 0;
+ 	}
+-
+-	if (((sliceoffset + slicelength) > attrsize) || slicelength < 0)
++	else if (slicelength < 0 || slicelimit > attrsize)
+ 		slicelength = attrsize - sliceoffset;
+ 
+ 	result = (struct varlena *) palloc(slicelength + VARHDRSZ);
+@@ -410,6 +424,11 @@ toast_fetch_datum_slice(struct varlena *attr, int32 sliceoffset,
+ 	if (VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer) && slicelength > 0)
+ 		slicelength = slicelength + sizeof(int32);
+ 
++	/*
++	 * Adjust length request if needed.  (Note: our sole caller,
++	 * detoast_attr_slice, protects us against sliceoffset + slicelength
++	 * overflowing.)
++	 */
+ 	if (((sliceoffset + slicelength) > attrsize) || slicelength < 0)
+ 		slicelength = attrsize - sliceoffset;
+ 
+diff --git a/src/backend/utils/adt/varbit.c b/src/backend/utils/adt/varbit.c
+index abbb4d810686..2235866244da 100644
+--- a/src/backend/utils/adt/varbit.c
++++ b/src/backend/utils/adt/varbit.c
+@@ -1059,7 +1059,7 @@ bitsubstring(VarBit *arg, int32 s, int32 l, bool length_not_specified)
+ 				len,
+ 				ishift,
+ 				i;
+-	int			e,
++	int32		e,
+ 				s1,
+ 				e1;
+ 	bits8	   *r,
+@@ -1072,18 +1072,24 @@ bitsubstring(VarBit *arg, int32 s, int32 l, bool length_not_specified)
+ 	{
+ 		e1 = bitlen + 1;
+ 	}
+-	else
++	else if (l < 0)
++	{
++		/* SQL99 says to throw an error for E < S, i.e., negative length */
++		ereport(ERROR,
++				(errcode(ERRCODE_SUBSTRING_ERROR),
++				 errmsg("negative substring length not allowed")));
++		e1 = -1;				/* silence stupider compilers */
++	}
++	else if (pg_add_s32_overflow(s, l, &e))
+ 	{
+-		e = s + l;
+-
+ 		/*
+-		 * A negative value for L is the only way for the end position to be
+-		 * before the start. SQL99 says to throw an error.
++		 * L could be large enough for S + L to overflow, in which case the
++		 * substring must run to end of string.
+ 		 */
+-		if (e < s)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_SUBSTRING_ERROR),
+-					 errmsg("negative substring length not allowed")));
++		e1 = bitlen + 1;
++	}
++	else
++	{
+ 		e1 = Min(e, bitlen + 1);
+ 	}
+ 	if (s1 > bitlen || e1 <= s1)
+diff --git a/src/backend/utils/adt/varlena.c b/src/backend/utils/adt/varlena.c
+index ec1fb4d1b90b..4838bfb4ff0c 100644
+--- a/src/backend/utils/adt/varlena.c
++++ b/src/backend/utils/adt/varlena.c
+@@ -868,29 +868,38 @@ text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
+ 	int32		S = start;		/* start position */
+ 	int32		S1;				/* adjusted start position */
+ 	int32		L1;				/* adjusted substring length */
++	int32		E;				/* end position */
++
++	/*
++	 * SQL99 says S can be zero or negative, but we still must fetch from the
++	 * start of the string.
++	 */
++	S1 = Max(S, 1);
+ 
+ 	/* life is easy if the encoding max length is 1 */
+ 	if (eml == 1)
+ 	{
+-		S1 = Max(S, 1);
+-
+ 		if (length_not_specified)	/* special case - get length to end of
+ 									 * string */
+ 			L1 = -1;
+-		else
++		else if (length < 0)
++		{
++			/* SQL99 says to throw an error for E < S, i.e., negative length */
++			ereport(ERROR,
++					(errcode(ERRCODE_SUBSTRING_ERROR),
++					 errmsg("negative substring length not allowed")));
++			L1 = -1;			/* silence stupider compilers */
++		}
++		else if (pg_add_s32_overflow(S, length, &E))
+ 		{
+-			/* end position */
+-			int			E = S + length;
+-
+ 			/*
+-			 * A negative value for L is the only way for the end position to
+-			 * be before the start. SQL99 says to throw an error.
++			 * L could be large enough for S + L to overflow, in which case
++			 * the substring must run to end of string.
+ 			 */
+-			if (E < S)
+-				ereport(ERROR,
+-						(errcode(ERRCODE_SUBSTRING_ERROR),
+-						 errmsg("negative substring length not allowed")));
+-
++			L1 = -1;
++		}
++		else
++		{
+ 			/*
+ 			 * A zero or negative value for the end position can happen if the
+ 			 * start was negative or one. SQL99 says to return a zero-length
+@@ -904,8 +913,8 @@ text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
+ 
+ 		/*
+ 		 * If the start position is past the end of the string, SQL99 says to
+-		 * return a zero-length string -- PG_GETARG_TEXT_P_SLICE() will do
+-		 * that for us. Convert to zero-based starting position
++		 * return a zero-length string -- DatumGetTextPSlice() will do that
++		 * for us.  We need only convert S1 to zero-based starting position.
+ 		 */
+ 		return DatumGetTextPSlice(str, S1 - 1, L1);
+ 	}
+@@ -926,12 +935,6 @@ text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
+ 		char	   *s;
+ 		text	   *ret;
+ 
+-		/*
+-		 * if S is past the end of the string, the tuple toaster will return a
+-		 * zero-length string to us
+-		 */
+-		S1 = Max(S, 1);
+-
+ 		/*
+ 		 * We need to start at position zero because there is no way to know
+ 		 * in advance which byte offset corresponds to the supplied start
+@@ -942,19 +945,24 @@ text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
+ 		if (length_not_specified)	/* special case - get length to end of
+ 									 * string */
+ 			slice_size = L1 = -1;
+-		else
++		else if (length < 0)
++		{
++			/* SQL99 says to throw an error for E < S, i.e., negative length */
++			ereport(ERROR,
++					(errcode(ERRCODE_SUBSTRING_ERROR),
++					 errmsg("negative substring length not allowed")));
++			slice_size = L1 = -1;	/* silence stupider compilers */
++		}
++		else if (pg_add_s32_overflow(S, length, &E))
+ 		{
+-			int			E = S + length;
+-
+ 			/*
+-			 * A negative value for L is the only way for the end position to
+-			 * be before the start. SQL99 says to throw an error.
++			 * L could be large enough for S + L to overflow, in which case
++			 * the substring must run to end of string.
+ 			 */
+-			if (E < S)
+-				ereport(ERROR,
+-						(errcode(ERRCODE_SUBSTRING_ERROR),
+-						 errmsg("negative substring length not allowed")));
+-
++			slice_size = L1 = -1;
++		}
++		else
++		{
+ 			/*
+ 			 * A zero or negative value for the end position can happen if the
+ 			 * start was negative or one. SQL99 says to return a zero-length
+@@ -972,8 +980,10 @@ text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
+ 			/*
+ 			 * Total slice size in bytes can't be any longer than the start
+ 			 * position plus substring length times the encoding max length.
++			 * If that overflows, we can just use -1.
+ 			 */
+-			slice_size = (S1 + L1) * eml;
++			if (pg_mul_s32_overflow(E, eml, &slice_size))
++				slice_size = -1;
+ 		}
+ 
+ 		/*
+@@ -3309,9 +3319,13 @@ bytea_substring(Datum str,
+ 				int L,
+ 				bool length_not_specified)
+ {
+-	int			S1;				/* adjusted start position */
+-	int			L1;				/* adjusted substring length */
++	int32		S1;				/* adjusted start position */
++	int32		L1;				/* adjusted substring length */
++	int32		E;				/* end position */
+ 
++	/*
++	 * The logic here should generally match text_substring().
++	 */
+ 	S1 = Max(S, 1);
+ 
+ 	if (length_not_specified)
+@@ -3322,20 +3336,24 @@ bytea_substring(Datum str,
+ 		 */
+ 		L1 = -1;
+ 	}
+-	else
++	else if (L < 0)
++	{
++		/* SQL99 says to throw an error for E < S, i.e., negative length */
++		ereport(ERROR,
++				(errcode(ERRCODE_SUBSTRING_ERROR),
++				 errmsg("negative substring length not allowed")));
++		L1 = -1;				/* silence stupider compilers */
++	}
++	else if (pg_add_s32_overflow(S, L, &E))
+ 	{
+-		/* end position */
+-		int			E = S + L;
+-
+ 		/*
+-		 * A negative value for L is the only way for the end position to be
+-		 * before the start. SQL99 says to throw an error.
++		 * L could be large enough for S + L to overflow, in which case the
++		 * substring must run to end of string.
+ 		 */
+-		if (E < S)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_SUBSTRING_ERROR),
+-					 errmsg("negative substring length not allowed")));
+-
++		L1 = -1;
++	}
++	else
++	{
+ 		/*
+ 		 * A zero or negative value for the end position can happen if the
+ 		 * start was negative or one. SQL99 says to return a zero-length
+@@ -3350,7 +3368,7 @@ bytea_substring(Datum str,
+ 	/*
+ 	 * If the start position is past the end of the string, SQL99 says to
+ 	 * return a zero-length string -- DatumGetByteaPSlice() will do that for
+-	 * us. Convert to zero-based starting position
++	 * us.  We need only convert S1 to zero-based starting position.
+ 	 */
+ 	return DatumGetByteaPSlice(str, S1 - 1, L1);
+ }
+diff --git a/src/test/regress/expected/bit.out b/src/test/regress/expected/bit.out
+index a1fab7ebcb07..a7f95b846d96 100644
+--- a/src/test/regress/expected/bit.out
++++ b/src/test/regress/expected/bit.out
+@@ -106,6 +106,35 @@ SELECT v,
+  01010101010 | 1010    | 01010    | 101010
+ (4 rows)
+ 
++-- test overflow cases
++SELECT SUBSTRING('01010101'::bit(8) FROM 2 FOR 2147483646) AS "1010101";
++ 1010101 
++---------
++ 1010101
++(1 row)
++
++SELECT SUBSTRING('01010101'::bit(8) FROM -10 FOR 2147483646) AS "01010101";
++ 01010101 
++----------
++ 01010101
++(1 row)
++
++SELECT SUBSTRING('01010101'::bit(8) FROM -10 FOR -2147483646) AS "error";
++ERROR:  negative substring length not allowed
++SELECT SUBSTRING('01010101'::varbit FROM 2 FOR 2147483646) AS "1010101";
++ 1010101 
++---------
++ 1010101
++(1 row)
++
++SELECT SUBSTRING('01010101'::varbit FROM -10 FOR 2147483646) AS "01010101";
++ 01010101 
++----------
++ 01010101
++(1 row)
++
++SELECT SUBSTRING('01010101'::varbit FROM -10 FOR -2147483646) AS "error";
++ERROR:  negative substring length not allowed
+ --- Bit operations
+ DROP TABLE varbit_table;
+ CREATE TABLE varbit_table (a BIT VARYING(16), b BIT VARYING(16));
+diff --git a/src/test/regress/expected/strings.out b/src/test/regress/expected/strings.out
+index 298b6c48c21b..595bd2446e52 100644
+--- a/src/test/regress/expected/strings.out
++++ b/src/test/regress/expected/strings.out
+@@ -396,6 +396,21 @@ SELECT SUBSTRING('1234567890' FROM 4 FOR 3) = '456' AS "456";
+  t
+ (1 row)
+ 
++-- test overflow cases
++SELECT SUBSTRING('string' FROM 2 FOR 2147483646) AS "tring";
++ tring 
++-------
++ tring
++(1 row)
++
++SELECT SUBSTRING('string' FROM -10 FOR 2147483646) AS "string";
++ string 
++--------
++ string
++(1 row)
++
++SELECT SUBSTRING('string' FROM -10 FOR -2147483646) AS "error";
++ERROR:  negative substring length not allowed
+ -- T581 regular expression substring (with SQL's bizarre regexp syntax)
+ SELECT SUBSTRING('abcdefg' SIMILAR 'a#"(b_d)#"%' ESCAPE '#') AS "bcd";
+  bcd 
+@@ -2084,6 +2099,32 @@ SELECT repeat('Pg', -4);
+  
+ (1 row)
+ 
++SELECT SUBSTRING('1234567890'::bytea FROM 3) "34567890";
++ 34567890 
++----------
++ 34567890
++(1 row)
++
++SELECT SUBSTRING('1234567890'::bytea FROM 4 FOR 3) AS "456";
++ 456 
++-----
++ 456
++(1 row)
++
++SELECT SUBSTRING('string'::bytea FROM 2 FOR 2147483646) AS "tring";
++ tring 
++-------
++ tring
++(1 row)
++
++SELECT SUBSTRING('string'::bytea FROM -10 FOR 2147483646) AS "string";
++ string 
++--------
++ string
++(1 row)
++
++SELECT SUBSTRING('string'::bytea FROM -10 FOR -2147483646) AS "error";
++ERROR:  negative substring length not allowed
+ SELECT trim(E'\\000'::bytea from E'\\000Tom\\000'::bytea);
+  btrim 
+ -------
+diff --git a/src/test/regress/sql/bit.sql b/src/test/regress/sql/bit.sql
+index 7681d4ab4d06..ea01742c4aa1 100644
+--- a/src/test/regress/sql/bit.sql
++++ b/src/test/regress/sql/bit.sql
+@@ -53,6 +53,14 @@ SELECT v,
+        SUBSTRING(v FROM 6) AS sub_6
+        FROM VARBIT_TABLE;
+ 
++-- test overflow cases
++SELECT SUBSTRING('01010101'::bit(8) FROM 2 FOR 2147483646) AS "1010101";
++SELECT SUBSTRING('01010101'::bit(8) FROM -10 FOR 2147483646) AS "01010101";
++SELECT SUBSTRING('01010101'::bit(8) FROM -10 FOR -2147483646) AS "error";
++SELECT SUBSTRING('01010101'::varbit FROM 2 FOR 2147483646) AS "1010101";
++SELECT SUBSTRING('01010101'::varbit FROM -10 FOR 2147483646) AS "01010101";
++SELECT SUBSTRING('01010101'::varbit FROM -10 FOR -2147483646) AS "error";
++
+ --- Bit operations
+ DROP TABLE varbit_table;
+ CREATE TABLE varbit_table (a BIT VARYING(16), b BIT VARYING(16));
+diff --git a/src/test/regress/sql/strings.sql b/src/test/regress/sql/strings.sql
+index ad5221ab6b09..ca465d050f70 100644
+--- a/src/test/regress/sql/strings.sql
++++ b/src/test/regress/sql/strings.sql
+@@ -131,6 +131,11 @@ SELECT SUBSTRING('1234567890' FROM 3) = '34567890' AS "34567890";
+ 
+ SELECT SUBSTRING('1234567890' FROM 4 FOR 3) = '456' AS "456";
+ 
++-- test overflow cases
++SELECT SUBSTRING('string' FROM 2 FOR 2147483646) AS "tring";
++SELECT SUBSTRING('string' FROM -10 FOR 2147483646) AS "string";
++SELECT SUBSTRING('string' FROM -10 FOR -2147483646) AS "error";
++
+ -- T581 regular expression substring (with SQL's bizarre regexp syntax)
+ SELECT SUBSTRING('abcdefg' SIMILAR 'a#"(b_d)#"%' ESCAPE '#') AS "bcd";
+ -- obsolete SQL99 syntax
+@@ -710,6 +715,12 @@ SELECT chr(0);
+ SELECT repeat('Pg', 4);
+ SELECT repeat('Pg', -4);
+ 
++SELECT SUBSTRING('1234567890'::bytea FROM 3) "34567890";
++SELECT SUBSTRING('1234567890'::bytea FROM 4 FOR 3) AS "456";
++SELECT SUBSTRING('string'::bytea FROM 2 FOR 2147483646) AS "tring";
++SELECT SUBSTRING('string'::bytea FROM -10 FOR 2147483646) AS "string";
++SELECT SUBSTRING('string'::bytea FROM -10 FOR -2147483646) AS "error";
++
+ SELECT trim(E'\\000'::bytea from E'\\000Tom\\000'::bytea);
+ SELECT btrim(E'\\000trim\\000'::bytea, E'\\000'::bytea);
+ SELECT btrim(''::bytea, E'\\000'::bytea);

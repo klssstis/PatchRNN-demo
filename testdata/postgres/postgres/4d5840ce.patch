@@ -1,0 +1,290 @@
+From 4d5840cea96d7f893389664dd423716b38fded7a Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 19 Apr 2019 11:20:37 -0400
+Subject: [PATCH] Fix problems with auto-held portals.
+
+HoldPinnedPortals() did things in the wrong order: it must not mark
+a portal autoHeld until it's been successfully held.  Otherwise,
+a failure while persisting the portal results in a server crash
+because we think the portal is in a good state when it's not.
+
+Also add a check that portal->status is READY before attempting to
+hold a pinned portal.  We have such a check before the only other
+use of HoldPortal(), so it seems unwise not to check it here.
+
+Lastly, rethink the responsibility for where to call HoldPinnedPortals.
+The comment for it imagined that it was optional for any individual PL
+to call it or not, but that cannot be the case: if some outer level of
+procedure has a pinned portal, failing to persist it when an inner
+procedure commits is going to be trouble.  Let's have SPI do it instead
+of the individual PLs.  That's not a complete solution, since in theory
+a PL might not be using SPI to perform commit/rollback, but such a PL
+is going to have to be aware of lots of related requirements anyway.
+(This change doesn't cause an API break for any external PLs that might
+be calling HoldPinnedPortals per the old regime, because calling it
+twice during a commit or rollback sequence won't hurt.)
+
+Per bug #15703 from Julian Schauder.  Back-patch to v11 where this code
+came in.
+
+Discussion: https://postgr.es/m/15703-c12c5bc0ea34ba26@postgresql.org
+---
+ src/backend/executor/spi.c                    | 17 +++++++
+ src/backend/utils/mmgr/portalmem.c            | 26 +++++++----
+ src/pl/plperl/plperl.c                        |  4 --
+ .../src/expected/plpgsql_transaction.out      | 44 +++++++++++++++++++
+ src/pl/plpgsql/src/pl_exec.c                  |  4 --
+ .../plpgsql/src/sql/plpgsql_transaction.sql   | 38 ++++++++++++++++
+ src/pl/plpython/plpy_plpymodule.c             |  4 --
+ 7 files changed, 117 insertions(+), 20 deletions(-)
+
+diff --git a/src/backend/executor/spi.c b/src/backend/executor/spi.c
+index 6e262d1a3ad9..22d0fe5ac4fa 100644
+--- a/src/backend/executor/spi.c
++++ b/src/backend/executor/spi.c
+@@ -241,6 +241,14 @@ _SPI_commit(bool chain)
+ 				(errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
+ 				 errmsg("cannot commit while a subtransaction is active")));
+ 
++	/*
++	 * Hold any pinned portals that any PLs might be using.  We have to do
++	 * this before changing transaction state, since this will run
++	 * user-defined code that might throw an error.
++	 */
++	HoldPinnedPortals();
++
++	/* Start the actual commit */
+ 	_SPI_current->internal_xact = true;
+ 
+ 	/*
+@@ -294,6 +302,15 @@ _SPI_rollback(bool chain)
+ 				(errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
+ 				 errmsg("cannot roll back while a subtransaction is active")));
+ 
++	/*
++	 * Hold any pinned portals that any PLs might be using.  We have to do
++	 * this before changing transaction state, since this will run
++	 * user-defined code that might throw an error, and in any case couldn't
++	 * be run in an already-aborted transaction.
++	 */
++	HoldPinnedPortals();
++
++	/* Start the actual rollback */
+ 	_SPI_current->internal_xact = true;
+ 
+ 	if (chain)
+diff --git a/src/backend/utils/mmgr/portalmem.c b/src/backend/utils/mmgr/portalmem.c
+index a92b4541bd0b..334e35bb6a31 100644
+--- a/src/backend/utils/mmgr/portalmem.c
++++ b/src/backend/utils/mmgr/portalmem.c
+@@ -1226,13 +1226,19 @@ ThereAreNoReadyPortals(void)
+ /*
+  * Hold all pinned portals.
+  *
+- * A procedural language implementation that uses pinned portals for its
+- * internally generated cursors can call this in its COMMIT command to convert
+- * those cursors to held cursors, so that they survive the transaction end.
+- * We mark those portals as "auto-held" so that exception exit knows to clean
+- * them up.  (In normal, non-exception code paths, the PL needs to clean those
+- * portals itself, since transaction end won't do it anymore, but that should
+- * be normal practice anyway.)
++ * When initiating a COMMIT or ROLLBACK inside a procedure, this must be
++ * called to protect internally-generated cursors from being dropped during
++ * the transaction shutdown.  Currently, SPI calls this automatically; PLs
++ * that initiate COMMIT or ROLLBACK some other way are on the hook to do it
++ * themselves.  (Note that we couldn't do this in, say, AtAbort_Portals
++ * because we need to run user-defined code while persisting a portal.
++ * It's too late to do that once transaction abort has started.)
++ *
++ * We protect such portals by converting them to held cursors.  We mark them
++ * as "auto-held" so that exception exit knows to clean them up.  (In normal,
++ * non-exception code paths, the PL needs to clean such portals itself, since
++ * transaction end won't do it anymore; but that should be normal practice
++ * anyway.)
+  */
+ void
+ HoldPinnedPortals(void)
+@@ -1262,8 +1268,12 @@ HoldPinnedPortals(void)
+ 						(errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
+ 						 errmsg("cannot perform transaction commands inside a cursor loop that is not read-only")));
+ 
+-			portal->autoHeld = true;
++			/* Verify it's in a suitable state to be held */
++			if (portal->status != PORTAL_READY)
++				elog(ERROR, "pinned portal is not ready to be auto-held");
++
+ 			HoldPortal(portal);
++			portal->autoHeld = true;
+ 		}
+ 	}
+ }
+diff --git a/src/pl/plperl/plperl.c b/src/pl/plperl/plperl.c
+index 31ba2f262f7e..bda9517971fd 100644
+--- a/src/pl/plperl/plperl.c
++++ b/src/pl/plperl/plperl.c
+@@ -3988,8 +3988,6 @@ plperl_spi_commit(void)
+ 
+ 	PG_TRY();
+ 	{
+-		HoldPinnedPortals();
+-
+ 		SPI_commit();
+ 		SPI_start_transaction();
+ 	}
+@@ -4015,8 +4013,6 @@ plperl_spi_rollback(void)
+ 
+ 	PG_TRY();
+ 	{
+-		HoldPinnedPortals();
+-
+ 		SPI_rollback();
+ 		SPI_start_transaction();
+ 	}
+diff --git a/src/pl/plpgsql/src/expected/plpgsql_transaction.out b/src/pl/plpgsql/src/expected/plpgsql_transaction.out
+index ba0745326af0..5f576231c3cd 100644
+--- a/src/pl/plpgsql/src/expected/plpgsql_transaction.out
++++ b/src/pl/plpgsql/src/expected/plpgsql_transaction.out
+@@ -401,6 +401,50 @@ SELECT * FROM test3;
+  1
+ (1 row)
+ 
++-- failure while trying to persist a cursor across a transaction (bug #15703)
++CREATE PROCEDURE cursor_fail_during_commit()
++ LANGUAGE plpgsql
++AS $$
++  DECLARE id int;
++  BEGIN
++    FOR id IN SELECT 1/(x-1000) FROM generate_series(1,1000) x LOOP
++        INSERT INTO test1 VALUES(id);
++        COMMIT;
++    END LOOP;
++  END;
++$$;
++TRUNCATE test1;
++CALL cursor_fail_during_commit();
++ERROR:  division by zero
++CONTEXT:  PL/pgSQL function cursor_fail_during_commit() line 6 at COMMIT
++-- note that error occurs during first COMMIT, hence nothing is in test1
++SELECT count(*) FROM test1;
++ count 
++-------
++     0
++(1 row)
++
++CREATE PROCEDURE cursor_fail_during_rollback()
++ LANGUAGE plpgsql
++AS $$
++  DECLARE id int;
++  BEGIN
++    FOR id IN SELECT 1/(x-1000) FROM generate_series(1,1000) x LOOP
++        INSERT INTO test1 VALUES(id);
++        ROLLBACK;
++    END LOOP;
++  END;
++$$;
++TRUNCATE test1;
++CALL cursor_fail_during_rollback();
++ERROR:  division by zero
++CONTEXT:  PL/pgSQL function cursor_fail_during_rollback() line 6 at ROLLBACK
++SELECT count(*) FROM test1;
++ count 
++-------
++     0
++(1 row)
++
+ -- SET TRANSACTION
+ DO LANGUAGE plpgsql $$
+ BEGIN
+diff --git a/src/pl/plpgsql/src/pl_exec.c b/src/pl/plpgsql/src/pl_exec.c
+index f0005009b2c3..23aed02dbd72 100644
+--- a/src/pl/plpgsql/src/pl_exec.c
++++ b/src/pl/plpgsql/src/pl_exec.c
+@@ -4791,8 +4791,6 @@ exec_stmt_close(PLpgSQL_execstate *estate, PLpgSQL_stmt_close *stmt)
+ static int
+ exec_stmt_commit(PLpgSQL_execstate *estate, PLpgSQL_stmt_commit *stmt)
+ {
+-	HoldPinnedPortals();
+-
+ 	if (stmt->chain)
+ 		SPI_commit_and_chain();
+ 	else
+@@ -4815,8 +4813,6 @@ exec_stmt_commit(PLpgSQL_execstate *estate, PLpgSQL_stmt_commit *stmt)
+ static int
+ exec_stmt_rollback(PLpgSQL_execstate *estate, PLpgSQL_stmt_rollback *stmt)
+ {
+-	HoldPinnedPortals();
+-
+ 	if (stmt->chain)
+ 		SPI_rollback_and_chain();
+ 	else
+diff --git a/src/pl/plpgsql/src/sql/plpgsql_transaction.sql b/src/pl/plpgsql/src/sql/plpgsql_transaction.sql
+index 0c137dd31dd6..7575655c1ae6 100644
+--- a/src/pl/plpgsql/src/sql/plpgsql_transaction.sql
++++ b/src/pl/plpgsql/src/sql/plpgsql_transaction.sql
+@@ -329,6 +329,44 @@ $$;
+ 
+ SELECT * FROM test3;
+ 
++-- failure while trying to persist a cursor across a transaction (bug #15703)
++CREATE PROCEDURE cursor_fail_during_commit()
++ LANGUAGE plpgsql
++AS $$
++  DECLARE id int;
++  BEGIN
++    FOR id IN SELECT 1/(x-1000) FROM generate_series(1,1000) x LOOP
++        INSERT INTO test1 VALUES(id);
++        COMMIT;
++    END LOOP;
++  END;
++$$;
++
++TRUNCATE test1;
++
++CALL cursor_fail_during_commit();
++
++-- note that error occurs during first COMMIT, hence nothing is in test1
++SELECT count(*) FROM test1;
++
++CREATE PROCEDURE cursor_fail_during_rollback()
++ LANGUAGE plpgsql
++AS $$
++  DECLARE id int;
++  BEGIN
++    FOR id IN SELECT 1/(x-1000) FROM generate_series(1,1000) x LOOP
++        INSERT INTO test1 VALUES(id);
++        ROLLBACK;
++    END LOOP;
++  END;
++$$;
++
++TRUNCATE test1;
++
++CALL cursor_fail_during_rollback();
++
++SELECT count(*) FROM test1;
++
+ 
+ -- SET TRANSACTION
+ DO LANGUAGE plpgsql $$
+diff --git a/src/pl/plpython/plpy_plpymodule.c b/src/pl/plpython/plpy_plpymodule.c
+index 23e49e4b754a..f40f0846bbc8 100644
+--- a/src/pl/plpython/plpy_plpymodule.c
++++ b/src/pl/plpython/plpy_plpymodule.c
+@@ -588,8 +588,6 @@ PLy_commit(PyObject *self, PyObject *args)
+ {
+ 	PLyExecutionContext *exec_ctx = PLy_current_execution_context();
+ 
+-	HoldPinnedPortals();
+-
+ 	SPI_commit();
+ 	SPI_start_transaction();
+ 
+@@ -604,8 +602,6 @@ PLy_rollback(PyObject *self, PyObject *args)
+ {
+ 	PLyExecutionContext *exec_ctx = PLy_current_execution_context();
+ 
+-	HoldPinnedPortals();
+-
+ 	SPI_rollback();
+ 	SPI_start_transaction();
+ 

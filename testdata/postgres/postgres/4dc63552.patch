@@ -1,0 +1,713 @@
+From 4dc63552109f65cebbe168203bd62c5e4c753162 Mon Sep 17 00:00:00 2001
+From: Andrew Dunstan <andrew@dunslane.net>
+Date: Sat, 30 Nov 2019 15:27:13 -0500
+Subject: [PATCH] libq support for sslpassword connection param,  DER format
+ keys
+
+This patch providies for support for password protected SSL client
+keys in libpq, and for DER format keys, both encrypted and unencrypted.
+There is a new connection parameter sslpassword, which is supplied to
+the OpenSSL libraries via a callback function. The callback function can
+also be set by an application by calling PQgetSSLKeyPassHook(). There is
+also a function to retreive the connection setting, PQsslpassword().
+
+Craig Ringer and Andrew Dunstan
+
+Reviewed by: Greg Nancarrow
+
+Discussion: https://postgr.es/m/f7ee88ed-95c4-95c1-d4bf-7b415363ab62@2ndQuadrant.com
+---
+ contrib/dblink/expected/dblink.out        |   2 +-
+ doc/src/sgml/libpq.sgml                   | 134 ++++++++++++++++++++++
+ doc/src/sgml/postgres-fdw.sgml            |   2 +-
+ src/interfaces/libpq/exports.txt          |   4 +
+ src/interfaces/libpq/fe-connect.c         |  14 +++
+ src/interfaces/libpq/fe-secure-openssl.c  |  99 +++++++++++++++-
+ src/interfaces/libpq/libpq-fe.h           |   9 ++
+ src/interfaces/libpq/libpq-int.h          |   2 +
+ src/test/ssl/Makefile                     |  22 +++-
+ src/test/ssl/ssl/client-der.key           | Bin 0 -> 1191 bytes
+ src/test/ssl/ssl/client-encrypted-der.key | Bin 0 -> 1191 bytes
+ src/test/ssl/ssl/client-encrypted-pem.key |  30 +++++
+ src/test/ssl/t/001_ssltests.pl            |  75 ++++++++++--
+ 13 files changed, 376 insertions(+), 17 deletions(-)
+ create mode 100644 src/test/ssl/ssl/client-der.key
+ create mode 100644 src/test/ssl/ssl/client-encrypted-der.key
+ create mode 100644 src/test/ssl/ssl/client-encrypted-pem.key
+
+diff --git a/contrib/dblink/expected/dblink.out b/contrib/dblink/expected/dblink.out
+index 6ceabb453c05..6516d4f13133 100644
+--- a/contrib/dblink/expected/dblink.out
++++ b/contrib/dblink/expected/dblink.out
+@@ -879,7 +879,7 @@ $d$;
+ CREATE USER MAPPING FOR public SERVER fdtest
+   OPTIONS (server 'localhost');  -- fail, can't specify server here
+ ERROR:  invalid option "server"
+-HINT:  Valid options in this context are: user, password
++HINT:  Valid options in this context are: user, password, sslpassword
+ CREATE USER MAPPING FOR public SERVER fdtest OPTIONS (user :'USER');
+ GRANT USAGE ON FOREIGN SERVER fdtest TO regress_dblink_user;
+ GRANT EXECUTE ON FUNCTION dblink_connect_u(text, text) TO regress_dblink_user;
+diff --git a/doc/src/sgml/libpq.sgml b/doc/src/sgml/libpq.sgml
+index 8c657d2d8d88..5a48c39b562b 100644
+--- a/doc/src/sgml/libpq.sgml
++++ b/doc/src/sgml/libpq.sgml
+@@ -776,6 +776,72 @@ PGPing PQping(const char *conninfo);
+      </listitem>
+     </varlistentry>
+ 
++    <varlistentry id="libpq-pqsetsslkeypasshook">
++     <term><function>PQsetSSLKeyPassHook</function><indexterm><primary>PQsetSSLKeyPassHook</primary></indexterm></term>
++     <listitem>
++      <para>
++       <function>PQsetSSLKeyPassHook</function> lets an application override
++       <literal>libpq</literal>'s <link linkend="libpq-ssl-clientcert">default
++       handling of encrypted client certificate key files</link> using
++       <xref linkend="libpq-connect-sslpassword"/> or interactive prompting.
++
++<synopsis>
++void PQsetSSLKeyPassHook(PQsslKeyPassHook_type hook);
++</synopsis>
++
++       The application passes a pointer to a callback function with signature:
++       <programlisting>
++       int callback_fn(char *buf, int size, PGconn *conn);
++       </programlisting>
++       which <literal>libpq</literal> will then call <emphasis>instead of</emphasis>
++       its default <function>PQdefaultSSLKeyPassHook</function> handler. The callback
++       should determine the password for the key and copy it to result-buffer
++       <literal>buf</literal> of size <literal>size</literal>. The string in <literal>
++       buf</literal> must be null-terminated. The calback must return the length of
++       the password stored in <literal>buf</literal> excluding the null terminator.
++       On failure, the callback should set <literal>buf[0] = '\0'</literal> and return 0.
++       See <function>PQdefaultSSLKeyPassHook</function> in <literal>libpq</literal>'s
++       source code for an example.
++      </para>
++       
++      <para>
++       If the user specified an explicit key location,
++       its path will be in <literal>conn->pgsslkey</literal> when the callback
++       is invoked. This will be empty if the default key path is being used.
++       For keys that are engine specifiers, it is up to engine implementations
++       whether they use the OpenSSL password callback or define their own handling.
++      </para>
++
++      <para>
++       The app callback may choose to delegate unhandled cases to
++       <function>PQdefaultSSLKeyPassHook</function>,
++       or call it first and try something else if it returns 0, or completely override it.
++      </para>
++
++      <para>
++       The callback <emphasis>must not</emphasis> escape normal flow control with exceptions,
++       <function>longjmp(...)</function>, etc. It must return normally.
++      </para>
++
++     </listitem>
++    </varlistentry>
++
++    <varlistentry id="libpq-pqgetsslkeypasshook">
++     <term><function>PQgetSSLKeyPassHook</function><indexterm><primary>PQgetSSLKeyPassHook</primary></indexterm></term>
++     <listitem>
++      <para>
++       <function>PQgetSSLKeyPassHook</function> returns the current
++       client certificate key password hook, or <literal>NULL</literal>
++       if none has been set.
++
++<synopsis>
++PQsslKeyPassHook_type PQgetSSLKeyPassHook(void);
++</synopsis>
++      </para>
++
++     </listitem>
++    </varlistentry>
++
+    </variablelist>
+   </para>
+ 
+@@ -1586,6 +1652,36 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry id="libpq-connect-sslpassword" xreflabel="sslpassword">
++      <term><literal>sslpassword</literal></term>
++      <listitem>
++       <para>
++        This parameter specifies the password for the secret key specified in
++        <literal>sslkey</literal>, allowing client certificate private keys
++        to be stored in encrypted form on disk even when interactive passphrase
++        input is not practical.
++       </para>
++       <para>
++        Specifying this parameter with any non-empty value suppresses the
++        <literal>Enter PEM passphrase:</literal>
++        prompt that OpenSSL will emit by default when an encrypted client
++        certificate key is provided to <literal>libpq</literal>.
++       </para>
++       <para>
++        If the key is not encrypted this parameter is ignored. The parameter has no
++        effect on keys specified by OpenSSL engines unless the engine uses the
++        OpenSSL password callback mechanism for prompts.
++       </para>
++       <para>
++        There is no environment variable equivalent to this option, and no
++        facility for looking it up in <filename>.pgpass</filename>. It can be
++        used in a service file connection definition. Users with
++        more sophisticated uses should consider using openssl engines and
++        tools like PKCS#11 or USB crypto offload devices.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry id="libpq-connect-sslrootcert" xreflabel="sslrootcert">
+       <term><literal>sslrootcert</literal></term>
+       <listitem>
+@@ -1771,6 +1867,24 @@ char *PQpass(const PGconn *conn);
+      </listitem>
+     </varlistentry>
+ 
++    <varlistentry id="libpq-PQsslpassword">
++     <term><function>PQsslpassword</function><indexterm><primary>PQsslpassword</primary></indexterm></term>
++
++     <listitem>
++      <para>
++       Returns the password for the SSL client key.
++<synopsis>
++char *PQsslpassword(const PGconn *conn);
++</synopsis>
++      </para>
++
++      <para>
++       <xref linkend="libpq-PQsslpassword"/> will return the SSL password specified
++       in the connection parameters.
++      </para>
++     </listitem>
++    </varlistentry>
++
+     <varlistentry id="libpq-PQhost">
+      <term><function>PQhost</function><indexterm><primary>PQhost</primary></indexterm></term>
+ 
+@@ -7499,6 +7613,26 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
+    certificates on the server (<xref linkend="guc-ssl-ca-file"/>).
+   </para>
+ 
++  <para>
++   The certificate and key may be in PEM or ASN.1 DER format.
++  </para>
++
++  <para>
++   The key may be
++   stored in cleartext or encrypted with a passphrase using any algorithm supported
++   by OpenSSL, like AES-128. If the key is stored encrypted, then the passphrase
++   may be provided in the <xref linkend="libpq-connect-sslpassword"/> connection
++   option. If an encrypted key is supplied and the <literal>sslpassword</literal>
++   option is absent or blank, a password will be prompted for interactively by
++   OpenSSL with a
++   <programlisting>
++    Enter PEM Passphrase:
++   </programlisting>
++   prompt if a TTY is available. Applications can override the client certificate
++   prompt and the handling of the <literal>sslpassword</literal> parameter by supplying
++   their own key password callback; see <xref linkend="libpq-pqsetsslkeypasshook"/>.
++  </para>
++
+   <para>
+    For instructions on creating certificates, see <xref
+    linkend="ssl-certificate-creation"/>.
+diff --git a/doc/src/sgml/postgres-fdw.sgml b/doc/src/sgml/postgres-fdw.sgml
+index ed369cb54b85..1d4bafd9f064 100644
+--- a/doc/src/sgml/postgres-fdw.sgml
++++ b/doc/src/sgml/postgres-fdw.sgml
+@@ -112,7 +112,7 @@
+     <itemizedlist spacing="compact">
+      <listitem>
+       <para>
+-       <literal>user</literal> and <literal>password</literal> (specify these
++       <literal>user</literal>, <literal>password</literal> and <literal>sslpassword</literal> (specify these
+        in a user mapping, instead)
+       </para>
+      </listitem>
+diff --git a/src/interfaces/libpq/exports.txt b/src/interfaces/libpq/exports.txt
+index ccec59919b2c..53f8ee0fc4b3 100644
+--- a/src/interfaces/libpq/exports.txt
++++ b/src/interfaces/libpq/exports.txt
+@@ -176,3 +176,7 @@ PQresultMemorySize        173
+ PQhostaddr                174
+ PQgssEncInUse             175
+ PQgetgssctx               176
++PQsslpassword			  177
++PQsetSSLKeyPassHook		  178
++PQgetSSLKeyPassHook		  179
++PQdefaultSSLKeyPassHook	  180
+diff --git a/src/interfaces/libpq/fe-connect.c b/src/interfaces/libpq/fe-connect.c
+index dcd86ee80436..5c786360a964 100644
+--- a/src/interfaces/libpq/fe-connect.c
++++ b/src/interfaces/libpq/fe-connect.c
+@@ -351,6 +351,10 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
+ 		"Target-Session-Attrs", "", 11, /* sizeof("read-write") = 11 */
+ 	offsetof(struct pg_conn, target_session_attrs)},
+ 
++	{"sslpassword", NULL, NULL, NULL,
++		"SSL-Client-Key-Password", "*", 20,
++	offsetof(struct pg_conn, sslpassword)},
++
+ 	/* Terminating entry --- MUST BE LAST */
+ 	{NULL, NULL, NULL, NULL,
+ 	NULL, NULL, 0}
+@@ -4026,6 +4030,8 @@ freePGconn(PGconn *conn)
+ 		free(conn->target_session_attrs);
+ 	termPQExpBuffer(&conn->errorMessage);
+ 	termPQExpBuffer(&conn->workBuffer);
++	if (conn->sslpassword)
++		free(conn->sslpassword);
+ 
+ 	free(conn);
+ 
+@@ -6544,6 +6550,14 @@ PQport(const PGconn *conn)
+ 	return "";
+ }
+ 
++char *
++PQsslpassword(const PGconn *conn)
++{
++	if (!conn)
++		return NULL;
++	return conn->sslpassword;
++}
++
+ char *
+ PQtty(const PGconn *conn)
+ {
+diff --git a/src/interfaces/libpq/fe-secure-openssl.c b/src/interfaces/libpq/fe-secure-openssl.c
+index c8dddfb5fdbc..cba81f63c0d8 100644
+--- a/src/interfaces/libpq/fe-secure-openssl.c
++++ b/src/interfaces/libpq/fe-secure-openssl.c
+@@ -70,6 +70,7 @@ static int	initialize_SSL(PGconn *conn);
+ static PostgresPollingStatusType open_client_SSL(PGconn *);
+ static char *SSLerrmessage(unsigned long ecode);
+ static void SSLerrfree(char *buf);
++static int PQssl_passwd_cb(char *buf, int size, int rwflag, void *userdata);
+ 
+ static int	my_sock_read(BIO *h, char *buf, int size);
+ static int	my_sock_write(BIO *h, const char *buf, int size);
+@@ -93,6 +94,7 @@ static long win32_ssl_create_mutex = 0;
+ #endif
+ #endif							/* ENABLE_THREAD_SAFETY */
+ 
++static PQsslKeyPassHook_type PQsslKeyPassHook = NULL;
+ 
+ /* ------------------------------------------------------------ */
+ /*			 Procedures common to all secure sessions			*/
+@@ -818,6 +820,26 @@ initialize_SSL(PGconn *conn)
+ 		return -1;
+ 	}
+ 
++	/*
++	 * Delegate the client cert password prompt to the libpq wrapper
++	 * callback if any is defined.
++	 *
++	 * If the application hasn't installed its own and the sslpassword
++	 * parameter is non-null, we install ours now to make sure we
++	 * supply PGconn->sslpassword to OpenSSL instead of letting it
++	 * prompt on stdin.
++	 *
++	 * This will replace OpenSSL's default PEM_def_callback (which
++	 * prompts on stdin), but we're only setting it for this SSL
++	 * context so it's harmless.
++	 */
++	if (PQsslKeyPassHook
++		|| (conn->sslpassword && strlen(conn->sslpassword) > 0))
++	{
++		SSL_CTX_set_default_passwd_cb(SSL_context, PQssl_passwd_cb);
++		SSL_CTX_set_default_passwd_cb_userdata(SSL_context, conn);
++	}
++
+ 	/* Disable old protocol versions */
+ 	SSL_CTX_set_options(SSL_context, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+ 
+@@ -1123,11 +1145,29 @@ initialize_SSL(PGconn *conn)
+ 		{
+ 			char	   *err = SSLerrmessage(ERR_get_error());
+ 
+-			printfPQExpBuffer(&conn->errorMessage,
+-							  libpq_gettext("could not load private key file \"%s\": %s\n"),
+-							  fnbuf, err);
++			/*
++			 * We'll try to load the file in DER (binary ASN.1) format, and if
++			 * that fails too, report the original error. This could mask
++			 * issues where there's something wrong with a DER-format cert, but
++			 * we'd have to duplicate openssl's format detection to be smarter
++			 * than this. We can't just probe for a leading -----BEGIN because
++			 * PEM can have leading non-matching lines and blanks. OpenSSL
++			 * doesn't expose its get_name(...) and its PEM routines don't
++			 * differentiate between failure modes in enough detail to let us
++			 * tell the difference between "not PEM, try DER" and "wrong
++			 * password".
++			 */
++			if (SSL_use_PrivateKey_file(conn->ssl, fnbuf, SSL_FILETYPE_ASN1) != 1)
++			{
++				printfPQExpBuffer(&conn->errorMessage,
++								  libpq_gettext("could not load private key file \"%s\": %s\n"),
++								  fnbuf, err);
++				SSLerrfree(err);
++				return -1;
++			}
++
+ 			SSLerrfree(err);
+-			return -1;
++
+ 		}
+ 	}
+ 
+@@ -1580,3 +1620,54 @@ my_SSL_set_fd(PGconn *conn, int fd)
+ err:
+ 	return ret;
+ }
++
++/*
++ * This is the default handler to return a client cert password from
++ * conn->sslpassword. Apps may install it explicitly if they want to
++ * prevent openssl from ever prompting on stdin.
++ */
++int
++PQdefaultSSLKeyPassHook(char *buf, int size, PGconn *conn)
++{
++	if (conn->sslpassword)
++	{
++		if (strlen(conn->sslpassword) + 1 > size)
++			fprintf(stderr, libpq_gettext("WARNING: sslpassword truncated"));
++		strncpy(buf, conn->sslpassword, size);
++		buf[size-1] = '\0';
++		return strlen(buf);
++	}
++	else
++	{
++		buf[0] = '\0';
++		return 0;
++	}
++}
++
++PQsslKeyPassHook_type
++PQgetSSLKeyPassHook(void)
++{
++	return PQsslKeyPassHook;
++}
++
++void
++PQsetSSLKeyPassHook(PQsslKeyPassHook_type hook)
++{
++	PQsslKeyPassHook = hook;
++}
++
++/*
++ * Supply a password to decrypt a client certificate.
++ *
++ * This must match OpenSSL type pem_passwd_cb.
++ */
++static int
++PQssl_passwd_cb(char *buf, int size, int rwflag, void *userdata)
++{
++	PGconn *conn = userdata;
++
++	if (PQsslKeyPassHook)
++		return PQsslKeyPassHook(buf, size, conn);
++	else
++		return PQdefaultSSLKeyPassHook(buf, size, conn);
++}
+diff --git a/src/interfaces/libpq/libpq-fe.h b/src/interfaces/libpq/libpq-fe.h
+index 5f65db30e4f3..f39db7780c38 100644
+--- a/src/interfaces/libpq/libpq-fe.h
++++ b/src/interfaces/libpq/libpq-fe.h
+@@ -317,6 +317,7 @@ extern char *PQpass(const PGconn *conn);
+ extern char *PQhost(const PGconn *conn);
+ extern char *PQhostaddr(const PGconn *conn);
+ extern char *PQport(const PGconn *conn);
++extern char *PQsslpassword(const PGconn *conn);
+ extern char *PQtty(const PGconn *conn);
+ extern char *PQoptions(const PGconn *conn);
+ extern ConnStatusType PQstatus(const PGconn *conn);
+@@ -617,6 +618,14 @@ extern int	pg_char_to_encoding(const char *name);
+ extern const char *pg_encoding_to_char(int encoding);
+ extern int	pg_valid_server_encoding_id(int encoding);
+ 
++/* == in fe-secure-openssl.c === */
++
++/* Support for overriding sslpassword handling with a callback. */
++typedef int (*PQsslKeyPassHook_type)(char *buf, int size, PGconn *conn);
++extern PQsslKeyPassHook_type PQgetSSLKeyPassHook(void);
++extern void PQsetSSLKeyPassHook(PQsslKeyPassHook_type hook);
++extern int PQdefaultSSLKeyPassHook(char *buf, int size, PGconn *conn);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/interfaces/libpq/libpq-int.h b/src/interfaces/libpq/libpq-int.h
+index 64468ab4dab9..7f5be7db7a1a 100644
+--- a/src/interfaces/libpq/libpq-int.h
++++ b/src/interfaces/libpq/libpq-int.h
+@@ -512,6 +512,8 @@ struct pg_conn
+ 
+ 	/* Buffer for receiving various parts of messages */
+ 	PQExpBufferData workBuffer; /* expansible string */
++
++	char *sslpassword; /* client key file password */
+ };
+ 
+ /* PGcancel stores all data necessary to cancel a connection. A copy of this
+diff --git a/src/test/ssl/Makefile b/src/test/ssl/Makefile
+index 3b53972f6f4e..cea5ace7aaa2 100644
+--- a/src/test/ssl/Makefile
++++ b/src/test/ssl/Makefile
+@@ -27,9 +27,14 @@ SSLFILES := $(CERTIFICATES:%=ssl/%.key) $(CERTIFICATES:%=ssl/%.crt) \
+ 	ssl/both-cas-1.crt ssl/both-cas-2.crt \
+ 	ssl/root+server_ca.crt ssl/root+server.crl \
+ 	ssl/root+client_ca.crt ssl/root+client.crl \
+-	ssl/client+client_ca.crt
++	ssl/client+client_ca.crt ssl/client-der.key \
++	ssl/client-encrypted-pem.key ssl/client-encrypted-der.key
+ 
+-# This target generates all the key and certificate files.
++# This target re-generates all the key and certificate files. Usually we just
++# use the ones that are committed to the tree without rebuilding them.
++#
++# This target will fail unless preceded by sslfiles-clean.
++#
+ sslfiles: $(SSLFILES)
+ 
+ # OpenSSL requires a directory to put all generated certificates in. We don't
+@@ -90,6 +95,18 @@ ssl/client-revoked.crt: ssl/client-revoked.key ssl/client_ca.crt client.config
+ 	openssl x509 -in ssl/temp.crt -out ssl/client-revoked.crt # to keep just the PEM cert
+ 	rm ssl/client-revoked.csr ssl/temp.crt
+ 
++# Convert the key to DER, to test our behaviour there too
++ssl/client-der.key: ssl/client.key
++	openssl rsa -in ssl/client.key -outform DER -out ssl/client-der.key
++
++# Convert the existing key to encrypted PEM (X.509 text) and DER (X.509 ASN.1) formats
++# to test libpq's support for the sslpassword= option.
++ssl/client-encrypted-pem.key: ssl/client.key
++	openssl rsa -in ssl/client.key -outform PEM -aes128 -passout 'pass:dUmmyP^#+' -out ssl/client-encrypted-pem.key
++
++ssl/client-encrypted-der.key: ssl/client.key
++	openssl rsa -in ssl/client.key -outform DER -aes128 -passout 'pass:dUmmyP^#+' -out ssl/client-encrypted-der.key
++
+ # Root certificate files that contains both CA certificates, for testing
+ # that multiple certificates can be used.
+ ssl/both-cas-1.crt: ssl/root_ca.crt ssl/client_ca.crt ssl/server_ca.crt
+@@ -138,6 +155,7 @@ clean distclean maintainer-clean:
+ 	rm -rf tmp_check
+ 	rm -rf ssl/*.old ssl/new_certs_dir ssl/client*_tmp.key
+ 
++# Doesn't depend on $(SSLFILES) because we don't rebuild them by default
+ check:
+ 	$(prove_check)
+ 
+diff --git a/src/test/ssl/ssl/client-der.key b/src/test/ssl/ssl/client-der.key
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9be5f91e9691e7cb1d42aefbda9b139e8f058f3
+GIT binary patch
+literal 1191
+zcmV;Y1X%kpf&`-i0RRGm0RaHCi=Zx{^1wg@za&{0#XynSHOwZt6jqNoL17*s45tB3
+z5P>4$E9CY>l11kxc$X-5Eo>~>1*+7*Z<|<XItC$DUvtmo#&0Zc#Kiw{PO#&52+E^5
+z2?*7aqYWW-g4)JPX03uctTK5|P?-f1!{HVVjZOVoQZZsd<%E_kA3&YIlkUtTgtWIx
+zLnM+`uAz9Br;>v2E3g_DTzt4VurumCx36hA6`MLA`e-1Jd5N!t@)5jBvSu-_Je{On
+ztGGv7%{FJLM22)$G(W8jXzkIKlYbn33ln%!I2&$*iHY>`kx}EjFj3dyGc0#8p^%F|
+zS0icEsxv-Y&LUG9(eq;h0|5X50)hbm4(6*o&JO$m45K~!z=)qPs%^hOzU#-$AVz&2
+zfMlxg_o8za4&jlHCC{+ONGy@XJUH5c#VE{`te{DN{c$vkQP-sQR+?@Yi?`p-d4IPj
+zzV1=eFy!X`!H|WA>TCC8fJK8ciDxG7PBn+SoOR$p^2mhLQ77<ye3aGUlP%6BQ%zvv
+zKr2W*yLP3b_Zs5G_M%LGn{D~16W*`tNU$I#ZlQ*OF9V|W?&2Nk;iO+z_z}&5-?8D-
+zxfLYsZ(c_Cpr=gDRPz&dt^Ts5{3KX?4WZ|gzTvOU@nAs3ag+Y`R?{}tx$PJZGwLWi
+z#B!M|ou(Bg_V@dUNs_NWSfE#t0)c@5=$(n?^Vlwx#+wUaASREARFZ{9*`=L1!|&<j
+zsfEJZvJljhv_G_-ztdxRkT$2B4K{2ynPQe&r<IogT~S<n&^n7GE+LHd7X!L0>5wct
+zA(y)sMB2&$<l(uwZE7cuwI$nnIJ}Z+ge%@{JO9}1Gh;1T{DGbj+7pxax4eWa0)c@5
+z#<B|i6{=I-3Ak(t7c~Q>28m$-xvj@OCr252IK`KmX=6`=Ji|dMv6?xxD_jHSSQNb)
+zZYl)b*>_QVs7c2c=WyosSmqZm0M`merQ$tF9nNY&HrZSJPn#HlCWcsj>I_W)qy#=4
+zlr!O+;o#pDNFOeFs!X@fIV|Z3ccYo90)c@5$(2l=f{w$$G(N<e#M<TL;}4$1=T2yJ
+zSmK^k^t<3=w`y{374&B~bC6?FL$SGvxWI!0qrVmbHQl1%L;i3fG!Uog5V|ghZwz7B
+z5H3o_Ym_V`JRL@sVVz^|*K7G7=*S1{VIjHL3mjoXRE?pO|Lb6{?Ck#NC$w|4X4}oh
+z0)c>YXWR@8c4f)*Sz?}%6(Fu)<B%<ZTvqy7v*|BgBp)94kx&qb&0F7LQj@F?s2w-I
+z_an07Lz0>df=U@4VdJ`$nY8?7ycNM7I>=-yTT*{gNuJw_@d<@(^G0)39r*46Z|#+?
+zt}H3v_m)-}xD&c}u57;x)D3#o*{JOA$z3S|fq({4I>rNHM{oq0iV7-G0}6YoF1yW2
+zMoT#74cjnlM7j_o9B&>vsuvt0@p1oZ<18{6QCQcK-_-V)Rv-$$#K&|J=|0Z#9WrQ|
+zCEzAc!1KjijN&22S-Y62YG_EZUh&_t4zc7xk>U9E_zIG6MB6uWLk44iqWtsIj~cjo
+FZz+*tLQwz!
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/test/ssl/ssl/client-encrypted-der.key b/src/test/ssl/ssl/client-encrypted-der.key
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9be5f91e9691e7cb1d42aefbda9b139e8f058f3
+GIT binary patch
+literal 1191
+zcmV;Y1X%kpf&`-i0RRGm0RaHCi=Zx{^1wg@za&{0#XynSHOwZt6jqNoL17*s45tB3
+z5P>4$E9CY>l11kxc$X-5Eo>~>1*+7*Z<|<XItC$DUvtmo#&0Zc#Kiw{PO#&52+E^5
+z2?*7aqYWW-g4)JPX03uctTK5|P?-f1!{HVVjZOVoQZZsd<%E_kA3&YIlkUtTgtWIx
+zLnM+`uAz9Br;>v2E3g_DTzt4VurumCx36hA6`MLA`e-1Jd5N!t@)5jBvSu-_Je{On
+ztGGv7%{FJLM22)$G(W8jXzkIKlYbn33ln%!I2&$*iHY>`kx}EjFj3dyGc0#8p^%F|
+zS0icEsxv-Y&LUG9(eq;h0|5X50)hbm4(6*o&JO$m45K~!z=)qPs%^hOzU#-$AVz&2
+zfMlxg_o8za4&jlHCC{+ONGy@XJUH5c#VE{`te{DN{c$vkQP-sQR+?@Yi?`p-d4IPj
+zzV1=eFy!X`!H|WA>TCC8fJK8ciDxG7PBn+SoOR$p^2mhLQ77<ye3aGUlP%6BQ%zvv
+zKr2W*yLP3b_Zs5G_M%LGn{D~16W*`tNU$I#ZlQ*OF9V|W?&2Nk;iO+z_z}&5-?8D-
+zxfLYsZ(c_Cpr=gDRPz&dt^Ts5{3KX?4WZ|gzTvOU@nAs3ag+Y`R?{}tx$PJZGwLWi
+z#B!M|ou(Bg_V@dUNs_NWSfE#t0)c@5=$(n?^Vlwx#+wUaASREARFZ{9*`=L1!|&<j
+zsfEJZvJljhv_G_-ztdxRkT$2B4K{2ynPQe&r<IogT~S<n&^n7GE+LHd7X!L0>5wct
+zA(y)sMB2&$<l(uwZE7cuwI$nnIJ}Z+ge%@{JO9}1Gh;1T{DGbj+7pxax4eWa0)c@5
+z#<B|i6{=I-3Ak(t7c~Q>28m$-xvj@OCr252IK`KmX=6`=Ji|dMv6?xxD_jHSSQNb)
+zZYl)b*>_QVs7c2c=WyosSmqZm0M`merQ$tF9nNY&HrZSJPn#HlCWcsj>I_W)qy#=4
+zlr!O+;o#pDNFOeFs!X@fIV|Z3ccYo90)c@5$(2l=f{w$$G(N<e#M<TL;}4$1=T2yJ
+zSmK^k^t<3=w`y{374&B~bC6?FL$SGvxWI!0qrVmbHQl1%L;i3fG!Uog5V|ghZwz7B
+z5H3o_Ym_V`JRL@sVVz^|*K7G7=*S1{VIjHL3mjoXRE?pO|Lb6{?Ck#NC$w|4X4}oh
+z0)c>YXWR@8c4f)*Sz?}%6(Fu)<B%<ZTvqy7v*|BgBp)94kx&qb&0F7LQj@F?s2w-I
+z_an07Lz0>df=U@4VdJ`$nY8?7ycNM7I>=-yTT*{gNuJw_@d<@(^G0)39r*46Z|#+?
+zt}H3v_m)-}xD&c}u57;x)D3#o*{JOA$z3S|fq({4I>rNHM{oq0iV7-G0}6YoF1yW2
+zMoT#74cjnlM7j_o9B&>vsuvt0@p1oZ<18{6QCQcK-_-V)Rv-$$#K&|J=|0Z#9WrQ|
+zCEzAc!1KjijN&22S-Y62YG_EZUh&_t4zc7xk>U9E_zIG6MB6uWLk44iqWtsIj~cjo
+FZz+*tLQwz!
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/test/ssl/ssl/client-encrypted-pem.key b/src/test/ssl/ssl/client-encrypted-pem.key
+new file mode 100644
+index 000000000000..1e7052a5bbb7
+--- /dev/null
++++ b/src/test/ssl/ssl/client-encrypted-pem.key
+@@ -0,0 +1,30 @@
++-----BEGIN RSA PRIVATE KEY-----
++Proc-Type: 4,ENCRYPTED
++DEK-Info: AES-128-CBC,E619306A930B60F360BF805500BA5659
++
++B9aYmIdIoF7hT9tJARMQWE7Ii7g+KDNaF4U0ljBsxgbtMyi9DQrlrFsbUO0Wy6iO
++UY/h57UA1pk7yF+rwkTK0L2t0j/d+HZc3ddsN3cZ040PmX8+8QZJWRUs2ywTLa4O
++JxPm2rUxLSeVa+FY9Nr1Cl6meQ2JS7MA7KBNuriBWNleGGgkbBMaH7zq98aOJmaz
++l02J2wrJ5STP2UI8uEaT/UtAgLInlAljCSg5oe5cj4u9UyUkRN7fj4mexq1r5YNU
++zTu7GrgcAdXrhsAhg9mAJol4frwsQuEiJbVIurAAvCrJk7Gm8xVjKCN1stDOASAY
++aawO1huIdTzjbGXFHBtJ4YuRClXZr5ij6kN+KeQaS+JLjehsAb6762l9wUPP5Bxv
++8c6CCxc+U4ndN0ZQPsx0UrJ/AYO1s12mebuKZvIdNoYdLIqJLfX/HSrzaXw6XA8b
++gAvVOruKGq12v71OrIdahxSzRs7s6GODGynSayFprn3CK+GZJumwQ0EK+fBzrzB1
++8JTp98qwMYfSuDmGl8VbT9k8OZFZbDD4k5wj8fHx5R4zkdgfNqBNAKXPrwm5uRT8
+++0mnYdP3ZnihnZnAoZvGXOE77TcZ/N9fLvwkBpwPmtftbn10HwlwXQgmn1ijMj60
++ZOYo1fvKJMmvCr+NUtyJALIvUdLQmjWx0PoZetIb24KBkTkr2ciU1d1RDEwOfffZ
++jwTfcJU/AXnxPBR6MBT9a+YkaMiOU0JF7vs/x0hG/o8GsXQJB/G7Vzakg0hxQ1WF
++KU0jInXPf2uCiBMEwuWRPHh25wspLjsHgt5pD55vE/M9Q7LFOez/9/RQqmmjDjZH
++sLJtdAjN57aaIhtzbYIYa7K7Eu5v0NrZ5++wP3h82aTy9PIlSmRGY8WiZSDDir0P
++w+PBP7JN/3ifqXURUmSDGbfdArbyuuF79Say6N9ijFeBAZrCgauw3jBs1dhusGJ/
++T6wh8mjdGf8SRm9SQdGuIyK7M657z3P0WRlpHN4beeGpzgGVexqjiyvtwQNH8kps
++3EDNwTe3HJMWf7G2FNjqtM0h3fnaB7d+prfzZIL5Y1Somgfiljp7zG/FfkYEybK6
++8OvW6O8byCSqJzugUa5HCv//iPYFrcALAXtva4KXtfauGhKmWpn3Wa5AW9/034H6
++QW/A8mcKSMKhGixZj5MZKGTMA9cRus3IRTAYnhCd5njJ1N/o67wwTGVuXVu6ExrM
++wY/WjkRrDlRopqo0U3wodHjfZ8/837rINwmcqzXTxasu+ApWUVZFuuQh/q3i8aTv
++BzFVOfLylxpIsoQHBQvNdM/u0HGXbw7wyjs6n+LCjeGwRuxKkoYlKf5cItNLDNvF
++6LYwA44BJ3/XfUSVZRD8PAVp5haUgpesPym1G5QdvYN4rWE6lsAtGSZDatWvaCsI
++S0qTwLFbw9BvclwkvJicvLwAmKiGMDyAwGNCPLnG7nZ48to4dXD93LmgC/mnENbp
++7EgW7fUtMvz0Lt2Xcd26ZTlJdOkT3sdKPSDxhgqsQoI4dQSmB4Fz40HsFvFtTCuF
++FXMFXjSkjiKrdfI+CQ1tJGXKpYAod8PcZ89vN3TjxehwhK6GxS0CiOJ+phh6q22i
++-----END RSA PRIVATE KEY-----
+diff --git a/src/test/ssl/t/001_ssltests.pl b/src/test/ssl/t/001_ssltests.pl
+index 67a3a28db6a1..93e2b7947a6f 100644
+--- a/src/test/ssl/t/001_ssltests.pl
++++ b/src/test/ssl/t/001_ssltests.pl
+@@ -13,7 +13,7 @@
+ 
+ if ($ENV{with_openssl} eq 'yes')
+ {
+-	plan tests => 75;
++	plan tests => 84;
+ }
+ else
+ {
+@@ -32,10 +32,17 @@
+ 
+ # The client's private key must not be world-readable, so take a copy
+ # of the key stored in the code tree and update its permissions.
+-copy("ssl/client.key", "ssl/client_tmp.key");
+-chmod 0600, "ssl/client_tmp.key";
+-copy("ssl/client-revoked.key", "ssl/client-revoked_tmp.key");
+-chmod 0600, "ssl/client-revoked_tmp.key";
++#
++# This changes ssl/client.key to ssl/client_tmp.key etc for the rest
++# of the tests.
++my @keys = ("client", "client-revoked", "client-der", "client-encrypted-pem", "client-encrypted-der");
++foreach my $key (@keys)
++{
++    copy("ssl/${key}.key", "ssl/${key}_tmp.key")
++        or die "couldn't copy ssl/${key}.key to ssl/${key}_tmp.key for permissions change: $!";
++    chmod 0600, "ssl/${key}_tmp.key"
++        or die "failed to change permissions on ssl/${key}_tmp.key: $!";
++}
+ 
+ # Also make a copy of that explicitly world-readable.  We can't
+ # necessarily rely on the file in the source tree having those
+@@ -344,11 +351,59 @@
+ 	qr/connection requires a valid client certificate/,
+ 	"certificate authorization fails without client cert");
+ 
+-# correct client cert
++# correct client cert in unencrypted PEM
+ test_connect_ok(
+ 	$common_connstr,
+ 	"user=ssltestuser sslcert=ssl/client.crt sslkey=ssl/client_tmp.key",
+-	"certificate authorization succeeds with correct client cert");
++	"certificate authorization succeeds with correct client cert in PEM format");
++
++# correct client cert in unencrypted DER
++test_connect_ok(
++	$common_connstr,
++	"user=ssltestuser sslcert=ssl/client.crt sslkey=ssl/client-der_tmp.key",
++	"certificate authorization succeeds with correct client cert in DER format");
++
++# correct client cert in encrypted PEM
++test_connect_ok(
++	$common_connstr,
++	"user=ssltestuser sslcert=ssl/client.crt sslkey=ssl/client-encrypted-pem_tmp.key sslpassword='dUmmyP^#+'",
++	"certificate authorization succeeds with correct client cert in encrypted PEM format");
++
++# correct client cert in encrypted DER
++test_connect_ok(
++	$common_connstr,
++	"user=ssltestuser sslcert=ssl/client.crt sslkey=ssl/client-encrypted-der_tmp.key sslpassword='dUmmyP^#+'",
++	"certificate authorization succeeds with correct client cert in encrypted DER format");
++
++# correct client cert in encrypted PEM with wrong password
++test_connect_fails(
++	$common_connstr,
++	"user=ssltestuser sslcert=ssl/client.crt sslkey=ssl/client-encrypted-pem_tmp.key sslpassword='wrong'",
++	qr!\Qprivate key file "ssl/client-encrypted-pem_tmp.key": bad decrypt\E!,
++	"certificate authorization fails with correct client cert and wrong password in encrypted PEM format");
++
++TODO:
++{
++	# these tests are left here waiting on us to get better pty support
++	# so they don't hang. For now they are not performed.
++
++	todo_skip "Need Pty support", 4;
++
++	# correct client cert in encrypted PEM with empty password
++	test_connect_fails(
++		$common_connstr,
++		"user=ssltestuser sslcert=ssl/client.crt sslkey=ssl/client-encrypted-pem_tmp.key sslpassword=''",
++		qr!\Qprivate key file "ssl/client-encrypted-pem_tmp.key": processing error\E!,
++		"certificate authorization fails with correct client cert and empty password in encrypted PEM format");
++
++	# correct client cert in encrypted PEM with no password
++	test_connect_fails(
++		$common_connstr,
++		"user=ssltestuser sslcert=ssl/client.crt sslkey=ssl/client-encrypted-pem_tmp.key",
++		qr!\Qprivate key file "ssl/client-encrypted-pem_tmp.key": processing error\E!,
++		"certificate authorization fails with correct client cert and no password in encrypted PEM format");
++
++}
+ 
+ # pg_stat_ssl
+ command_like(
+@@ -436,5 +491,7 @@
+ 	qr/SSL error/, "intermediate client certificate is missing");
+ 
+ # clean up
+-unlink("ssl/client_tmp.key", "ssl/client_wrongperms_tmp.key",
+-	"ssl/client-revoked_tmp.key");
++foreach my $key (@keys)
++{
++    unlink("ssl/${key}_tmp.key");
++}

@@ -1,0 +1,172 @@
+From 4c689a69eef639caa881539ee546ff1a5b11f98f Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 2 Dec 2022 15:20:30 -0500
+Subject: [PATCH] Remove gen_node_support.pl's special treatment of
+ EquivalenceClasses.
+
+It seems better to deal with this by explicit annotations on the
+fields in question, instead of magic knowledge embedded in the
+script.  While that creates a risk-of-omission from failing to
+annotate fields, the preceding commit should catch any such
+oversights.
+
+Discussion: https://postgr.es/m/263413.1669513145@sss.pgh.pa.us
+---
+ src/backend/nodes/gen_node_support.pl | 40 ++++++++++++++++++++++-----
+ src/include/nodes/nodes.h             |  6 ++++
+ src/include/nodes/pathnodes.h         | 17 +++++++-----
+ 3 files changed, 49 insertions(+), 14 deletions(-)
+
+diff --git a/src/backend/nodes/gen_node_support.pl b/src/backend/nodes/gen_node_support.pl
+index 705b01bea315..7212bc486f3d 100644
+--- a/src/backend/nodes/gen_node_support.pl
++++ b/src/backend/nodes/gen_node_support.pl
+@@ -171,9 +171,6 @@ sub elem
+ # Track node types with manually assigned NodeTag numbers.
+ my %manual_nodetag_number;
+ 
+-# EquivalenceClasses are never moved, so just shallow-copy the pointer
+-push @scalar_types, qw(EquivalenceClass* EquivalenceMember*);
+-
+ # This is a struct, so we can copy it by assignment.  Equal support is
+ # currently not required.
+ push @scalar_types, qw(QualCost);
+@@ -454,9 +451,14 @@ sub elem
+ 								&& $attr !~ /^copy_as\(\w+\)$/
+ 								&& $attr !~ /^read_as\(\w+\)$/
+ 								&& !elem $attr,
+-								qw(equal_ignore equal_ignore_if_zero read_write_ignore
+-								write_only_relids write_only_nondefault_pathtarget write_only_req_outer)
+-							  )
++								qw(copy_as_scalar
++								equal_as_scalar
++								equal_ignore
++								equal_ignore_if_zero
++								read_write_ignore
++								write_only_relids
++								write_only_nondefault_pathtarget
++								write_only_req_outer))
+ 							{
+ 								die
+ 								  "$infile:$lineno: unrecognized attribute \"$attr\"\n";
+@@ -691,6 +693,8 @@ sub elem
+ 		# extract per-field attributes
+ 		my $array_size_field;
+ 		my $copy_as_field;
++		my $copy_as_scalar  = 0;
++		my $equal_as_scalar = 0;
+ 		foreach my $a (@a)
+ 		{
+ 			if ($a =~ /^array_size\(([\w.]+)\)$/)
+@@ -705,19 +709,41 @@ sub elem
+ 			{
+ 				$copy_as_field = $1;
+ 			}
++			elsif ($a eq 'copy_as_scalar')
++			{
++				$copy_as_scalar = 1;
++			}
++			elsif ($a eq 'equal_as_scalar')
++			{
++				$equal_as_scalar = 1;
++			}
+ 			elsif ($a eq 'equal_ignore')
+ 			{
+ 				$equal_ignore = 1;
+ 			}
+ 		}
+ 
+-		# override type-specific copy method if copy_as is specified
++		# override type-specific copy method if requested
+ 		if (defined $copy_as_field)
+ 		{
+ 			print $cff "\tnewnode->$f = $copy_as_field;\n"
+ 			  unless $copy_ignore;
+ 			$copy_ignore = 1;
+ 		}
++		elsif ($copy_as_scalar)
++		{
++			print $cff "\tCOPY_SCALAR_FIELD($f);\n"
++			  unless $copy_ignore;
++			$copy_ignore = 1;
++		}
++
++		# override type-specific equal method if requested
++		if ($equal_as_scalar)
++		{
++			print $eff "\tCOMPARE_SCALAR_FIELD($f);\n"
++			  unless $equal_ignore;
++			$equal_ignore = 1;
++		}
+ 
+ 		# select instructions by field type
+ 		if ($t eq 'char*')
+diff --git a/src/include/nodes/nodes.h b/src/include/nodes/nodes.h
+index a80f43e540a4..1f3390294747 100644
+--- a/src/include/nodes/nodes.h
++++ b/src/include/nodes/nodes.h
+@@ -86,6 +86,12 @@ typedef enum NodeTag
+  *
+  * - copy_as(VALUE): In copyObject(), replace the field's value with VALUE.
+  *
++ * - copy_as_scalar: In copyObject(), copy the field as a scalar value
++ *   (e.g. a pointer) even if it is a node-type pointer.
++ *
++ * - equal_as_scalar: In equal(), compare the field as a scalar value
++ *   even if it is a node-type pointer.
++ *
+  * - equal_ignore: Ignore the field for equality.
+  *
+  * - equal_ignore_if_zero: Ignore the field for equality if it is zero.
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index dd4eb8679df0..dbaa9bb54dc0 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -1279,7 +1279,9 @@ typedef struct StatisticExtInfo
+  *
+  * NB: EquivalenceClasses are never copied after creation.  Therefore,
+  * copyObject() copies pointers to them as pointers, and equal() compares
+- * pointers to EquivalenceClasses via pointer equality.
++ * pointers to EquivalenceClasses via pointer equality.  This is implemented
++ * by putting copy_as_scalar and equal_as_scalar attributes on fields that
++ * are pointers to EquivalenceClasses.  The same goes for EquivalenceMembers.
+  */
+ typedef struct EquivalenceClass
+ {
+@@ -1370,7 +1372,8 @@ typedef struct PathKey
+ 
+ 	NodeTag		type;
+ 
+-	EquivalenceClass *pk_eclass;	/* the value that is ordered */
++	/* the value that is ordered */
++	EquivalenceClass *pk_eclass pg_node_attr(copy_as_scalar, equal_as_scalar);
+ 	Oid			pk_opfamily;	/* btree opfamily defining the ordering */
+ 	int			pk_strategy;	/* sort direction (ASC or DESC) */
+ 	bool		pk_nulls_first; /* do NULLs come before normal values? */
+@@ -2478,7 +2481,7 @@ typedef struct RestrictInfo
+ 	 * Generating EquivalenceClass.  This field is NULL unless clause is
+ 	 * potentially redundant.
+ 	 */
+-	EquivalenceClass *parent_ec pg_node_attr(equal_ignore, read_write_ignore);
++	EquivalenceClass *parent_ec pg_node_attr(copy_as_scalar, equal_ignore, read_write_ignore);
+ 
+ 	/*
+ 	 * cache space for cost and selectivity
+@@ -2506,13 +2509,13 @@ typedef struct RestrictInfo
+ 	 */
+ 
+ 	/* EquivalenceClass containing lefthand */
+-	EquivalenceClass *left_ec pg_node_attr(equal_ignore, read_write_ignore);
++	EquivalenceClass *left_ec pg_node_attr(copy_as_scalar, equal_ignore, read_write_ignore);
+ 	/* EquivalenceClass containing righthand */
+-	EquivalenceClass *right_ec pg_node_attr(equal_ignore, read_write_ignore);
++	EquivalenceClass *right_ec pg_node_attr(copy_as_scalar, equal_ignore, read_write_ignore);
+ 	/* EquivalenceMember for lefthand */
+-	EquivalenceMember *left_em pg_node_attr(equal_ignore);
++	EquivalenceMember *left_em pg_node_attr(copy_as_scalar, equal_ignore);
+ 	/* EquivalenceMember for righthand */
+-	EquivalenceMember *right_em pg_node_attr(equal_ignore);
++	EquivalenceMember *right_em pg_node_attr(copy_as_scalar, equal_ignore);
+ 
+ 	/*
+ 	 * List of MergeScanSelCache structs.  Those aren't Nodes, so hard to

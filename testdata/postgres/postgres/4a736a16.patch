@@ -1,0 +1,99 @@
+From 4a736a161c306fcfed970e6b649f2f03f465ac24 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Sat, 16 Apr 2022 12:13:31 -0700
+Subject: [PATCH] pgstat: Use correct lock level in pgstat_drop_all_entries().
+
+Previously we didn't, which lead to an assertion failure when resetting
+partially loaded statistics. This was encountered on the buildfarm, for
+as-of-yet unknown reasons.
+
+Ttighten up a validity check when reading the stats file, verifying 'E'
+signals the end of the file (rather than just stopping reading). That's then
+used in a test appending to the stats file that crashed before the fix in
+pgstat_drop_all_entries().
+
+Reported by buildfarm animals mylodon and kestrel, via Tom Lane.
+
+Discussion: https://postgr.es/m/1656446.1650043715@sss.pgh.pa.us
+---
+ src/backend/utils/activity/pgstat.c       |  4 +++
+ src/backend/utils/activity/pgstat_shmem.c |  2 +-
+ src/test/recovery/t/029_stats_restart.pl  | 30 +++++++++++++++++++++--
+ 3 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/utils/activity/pgstat.c b/src/backend/utils/activity/pgstat.c
+index f658f8f19897..3c3fd0e9b7fc 100644
+--- a/src/backend/utils/activity/pgstat.c
++++ b/src/backend/utils/activity/pgstat.c
+@@ -1583,6 +1583,10 @@ pgstat_read_statsfile(void)
+ 					break;
+ 				}
+ 			case 'E':
++				/* check that 'E' actually signals end of file */
++				if (fgetc(fpin) != EOF)
++					goto error;
++
+ 				goto done;
+ 
+ 			default:
+diff --git a/src/backend/utils/activity/pgstat_shmem.c b/src/backend/utils/activity/pgstat_shmem.c
+index 68ff6f51fcfa..89060ef29a01 100644
+--- a/src/backend/utils/activity/pgstat_shmem.c
++++ b/src/backend/utils/activity/pgstat_shmem.c
+@@ -878,7 +878,7 @@ pgstat_drop_all_entries(void)
+ 	PgStatShared_HashEntry *ps;
+ 	uint64		not_freed_count = 0;
+ 
+-	dshash_seq_init(&hstat, pgStatLocal.shared_hash, false);
++	dshash_seq_init(&hstat, pgStatLocal.shared_hash, true);
+ 	while ((ps = dshash_seq_next(&hstat)) != NULL)
+ 	{
+ 		if (ps->dropped)
+diff --git a/src/test/recovery/t/029_stats_restart.pl b/src/test/recovery/t/029_stats_restart.pl
+index e0478f8af8d4..2fe8db88079e 100644
+--- a/src/test/recovery/t/029_stats_restart.pl
++++ b/src/test/recovery/t/029_stats_restart.pl
+@@ -113,7 +113,23 @@
+ $node->start;
+ 
+ # no stats present due to invalid stats file
+-$sect = "invalid";
++$sect = "invalid_overwrite";
++is(have_stats('database', $dboid, 0), 'f', "$sect: db stats do not exist");
++is(have_stats('function', $dboid, $funcoid),
++	'f', "$sect: function stats do not exist");
++is(have_stats('relation', $dboid, $tableoid),
++	'f', "$sect: relation stats do not exist");
++
++
++## check invalid stats file starting with valid contents, but followed by
++## invalid content is handled.
++
++trigger_funcrel_stat();
++$node->stop;
++append_file($og_stats, "XYZ");
++$node->start;
++
++$sect = "invalid_append";
+ is(have_stats('database', $dboid, 0), 'f', "$sect: db stats do not exist");
+ is(have_stats('function', $dboid, $funcoid),
+ 	'f', "$sect: function stats do not exist");
+@@ -285,7 +301,17 @@ sub overwrite_file
+ {
+ 	my ($filename, $str) = @_;
+ 	open my $fh, ">", $filename
+-	  or die "could not write \"$filename\": $!";
++	  or die "could not overwrite \"$filename\": $!";
++	print $fh $str;
++	close $fh;
++	return;
++}
++
++sub append_file
++{
++	my ($filename, $str) = @_;
++	open my $fh, ">>", $filename
++	  or die "could not append to \"$filename\": $!";
+ 	print $fh $str;
+ 	close $fh;
+ 	return;

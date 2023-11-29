@@ -1,0 +1,148 @@
+From 4f5d461e048b9c56fe2fa8c7faf7010eed05ba82 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Sat, 11 Mar 2023 14:12:51 -0800
+Subject: [PATCH] amcheck: Fix FullTransactionIdFromXidAndCtx() for xids before
+ epoch 0
+
+64bit xids can't represent xids before epoch 0 (see also be504a3e974). When
+FullTransactionIdFromXidAndCtx() was passed such an xid, it'd create a 64bit
+xid far into the future. Noticed while adding assertions in the course of
+investigating be504a3e974, as amcheck's test create such xids.
+
+To fix the issue, just return FirstNormalFullTransactionId in this case. A
+freshly initdb'd cluster already has a newer horizon. The most minimal version
+of this would make the messages for some detected corruptions differently
+inaccurate. To make those cases accurate, switch
+FullTransactionIdFromXidAndCtx() to use the 32bit modulo difference between
+xid and nextxid to compute the 64bit xid, yielding sensible "in the future" /
+"in the past" answers.
+
+Reviewed-by: Mark Dilger <mark.dilger@enterprisedb.com>
+Discussion: https://postgr.es/m/20230108002923.cyoser3ttmt63bfn@awork3.anarazel.de
+Backpatch: 14-, where heapam verification was introduced
+---
+ contrib/amcheck/verify_heapam.c           | 33 +++++++++++++++++++----
+ src/bin/pg_amcheck/t/004_verify_heapam.pl | 28 +++++++++++++------
+ 2 files changed, 48 insertions(+), 13 deletions(-)
+
+diff --git a/contrib/amcheck/verify_heapam.c b/contrib/amcheck/verify_heapam.c
+index 33c5b3389596..94ddccd23a80 100644
+--- a/contrib/amcheck/verify_heapam.c
++++ b/contrib/amcheck/verify_heapam.c
+@@ -1574,17 +1574,40 @@ check_tuple(HeapCheckContext *ctx)
+ static FullTransactionId
+ FullTransactionIdFromXidAndCtx(TransactionId xid, const HeapCheckContext *ctx)
+ {
+-	uint32		epoch;
++	uint64		nextfxid_i;
++	int32		diff;
++	FullTransactionId fxid;
+ 
+ 	Assert(TransactionIdIsNormal(ctx->next_xid));
+ 	Assert(FullTransactionIdIsNormal(ctx->next_fxid));
++	Assert(XidFromFullTransactionId(ctx->next_fxid) == ctx->next_xid);
+ 
+ 	if (!TransactionIdIsNormal(xid))
+ 		return FullTransactionIdFromEpochAndXid(0, xid);
+-	epoch = EpochFromFullTransactionId(ctx->next_fxid);
+-	if (xid > ctx->next_xid)
+-		epoch--;
+-	return FullTransactionIdFromEpochAndXid(epoch, xid);
++
++	nextfxid_i = U64FromFullTransactionId(ctx->next_fxid);
++
++	/* compute the 32bit modulo difference */
++	diff = (int32) (ctx->next_xid - xid);
++
++	/*
++	 * In cases of corruption we might see a 32bit xid that is before epoch
++	 * 0. We can't represent that as a 64bit xid, due to 64bit xids being
++	 * unsigned integers, without the modulo arithmetic of 32bit xid. There's
++	 * no really nice way to deal with that, but it works ok enough to use
++	 * FirstNormalFullTransactionId in that case, as a freshly initdb'd
++	 * cluster already has a newer horizon.
++	 */
++	if (diff > 0 && (nextfxid_i - FirstNormalTransactionId) < (int64) diff)
++	{
++		Assert(EpochFromFullTransactionId(ctx->next_fxid) == 0);
++		fxid = FirstNormalFullTransactionId;
++	}
++	else
++		fxid = FullTransactionIdFromU64(nextfxid_i - diff);
++
++	Assert(FullTransactionIdIsNormal(fxid));
++	return fxid;
+ }
+ 
+ /*
+diff --git a/src/bin/pg_amcheck/t/004_verify_heapam.pl b/src/bin/pg_amcheck/t/004_verify_heapam.pl
+index 215c30eaa8ea..9984d0d9f87e 100644
+--- a/src/bin/pg_amcheck/t/004_verify_heapam.pl
++++ b/src/bin/pg_amcheck/t/004_verify_heapam.pl
+@@ -217,7 +217,7 @@ sub write_tuple
+ my $relpath = "$pgdata/$rel";
+ 
+ # Insert data and freeze public.test
+-use constant ROWCOUNT => 16;
++use constant ROWCOUNT => 17;
+ $node->safe_psql(
+ 	'postgres', qq(
+ 	INSERT INTO public.test (a, b, c)
+@@ -378,23 +378,24 @@ sub header
+ 	elsif ($offnum == 3)
+ 	{
+ 		# Corruptly set xmin < datfrozenxid, further back, noting circularity
+-		# of xid comparison.  For a new cluster with epoch = 0, the corrupt
+-		# xmin will be interpreted as in the future
+-		$tup->{t_xmin} = 4026531839;
++		# of xid comparison.
++		my $xmin = 4026531839;
++		$tup->{t_xmin} = $xmin;
+ 		$tup->{t_infomask} &= ~HEAP_XMIN_COMMITTED;
+ 		$tup->{t_infomask} &= ~HEAP_XMIN_INVALID;
+ 
+ 		push @expected,
+-		  qr/${$header}xmin 4026531839 equals or exceeds next valid transaction ID 0:\d+/;
++		  qr/${$header}xmin ${xmin} precedes oldest valid transaction ID 0:\d+/;
+ 	}
+ 	elsif ($offnum == 4)
+ 	{
+ 		# Corruptly set xmax < relminmxid;
+-		$tup->{t_xmax} = 4026531839;
++		my $xmax = 4026531839;
++		$tup->{t_xmax} = $xmax;
+ 		$tup->{t_infomask} &= ~HEAP_XMAX_INVALID;
+ 
+ 		push @expected,
+-		  qr/${$header}xmax 4026531839 equals or exceeds next valid transaction ID 0:\d+/;
++		  qr/${$header}xmax ${xmax} precedes oldest valid transaction ID 0:\d+/;
+ 	}
+ 	elsif ($offnum == 5)
+ 	{
+@@ -502,7 +503,7 @@ sub header
+ 		push @expected,
+ 		  qr/${header}multitransaction ID 4 equals or exceeds next valid multitransaction ID 1/;
+ 	}
+-	elsif ($offnum == 15)    # Last offnum must equal ROWCOUNT
++	elsif ($offnum == 15)
+ 	{
+ 		# Set both HEAP_XMAX_COMMITTED and HEAP_XMAX_IS_MULTI
+ 		$tup->{t_infomask} |= HEAP_XMAX_COMMITTED;
+@@ -512,6 +513,17 @@ sub header
+ 		push @expected,
+ 		  qr/${header}multitransaction ID 4000000000 precedes relation minimum multitransaction ID threshold 1/;
+ 	}
++	elsif ($offnum == 16)    # Last offnum must equal ROWCOUNT
++	{
++		# Corruptly set xmin > next_xid to be in the future.
++		my $xmin = 123456;
++		$tup->{t_xmin} = $xmin;
++		$tup->{t_infomask} &= ~HEAP_XMIN_COMMITTED;
++		$tup->{t_infomask} &= ~HEAP_XMIN_INVALID;
++
++		push @expected,
++          qr/${$header}xmin ${xmin} equals or exceeds next valid transaction ID 0:\d+/;
++	}
+ 	write_tuple($file, $offset, $tup);
+ }
+ close($file)

@@ -1,0 +1,107 @@
+From 4c032dd8046b145a25032643f536aab83deb19e3 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 6 Jan 2023 15:35:31 -0500
+Subject: [PATCH] Check for two_phase change at end of
+ process_syncing_tables_for_apply.
+
+Previously this function checked to see if we were ready to switch
+to two_phase mode at its start, but that's silly: we should check
+at the end, after we've done the work that might make us ready.
+This simple change removes one sleep cycle from the time needed to
+switch to two_phase mode.  In the real world that might not be
+worth much, but it shaves a few seconds off the runtime for the
+subscription test suite.
+
+Nathan Bossart
+
+Discussion: https://postgr.es/m/20221122004119.GA132961@nathanxps13
+---
+ src/backend/replication/logical/tablesync.c | 51 ++++++++++++---------
+ 1 file changed, 29 insertions(+), 22 deletions(-)
+
+diff --git a/src/backend/replication/logical/tablesync.c b/src/backend/replication/logical/tablesync.c
+index 2fdfeb5b4c9d..09b3e8b32ac5 100644
+--- a/src/backend/replication/logical/tablesync.c
++++ b/src/backend/replication/logical/tablesync.c
+@@ -415,6 +415,7 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
+ 	static HTAB *last_start_times = NULL;
+ 	ListCell   *lc;
+ 	bool		started_tx = false;
++	bool		should_exit = false;
+ 
+ 	Assert(!IsTransactionState());
+ 
+@@ -446,28 +447,6 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
+ 		last_start_times = NULL;
+ 	}
+ 
+-	/*
+-	 * Even when the two_phase mode is requested by the user, it remains as
+-	 * 'pending' until all tablesyncs have reached READY state.
+-	 *
+-	 * When this happens, we restart the apply worker and (if the conditions
+-	 * are still ok) then the two_phase tri-state will become 'enabled' at
+-	 * that time.
+-	 *
+-	 * Note: If the subscription has no tables then leave the state as
+-	 * PENDING, which allows ALTER SUBSCRIPTION ... REFRESH PUBLICATION to
+-	 * work.
+-	 */
+-	if (MySubscription->twophasestate == LOGICALREP_TWOPHASE_STATE_PENDING &&
+-		AllTablesyncsReady())
+-	{
+-		ereport(LOG,
+-				(errmsg("logical replication apply worker for subscription \"%s\" will restart so that two_phase can be enabled",
+-						MySubscription->name)));
+-
+-		proc_exit(0);
+-	}
+-
+ 	/*
+ 	 * Process all tables that are being synchronized.
+ 	 */
+@@ -619,9 +598,36 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
+ 
+ 	if (started_tx)
+ 	{
++		/*
++		 * Even when the two_phase mode is requested by the user, it remains
++		 * as 'pending' until all tablesyncs have reached READY state.
++		 *
++		 * When this happens, we restart the apply worker and (if the
++		 * conditions are still ok) then the two_phase tri-state will become
++		 * 'enabled' at that time.
++		 *
++		 * Note: If the subscription has no tables then leave the state as
++		 * PENDING, which allows ALTER SUBSCRIPTION ... REFRESH PUBLICATION to
++		 * work.
++		 */
++		if (MySubscription->twophasestate == LOGICALREP_TWOPHASE_STATE_PENDING)
++		{
++			CommandCounterIncrement();	/* make updates visible */
++			if (AllTablesyncsReady())
++			{
++				ereport(LOG,
++						(errmsg("logical replication apply worker for subscription \"%s\" will restart so that two_phase can be enabled",
++								MySubscription->name)));
++				should_exit = true;
++			}
++		}
++
+ 		CommitTransactionCommand();
+ 		pgstat_report_stat(true);
+ 	}
++
++	if (should_exit)
++		proc_exit(0);
+ }
+ 
+ /*
+@@ -802,6 +808,7 @@ fetch_remote_table_info(char *nspname, char *relname,
+ 		TupleTableSlot *tslot;
+ 		Oid			attrsRow[] = {INT2VECTOROID};
+ 		StringInfoData pub_names;
++
+ 		initStringInfo(&pub_names);
+ 		foreach(lc, MySubscription->publications)
+ 		{

@@ -1,0 +1,211 @@
+From 4e9fc3a9762065a442b829d759dc61d9a3265e81 Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Thu, 28 Sep 2023 10:36:34 -0400
+Subject: [PATCH] Return data from heap_page_prune via a struct.
+
+Previously, one of the values in the struct was returned as the return
+value, and another was returned via an output parameter. In
+preparation for returning more stuff, consolidate both values into a
+struct returned via an output parameter.
+
+Melanie Plageman, reviewed by Andres Freund and by me.
+
+Discussion: https://postgr.es/m/CAAKRu_br124qsGJieuYA0nGjywEukhK1dKBfRdby_4yY3E9SXA%40mail.gmail.com
+---
+ src/backend/access/heap/pruneheap.c  | 33 +++++++++++++---------------
+ src/backend/access/heap/vacuumlazy.c | 17 +++++---------
+ src/include/access/heapam.h          | 13 +++++++++--
+ src/tools/pgindent/typedefs.list     |  1 +
+ 4 files changed, 33 insertions(+), 31 deletions(-)
+
+diff --git a/src/backend/access/heap/pruneheap.c b/src/backend/access/heap/pruneheap.c
+index 18193efa238c..d5892a2db46b 100644
+--- a/src/backend/access/heap/pruneheap.c
++++ b/src/backend/access/heap/pruneheap.c
+@@ -155,15 +155,13 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
+ 		 */
+ 		if (PageIsFull(page) || PageGetHeapFreeSpace(page) < minfree)
+ 		{
+-			int			ndeleted,
+-						nnewlpdead;
++			PruneResult presult;
+ 
+-			ndeleted = heap_page_prune(relation, buffer, vistest,
+-									   &nnewlpdead, NULL);
++			heap_page_prune(relation, buffer, vistest, &presult, NULL);
+ 
+ 			/*
+ 			 * Report the number of tuples reclaimed to pgstats.  This is
+-			 * ndeleted minus the number of newly-LP_DEAD-set items.
++			 * presult.ndeleted minus the number of newly-LP_DEAD-set items.
+ 			 *
+ 			 * We derive the number of dead tuples like this to avoid totally
+ 			 * forgetting about items that were set to LP_DEAD, since they
+@@ -175,9 +173,9 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
+ 			 * tracks ndeleted, since it will set the same LP_DEAD items to
+ 			 * LP_UNUSED separately.
+ 			 */
+-			if (ndeleted > nnewlpdead)
++			if (presult.ndeleted > presult.nnewlpdead)
+ 				pgstat_update_heap_dead_tuples(relation,
+-											   ndeleted - nnewlpdead);
++											   presult.ndeleted - presult.nnewlpdead);
+ 		}
+ 
+ 		/* And release buffer lock */
+@@ -204,21 +202,19 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
+  * (see heap_prune_satisfies_vacuum and
+  * HeapTupleSatisfiesVacuum).
+  *
+- * Sets *nnewlpdead for caller, indicating the number of items that were
+- * newly set LP_DEAD during prune operation.
+- *
+  * off_loc is the offset location required by the caller to use in error
+  * callback.
+  *
+- * Returns the number of tuples deleted from the page during this call.
++ * presult contains output parameters needed by callers such as the number of
++ * tuples removed and the number of line pointers newly marked LP_DEAD.
++ * heap_page_prune() is responsible for initializing it.
+  */
+-int
++void
+ heap_page_prune(Relation relation, Buffer buffer,
+ 				GlobalVisState *vistest,
+-				int *nnewlpdead,
++				PruneResult *presult,
+ 				OffsetNumber *off_loc)
+ {
+-	int			ndeleted = 0;
+ 	Page		page = BufferGetPage(buffer);
+ 	BlockNumber blockno = BufferGetBlockNumber(buffer);
+ 	OffsetNumber offnum,
+@@ -244,6 +240,9 @@ heap_page_prune(Relation relation, Buffer buffer,
+ 	prstate.nredirected = prstate.ndead = prstate.nunused = 0;
+ 	memset(prstate.marked, 0, sizeof(prstate.marked));
+ 
++	presult->ndeleted = 0;
++	presult->nnewlpdead = 0;
++
+ 	maxoff = PageGetMaxOffsetNumber(page);
+ 	tup.t_tableOid = RelationGetRelid(prstate.rel);
+ 
+@@ -318,7 +317,7 @@ heap_page_prune(Relation relation, Buffer buffer,
+ 			continue;
+ 
+ 		/* Process this item or chain of items */
+-		ndeleted += heap_prune_chain(buffer, offnum, &prstate);
++		presult->ndeleted += heap_prune_chain(buffer, offnum, &prstate);
+ 	}
+ 
+ 	/* Clear the offset information once we have processed the given page. */
+@@ -419,9 +418,7 @@ heap_page_prune(Relation relation, Buffer buffer,
+ 	END_CRIT_SECTION();
+ 
+ 	/* Record number of newly-set-LP_DEAD items for caller */
+-	*nnewlpdead = prstate.ndead;
+-
+-	return ndeleted;
++	presult->nnewlpdead = prstate.ndead;
+ }
+ 
+ 
+diff --git a/src/backend/access/heap/vacuumlazy.c b/src/backend/access/heap/vacuumlazy.c
+index b3c24d68f026..fa77ef7f4ad8 100644
+--- a/src/backend/access/heap/vacuumlazy.c
++++ b/src/backend/access/heap/vacuumlazy.c
+@@ -1544,12 +1544,11 @@ lazy_scan_prune(LVRelState *vacrel,
+ 	ItemId		itemid;
+ 	HeapTupleData tuple;
+ 	HTSV_Result res;
+-	int			tuples_deleted,
+-				tuples_frozen,
++	PruneResult presult;
++	int			tuples_frozen,
+ 				lpdead_items,
+ 				live_tuples,
+ 				recently_dead_tuples;
+-	int			nnewlpdead;
+ 	HeapPageFreeze pagefrz;
+ 	int64		fpi_before = pgWalUsage.wal_fpi;
+ 	OffsetNumber deadoffsets[MaxHeapTuplesPerPage];
+@@ -1572,7 +1571,6 @@ lazy_scan_prune(LVRelState *vacrel,
+ 	pagefrz.FreezePageRelminMxid = vacrel->NewRelminMxid;
+ 	pagefrz.NoFreezePageRelfrozenXid = vacrel->NewRelfrozenXid;
+ 	pagefrz.NoFreezePageRelminMxid = vacrel->NewRelminMxid;
+-	tuples_deleted = 0;
+ 	tuples_frozen = 0;
+ 	lpdead_items = 0;
+ 	live_tuples = 0;
+@@ -1581,15 +1579,12 @@ lazy_scan_prune(LVRelState *vacrel,
+ 	/*
+ 	 * Prune all HOT-update chains in this page.
+ 	 *
+-	 * We count tuples removed by the pruning step as tuples_deleted.  Its
+-	 * final value can be thought of as the number of tuples that have been
+-	 * deleted from the table.  It should not be confused with lpdead_items;
++	 * We count the number of tuples removed from the page by the pruning step
++	 * in presult.ndeleted. It should not be confused with lpdead_items;
+ 	 * lpdead_items's final value can be thought of as the number of tuples
+ 	 * that were deleted from indexes.
+ 	 */
+-	tuples_deleted = heap_page_prune(rel, buf, vacrel->vistest,
+-									 &nnewlpdead,
+-									 &vacrel->offnum);
++	heap_page_prune(rel, buf, vacrel->vistest, &presult, &vacrel->offnum);
+ 
+ 	/*
+ 	 * Now scan the page to collect LP_DEAD items and check for tuples
+@@ -1929,7 +1924,7 @@ lazy_scan_prune(LVRelState *vacrel,
+ 	}
+ 
+ 	/* Finally, add page-local counts to whole-VACUUM counts */
+-	vacrel->tuples_deleted += tuples_deleted;
++	vacrel->tuples_deleted += presult.ndeleted;
+ 	vacrel->tuples_frozen += tuples_frozen;
+ 	vacrel->lpdead_items += lpdead_items;
+ 	vacrel->live_tuples += live_tuples;
+diff --git a/src/include/access/heapam.h b/src/include/access/heapam.h
+index 6598c4d7d8bb..2d3f149e4f0b 100644
+--- a/src/include/access/heapam.h
++++ b/src/include/access/heapam.h
+@@ -191,6 +191,15 @@ typedef struct HeapPageFreeze
+ 
+ } HeapPageFreeze;
+ 
++/*
++ * Per-page state returned from pruning
++ */
++typedef struct PruneResult
++{
++	int			ndeleted;		/* Number of tuples deleted from the page */
++	int			nnewlpdead;		/* Number of newly LP_DEAD items */
++} PruneResult;
++
+ /* ----------------
+  *		function prototypes for heap access method
+  *
+@@ -284,9 +293,9 @@ extern TransactionId heap_index_delete_tuples(Relation rel,
+ /* in heap/pruneheap.c */
+ struct GlobalVisState;
+ extern void heap_page_prune_opt(Relation relation, Buffer buffer);
+-extern int	heap_page_prune(Relation relation, Buffer buffer,
++extern void heap_page_prune(Relation relation, Buffer buffer,
+ 							struct GlobalVisState *vistest,
+-							int *nnewlpdead,
++							PruneResult *presult,
+ 							OffsetNumber *off_loc);
+ extern void heap_page_prune_execute(Buffer buffer,
+ 									OffsetNumber *redirected, int nredirected,
+diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list
+index b5bbdd1608cf..8de90c495853 100644
+--- a/src/tools/pgindent/typedefs.list
++++ b/src/tools/pgindent/typedefs.list
+@@ -2151,6 +2151,7 @@ ProjectionPath
+ PromptInterruptContext
+ ProtocolVersion
+ PrsStorage
++PruneResult
+ PruneState
+ PruneStepResult
+ PsqlScanCallbacks

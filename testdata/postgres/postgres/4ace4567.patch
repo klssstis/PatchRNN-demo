@@ -1,0 +1,206 @@
+From 4ace456776524839ef3279ab0bad8a2c9f6cc2a7 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sat, 1 Jan 2022 16:12:03 -0500
+Subject: [PATCH] Fix index-only scan plans when not all index columns can be
+ returned.
+
+If an index has both returnable and non-returnable columns, and one of
+the non-returnable columns is an expression using a Var that is in a
+returnable column, then a query returning that expression could result
+in an index-only scan plan that attempts to read the non-returnable
+column, instead of recomputing the expression from the returnable
+column as intended.
+
+To fix, redefine the "indextlist" list of an IndexOnlyScan plan node
+as containing null Consts in place of any non-returnable columns.
+This solves the problem by preventing setrefs.c from falsely matching
+to such entries.  The executor is happy since it only cares about the
+exposed types of the entries, and ruleutils.c doesn't care because a
+correct plan won't reference those entries.  I considered some other
+ways to prevent setrefs.c from doing the wrong thing, but this way
+seems good since (a) it allows a very localized fix, (b) it makes
+the indextlist structure more compact in many cases, and (c) the
+indextlist is now a more faithful representation of what the index AM
+will actually produce, viz. nulls for any non-returnable columns.
+
+This is easier to hit since we introduced included columns, but it's
+possible to construct failing examples without that, as per the
+added regression test.  Hence, back-patch to all supported branches.
+
+Per bug #17350 from Louis Jachiet.
+
+Discussion: https://postgr.es/m/17350-b5bdcf476e5badbb@postgresql.org
+---
+ src/backend/optimizer/plan/createplan.c | 53 ++++++++++++++++++++++++-
+ src/include/nodes/plannodes.h           |  3 +-
+ src/test/regress/expected/gist.out      | 28 +++++++++++++
+ src/test/regress/sql/gist.sql           | 11 +++++
+ 4 files changed, 92 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index f12660a2606f..ff2b14e88006 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -20,6 +20,7 @@
+ #include <math.h>
+ 
+ #include "access/sysattr.h"
++#include "catalog/pg_am.h"
+ #include "catalog/pg_class.h"
+ #include "foreign/fdwapi.h"
+ #include "miscadmin.h"
+@@ -191,6 +192,7 @@ static IndexOnlyScan *make_indexonlyscan(List *qptlist, List *qpqual,
+ 										 List *indexqual, List *indexorderby,
+ 										 List *indextlist,
+ 										 ScanDirection indexscandir);
++static List *make_indexonly_tlist(IndexOptInfo *indexinfo);
+ static BitmapIndexScan *make_bitmap_indexscan(Index scanrelid, Oid indexid,
+ 											  List *indexqual,
+ 											  List *indexqualorig);
+@@ -621,7 +623,7 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
+ 		if (best_path->pathtype == T_IndexOnlyScan)
+ 		{
+ 			/* For index-only scan, the preferred tlist is the index's */
+-			tlist = copyObject(((IndexPath *) best_path)->indexinfo->indextlist);
++			tlist = copyObject(make_indexonly_tlist(((IndexPath *) best_path)->indexinfo));
+ 
+ 			/*
+ 			 * Transfer sortgroupref data to the replacement tlist, if
+@@ -3070,7 +3072,7 @@ create_indexscan_plan(PlannerInfo *root,
+ 												indexoid,
+ 												fixed_indexquals,
+ 												fixed_indexorderbys,
+-												best_path->indexinfo->indextlist,
++												make_indexonly_tlist(best_path->indexinfo),
+ 												best_path->indexscandir);
+ 	else
+ 		scan_plan = (Scan *) make_indexscan(tlist,
+@@ -5463,6 +5465,53 @@ make_indexonlyscan(List *qptlist,
+ 	return node;
+ }
+ 
++/*
++ * make_indexonly_tlist
++ *
++ * Construct the indextlist for an IndexOnlyScan plan node.
++ * We must replace any column that can't be returned by the index AM
++ * with a null Const of the appropriate datatype.  This is necessary
++ * to prevent setrefs.c from trying to use the value of such a column,
++ * and anyway it makes the indextlist a better representative of what
++ * the indexscan will really return.  (We do this here, not where the
++ * IndexOptInfo is originally constructed, because earlier planner
++ * steps need to know what is in such columns.)
++ */
++static List *
++make_indexonly_tlist(IndexOptInfo *indexinfo)
++{
++	List	   *result;
++	int			i;
++	ListCell   *lc;
++
++	/* We needn't work hard for the common case of btrees. */
++	if (indexinfo->relam == BTREE_AM_OID)
++		return indexinfo->indextlist;
++
++	result = NIL;
++	i = 0;
++	foreach(lc, indexinfo->indextlist)
++	{
++		TargetEntry *indextle = (TargetEntry *) lfirst(lc);
++
++		if (indexinfo->canreturn[i])
++			result = lappend(result, indextle);
++		else
++		{
++			TargetEntry *newtle = makeNode(TargetEntry);
++			Node	   *texpr = (Node *) indextle->expr;
++
++			memcpy(newtle, indextle, sizeof(TargetEntry));
++			newtle->expr = (Expr *) makeNullConst(exprType(texpr),
++												  exprTypmod(texpr),
++												  exprCollation(texpr));
++			result = lappend(result, newtle);
++		}
++		i++;
++	}
++	return result;
++}
++
+ static BitmapIndexScan *
+ make_bitmap_indexscan(Index scanrelid,
+ 					  Oid indexid,
+diff --git a/src/include/nodes/plannodes.h b/src/include/nodes/plannodes.h
+index be3c30704ad1..13e07ead31a6 100644
+--- a/src/include/nodes/plannodes.h
++++ b/src/include/nodes/plannodes.h
+@@ -427,7 +427,8 @@ typedef struct IndexScan
+  * indextlist, which represents the contents of the index as a targetlist
+  * with one TLE per index column.  Vars appearing in this list reference
+  * the base table, and this is the only field in the plan node that may
+- * contain such Vars.
++ * contain such Vars.  Note however that index columns that the AM can't
++ * reconstruct are replaced by null Consts in indextlist.
+  * ----------------
+  */
+ typedef struct IndexOnlyScan
+diff --git a/src/test/regress/expected/gist.out b/src/test/regress/expected/gist.out
+index 90edb4061d4d..6c6ced91e9c3 100644
+--- a/src/test/regress/expected/gist.out
++++ b/src/test/regress/expected/gist.out
+@@ -312,6 +312,34 @@ and p <@ box(point(5,5), point(6, 6));
+ (11 rows)
+ 
+ drop index gist_tbl_multi_index;
++-- Test that we don't try to return the value of a non-returnable
++-- column in an index-only scan.  (This isn't GIST-specific, but
++-- it only applies to index AMs that can return some columns and not
++-- others, so GIST with appropriate opclasses is a convenient test case.)
++create index gist_tbl_multi_index on gist_tbl using gist (circle(p,1), p);
++explain (verbose, costs off)
++select circle(p,1) from gist_tbl
++where p <@ box(point(5, 5), point(5.3, 5.3));
++                          QUERY PLAN                           
++---------------------------------------------------------------
++ Index Only Scan using gist_tbl_multi_index on public.gist_tbl
++   Output: circle(p, '1'::double precision)
++   Index Cond: (gist_tbl.p <@ '(5.3,5.3),(5,5)'::box)
++(3 rows)
++
++select circle(p,1) from gist_tbl
++where p <@ box(point(5, 5), point(5.3, 5.3));
++     circle      
++-----------------
++ <(5,5),1>
++ <(5.05,5.05),1>
++ <(5.1,5.1),1>
++ <(5.15,5.15),1>
++ <(5.2,5.2),1>
++ <(5.25,5.25),1>
++ <(5.3,5.3),1>
++(7 rows)
++
+ -- Clean up
+ reset enable_seqscan;
+ reset enable_bitmapscan;
+diff --git a/src/test/regress/sql/gist.sql b/src/test/regress/sql/gist.sql
+index b9d398ea9417..c6bac320b162 100644
+--- a/src/test/regress/sql/gist.sql
++++ b/src/test/regress/sql/gist.sql
+@@ -142,6 +142,17 @@ and p <@ box(point(5,5), point(6, 6));
+ 
+ drop index gist_tbl_multi_index;
+ 
++-- Test that we don't try to return the value of a non-returnable
++-- column in an index-only scan.  (This isn't GIST-specific, but
++-- it only applies to index AMs that can return some columns and not
++-- others, so GIST with appropriate opclasses is a convenient test case.)
++create index gist_tbl_multi_index on gist_tbl using gist (circle(p,1), p);
++explain (verbose, costs off)
++select circle(p,1) from gist_tbl
++where p <@ box(point(5, 5), point(5.3, 5.3));
++select circle(p,1) from gist_tbl
++where p <@ box(point(5, 5), point(5.3, 5.3));
++
+ -- Clean up
+ reset enable_seqscan;
+ reset enable_bitmapscan;

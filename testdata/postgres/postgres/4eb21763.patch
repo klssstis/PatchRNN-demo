@@ -1,0 +1,309 @@
+From 4eb2176318d0561846c1f9fb3c68bede799d640f Mon Sep 17 00:00:00 2001
+From: Thomas Munro <tmunro@postgresql.org>
+Date: Sat, 12 Feb 2022 10:21:23 +1300
+Subject: [PATCH] Fix DROP {DATABASE,TABLESPACE} on Windows.
+
+Previously, it was possible for DROP DATABASE, DROP TABLESPACE and ALTER
+DATABASE SET TABLESPACE to fail because other backends still had file
+handles open for dropped tables.  Windows won't allow a directory
+containing unlinked-but-still-open files to be unlinked.  Tackle this
+problem by forcing all backends to close all smgr fds.  No change for
+Unix systems, which don't suffer from the problem, but the new code path
+can be tested by Unix-based developers by defining
+USE_BARRIER_SMGRRELEASE explicitly.
+
+It's possible that PROCSIGNAL_BARRIER_SMGRRELEASE will have more
+bug-fixing applications soon (under discussion).  Note that this is the
+first user of the ProcSignalBarrier mechanism from commit 16a4e4aec.  It
+could in principle be back-patched as far as 14, but since field
+complaints are rare and ProcSignalBarrier hasn't been battle-tested,
+that seems like a bad idea.  Fix in master only, where these failures
+have started to show up in automated testing due to new tests.
+
+Suggested-by: Andres Freund <andres@anarazel.de>
+Reviewed-by: Andres Freund <andres@anarazel.de>
+Reviewed-by: Daniel Gustafsson <daniel@yesql.se>
+Reviewed-by: Robert Haas <robertmhaas@gmail.com>
+Discussion: https://postgr.es/m/CA+hUKGLdemy2gBm80kz20GTe6hNVwoErE8KwcJk6-U56oStjtg@mail.gmail.com
+---
+ src/backend/commands/dbcommands.c    | 19 ++++++++++++++++---
+ src/backend/commands/tablespace.c    | 26 ++++++++++++++++++++------
+ src/backend/storage/ipc/procsignal.c | 24 +++---------------------
+ src/backend/storage/smgr/md.c        |  6 ++++++
+ src/backend/storage/smgr/smgr.c      | 18 ++++++++++++++++++
+ src/include/pg_config_manual.h       | 11 +++++++++++
+ src/include/storage/md.h             |  1 +
+ src/include/storage/procsignal.h     |  7 +------
+ src/include/storage/smgr.h           |  1 +
+ 9 files changed, 77 insertions(+), 36 deletions(-)
+
+diff --git a/src/backend/commands/dbcommands.c b/src/backend/commands/dbcommands.c
+index e673138cbdff..700b12096528 100644
+--- a/src/backend/commands/dbcommands.c
++++ b/src/backend/commands/dbcommands.c
+@@ -997,12 +997,15 @@ dropdb(const char *dbname, bool missing_ok, bool force)
+ 
+ 	/*
+ 	 * Force a checkpoint to make sure the checkpointer has received the
+-	 * message sent by ForgetDatabaseSyncRequests. On Windows, this also
+-	 * ensures that background procs don't hold any open files, which would
+-	 * cause rmdir() to fail.
++	 * message sent by ForgetDatabaseSyncRequests.
+ 	 */
+ 	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+ 
++#if defined(USE_BARRIER_SMGRRELEASE)
++	/* Close all smgr fds in all backends. */
++	WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
++#endif
++
+ 	/*
+ 	 * Remove all tablespace subdirs belonging to the database.
+ 	 */
+@@ -1251,6 +1254,11 @@ movedb(const char *dbname, const char *tblspcname)
+ 	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT
+ 					  | CHECKPOINT_FLUSH_ALL);
+ 
++#if defined(USE_BARRIER_SMGRRELEASE)
++	/* Close all smgr fds in all backends. */
++	WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
++#endif
++
+ 	/*
+ 	 * Now drop all buffers holding data of the target database; they should
+ 	 * no longer be dirty so DropDatabaseBuffers is safe.
+@@ -2258,6 +2266,11 @@ dbase_redo(XLogReaderState *record)
+ 		/* Clean out the xlog relcache too */
+ 		XLogDropDatabase(xlrec->db_id);
+ 
++#if defined(USE_BARRIER_SMGRRELEASE)
++		/* Close all sgmr fds in all backends. */
++		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
++#endif
++
+ 		for (i = 0; i < xlrec->ntablespaces; i++)
+ 		{
+ 			dst_path = GetDatabasePath(xlrec->db_id, xlrec->tablespace_ids[i]);
+diff --git a/src/backend/commands/tablespace.c b/src/backend/commands/tablespace.c
+index b2ccf5e06efd..40514ab550fe 100644
+--- a/src/backend/commands/tablespace.c
++++ b/src/backend/commands/tablespace.c
+@@ -536,15 +536,24 @@ DropTableSpace(DropTableSpaceStmt *stmt)
+ 		 * but we can't tell them apart from important data files that we
+ 		 * mustn't delete.  So instead, we force a checkpoint which will clean
+ 		 * out any lingering files, and try again.
+-		 *
+-		 * XXX On Windows, an unlinked file persists in the directory listing
++		 */
++		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
++
++		/*
++		 * On Windows, an unlinked file persists in the directory listing
+ 		 * until no process retains an open handle for the file.  The DDL
+ 		 * commands that schedule files for unlink send invalidation messages
+-		 * directing other PostgreSQL processes to close the files.  DROP
+-		 * TABLESPACE should not give up on the tablespace becoming empty
+-		 * until all relevant invalidation processing is complete.
++		 * directing other PostgreSQL processes to close the files, but
++		 * nothing guarantees they'll be processed in time.  So, we'll also
++		 * use a global barrier to ask all backends to close all files, and
++		 * wait until they're finished.
+ 		 */
+-		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
++#if defined(USE_BARRIER_SMGRRELEASE)
++		LWLockRelease(TablespaceCreateLock);
++		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
++		LWLockAcquire(TablespaceCreateLock, LW_EXCLUSIVE);
++#endif
++		/* And now try again. */
+ 		if (!destroy_tablespace_directories(tablespaceoid, false))
+ 		{
+ 			/* Still not empty, the files must be important then */
+@@ -1582,6 +1591,11 @@ tblspc_redo(XLogReaderState *record)
+ 		 */
+ 		if (!destroy_tablespace_directories(xlrec->ts_id, true))
+ 		{
++#if defined(USE_BARRIER_SMGRRELEASE)
++			/* Close all smgr fds in all backends. */
++			WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
++#endif
++
+ 			ResolveRecoveryConflictWithTablespace(xlrec->ts_id);
+ 
+ 			/*
+diff --git a/src/backend/storage/ipc/procsignal.c b/src/backend/storage/ipc/procsignal.c
+index d158bb7a19fc..f41563a0a481 100644
+--- a/src/backend/storage/ipc/procsignal.c
++++ b/src/backend/storage/ipc/procsignal.c
+@@ -28,6 +28,7 @@
+ #include "storage/latch.h"
+ #include "storage/proc.h"
+ #include "storage/shmem.h"
++#include "storage/smgr.h"
+ #include "storage/sinval.h"
+ #include "tcop/tcopprot.h"
+ #include "utils/memutils.h"
+@@ -94,7 +95,6 @@ static ProcSignalSlot *MyProcSignalSlot = NULL;
+ static bool CheckProcSignal(ProcSignalReason reason);
+ static void CleanupProcSignalState(int status, Datum arg);
+ static void ResetProcSignalBarrierBits(uint32 flags);
+-static bool ProcessBarrierPlaceholder(void);
+ static inline int GetNumProcSignalSlots(void);
+ 
+ /*
+@@ -536,8 +536,8 @@ ProcessProcSignalBarrier(void)
+ 				type = (ProcSignalBarrierType) pg_rightmost_one_pos32(flags);
+ 				switch (type)
+ 				{
+-					case PROCSIGNAL_BARRIER_PLACEHOLDER:
+-						processed = ProcessBarrierPlaceholder();
++					case PROCSIGNAL_BARRIER_SMGRRELEASE:
++						processed = ProcessBarrierSmgrRelease();
+ 						break;
+ 				}
+ 
+@@ -603,24 +603,6 @@ ResetProcSignalBarrierBits(uint32 flags)
+ 	InterruptPending = true;
+ }
+ 
+-static bool
+-ProcessBarrierPlaceholder(void)
+-{
+-	/*
+-	 * XXX. This is just a placeholder until the first real user of this
+-	 * machinery gets committed. Rename PROCSIGNAL_BARRIER_PLACEHOLDER to
+-	 * PROCSIGNAL_BARRIER_SOMETHING_ELSE where SOMETHING_ELSE is something
+-	 * appropriately descriptive. Get rid of this function and instead have
+-	 * ProcessBarrierSomethingElse. Most likely, that function should live in
+-	 * the file pertaining to that subsystem, rather than here.
+-	 *
+-	 * The return value should be 'true' if the barrier was successfully
+-	 * absorbed and 'false' if not. Note that returning 'false' can lead to
+-	 * very frequent retries, so try hard to make that an uncommon case.
+-	 */
+-	return true;
+-}
+-
+ /*
+  * CheckProcSignal - check to see if a particular reason has been
+  * signaled, and clear the signal flag.  Should be called after receiving
+diff --git a/src/backend/storage/smgr/md.c b/src/backend/storage/smgr/md.c
+index d26c915f90eb..879f647dbc22 100644
+--- a/src/backend/storage/smgr/md.c
++++ b/src/backend/storage/smgr/md.c
+@@ -549,6 +549,12 @@ mdclose(SMgrRelation reln, ForkNumber forknum)
+ 	}
+ }
+ 
++void
++mdrelease(void)
++{
++	closeAllVfds();
++}
++
+ /*
+  *	mdprefetch() -- Initiate asynchronous read of the specified block of a relation
+  */
+diff --git a/src/backend/storage/smgr/smgr.c b/src/backend/storage/smgr/smgr.c
+index eb701dce5767..d71a557a3529 100644
+--- a/src/backend/storage/smgr/smgr.c
++++ b/src/backend/storage/smgr/smgr.c
+@@ -41,6 +41,7 @@ typedef struct f_smgr
+ {
+ 	void		(*smgr_init) (void);	/* may be NULL */
+ 	void		(*smgr_shutdown) (void);	/* may be NULL */
++	void		(*smgr_release) (void); /* may be NULL */
+ 	void		(*smgr_open) (SMgrRelation reln);
+ 	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
+ 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
+@@ -69,6 +70,7 @@ static const f_smgr smgrsw[] = {
+ 	{
+ 		.smgr_init = mdinit,
+ 		.smgr_shutdown = NULL,
++		.smgr_release = mdrelease,
+ 		.smgr_open = mdopen,
+ 		.smgr_close = mdclose,
+ 		.smgr_create = mdcreate,
+@@ -693,3 +695,19 @@ AtEOXact_SMgr(void)
+ 		smgrclose(rel);
+ 	}
+ }
++
++/*
++ * This routine is called when we are ordered to release all open files by a
++ * ProcSignalBarrier.
++ */
++bool
++ProcessBarrierSmgrRelease(void)
++{
++	for (int i = 0; i < NSmgr; i++)
++	{
++		if (smgrsw[i].smgr_release)
++			smgrsw[i].smgr_release();
++	}
++
++	return true;
++}
+diff --git a/src/include/pg_config_manual.h b/src/include/pg_config_manual.h
+index 8d2e3e3a57d0..84ce5a4a5d7f 100644
+--- a/src/include/pg_config_manual.h
++++ b/src/include/pg_config_manual.h
+@@ -152,6 +152,17 @@
+ #define EXEC_BACKEND
+ #endif
+ 
++/*
++ * If USE_BARRIER_SMGRRELEASE is defined, certain code paths that unlink
++ * directories will ask other backends to close all smgr file descriptors.
++ * This is enabled on Windows, because otherwise unlinked but still open files
++ * can prevent rmdir(containing_directory) from succeeding.  On other
++ * platforms, it can be defined to exercise those code paths.
++ */
++#if defined(WIN32)
++#define USE_BARRIER_SMGRRELEASE
++#endif
++
+ /*
+  * Define this if your operating system supports link()
+  */
+diff --git a/src/include/storage/md.h b/src/include/storage/md.h
+index ffffa40db719..6e46d8d96a7c 100644
+--- a/src/include/storage/md.h
++++ b/src/include/storage/md.h
+@@ -23,6 +23,7 @@
+ extern void mdinit(void);
+ extern void mdopen(SMgrRelation reln);
+ extern void mdclose(SMgrRelation reln, ForkNumber forknum);
++extern void mdrelease(void);
+ extern void mdcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
+ extern bool mdexists(SMgrRelation reln, ForkNumber forknum);
+ extern void mdunlink(RelFileNodeBackend rnode, ForkNumber forknum, bool isRedo);
+diff --git a/src/include/storage/procsignal.h b/src/include/storage/procsignal.h
+index a121e6506656..ee636900f33c 100644
+--- a/src/include/storage/procsignal.h
++++ b/src/include/storage/procsignal.h
+@@ -49,12 +49,7 @@ typedef enum
+ 
+ typedef enum
+ {
+-	/*
+-	 * XXX. PROCSIGNAL_BARRIER_PLACEHOLDER should be replaced when the first
+-	 * real user of the ProcSignalBarrier mechanism is added. It's just here
+-	 * for now because we can't have an empty enum.
+-	 */
+-	PROCSIGNAL_BARRIER_PLACEHOLDER = 0
++	PROCSIGNAL_BARRIER_SMGRRELEASE	/* ask smgr to close files */
+ } ProcSignalBarrierType;
+ 
+ /*
+diff --git a/src/include/storage/smgr.h b/src/include/storage/smgr.h
+index 052e0b8426ac..8e3ef92cda10 100644
+--- a/src/include/storage/smgr.h
++++ b/src/include/storage/smgr.h
+@@ -104,5 +104,6 @@ extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum,
+ 						 int nforks, BlockNumber *nblocks);
+ extern void smgrimmedsync(SMgrRelation reln, ForkNumber forknum);
+ extern void AtEOXact_SMgr(void);
++extern bool ProcessBarrierSmgrRelease(void);
+ 
+ #endif							/* SMGR_H */

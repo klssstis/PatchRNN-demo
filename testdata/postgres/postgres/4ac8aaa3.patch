@@ -1,0 +1,280 @@
+From 4ac8aaa36fa24639989849c8109f8b52e9544fd1 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 8 Jan 2020 09:42:53 -0500
+Subject: [PATCH] Fix handling of generated columns in ALTER TABLE.
+
+ALTER TABLE failed if a column referenced in a GENERATED expression
+had been added or changed in type earlier in the ALTER command.
+That's because the GENERATED expression needs to be evaluated
+against the table's updated tuples, but it was being evaluated
+against the original tuples.  (Fortunately the executor has adequate
+cross-checks to notice the mismatch, so we just got an obscure error
+message and not anything more dangerous.)
+
+Per report from Andreas Joseph Krogh.  Back-patch to v12 where
+GENERATED was added.
+
+Discussion: https://postgr.es/m/VisenaEmail.200.231b0a41523275d0.16ea7f800c7@tc7-visena
+---
+ src/backend/commands/tablecmds.c        | 33 ++++++++-
+ src/test/regress/expected/generated.out | 97 +++++++++++++++++++------
+ src/test/regress/sql/generated.sql      | 31 ++++++--
+ 3 files changed, 132 insertions(+), 29 deletions(-)
+
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index 1c4394abea15..421bc28727e8 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -192,13 +192,15 @@ typedef struct NewConstraint
+  * Phase 3 copy (this could be either a new column with a non-null default, or
+  * a column that we're changing the type of).  Columns without such an entry
+  * are just copied from the old table during ATRewriteTable.  Note that the
+- * expr is an expression over *old* table values.
++ * expr is an expression over *old* table values, except when is_generated
++ * is true; then it is an expression over columns of the *new* tuple.
+  */
+ typedef struct NewColumnValue
+ {
+ 	AttrNumber	attnum;			/* which column */
+ 	Expr	   *expr;			/* expression to compute */
+ 	ExprState  *exprstate;		/* execution state */
++	bool		is_generated;	/* is it a GENERATED expression? */
+ } NewColumnValue;
+ 
+ /*
+@@ -4961,7 +4963,9 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap, LOCKMODE lockmode)
+ 
+ 				/*
+ 				 * Process supplied expressions to replace selected columns.
+-				 * Expression inputs come from the old tuple.
++				 *
++				 * First, evaluate expressions whose inputs come from the old
++				 * tuple.
+ 				 */
+ 				econtext->ecxt_scantuple = oldslot;
+ 
+@@ -4969,6 +4973,9 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap, LOCKMODE lockmode)
+ 				{
+ 					NewColumnValue *ex = lfirst(l);
+ 
++					if (ex->is_generated)
++						continue;
++
+ 					newslot->tts_values[ex->attnum - 1]
+ 						= ExecEvalExpr(ex->exprstate,
+ 									   econtext,
+@@ -4977,6 +4984,26 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap, LOCKMODE lockmode)
+ 
+ 				ExecStoreVirtualTuple(newslot);
+ 
++				/*
++				 * Now, evaluate any expressions whose inputs come from the
++				 * new tuple.  We assume these columns won't reference each
++				 * other, so that there's no ordering dependency.
++				 */
++				econtext->ecxt_scantuple = newslot;
++
++				foreach(l, tab->newvals)
++				{
++					NewColumnValue *ex = lfirst(l);
++
++					if (!ex->is_generated)
++						continue;
++
++					newslot->tts_values[ex->attnum - 1]
++						= ExecEvalExpr(ex->exprstate,
++									   econtext,
++									   &newslot->tts_isnull[ex->attnum - 1]);
++				}
++
+ 				/*
+ 				 * Constraints might reference the tableoid column, so
+ 				 * initialize t_tableOid before evaluating them.
+@@ -5892,6 +5919,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
+ 			newval = (NewColumnValue *) palloc0(sizeof(NewColumnValue));
+ 			newval->attnum = attribute.attnum;
+ 			newval->expr = expression_planner(defval);
++			newval->is_generated = (colDef->generated != '\0');
+ 
+ 			tab->newvals = lappend(tab->newvals, newval);
+ 		}
+@@ -10379,6 +10407,7 @@ ATPrepAlterColumnType(List **wqueue,
+ 		newval = (NewColumnValue *) palloc0(sizeof(NewColumnValue));
+ 		newval->attnum = attnum;
+ 		newval->expr = (Expr *) transform;
++		newval->is_generated = false;
+ 
+ 		tab->newvals = lappend(tab->newvals, newval);
+ 		if (ATColumnChangeRequiresRewrite(transform, attnum))
+diff --git a/src/test/regress/expected/generated.out b/src/test/regress/expected/generated.out
+index f62c93f4686c..8cffef04778f 100644
+--- a/src/test/regress/expected/generated.out
++++ b/src/test/regress/expected/generated.out
+@@ -593,40 +593,95 @@ ERROR:  cannot use generated column "b" in column generation expression
+ DETAIL:  A generated column cannot reference another generated column.
+ ALTER TABLE gtest25 ADD COLUMN x int GENERATED ALWAYS AS (z * 4) STORED;  -- error
+ ERROR:  column "z" does not exist
++ALTER TABLE gtest25 ADD COLUMN c int DEFAULT 42,
++  ADD COLUMN x int GENERATED ALWAYS AS (c * 4) STORED;
++ALTER TABLE gtest25 ADD COLUMN d int DEFAULT 101;
++ALTER TABLE gtest25 ALTER COLUMN d SET DATA TYPE float8,
++  ADD COLUMN y float8 GENERATED ALWAYS AS (d * 4) STORED;
++SELECT * FROM gtest25 ORDER BY a;
++ a | b  | c  |  x  |  d  |  y  
++---+----+----+-----+-----+-----
++ 3 |  9 | 42 | 168 | 101 | 404
++ 4 | 12 | 42 | 168 | 101 | 404
++(2 rows)
++
++\d gtest25
++                                         Table "public.gtest25"
++ Column |       Type       | Collation | Nullable |                       Default                        
++--------+------------------+-----------+----------+------------------------------------------------------
++ a      | integer          |           | not null | 
++ b      | integer          |           |          | generated always as (a * 3) stored
++ c      | integer          |           |          | 42
++ x      | integer          |           |          | generated always as (c * 4) stored
++ d      | double precision |           |          | 101
++ y      | double precision |           |          | generated always as (d * 4::double precision) stored
++Indexes:
++    "gtest25_pkey" PRIMARY KEY, btree (a)
++
+ -- ALTER TABLE ... ALTER COLUMN
+ CREATE TABLE gtest27 (
+     a int,
+-    b int GENERATED ALWAYS AS (a * 2) STORED
++    b int,
++    x int GENERATED ALWAYS AS ((a + b) * 2) STORED
+ );
+-INSERT INTO gtest27 (a) VALUES (3), (4);
++INSERT INTO gtest27 (a, b) VALUES (3, 7), (4, 11);
+ ALTER TABLE gtest27 ALTER COLUMN a TYPE text;  -- error
+ ERROR:  cannot alter type of a column used by a generated column
+-DETAIL:  Column "a" is used by generated column "b".
+-ALTER TABLE gtest27 ALTER COLUMN b TYPE numeric;
++DETAIL:  Column "a" is used by generated column "x".
++ALTER TABLE gtest27 ALTER COLUMN x TYPE numeric;
+ \d gtest27
+-                             Table "public.gtest27"
+- Column |  Type   | Collation | Nullable |               Default                
+---------+---------+-----------+----------+--------------------------------------
++                                Table "public.gtest27"
++ Column |  Type   | Collation | Nullable |                  Default                   
++--------+---------+-----------+----------+--------------------------------------------
+  a      | integer |           |          | 
+- b      | numeric |           |          | generated always as ((a * 2)) stored
++ b      | integer |           |          | 
++ x      | numeric |           |          | generated always as (((a + b) * 2)) stored
+ 
+ SELECT * FROM gtest27;
+- a | b 
+----+---
+- 3 | 6
+- 4 | 8
++ a | b  | x  
++---+----+----
++ 3 |  7 | 20
++ 4 | 11 | 30
+ (2 rows)
+ 
+-ALTER TABLE gtest27 ALTER COLUMN b TYPE boolean USING b <> 0;  -- error
+-ERROR:  generation expression for column "b" cannot be cast automatically to type boolean
+-ALTER TABLE gtest27 ALTER COLUMN b DROP DEFAULT;  -- error
+-ERROR:  column "b" of relation "gtest27" is a generated column
++ALTER TABLE gtest27 ALTER COLUMN x TYPE boolean USING x <> 0;  -- error
++ERROR:  generation expression for column "x" cannot be cast automatically to type boolean
++ALTER TABLE gtest27 ALTER COLUMN x DROP DEFAULT;  -- error
++ERROR:  column "x" of relation "gtest27" is a generated column
++-- It's possible to alter the column types this way:
++ALTER TABLE gtest27
++  DROP COLUMN x,
++  ALTER COLUMN a TYPE bigint,
++  ALTER COLUMN b TYPE bigint,
++  ADD COLUMN x bigint GENERATED ALWAYS AS ((a + b) * 2) STORED;
+ \d gtest27
+-                             Table "public.gtest27"
+- Column |  Type   | Collation | Nullable |               Default                
+---------+---------+-----------+----------+--------------------------------------
+- a      | integer |           |          | 
+- b      | numeric |           |          | generated always as ((a * 2)) stored
++                              Table "public.gtest27"
++ Column |  Type  | Collation | Nullable |                 Default                  
++--------+--------+-----------+----------+------------------------------------------
++ a      | bigint |           |          | 
++ b      | bigint |           |          | 
++ x      | bigint |           |          | generated always as ((a + b) * 2) stored
++
++-- Ideally you could just do this, but not today (and should x change type?):
++ALTER TABLE gtest27
++  ALTER COLUMN a TYPE float8,
++  ALTER COLUMN b TYPE float8;  -- error
++ERROR:  cannot alter type of a column used by a generated column
++DETAIL:  Column "a" is used by generated column "x".
++\d gtest27
++                              Table "public.gtest27"
++ Column |  Type  | Collation | Nullable |                 Default                  
++--------+--------+-----------+----------+------------------------------------------
++ a      | bigint |           |          | 
++ b      | bigint |           |          | 
++ x      | bigint |           |          | generated always as ((a + b) * 2) stored
++
++SELECT * FROM gtest27;
++ a | b  | x  
++---+----+----
++ 3 |  7 | 20
++ 4 | 11 | 30
++(2 rows)
+ 
+ -- triggers
+ CREATE TABLE gtest26 (
+diff --git a/src/test/regress/sql/generated.sql b/src/test/regress/sql/generated.sql
+index 6a56ae260f6f..ff5c8607def4 100644
+--- a/src/test/regress/sql/generated.sql
++++ b/src/test/regress/sql/generated.sql
+@@ -316,21 +316,40 @@ ALTER TABLE gtest25 ADD COLUMN b int GENERATED ALWAYS AS (a * 3) STORED;
+ SELECT * FROM gtest25 ORDER BY a;
+ ALTER TABLE gtest25 ADD COLUMN x int GENERATED ALWAYS AS (b * 4) STORED;  -- error
+ ALTER TABLE gtest25 ADD COLUMN x int GENERATED ALWAYS AS (z * 4) STORED;  -- error
++ALTER TABLE gtest25 ADD COLUMN c int DEFAULT 42,
++  ADD COLUMN x int GENERATED ALWAYS AS (c * 4) STORED;
++ALTER TABLE gtest25 ADD COLUMN d int DEFAULT 101;
++ALTER TABLE gtest25 ALTER COLUMN d SET DATA TYPE float8,
++  ADD COLUMN y float8 GENERATED ALWAYS AS (d * 4) STORED;
++SELECT * FROM gtest25 ORDER BY a;
++\d gtest25
+ 
+ -- ALTER TABLE ... ALTER COLUMN
+ CREATE TABLE gtest27 (
+     a int,
+-    b int GENERATED ALWAYS AS (a * 2) STORED
++    b int,
++    x int GENERATED ALWAYS AS ((a + b) * 2) STORED
+ );
+-INSERT INTO gtest27 (a) VALUES (3), (4);
++INSERT INTO gtest27 (a, b) VALUES (3, 7), (4, 11);
+ ALTER TABLE gtest27 ALTER COLUMN a TYPE text;  -- error
+-ALTER TABLE gtest27 ALTER COLUMN b TYPE numeric;
++ALTER TABLE gtest27 ALTER COLUMN x TYPE numeric;
+ \d gtest27
+ SELECT * FROM gtest27;
+-ALTER TABLE gtest27 ALTER COLUMN b TYPE boolean USING b <> 0;  -- error
+-
+-ALTER TABLE gtest27 ALTER COLUMN b DROP DEFAULT;  -- error
++ALTER TABLE gtest27 ALTER COLUMN x TYPE boolean USING x <> 0;  -- error
++ALTER TABLE gtest27 ALTER COLUMN x DROP DEFAULT;  -- error
++-- It's possible to alter the column types this way:
++ALTER TABLE gtest27
++  DROP COLUMN x,
++  ALTER COLUMN a TYPE bigint,
++  ALTER COLUMN b TYPE bigint,
++  ADD COLUMN x bigint GENERATED ALWAYS AS ((a + b) * 2) STORED;
+ \d gtest27
++-- Ideally you could just do this, but not today (and should x change type?):
++ALTER TABLE gtest27
++  ALTER COLUMN a TYPE float8,
++  ALTER COLUMN b TYPE float8;  -- error
++\d gtest27
++SELECT * FROM gtest27;
+ 
+ -- triggers
+ CREATE TABLE gtest26 (

@@ -1,0 +1,301 @@
+From 4d29e6dbd0bb6d8c3a48d0f3c7d65dc1def1b07e Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Mon, 28 Sep 2020 10:13:59 +0900
+Subject: [PATCH] Improve range checks of options for pg_test_fsync and
+ pg_test_timing
+
+Both tools never had safeguard checks for the options provided, and it
+was possible to make pg_test_fsync run an infinite amount of time or
+pass down buggy values to pg_test_timing.
+
+These behaviors have existed for a long time, with no actual complaints,
+so no backpatch is done.  Basic TAP tests are introduced for both tools.
+
+Author: Michael Paquier
+Reviewed-by: Peter Eisentraut
+Discussion: https://postgr.es/m/20200806062759.GE16470@paquier.xyz
+---
+ src/bin/pg_test_fsync/.gitignore        |  2 +
+ src/bin/pg_test_fsync/Makefile          |  6 +++
+ src/bin/pg_test_fsync/pg_test_fsync.c   | 28 ++++++++++++--
+ src/bin/pg_test_fsync/t/001_basic.pl    | 25 ++++++++++++
+ src/bin/pg_test_timing/.gitignore       |  2 +
+ src/bin/pg_test_timing/Makefile         |  6 +++
+ src/bin/pg_test_timing/pg_test_timing.c | 51 +++++++++++++++----------
+ src/bin/pg_test_timing/t/001_basic.pl   | 25 ++++++++++++
+ 8 files changed, 121 insertions(+), 24 deletions(-)
+ create mode 100644 src/bin/pg_test_fsync/t/001_basic.pl
+ create mode 100644 src/bin/pg_test_timing/t/001_basic.pl
+
+diff --git a/src/bin/pg_test_fsync/.gitignore b/src/bin/pg_test_fsync/.gitignore
+index f3b593249859..5eb5085f4524 100644
+--- a/src/bin/pg_test_fsync/.gitignore
++++ b/src/bin/pg_test_fsync/.gitignore
+@@ -1 +1,3 @@
+ /pg_test_fsync
++
++/tmp_check/
+diff --git a/src/bin/pg_test_fsync/Makefile b/src/bin/pg_test_fsync/Makefile
+index 7632c94eb7f6..c4f9ae066484 100644
+--- a/src/bin/pg_test_fsync/Makefile
++++ b/src/bin/pg_test_fsync/Makefile
+@@ -22,6 +22,12 @@ install: all installdirs
+ installdirs:
+ 	$(MKDIR_P) '$(DESTDIR)$(bindir)'
+ 
++check:
++	$(prove_check)
++
++installcheck:
++	$(prove_installcheck)
++
+ uninstall:
+ 	rm -f '$(DESTDIR)$(bindir)/pg_test_fsync$(X)'
+ 
+diff --git a/src/bin/pg_test_fsync/pg_test_fsync.c b/src/bin/pg_test_fsync/pg_test_fsync.c
+index 6e4729312331..3eddd983c63b 100644
+--- a/src/bin/pg_test_fsync/pg_test_fsync.c
++++ b/src/bin/pg_test_fsync/pg_test_fsync.c
+@@ -5,6 +5,7 @@
+ 
+ #include "postgres_fe.h"
+ 
++#include <limits.h>
+ #include <sys/stat.h>
+ #include <sys/time.h>
+ #include <fcntl.h>
+@@ -62,7 +63,7 @@ do { \
+ 
+ static const char *progname;
+ 
+-static int	secs_per_test = 5;
++static unsigned int secs_per_test = 5;
+ static int	needs_unlink = 0;
+ static char full_buf[DEFAULT_XLOG_SEG_SIZE],
+ 		   *buf,
+@@ -148,6 +149,8 @@ handle_args(int argc, char *argv[])
+ 
+ 	int			option;			/* Command line option */
+ 	int			optindex = 0;	/* used by getopt_long */
++	unsigned long optval;		/* used for option parsing */
++	char	   *endptr;
+ 
+ 	if (argc > 1)
+ 	{
+@@ -173,7 +176,24 @@ handle_args(int argc, char *argv[])
+ 				break;
+ 
+ 			case 's':
+-				secs_per_test = atoi(optarg);
++				errno = 0;
++				optval = strtoul(optarg, &endptr, 10);
++
++				if (endptr == optarg || *endptr != '\0' ||
++					errno != 0 || optval != (unsigned int) optval)
++				{
++					pg_log_error("invalid argument for option %s", "--secs-per-test");
++					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
++					exit(1);
++				}
++
++				secs_per_test = (unsigned int) optval;
++				if (secs_per_test == 0)
++				{
++					pg_log_error("%s must be in range %u..%u",
++								 "--secs-per-test", 1, UINT_MAX);
++					exit(1);
++				}
+ 				break;
+ 
+ 			default:
+@@ -193,8 +213,8 @@ handle_args(int argc, char *argv[])
+ 		exit(1);
+ 	}
+ 
+-	printf(ngettext("%d second per test\n",
+-					"%d seconds per test\n",
++	printf(ngettext("%u second per test\n",
++					"%u seconds per test\n",
+ 					secs_per_test),
+ 		   secs_per_test);
+ #if PG_O_DIRECT != 0
+diff --git a/src/bin/pg_test_fsync/t/001_basic.pl b/src/bin/pg_test_fsync/t/001_basic.pl
+new file mode 100644
+index 000000000000..fe9c295c4976
+--- /dev/null
++++ b/src/bin/pg_test_fsync/t/001_basic.pl
+@@ -0,0 +1,25 @@
++use strict;
++use warnings;
++
++use Config;
++use TestLib;
++use Test::More tests => 12;
++
++#########################################
++# Basic checks
++
++program_help_ok('pg_test_fsync');
++program_version_ok('pg_test_fsync');
++program_options_handling_ok('pg_test_fsync');
++
++#########################################
++# Test invalid option combinations
++
++command_fails_like(
++	[ 'pg_test_fsync', '--secs-per-test', 'a' ],
++	qr/\Qpg_test_fsync: error: invalid argument for option --secs-per-test\E/,
++	'pg_test_fsync: invalid argument for option --secs-per-test');
++command_fails_like(
++	[ 'pg_test_fsync', '--secs-per-test', '0' ],
++	qr/\Qpg_test_fsync: error: --secs-per-test must be in range 1..4294967295\E/,
++	'pg_test_fsync: --secs-per-test must be in range');
+diff --git a/src/bin/pg_test_timing/.gitignore b/src/bin/pg_test_timing/.gitignore
+index f6c664c76576..e5aac2ab120f 100644
+--- a/src/bin/pg_test_timing/.gitignore
++++ b/src/bin/pg_test_timing/.gitignore
+@@ -1 +1,3 @@
+ /pg_test_timing
++
++/tmp_check/
+diff --git a/src/bin/pg_test_timing/Makefile b/src/bin/pg_test_timing/Makefile
+index 334d6ff5c00d..52994b4103c3 100644
+--- a/src/bin/pg_test_timing/Makefile
++++ b/src/bin/pg_test_timing/Makefile
+@@ -22,6 +22,12 @@ install: all installdirs
+ installdirs:
+ 	$(MKDIR_P) '$(DESTDIR)$(bindir)'
+ 
++check:
++	$(prove_check)
++
++installcheck:
++	$(prove_installcheck)
++
+ uninstall:
+ 	rm -f '$(DESTDIR)$(bindir)/pg_test_timing$(X)'
+ 
+diff --git a/src/bin/pg_test_timing/pg_test_timing.c b/src/bin/pg_test_timing/pg_test_timing.c
+index e14802372bd6..c29d6f876294 100644
+--- a/src/bin/pg_test_timing/pg_test_timing.c
++++ b/src/bin/pg_test_timing/pg_test_timing.c
+@@ -6,15 +6,17 @@
+ 
+ #include "postgres_fe.h"
+ 
++#include <limits.h>
++
+ #include "getopt_long.h"
+ #include "portability/instr_time.h"
+ 
+ static const char *progname;
+ 
+-static int32 test_duration = 3;
++static unsigned int test_duration = 3;
+ 
+ static void handle_args(int argc, char *argv[]);
+-static uint64 test_timing(int32);
++static uint64 test_timing(unsigned int duration);
+ static void output(uint64 loop_count);
+ 
+ /* record duration in powers of 2 microseconds */
+@@ -47,6 +49,8 @@ handle_args(int argc, char *argv[])
+ 
+ 	int			option;			/* Command line option */
+ 	int			optindex = 0;	/* used by getopt_long */
++	unsigned long optval;		/* used for option parsing */
++	char	   *endptr;
+ 
+ 	if (argc > 1)
+ 	{
+@@ -68,7 +72,25 @@ handle_args(int argc, char *argv[])
+ 		switch (option)
+ 		{
+ 			case 'd':
+-				test_duration = atoi(optarg);
++				errno = 0;
++				optval = strtoul(optarg, &endptr, 10);
++
++				if (endptr == optarg || *endptr != '\0' ||
++					errno != 0 || optval != (unsigned int) optval)
++				{
++					fprintf(stderr, _("%s: invalid argument for option %s\n"),
++							progname, "--duration");
++					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
++					exit(1);
++				}
++
++				test_duration = (unsigned int) optval;
++				if (test_duration == 0)
++				{
++					fprintf(stderr, _("%s: %s must be in range %u..%u\n"),
++							progname, "--duration", 1, UINT_MAX);
++					exit(1);
++				}
+ 				break;
+ 
+ 			default:
+@@ -89,26 +111,15 @@ handle_args(int argc, char *argv[])
+ 		exit(1);
+ 	}
+ 
+-	if (test_duration > 0)
+-	{
+-		printf(ngettext("Testing timing overhead for %d second.\n",
+-						"Testing timing overhead for %d seconds.\n",
+-						test_duration),
+-			   test_duration);
+-	}
+-	else
+-	{
+-		fprintf(stderr,
+-				_("%s: duration must be a positive integer (duration is \"%d\")\n"),
+-				progname, test_duration);
+-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
+-				progname);
+-		exit(1);
+-	}
++
++	printf(ngettext("Testing timing overhead for %u second.\n",
++					"Testing timing overhead for %u seconds.\n",
++					test_duration),
++		   test_duration);
+ }
+ 
+ static uint64
+-test_timing(int32 duration)
++test_timing(unsigned int duration)
+ {
+ 	uint64		total_time;
+ 	int64		time_elapsed = 0;
+diff --git a/src/bin/pg_test_timing/t/001_basic.pl b/src/bin/pg_test_timing/t/001_basic.pl
+new file mode 100644
+index 000000000000..8bad19c7fad9
+--- /dev/null
++++ b/src/bin/pg_test_timing/t/001_basic.pl
+@@ -0,0 +1,25 @@
++use strict;
++use warnings;
++
++use Config;
++use TestLib;
++use Test::More tests => 12;
++
++#########################################
++# Basic checks
++
++program_help_ok('pg_test_timing');
++program_version_ok('pg_test_timing');
++program_options_handling_ok('pg_test_timing');
++
++#########################################
++# Test invalid option combinations
++
++command_fails_like(
++	[ 'pg_test_timing', '--duration', 'a' ],
++	qr/\Qpg_test_timing: invalid argument for option --duration\E/,
++	'pg_test_timing: invalid argument for option --duration');
++command_fails_like(
++	[ 'pg_test_timing', '--duration', '0' ],
++	qr/\Qpg_test_timing: --duration must be in range 1..4294967295\E/,
++	'pg_test_timing: --duration must be in range');

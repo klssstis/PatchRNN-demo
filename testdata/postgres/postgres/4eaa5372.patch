@@ -1,0 +1,134 @@
+From 4eaa53727542c39cca71b80e8ff3e1f742d64452 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Mon, 14 May 2018 13:09:32 -0400
+Subject: [PATCH] Don't allow partitioned index on foreign-table partitions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Creating indexes on foreign tables is already forbidden, but local
+partitioned indexes (commit 8b08f7d4820f) forgot to check for them.  Add
+a preliminary check to prevent wasting time.
+
+Another school of thought says to allow the index to be created if it's
+not a unique index; but it's possible to do better in the future (enable
+indexing of foreign tables, somehow), so we avoid painting ourselves in
+a corner by rejecting all cases, to avoid future grief (a.k.a. backward
+incompatible changes).
+
+Reported-by: Arseny Sher
+Author: Amit Langote, Álvaro Herrera
+Discussion: https://postgr.es/m/87sh71cakz.fsf@ars-thinkpad
+---
+ src/backend/tcop/utility.c                 | 38 +++++++++++++++-------
+ src/test/regress/expected/foreign_data.out |  7 ++++
+ src/test/regress/sql/foreign_data.sql      |  6 ++++
+ 3 files changed, 39 insertions(+), 12 deletions(-)
+
+diff --git a/src/backend/tcop/utility.c b/src/backend/tcop/utility.c
+index 287addf42986..bdfb66fa74b3 100644
+--- a/src/backend/tcop/utility.c
++++ b/src/backend/tcop/utility.c
+@@ -67,6 +67,7 @@
+ #include "tcop/utility.h"
+ #include "utils/acl.h"
+ #include "utils/guc.h"
++#include "utils/lsyscache.h"
+ #include "utils/syscache.h"
+ #include "utils/rel.h"
+ 
+@@ -1287,7 +1288,6 @@ ProcessUtilitySlow(ParseState *pstate,
+ 					IndexStmt  *stmt = (IndexStmt *) parsetree;
+ 					Oid			relid;
+ 					LOCKMODE	lockmode;
+-					List	   *inheritors = NIL;
+ 
+ 					if (stmt->concurrent)
+ 						PreventInTransactionBlock(isTopLevel,
+@@ -1314,17 +1314,33 @@ ProcessUtilitySlow(ParseState *pstate,
+ 					 * CREATE INDEX on partitioned tables (but not regular
+ 					 * inherited tables) recurses to partitions, so we must
+ 					 * acquire locks early to avoid deadlocks.
++					 *
++					 * We also take the opportunity to verify that all
++					 * partitions are something we can put an index on,
++					 * to avoid building some indexes only to fail later.
+ 					 */
+-					if (stmt->relation->inh)
++					if (stmt->relation->inh &&
++						get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
+ 					{
+-						Relation	rel;
+-
+-						/* already locked by RangeVarGetRelidExtended */
+-						rel = heap_open(relid, NoLock);
+-						if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+-							inheritors = find_all_inheritors(relid, lockmode,
+-															 NULL);
+-						heap_close(rel, NoLock);
++						ListCell   *lc;
++						List	   *inheritors = NIL;
++
++						inheritors = find_all_inheritors(relid, lockmode, NULL);
++						foreach(lc, inheritors)
++						{
++							char	relkind = get_rel_relkind(lfirst_oid(lc));
++
++							if (relkind != RELKIND_RELATION &&
++								relkind != RELKIND_MATVIEW &&
++								relkind != RELKIND_PARTITIONED_TABLE)
++								ereport(ERROR,
++										(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
++										 errmsg("cannot create index on partitioned table \"%s\"",
++												stmt->relation->relname),
++										 errdetail("Table \"%s\" contains partitions that are foreign tables.",
++												   stmt->relation->relname)));
++						}
++						list_free(inheritors);
+ 					}
+ 
+ 					/* Run parse analysis ... */
+@@ -1353,8 +1369,6 @@ ProcessUtilitySlow(ParseState *pstate,
+ 													 parsetree);
+ 					commandCollected = true;
+ 					EventTriggerAlterTableEnd();
+-
+-					list_free(inheritors);
+ 				}
+ 				break;
+ 
+diff --git a/src/test/regress/expected/foreign_data.out b/src/test/regress/expected/foreign_data.out
+index 7b54e96d30e2..339a43ff9e47 100644
+--- a/src/test/regress/expected/foreign_data.out
++++ b/src/test/regress/expected/foreign_data.out
+@@ -749,6 +749,13 @@ SELECT * FROM ft1;                                              -- ERROR
+ ERROR:  foreign-data wrapper "dummy" has no handler
+ EXPLAIN SELECT * FROM ft1;                                      -- ERROR
+ ERROR:  foreign-data wrapper "dummy" has no handler
++CREATE TABLE lt1 (a INT) PARTITION BY RANGE (a);
++CREATE FOREIGN TABLE ft_part1
++  PARTITION OF lt1 FOR VALUES FROM (0) TO (1000) SERVER s0;
++CREATE INDEX ON lt1 (a);                                        -- ERROR
++ERROR:  cannot create index on partitioned table "lt1"
++DETAIL:  Table "lt1" contains partitions that are foreign tables.
++DROP TABLE lt1;
+ -- ALTER FOREIGN TABLE
+ COMMENT ON FOREIGN TABLE ft1 IS 'foreign table';
+ COMMENT ON FOREIGN TABLE ft1 IS NULL;
+diff --git a/src/test/regress/sql/foreign_data.sql b/src/test/regress/sql/foreign_data.sql
+index 63e2e616d713..c029b2465d95 100644
+--- a/src/test/regress/sql/foreign_data.sql
++++ b/src/test/regress/sql/foreign_data.sql
+@@ -316,6 +316,12 @@ CREATE INDEX id_ft1_c2 ON ft1 (c2);                             -- ERROR
+ SELECT * FROM ft1;                                              -- ERROR
+ EXPLAIN SELECT * FROM ft1;                                      -- ERROR
+ 
++CREATE TABLE lt1 (a INT) PARTITION BY RANGE (a);
++CREATE FOREIGN TABLE ft_part1
++  PARTITION OF lt1 FOR VALUES FROM (0) TO (1000) SERVER s0;
++CREATE INDEX ON lt1 (a);                                        -- ERROR
++DROP TABLE lt1;
++
+ -- ALTER FOREIGN TABLE
+ COMMENT ON FOREIGN TABLE ft1 IS 'foreign table';
+ COMMENT ON FOREIGN TABLE ft1 IS NULL;
