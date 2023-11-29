@@ -1,0 +1,430 @@
+From 249d64999615802752940e017ee5166e726bc7cd Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Sat, 6 Apr 2019 15:23:37 +0900
+Subject: [PATCH] Add support TCP user timeout in libpq and the backend server
+
+Similarly to the set of parameters for keepalive, a connection parameter
+for libpq is added as well as a backend GUC, called tcp_user_timeout.
+
+Increasing the TCP user timeout is useful to allow a connection to
+survive extended periods without end-to-end connection, and decreasing
+it allows application to fail faster.  By default, the parameter is 0,
+which makes the connection use the system default, and follows a logic
+close to the keepalive parameters in its handling.  When connecting
+through a Unix-socket domain, the parameters have no effect.
+
+Author: Ryohei Nagaura
+Reviewed-by: Fabien Coelho, Robert Haas, Kyotaro Horiguchi, Kirk
+Jamison, Mikalai Keida, Takayuki Tsunakawa, Andrei Yahorau
+Discussion: https://postgr.es/m/EDA4195584F5064680D8130B1CA91C45367328@G01JPEXMBYT04
+---
+ .../postgres_fdw/expected/postgres_fdw.out    |  1 +
+ contrib/postgres_fdw/sql/postgres_fdw.sql     |  1 +
+ doc/src/sgml/config.sgml                      | 25 +++++++
+ doc/src/sgml/libpq.sgml                       | 14 ++++
+ src/backend/libpq/pqcomm.c                    | 73 +++++++++++++++++++
+ src/backend/utils/misc/guc.c                  | 31 ++++++++
+ src/backend/utils/misc/postgresql.conf.sample |  4 +-
+ src/include/libpq/libpq-be.h                  |  6 +-
+ src/include/utils/guc.h                       |  1 +
+ src/interfaces/libpq/fe-connect.c             | 43 +++++++++++
+ src/interfaces/libpq/libpq-int.h              |  1 +
+ 11 files changed, 198 insertions(+), 2 deletions(-)
+
+diff --git a/contrib/postgres_fdw/expected/postgres_fdw.out b/contrib/postgres_fdw/expected/postgres_fdw.out
+index 8ee1ff509383..3ed52709eeab 100644
+--- a/contrib/postgres_fdw/expected/postgres_fdw.out
++++ b/contrib/postgres_fdw/expected/postgres_fdw.out
+@@ -151,6 +151,7 @@ ALTER SERVER testserver1 OPTIONS (
+ 	keepalives 'value',
+ 	keepalives_idle 'value',
+ 	keepalives_interval 'value',
++	tcp_user_timeout 'value',
+ 	-- requiressl 'value',
+ 	sslcompression 'value',
+ 	sslmode 'value',
+diff --git a/contrib/postgres_fdw/sql/postgres_fdw.sql b/contrib/postgres_fdw/sql/postgres_fdw.sql
+index c588c96727c0..3bfcdabc784b 100644
+--- a/contrib/postgres_fdw/sql/postgres_fdw.sql
++++ b/contrib/postgres_fdw/sql/postgres_fdw.sql
+@@ -164,6 +164,7 @@ ALTER SERVER testserver1 OPTIONS (
+ 	keepalives 'value',
+ 	keepalives_idle 'value',
+ 	keepalives_interval 'value',
++	tcp_user_timeout 'value',
+ 	-- requiressl 'value',
+ 	sslcompression 'value',
+ 	sslmode 'value',
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index bc1d0f7bfaee..d2da1abe6180 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -939,6 +939,31 @@ include_dir 'conf.d'
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry id="guc-tcp-user-timeout" xreflabel="tcp_user_timeout">
++      <term><varname>tcp_user_timeout</varname> (<type>integer</type>)
++      <indexterm>
++       <primary><varname>tcp_user_timeout</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        Specifies the number of milliseconds that transmitted data may
++        remain unacknowledged before a connection is forcibly closed.
++        A value of 0 uses the system default.
++        This parameter is supported only on systems that support
++        <symbol>TCP_USER_TIMEOUT</symbol>; on other systems, it must be zero.
++        In sessions connected via a Unix-domain socket, this parameter is
++        ignored and always reads as zero. 
++       </para>
++       <note>
++        <para>
++         This parameter is not supported on Windows and on Linux version
++         2.6.36 or older.
++        </para>
++       </note>
++      </listitem>
++     </varlistentry>
++
+      </variablelist>
+      </sect2>
+ 
+diff --git a/doc/src/sgml/libpq.sgml b/doc/src/sgml/libpq.sgml
+index 924b7ce50e19..fe833aa62604 100644
+--- a/doc/src/sgml/libpq.sgml
++++ b/doc/src/sgml/libpq.sgml
+@@ -1249,6 +1249,20 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry id="libpq-tcp-user-timeout" xreflabel="libpq_tcp_user_timeout">
++      <term><literal>tcp_user_timeout</literal></term>
++      <listitem>
++       <para>
++        Controls the number of milliseconds that transmitted data may
++        remain unacknowledged before a connection is forcibly closed.
++        A value of zero uses the system default. This parameter is
++        ignored for connections made via a Unix-domain socket.
++        It is only supported on systems where <symbol>TCP_USER_TIMEOUT</symbol>
++        is available; on other systems, it has no effect.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry id="libpq-connect-tty" xreflabel="tty">
+       <term><literal>tty</literal></term>
+       <listitem>
+diff --git a/src/backend/libpq/pqcomm.c b/src/backend/libpq/pqcomm.c
+index c39617a430aa..384887e70d92 100644
+--- a/src/backend/libpq/pqcomm.c
++++ b/src/backend/libpq/pqcomm.c
+@@ -825,6 +825,7 @@ StreamConnection(pgsocket server_fd, Port *port)
+ 		(void) pq_setkeepalivesidle(tcp_keepalives_idle, port);
+ 		(void) pq_setkeepalivesinterval(tcp_keepalives_interval, port);
+ 		(void) pq_setkeepalivescount(tcp_keepalives_count, port);
++		(void) pq_settcpusertimeout(tcp_user_timeout, port);
+ 	}
+ 
+ 	return STATUS_OK;
+@@ -1926,3 +1927,75 @@ pq_setkeepalivescount(int count, Port *port)
+ 
+ 	return STATUS_OK;
+ }
++
++int
++pq_gettcpusertimeout(Port *port)
++{
++#ifdef TCP_USER_TIMEOUT
++	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
++		return 0;
++
++	if (port->tcp_user_timeout != 0)
++		return port->tcp_user_timeout;
++
++	if (port->default_tcp_user_timeout == 0)
++	{
++		ACCEPT_TYPE_ARG3 size = sizeof(port->default_tcp_user_timeout);
++
++		if (getsockopt(port->sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
++					   (char *) &port->default_tcp_user_timeout,
++					   &size) < 0)
++		{
++			elog(LOG, "getsockopt(%s) failed: %m", "TCP_USER_TIMEOUT");
++			port->default_tcp_user_timeout = -1;	/* don't know */
++		}
++	}
++
++	return port->default_tcp_user_timeout;
++#else
++	return 0;
++#endif
++}
++
++int
++pq_settcpusertimeout(int timeout, Port *port)
++{
++	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
++		return STATUS_OK;
++
++#ifdef TCP_USER_TIMEOUT
++	if (timeout == port->tcp_user_timeout)
++		return STATUS_OK;
++
++	if (port->default_tcp_user_timeout <= 0)
++	{
++		if (pq_gettcpusertimeout(port) < 0)
++		{
++			if (timeout == 0)
++				return STATUS_OK;	/* default is set but unknown */
++			else
++				return STATUS_ERROR;
++		}
++	}
++
++	if (timeout == 0)
++		timeout = port->default_tcp_user_timeout;
++
++	if (setsockopt(port->sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
++				   (char *) &timeout, sizeof(timeout)) < 0)
++	{
++		elog(LOG, "setsockopt(%s) failed: %m", "TCP_USER_TIMEOUT");
++		return STATUS_ERROR;
++	}
++
++	port->tcp_user_timeout = timeout;
++#else
++	if (timeout != 0)
++	{
++		elog(LOG, "setsockopt(%s) not supported", "TCP_USER_TIMEOUT");
++		return STATUS_ERROR;
++	}
++#endif
++
++	return STATUS_OK;
++}
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index 1766e46037f3..f7f726b5aecb 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -182,9 +182,11 @@ static const char *show_archive_command(void);
+ static void assign_tcp_keepalives_idle(int newval, void *extra);
+ static void assign_tcp_keepalives_interval(int newval, void *extra);
+ static void assign_tcp_keepalives_count(int newval, void *extra);
++static void assign_tcp_user_timeout(int newval, void *extra);
+ static const char *show_tcp_keepalives_idle(void);
+ static const char *show_tcp_keepalives_interval(void);
+ static const char *show_tcp_keepalives_count(void);
++static const char *show_tcp_user_timeout(void);
+ static bool check_maxconnections(int *newval, void **extra, GucSource source);
+ static bool check_max_worker_processes(int *newval, void **extra, GucSource source);
+ static bool check_autovacuum_max_workers(int *newval, void **extra, GucSource source);
+@@ -530,6 +532,7 @@ char	   *application_name;
+ int			tcp_keepalives_idle;
+ int			tcp_keepalives_interval;
+ int			tcp_keepalives_count;
++int			tcp_user_timeout;
+ 
+ /*
+  * SSL renegotiation was been removed in PostgreSQL 9.5, but we tolerate it
+@@ -3182,6 +3185,17 @@ static struct config_int ConfigureNamesInt[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"tcp_user_timeout", PGC_USERSET, CLIENT_CONN_OTHER,
++			gettext_noop("TCP user timeout."),
++			gettext_noop("A value of 0 uses the system default."),
++			GUC_UNIT_MS
++		},
++		&tcp_user_timeout,
++		0, 0, INT_MAX,
++		NULL, assign_tcp_user_timeout, show_tcp_user_timeout
++	},
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
+@@ -11238,6 +11252,23 @@ show_tcp_keepalives_count(void)
+ 	return nbuf;
+ }
+ 
++static void
++assign_tcp_user_timeout(int newval, void *extra)
++{
++	/* See comments in assign_tcp_keepalives_idle */
++	(void) pq_settcpusertimeout(newval, MyProcPort);
++}
++
++static const char *
++show_tcp_user_timeout(void)
++{
++	/* See comments in assign_tcp_keepalives_idle */
++	static char nbuf[16];
++
++	snprintf(nbuf, sizeof(nbuf), "%d", pq_gettcpusertimeout(MyProcPort));
++	return nbuf;
++}
++
+ static bool
+ check_maxconnections(int *newval, void **extra, GucSource source)
+ {
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index bbbeb4bb155d..77bb7c240280 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -73,7 +73,7 @@
+ #bonjour_name = ''			# defaults to the computer name
+ 					# (change requires restart)
+ 
+-# - TCP Keepalives -
++# - TCP settings -
+ # see "man 7 tcp" for details
+ 
+ #tcp_keepalives_idle = 0		# TCP_KEEPIDLE, in seconds;
+@@ -82,6 +82,8 @@
+ 					# 0 selects the system default
+ #tcp_keepalives_count = 0		# TCP_KEEPCNT;
+ 					# 0 selects the system default
++#tcp_user_timeout = 0			# TCP_USER_TIMEOUT, in milliseconds;
++					# 0 selects the system default
+ 
+ # - Authentication -
+ 
+diff --git a/src/include/libpq/libpq-be.h b/src/include/libpq/libpq-be.h
+index b135ef9d9fd5..00b1fbe44158 100644
+--- a/src/include/libpq/libpq-be.h
++++ b/src/include/libpq/libpq-be.h
+@@ -155,7 +155,7 @@ typedef struct Port
+ 	HbaLine    *hba;
+ 
+ 	/*
+-	 * TCP keepalive settings.
++	 * TCP keepalive and user timeout settings.
+ 	 *
+ 	 * default values are 0 if AF_UNIX or not yet known; current values are 0
+ 	 * if AF_UNIX or using the default. Also, -1 in a default value means we
+@@ -164,9 +164,11 @@ typedef struct Port
+ 	int			default_keepalives_idle;
+ 	int			default_keepalives_interval;
+ 	int			default_keepalives_count;
++	int			default_tcp_user_timeout;
+ 	int			keepalives_idle;
+ 	int			keepalives_interval;
+ 	int			keepalives_count;
++	int			tcp_user_timeout;
+ 
+ 	/*
+ 	 * GSSAPI structures.
+@@ -306,9 +308,11 @@ extern ProtocolVersion FrontendProtocol;
+ extern int	pq_getkeepalivesidle(Port *port);
+ extern int	pq_getkeepalivesinterval(Port *port);
+ extern int	pq_getkeepalivescount(Port *port);
++extern int	pq_gettcpusertimeout(Port *port);
+ 
+ extern int	pq_setkeepalivesidle(int idle, Port *port);
+ extern int	pq_setkeepalivesinterval(int interval, Port *port);
+ extern int	pq_setkeepalivescount(int count, Port *port);
++extern int	pq_settcpusertimeout(int timeout, Port *port);
+ 
+ #endif							/* LIBPQ_BE_H */
+diff --git a/src/include/utils/guc.h b/src/include/utils/guc.h
+index 2f7cf919335c..6c41edac008a 100644
+--- a/src/include/utils/guc.h
++++ b/src/include/utils/guc.h
+@@ -271,6 +271,7 @@ extern PGDLLIMPORT char *application_name;
+ extern int	tcp_keepalives_idle;
+ extern int	tcp_keepalives_interval;
+ extern int	tcp_keepalives_count;
++extern int	tcp_user_timeout;
+ 
+ #ifdef TRACE_SORT
+ extern bool trace_sort;
+diff --git a/src/interfaces/libpq/fe-connect.c b/src/interfaces/libpq/fe-connect.c
+index 5dcc7d76922c..87df79880afc 100644
+--- a/src/interfaces/libpq/fe-connect.c
++++ b/src/interfaces/libpq/fe-connect.c
+@@ -270,6 +270,10 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
+ 		"TCP-Keepalives-Count", "", 10, /* strlen(INT32_MAX) == 10 */
+ 	offsetof(struct pg_conn, keepalives_count)},
+ 
++	{"tcp_user_timeout", NULL, NULL, NULL,
++		"TCP-User-Timeout", "", 10, /* strlen(INT32_MAX) == 10 */
++	offsetof(struct pg_conn, pgtcp_user_timeout)},
++
+ 	/*
+ 	 * ssl options are allowed even without client SSL support because the
+ 	 * client can still handle SSL modes "disable" and "allow". Other
+@@ -1833,6 +1837,41 @@ setKeepalivesWin32(PGconn *conn)
+ #endif							/* SIO_KEEPALIVE_VALS */
+ #endif							/* WIN32 */
+ 
++/*
++ * Set the TCP user timeout.
++ */
++static int
++setTCPUserTimeout(PGconn *conn)
++{
++	int			timeout;
++
++	if (conn->pgtcp_user_timeout == NULL)
++		return 1;
++
++	if (!parse_int_param(conn->pgtcp_user_timeout, &timeout, conn,
++						 "tcp_user_timeout"))
++		return 0;
++
++	if (timeout < 0)
++		timeout = 0;
++
++#ifdef TCP_USER_TIMEOUT
++	if (setsockopt(conn->sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
++				   (char *) &timeout, sizeof(timeout)) < 0)
++	{
++		char		sebuf[256];
++
++		appendPQExpBuffer(&conn->errorMessage,
++						  libpq_gettext("setsockopt(%s) failed: %s\n"),
++						  "TCP_USER_TIMEOUT",
++						  SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
++		return 0;
++	}
++#endif
++
++	return 1;
++}
++
+ /* ----------
+  * connectDBStart -
+  *		Begin the process of making a connection to the backend.
+@@ -2480,6 +2519,8 @@ PQconnectPoll(PGconn *conn)
+ 							err = 1;
+ #endif							/* SIO_KEEPALIVE_VALS */
+ #endif							/* WIN32 */
++						else if (!setTCPUserTimeout(conn))
++							err = 1;
+ 
+ 						if (err)
+ 						{
+@@ -3863,6 +3904,8 @@ freePGconn(PGconn *conn)
+ 		free(conn->pgtty);
+ 	if (conn->connect_timeout)
+ 		free(conn->connect_timeout);
++	if (conn->pgtcp_user_timeout)
++		free(conn->pgtcp_user_timeout);
+ 	if (conn->pgoptions)
+ 		free(conn->pgoptions);
+ 	if (conn->appname)
+diff --git a/src/interfaces/libpq/libpq-int.h b/src/interfaces/libpq/libpq-int.h
+index 84222f2c7ca0..1221ea9eefa2 100644
+--- a/src/interfaces/libpq/libpq-int.h
++++ b/src/interfaces/libpq/libpq-int.h
+@@ -336,6 +336,7 @@ struct pg_conn
+ 	char	   *pgtty;			/* tty on which the backend messages is
+ 								 * displayed (OBSOLETE, NOT USED) */
+ 	char	   *connect_timeout;	/* connection timeout (numeric string) */
++	char	   *pgtcp_user_timeout; /* tcp user timeout (numeric string) */
+ 	char	   *client_encoding_initial;	/* encoding to use */
+ 	char	   *pgoptions;		/* options to start the backend with */
+ 	char	   *appname;		/* application name */

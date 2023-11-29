@@ -1,0 +1,159 @@
+From 126cdaf47af275f76b2f2ddb023bfdc6f018ae30 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 23 Jun 2021 14:01:32 -0400
+Subject: [PATCH] Don't assume GSSAPI result strings are null-terminated.
+
+Our uses of gss_display_status() and gss_display_name() assumed
+that the gss_buffer_desc strings returned by those functions are
+null-terminated.  It appears that they generally are, given the
+lack of field complaints up to now.  However, the available
+documentation does not promise this, and some man pages
+for gss_display_status() show examples that rely on the
+gss_buffer_desc.length field instead of expecting null
+termination.  Also, we now have a report that on some
+implementations, clang's address sanitizer is of the opinion
+that the byte after the specified length is undefined.
+
+Hence, change the code to rely on the length field instead.
+
+This might well be cosmetic rather than fixing any real bug, but
+it's hard to be sure, so back-patch to all supported branches.
+While here, also back-patch the v12 changes that made pg_GSS_error
+deal honestly with multiple messages available from
+gss_display_status.
+
+Per report from Sudheer H R.
+
+Discussion: https://postgr.es/m/5372B6D4-8276-42C0-B8FB-BD0918826FC3@tekenlight.com
+---
+ src/backend/libpq/auth.c                | 27 ++++++++++++++++---------
+ src/backend/libpq/be-gssapi-common.c    | 11 +++++-----
+ src/interfaces/libpq/fe-gssapi-common.c |  3 ++-
+ 3 files changed, 26 insertions(+), 15 deletions(-)
+
+diff --git a/src/backend/libpq/auth.c b/src/backend/libpq/auth.c
+index 68372fcea87e..967b5ef73cc3 100644
+--- a/src/backend/libpq/auth.c
++++ b/src/backend/libpq/auth.c
+@@ -1213,6 +1213,7 @@ pg_GSS_checkauth(Port *port)
+ 				min_stat,
+ 				lmin_s;
+ 	gss_buffer_desc gbuf;
++	char	   *princ;
+ 
+ 	/*
+ 	 * Get the name of the user that authenticated, and compare it to the pg
+@@ -1226,6 +1227,15 @@ pg_GSS_checkauth(Port *port)
+ 		return STATUS_ERROR;
+ 	}
+ 
++	/*
++	 * gbuf.value might not be null-terminated, so turn it into a regular
++	 * null-terminated string.
++	 */
++	princ = palloc(gbuf.length + 1);
++	memcpy(princ, gbuf.value, gbuf.length);
++	princ[gbuf.length] = '\0';
++	gss_release_buffer(&lmin_s, &gbuf);
++
+ 	/*
+ 	 * Copy the original name of the authenticated principal into our backend
+ 	 * memory for display later.
+@@ -1234,15 +1244,15 @@ pg_GSS_checkauth(Port *port)
+ 	 * waiting for the usermap check below, because authentication has already
+ 	 * succeeded and we want the log file to reflect that.
+ 	 */
+-	port->gss->princ = MemoryContextStrdup(TopMemoryContext, gbuf.value);
+-	set_authn_id(port, gbuf.value);
++	port->gss->princ = MemoryContextStrdup(TopMemoryContext, princ);
++	set_authn_id(port, princ);
+ 
+ 	/*
+ 	 * Split the username at the realm separator
+ 	 */
+-	if (strchr(gbuf.value, '@'))
++	if (strchr(princ, '@'))
+ 	{
+-		char	   *cp = strchr(gbuf.value, '@');
++		char	   *cp = strchr(princ, '@');
+ 
+ 		/*
+ 		 * If we are not going to include the realm in the username that is
+@@ -1269,7 +1279,7 @@ pg_GSS_checkauth(Port *port)
+ 				elog(DEBUG2,
+ 					 "GSSAPI realm (%s) and configured realm (%s) don't match",
+ 					 cp, port->hba->krb_realm);
+-				gss_release_buffer(&lmin_s, &gbuf);
++				pfree(princ);
+ 				return STATUS_ERROR;
+ 			}
+ 		}
+@@ -1278,15 +1288,14 @@ pg_GSS_checkauth(Port *port)
+ 	{
+ 		elog(DEBUG2,
+ 			 "GSSAPI did not return realm but realm matching was requested");
+-
+-		gss_release_buffer(&lmin_s, &gbuf);
++		pfree(princ);
+ 		return STATUS_ERROR;
+ 	}
+ 
+-	ret = check_usermap(port->hba->usermap, port->user_name, gbuf.value,
++	ret = check_usermap(port->hba->usermap, port->user_name, princ,
+ 						pg_krb_caseins_users);
+ 
+-	gss_release_buffer(&lmin_s, &gbuf);
++	pfree(princ);
+ 
+ 	return ret;
+ }
+diff --git a/src/backend/libpq/be-gssapi-common.c b/src/backend/libpq/be-gssapi-common.c
+index cb2df0bfb3df..38f58def25cc 100644
+--- a/src/backend/libpq/be-gssapi-common.c
++++ b/src/backend/libpq/be-gssapi-common.c
+@@ -29,8 +29,6 @@ pg_GSS_error_int(char *s, size_t len, OM_uint32 stat, int type)
+ 	OM_uint32	lmin_s,
+ 				msg_ctx = 0;
+ 
+-	s[0] = '\0';				/* just in case gss_display_status fails */
+-
+ 	do
+ 	{
+ 		if (gss_display_status(&lmin_s, stat, type, GSS_C_NO_OID,
+@@ -43,16 +41,19 @@ pg_GSS_error_int(char *s, size_t len, OM_uint32 stat, int type)
+ 			i++;
+ 		}
+ 		if (i < len)
+-			strlcpy(s + i, gmsg.value, len - i);
++			memcpy(s + i, gmsg.value, Min(len - i, gmsg.length));
+ 		i += gmsg.length;
+ 		gss_release_buffer(&lmin_s, &gmsg);
+ 	}
+ 	while (msg_ctx);
+ 
+-	if (i >= len)
++	/* add nul termination */
++	if (i < len)
++		s[i] = '\0';
++	else
+ 	{
+ 		elog(COMMERROR, "incomplete GSS error report");
+-		s[len - 1] = '\0';		/* ensure string is nul-terminated */
++		s[len - 1] = '\0';
+ 	}
+ }
+ 
+diff --git a/src/interfaces/libpq/fe-gssapi-common.c b/src/interfaces/libpq/fe-gssapi-common.c
+index b26fbf8a9f91..9e8aeae11979 100644
+--- a/src/interfaces/libpq/fe-gssapi-common.c
++++ b/src/interfaces/libpq/fe-gssapi-common.c
+@@ -34,7 +34,8 @@ pg_GSS_error_int(PQExpBuffer str, OM_uint32 stat, int type)
+ 		if (gss_display_status(&lmin_s, stat, type, GSS_C_NO_OID,
+ 							   &msg_ctx, &lmsg) != GSS_S_COMPLETE)
+ 			break;
+-		appendPQExpBuffer(str, " %s", (char *) lmsg.value);
++		appendPQExpBufferChar(str, ' ');
++		appendBinaryPQExpBuffer(str, lmsg.value, lmsg.length);
+ 		gss_release_buffer(&lmin_s, &lmsg);
+ 	} while (msg_ctx);
+ }

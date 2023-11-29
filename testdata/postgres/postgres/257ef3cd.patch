@@ -1,0 +1,109 @@
+From 257ef3cd4fec7ca1213f31b660486b492b1c7031 Mon Sep 17 00:00:00 2001
+From: Thomas Munro <tmunro@postgresql.org>
+Date: Tue, 13 Nov 2018 17:39:36 +1300
+Subject: [PATCH] Fix handling of HBA ldapserver with multiple hostnames.
+
+Commit 35c0754f failed to handle space-separated lists of alternative
+hostnames in ldapserver, when building a URI for ldap_initialize()
+(OpenLDAP).  Such lists need to be expanded to space-separated URIs.
+
+Repair.  Back-patch to 11, to fix bug report #15495.
+
+Author: Thomas Munro
+Reported-by: Renaud Navarro
+Discussion: https://postgr.es/m/15495-2c39fc196c95cd72%40postgresql.org
+---
+ src/backend/libpq/auth.c    | 42 ++++++++++++++++++++++++++++++++-----
+ src/test/ldap/t/001_auth.pl | 18 +++++++++++++++-
+ 2 files changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/src/backend/libpq/auth.c b/src/backend/libpq/auth.c
+index 851756553598..bbf102ed7de9 100644
+--- a/src/backend/libpq/auth.c
++++ b/src/backend/libpq/auth.c
+@@ -2352,12 +2352,44 @@ InitializeLDAPConnection(Port *port, LDAP **ldap)
+ #else
+ #ifdef HAVE_LDAP_INITIALIZE
+ 	{
+-		char	   *uri;
++		const char *hostnames = port->hba->ldapserver;
++		char	   *uris = NULL;
+ 
+-		uri = psprintf("%s://%s:%d", scheme, port->hba->ldapserver,
+-					   port->hba->ldapport);
+-		r = ldap_initialize(ldap, uri);
+-		pfree(uri);
++		/*
++		 * We have a space-separated list of hostnames.  Convert it
++		 * to a space-separated list of URIs.
++		 */
++		do
++		{
++			const char *hostname;
++			size_t		hostname_size;
++			char	   *new_uris;
++
++			/* Find the leading hostname. */
++			hostname_size = strcspn(hostnames, " ");
++			hostname = pnstrdup(hostnames, hostname_size);
++
++			/* Append a URI for this hostname. */
++			new_uris = psprintf("%s%s%s://%s:%d",
++								uris ? uris : "",
++								uris ? " " : "",
++								scheme,
++								hostname,
++								port->hba->ldapport);
++
++			pfree(hostname);
++			if (uris)
++				pfree(uris);
++			uris = new_uris;
++
++			/* Step over this hostname and any spaces. */
++			hostnames += hostname_size;
++			while (*hostnames == ' ')
++				++hostnames;
++		} while (*hostnames);
++
++		r = ldap_initialize(ldap, uris);
++		pfree(uris);
+ 		if (r != LDAP_SUCCESS)
+ 		{
+ 			ereport(LOG,
+diff --git a/src/test/ldap/t/001_auth.pl b/src/test/ldap/t/001_auth.pl
+index 67b406c981b3..431ad6442c3e 100644
+--- a/src/test/ldap/t/001_auth.pl
++++ b/src/test/ldap/t/001_auth.pl
+@@ -6,7 +6,7 @@
+ 
+ if ($ENV{with_ldap} eq 'yes')
+ {
+-	plan tests => 19;
++	plan tests => 22;
+ }
+ else
+ {
+@@ -179,6 +179,22 @@ sub test_access
+ $ENV{"PGPASSWORD"} = 'secret1';
+ test_access($node, 'test1', 0, 'search+bind authentication succeeds');
+ 
++note "multiple servers";
++
++unlink($node->data_dir . '/pg_hba.conf');
++$node->append_conf('pg_hba.conf',
++	qq{local all all ldap ldapserver="$ldap_server $ldap_server" ldapport=$ldap_port ldapbasedn="$ldap_basedn"}
++);
++$node->restart;
++
++$ENV{"PGPASSWORD"} = 'wrong';
++test_access($node, 'test0', 2,
++	'search+bind authentication fails if user not found in LDAP');
++test_access($node, 'test1', 2,
++	'search+bind authentication fails with wrong password');
++$ENV{"PGPASSWORD"} = 'secret1';
++test_access($node, 'test1', 0, 'search+bind authentication succeeds');
++
+ note "LDAP URLs";
+ 
+ unlink($node->data_dir . '/pg_hba.conf');

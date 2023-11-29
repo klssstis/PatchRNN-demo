@@ -1,0 +1,1198 @@
+From 273c458a2b3a0fb73968020ea5e9e35eb6928967 Mon Sep 17 00:00:00 2001
+From: Heikki Linnakangas <heikki.linnakangas@iki.fi>
+Date: Tue, 7 Mar 2017 14:23:49 +0200
+Subject: [PATCH] Refactor SHA2 functions and move them to src/common/.
+
+This way both frontend and backends can use them. The functions are taken
+from pgcrypto, which now fetches the source files it needs from
+src/common/.
+
+A new interface is designed for the SHA2 functions, which allow linking
+to either OpenSSL or the in-core stuff taken from KAME as needed.
+
+Michael Paquier, reviewed by Robert Haas.
+
+Discussion: https://www.postgresql.org/message-id/CAB7nPqTGKuTM5jiZriHrNaQeVqp5e_iT3X4BFLWY_HyHxLvySQ%40mail.gmail.com
+---
+ contrib/pgcrypto/.gitignore             |   4 +
+ contrib/pgcrypto/Makefile               |   9 +-
+ contrib/pgcrypto/internal-sha2.c        |  82 +++++------
+ contrib/pgcrypto/sha2.h                 | 100 --------------
+ src/common/Makefile                     |   6 +
+ {contrib/pgcrypto => src/common}/sha2.c | 174 +++++++++++++-----------
+ src/common/sha2_openssl.c               | 102 ++++++++++++++
+ src/include/common/sha2.h               | 115 ++++++++++++++++
+ src/tools/msvc/Mkvcbuild.pm             |  20 ++-
+ 9 files changed, 385 insertions(+), 227 deletions(-)
+ delete mode 100644 contrib/pgcrypto/sha2.h
+ rename {contrib/pgcrypto => src/common}/sha2.c (82%)
+ create mode 100644 src/common/sha2_openssl.c
+ create mode 100644 src/include/common/sha2.h
+
+diff --git a/contrib/pgcrypto/.gitignore b/contrib/pgcrypto/.gitignore
+index 5dcb3ff97235..30619bfbbf91 100644
+--- a/contrib/pgcrypto/.gitignore
++++ b/contrib/pgcrypto/.gitignore
+@@ -1,3 +1,7 @@
++# Source file copied from src/common
++/sha2.c
++/sha2_openssl.c
++
+ # Generated subdirectories
+ /log/
+ /results/
+diff --git a/contrib/pgcrypto/Makefile b/contrib/pgcrypto/Makefile
+index f65d84d1f35a..14e74f899cd4 100644
+--- a/contrib/pgcrypto/Makefile
++++ b/contrib/pgcrypto/Makefile
+@@ -4,7 +4,7 @@ INT_SRCS = md5.c sha1.c sha2.c internal.c internal-sha2.c blf.c rijndael.c \
+ 		pgp-mpi-internal.c imath.c
+ INT_TESTS = sha2
+ 
+-OSSL_SRCS = openssl.c pgp-mpi-openssl.c
++OSSL_SRCS = openssl.c pgp-mpi-openssl.c sha2_openssl.c
+ OSSL_TESTS = sha2 des 3des cast5
+ 
+ ZLIB_TST = pgp-compression
+@@ -59,6 +59,13 @@ SHLIB_LINK += $(filter -leay32, $(LIBS))
+ SHLIB_LINK += -lws2_32
+ endif
+ 
++# Compiling pgcrypto with those two raw files is necessary as long
++# as none of their routines are used by the backend code.  Note doing
++# so can either result in library loading failures or linking resolution
++# failures at compilation depending on the environment used.
++sha2.c sha2_openssl.c: % : $(top_srcdir)/src/common/%
++	rm -f $@ && $(LN_S) $< .
++
+ rijndael.o: rijndael.tbl
+ 
+ rijndael.tbl:
+diff --git a/contrib/pgcrypto/internal-sha2.c b/contrib/pgcrypto/internal-sha2.c
+index 55ec7e16bd9f..e06f55445eff 100644
+--- a/contrib/pgcrypto/internal-sha2.c
++++ b/contrib/pgcrypto/internal-sha2.c
+@@ -33,8 +33,8 @@
+ 
+ #include <time.h>
+ 
++#include "common/sha2.h"
+ #include "px.h"
+-#include "sha2.h"
+ 
+ void		init_sha224(PX_MD *h);
+ void		init_sha256(PX_MD *h);
+@@ -46,43 +46,43 @@ void		init_sha512(PX_MD *h);
+ static unsigned
+ int_sha224_len(PX_MD *h)
+ {
+-	return SHA224_DIGEST_LENGTH;
++	return PG_SHA224_DIGEST_LENGTH;
+ }
+ 
+ static unsigned
+ int_sha224_block_len(PX_MD *h)
+ {
+-	return SHA224_BLOCK_LENGTH;
++	return PG_SHA224_BLOCK_LENGTH;
+ }
+ 
+ static void
+ int_sha224_update(PX_MD *h, const uint8 *data, unsigned dlen)
+ {
+-	SHA224_CTX *ctx = (SHA224_CTX *) h->p.ptr;
++	pg_sha224_ctx *ctx = (pg_sha224_ctx *) h->p.ptr;
+ 
+-	SHA224_Update(ctx, data, dlen);
++	pg_sha224_update(ctx, data, dlen);
+ }
+ 
+ static void
+ int_sha224_reset(PX_MD *h)
+ {
+-	SHA224_CTX *ctx = (SHA224_CTX *) h->p.ptr;
++	pg_sha224_ctx *ctx = (pg_sha224_ctx *) h->p.ptr;
+ 
+-	SHA224_Init(ctx);
++	pg_sha224_init(ctx);
+ }
+ 
+ static void
+ int_sha224_finish(PX_MD *h, uint8 *dst)
+ {
+-	SHA224_CTX *ctx = (SHA224_CTX *) h->p.ptr;
++	pg_sha224_ctx *ctx = (pg_sha224_ctx *) h->p.ptr;
+ 
+-	SHA224_Final(dst, ctx);
++	pg_sha224_final(ctx, dst);
+ }
+ 
+ static void
+ int_sha224_free(PX_MD *h)
+ {
+-	SHA224_CTX *ctx = (SHA224_CTX *) h->p.ptr;
++	pg_sha224_ctx *ctx = (pg_sha224_ctx *) h->p.ptr;
+ 
+ 	px_memset(ctx, 0, sizeof(*ctx));
+ 	px_free(ctx);
+@@ -94,43 +94,43 @@ int_sha224_free(PX_MD *h)
+ static unsigned
+ int_sha256_len(PX_MD *h)
+ {
+-	return SHA256_DIGEST_LENGTH;
++	return PG_SHA256_DIGEST_LENGTH;
+ }
+ 
+ static unsigned
+ int_sha256_block_len(PX_MD *h)
+ {
+-	return SHA256_BLOCK_LENGTH;
++	return PG_SHA256_BLOCK_LENGTH;
+ }
+ 
+ static void
+ int_sha256_update(PX_MD *h, const uint8 *data, unsigned dlen)
+ {
+-	SHA256_CTX *ctx = (SHA256_CTX *) h->p.ptr;
++	pg_sha256_ctx *ctx = (pg_sha256_ctx *) h->p.ptr;
+ 
+-	SHA256_Update(ctx, data, dlen);
++	pg_sha256_update(ctx, data, dlen);
+ }
+ 
+ static void
+ int_sha256_reset(PX_MD *h)
+ {
+-	SHA256_CTX *ctx = (SHA256_CTX *) h->p.ptr;
++	pg_sha256_ctx *ctx = (pg_sha256_ctx *) h->p.ptr;
+ 
+-	SHA256_Init(ctx);
++	pg_sha256_init(ctx);
+ }
+ 
+ static void
+ int_sha256_finish(PX_MD *h, uint8 *dst)
+ {
+-	SHA256_CTX *ctx = (SHA256_CTX *) h->p.ptr;
++	pg_sha256_ctx *ctx = (pg_sha256_ctx *) h->p.ptr;
+ 
+-	SHA256_Final(dst, ctx);
++	pg_sha256_final(ctx, dst);
+ }
+ 
+ static void
+ int_sha256_free(PX_MD *h)
+ {
+-	SHA256_CTX *ctx = (SHA256_CTX *) h->p.ptr;
++	pg_sha256_ctx *ctx = (pg_sha256_ctx *) h->p.ptr;
+ 
+ 	px_memset(ctx, 0, sizeof(*ctx));
+ 	px_free(ctx);
+@@ -142,43 +142,43 @@ int_sha256_free(PX_MD *h)
+ static unsigned
+ int_sha384_len(PX_MD *h)
+ {
+-	return SHA384_DIGEST_LENGTH;
++	return PG_SHA384_DIGEST_LENGTH;
+ }
+ 
+ static unsigned
+ int_sha384_block_len(PX_MD *h)
+ {
+-	return SHA384_BLOCK_LENGTH;
++	return PG_SHA384_BLOCK_LENGTH;
+ }
+ 
+ static void
+ int_sha384_update(PX_MD *h, const uint8 *data, unsigned dlen)
+ {
+-	SHA384_CTX *ctx = (SHA384_CTX *) h->p.ptr;
++	pg_sha384_ctx *ctx = (pg_sha384_ctx *) h->p.ptr;
+ 
+-	SHA384_Update(ctx, data, dlen);
++	pg_sha384_update(ctx, data, dlen);
+ }
+ 
+ static void
+ int_sha384_reset(PX_MD *h)
+ {
+-	SHA384_CTX *ctx = (SHA384_CTX *) h->p.ptr;
++	pg_sha384_ctx *ctx = (pg_sha384_ctx *) h->p.ptr;
+ 
+-	SHA384_Init(ctx);
++	pg_sha384_init(ctx);
+ }
+ 
+ static void
+ int_sha384_finish(PX_MD *h, uint8 *dst)
+ {
+-	SHA384_CTX *ctx = (SHA384_CTX *) h->p.ptr;
++	pg_sha384_ctx *ctx = (pg_sha384_ctx *) h->p.ptr;
+ 
+-	SHA384_Final(dst, ctx);
++	pg_sha384_final(ctx, dst);
+ }
+ 
+ static void
+ int_sha384_free(PX_MD *h)
+ {
+-	SHA384_CTX *ctx = (SHA384_CTX *) h->p.ptr;
++	pg_sha384_ctx *ctx = (pg_sha384_ctx *) h->p.ptr;
+ 
+ 	px_memset(ctx, 0, sizeof(*ctx));
+ 	px_free(ctx);
+@@ -190,43 +190,43 @@ int_sha384_free(PX_MD *h)
+ static unsigned
+ int_sha512_len(PX_MD *h)
+ {
+-	return SHA512_DIGEST_LENGTH;
++	return PG_SHA512_DIGEST_LENGTH;
+ }
+ 
+ static unsigned
+ int_sha512_block_len(PX_MD *h)
+ {
+-	return SHA512_BLOCK_LENGTH;
++	return PG_SHA512_BLOCK_LENGTH;
+ }
+ 
+ static void
+ int_sha512_update(PX_MD *h, const uint8 *data, unsigned dlen)
+ {
+-	SHA512_CTX *ctx = (SHA512_CTX *) h->p.ptr;
++	pg_sha512_ctx *ctx = (pg_sha512_ctx *) h->p.ptr;
+ 
+-	SHA512_Update(ctx, data, dlen);
++	pg_sha512_update(ctx, data, dlen);
+ }
+ 
+ static void
+ int_sha512_reset(PX_MD *h)
+ {
+-	SHA512_CTX *ctx = (SHA512_CTX *) h->p.ptr;
++	pg_sha512_ctx *ctx = (pg_sha512_ctx *) h->p.ptr;
+ 
+-	SHA512_Init(ctx);
++	pg_sha512_init(ctx);
+ }
+ 
+ static void
+ int_sha512_finish(PX_MD *h, uint8 *dst)
+ {
+-	SHA512_CTX *ctx = (SHA512_CTX *) h->p.ptr;
++	pg_sha512_ctx *ctx = (pg_sha512_ctx *) h->p.ptr;
+ 
+-	SHA512_Final(dst, ctx);
++	pg_sha512_final(ctx, dst);
+ }
+ 
+ static void
+ int_sha512_free(PX_MD *h)
+ {
+-	SHA512_CTX *ctx = (SHA512_CTX *) h->p.ptr;
++	pg_sha512_ctx *ctx = (pg_sha512_ctx *) h->p.ptr;
+ 
+ 	px_memset(ctx, 0, sizeof(*ctx));
+ 	px_free(ctx);
+@@ -238,7 +238,7 @@ int_sha512_free(PX_MD *h)
+ void
+ init_sha224(PX_MD *md)
+ {
+-	SHA224_CTX *ctx;
++	pg_sha224_ctx *ctx;
+ 
+ 	ctx = px_alloc(sizeof(*ctx));
+ 	memset(ctx, 0, sizeof(*ctx));
+@@ -258,7 +258,7 @@ init_sha224(PX_MD *md)
+ void
+ init_sha256(PX_MD *md)
+ {
+-	SHA256_CTX *ctx;
++	pg_sha256_ctx *ctx;
+ 
+ 	ctx = px_alloc(sizeof(*ctx));
+ 	memset(ctx, 0, sizeof(*ctx));
+@@ -278,7 +278,7 @@ init_sha256(PX_MD *md)
+ void
+ init_sha384(PX_MD *md)
+ {
+-	SHA384_CTX *ctx;
++	pg_sha384_ctx *ctx;
+ 
+ 	ctx = px_alloc(sizeof(*ctx));
+ 	memset(ctx, 0, sizeof(*ctx));
+@@ -298,7 +298,7 @@ init_sha384(PX_MD *md)
+ void
+ init_sha512(PX_MD *md)
+ {
+-	SHA512_CTX *ctx;
++	pg_sha512_ctx *ctx;
+ 
+ 	ctx = px_alloc(sizeof(*ctx));
+ 	memset(ctx, 0, sizeof(*ctx));
+diff --git a/contrib/pgcrypto/sha2.h b/contrib/pgcrypto/sha2.h
+deleted file mode 100644
+index 501f0e044633..000000000000
+--- a/contrib/pgcrypto/sha2.h
++++ /dev/null
+@@ -1,100 +0,0 @@
+-/*	contrib/pgcrypto/sha2.h */
+-/*	$OpenBSD: sha2.h,v 1.2 2004/04/28 23:11:57 millert Exp $	*/
+-
+-/*
+- * FILE:	sha2.h
+- * AUTHOR:	Aaron D. Gifford <me@aarongifford.com>
+- *
+- * Copyright (c) 2000-2001, Aaron D. Gifford
+- * All rights reserved.
+- *
+- * Redistribution and use in source and binary forms, with or without
+- * modification, are permitted provided that the following conditions
+- * are met:
+- * 1. Redistributions of source code must retain the above copyright
+- *	  notice, this list of conditions and the following disclaimer.
+- * 2. Redistributions in binary form must reproduce the above copyright
+- *	  notice, this list of conditions and the following disclaimer in the
+- *	  documentation and/or other materials provided with the distribution.
+- * 3. Neither the name of the copyright holder nor the names of contributors
+- *	  may be used to endorse or promote products derived from this software
+- *	  without specific prior written permission.
+- *
+- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTOR(S) ``AS IS'' AND
+- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+- * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTOR(S) BE LIABLE
+- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+- * SUCH DAMAGE.
+- *
+- * $From: sha2.h,v 1.1 2001/11/08 00:02:01 adg Exp adg $
+- */
+-
+-#ifndef _SHA2_H
+-#define _SHA2_H
+-
+-/* avoid conflict with OpenSSL */
+-#define SHA256_Init pg_SHA256_Init
+-#define SHA256_Update pg_SHA256_Update
+-#define SHA256_Final pg_SHA256_Final
+-#define SHA384_Init pg_SHA384_Init
+-#define SHA384_Update pg_SHA384_Update
+-#define SHA384_Final pg_SHA384_Final
+-#define SHA512_Init pg_SHA512_Init
+-#define SHA512_Update pg_SHA512_Update
+-#define SHA512_Final pg_SHA512_Final
+-
+-/*** SHA-224/256/384/512 Various Length Definitions ***********************/
+-#define SHA224_BLOCK_LENGTH		64
+-#define SHA224_DIGEST_LENGTH		28
+-#define SHA224_DIGEST_STRING_LENGTH (SHA224_DIGEST_LENGTH * 2 + 1)
+-#define SHA256_BLOCK_LENGTH		64
+-#define SHA256_DIGEST_LENGTH		32
+-#define SHA256_DIGEST_STRING_LENGTH (SHA256_DIGEST_LENGTH * 2 + 1)
+-#define SHA384_BLOCK_LENGTH		128
+-#define SHA384_DIGEST_LENGTH		48
+-#define SHA384_DIGEST_STRING_LENGTH (SHA384_DIGEST_LENGTH * 2 + 1)
+-#define SHA512_BLOCK_LENGTH		128
+-#define SHA512_DIGEST_LENGTH		64
+-#define SHA512_DIGEST_STRING_LENGTH (SHA512_DIGEST_LENGTH * 2 + 1)
+-
+-
+-/*** SHA-256/384/512 Context Structures *******************************/
+-typedef struct _SHA256_CTX
+-{
+-	uint32		state[8];
+-	uint64		bitcount;
+-	uint8		buffer[SHA256_BLOCK_LENGTH];
+-} SHA256_CTX;
+-typedef struct _SHA512_CTX
+-{
+-	uint64		state[8];
+-	uint64		bitcount[2];
+-	uint8		buffer[SHA512_BLOCK_LENGTH];
+-} SHA512_CTX;
+-
+-typedef SHA256_CTX SHA224_CTX;
+-typedef SHA512_CTX SHA384_CTX;
+-
+-void		SHA224_Init(SHA224_CTX *);
+-void		SHA224_Update(SHA224_CTX *, const uint8 *, size_t);
+-void		SHA224_Final(uint8[SHA224_DIGEST_LENGTH], SHA224_CTX *);
+-
+-void		SHA256_Init(SHA256_CTX *);
+-void		SHA256_Update(SHA256_CTX *, const uint8 *, size_t);
+-void		SHA256_Final(uint8[SHA256_DIGEST_LENGTH], SHA256_CTX *);
+-
+-void		SHA384_Init(SHA384_CTX *);
+-void		SHA384_Update(SHA384_CTX *, const uint8 *, size_t);
+-void		SHA384_Final(uint8[SHA384_DIGEST_LENGTH], SHA384_CTX *);
+-
+-void		SHA512_Init(SHA512_CTX *);
+-void		SHA512_Update(SHA512_CTX *, const uint8 *, size_t);
+-void		SHA512_Final(uint8[SHA512_DIGEST_LENGTH], SHA512_CTX *);
+-
+-#endif   /* _SHA2_H */
+diff --git a/src/common/Makefile b/src/common/Makefile
+index 03dfaa19c48a..5ddfff8b440f 100644
+--- a/src/common/Makefile
++++ b/src/common/Makefile
+@@ -44,6 +44,12 @@ OBJS_COMMON = config_info.o controldata_utils.o exec.o ip.o keywords.o \
+ 	md5.o pg_lzcompress.o pgfnames.o psprintf.o relpath.o rmtree.o \
+ 	string.o username.o wait_error.o
+ 
++ifeq ($(with_openssl),yes)
++OBJS_COMMON += sha2_openssl.o
++else
++OBJS_COMMON += sha2.o
++endif
++
+ OBJS_FRONTEND = $(OBJS_COMMON) fe_memutils.o file_utils.o restricted_token.o
+ 
+ OBJS_SRV = $(OBJS_COMMON:%.o=%_srv.o)
+diff --git a/contrib/pgcrypto/sha2.c b/src/common/sha2.c
+similarity index 82%
+rename from contrib/pgcrypto/sha2.c
+rename to src/common/sha2.c
+index 231f9dfbb0e6..496467507d07 100644
+--- a/contrib/pgcrypto/sha2.c
++++ b/src/common/sha2.c
+@@ -1,5 +1,20 @@
+-/*	$OpenBSD: sha2.c,v 1.6 2004/05/03 02:57:36 millert Exp $	*/
++/*-------------------------------------------------------------------------
++ *
++ * sha2.c
++ *	  Set of SHA functions for SHA-224, SHA-256, SHA-384 and SHA-512.
++ *
++ * This is the set of in-core functions used when there are no other
++ * alternative options like OpenSSL.
++ *
++ * Portions Copyright (c) 2016, PostgreSQL Global Development Group
++ *
++ * IDENTIFICATION
++ *	  src/common/sha2.c
++ *
++ *-------------------------------------------------------------------------
++ */
+ 
++/*	$OpenBSD: sha2.c,v 1.6 2004/05/03 02:57:36 millert Exp $	*/
+ /*
+  * FILE:	sha2.c
+  * AUTHOR:	Aaron D. Gifford <me@aarongifford.com>
+@@ -32,16 +47,18 @@
+  * SUCH DAMAGE.
+  *
+  * $From: sha2.c,v 1.1 2001/11/08 00:01:51 adg Exp adg $
+- *
+- * contrib/pgcrypto/sha2.c
+  */
+ 
++
++#ifndef FRONTEND
+ #include "postgres.h"
++#else
++#include "postgres_fe.h"
++#endif
+ 
+ #include <sys/param.h>
+ 
+-#include "px.h"
+-#include "sha2.h"
++#include "common/sha2.h"
+ 
+ /*
+  * UNROLLED TRANSFORM LOOP NOTE:
+@@ -58,11 +75,9 @@
+  */
+ 
+ /*** SHA-256/384/512 Various Length Definitions ***********************/
+-/* NOTE: Most of these are in sha2.h */
+-#define SHA256_SHORT_BLOCK_LENGTH	(SHA256_BLOCK_LENGTH - 8)
+-#define SHA384_SHORT_BLOCK_LENGTH	(SHA384_BLOCK_LENGTH - 16)
+-#define SHA512_SHORT_BLOCK_LENGTH	(SHA512_BLOCK_LENGTH - 16)
+-
++#define PG_SHA256_SHORT_BLOCK_LENGTH	(PG_SHA256_BLOCK_LENGTH - 8)
++#define PG_SHA384_SHORT_BLOCK_LENGTH	(PG_SHA384_BLOCK_LENGTH - 16)
++#define PG_SHA512_SHORT_BLOCK_LENGTH	(PG_SHA512_BLOCK_LENGTH - 16)
+ 
+ /*** ENDIAN REVERSAL MACROS *******************************************/
+ #ifndef WORDS_BIGENDIAN
+@@ -130,10 +145,9 @@
+  * library -- they are intended for private internal visibility/use
+  * only.
+  */
+-static void SHA512_Last(SHA512_CTX *);
+-static void SHA256_Transform(SHA256_CTX *, const uint8 *);
+-static void SHA512_Transform(SHA512_CTX *, const uint8 *);
+-
++static void SHA512_Last(pg_sha512_ctx *context);
++static void SHA256_Transform(pg_sha256_ctx *context, const uint8 *data);
++static void SHA512_Transform(pg_sha512_ctx *context, const uint8 *data);
+ 
+ /*** SHA-XYZ INITIAL HASH VALUES AND CONSTANTS ************************/
+ /* Hash constant words K for SHA-256: */
+@@ -251,12 +265,12 @@ static const uint64 sha512_initial_hash_value[8] = {
+ 
+ /*** SHA-256: *********************************************************/
+ void
+-SHA256_Init(SHA256_CTX *context)
++pg_sha256_init(pg_sha256_ctx *context)
+ {
+ 	if (context == NULL)
+ 		return;
+-	memcpy(context->state, sha256_initial_hash_value, SHA256_DIGEST_LENGTH);
+-	memset(context->buffer, 0, SHA256_BLOCK_LENGTH);
++	memcpy(context->state, sha256_initial_hash_value, PG_SHA256_DIGEST_LENGTH);
++	memset(context->buffer, 0, PG_SHA256_BLOCK_LENGTH);
+ 	context->bitcount = 0;
+ }
+ 
+@@ -287,7 +301,7 @@ SHA256_Init(SHA256_CTX *context)
+ } while(0)
+ 
+ static void
+-SHA256_Transform(SHA256_CTX *context, const uint8 *data)
++SHA256_Transform(pg_sha256_ctx *context, const uint8 *data)
+ {
+ 	uint32		a,
+ 				b,
+@@ -358,7 +372,7 @@ SHA256_Transform(SHA256_CTX *context, const uint8 *data)
+ #else							/* SHA2_UNROLL_TRANSFORM */
+ 
+ static void
+-SHA256_Transform(SHA256_CTX *context, const uint8 *data)
++SHA256_Transform(pg_sha256_ctx *context, const uint8 *data)
+ {
+ 	uint32		a,
+ 				b,
+@@ -448,7 +462,7 @@ SHA256_Transform(SHA256_CTX *context, const uint8 *data)
+ #endif   /* SHA2_UNROLL_TRANSFORM */
+ 
+ void
+-SHA256_Update(SHA256_CTX *context, const uint8 *data, size_t len)
++pg_sha256_update(pg_sha256_ctx *context, const uint8 *data, size_t len)
+ {
+ 	size_t		freespace,
+ 				usedspace;
+@@ -457,11 +471,11 @@ SHA256_Update(SHA256_CTX *context, const uint8 *data, size_t len)
+ 	if (len == 0)
+ 		return;
+ 
+-	usedspace = (context->bitcount >> 3) % SHA256_BLOCK_LENGTH;
++	usedspace = (context->bitcount >> 3) % PG_SHA256_BLOCK_LENGTH;
+ 	if (usedspace > 0)
+ 	{
+ 		/* Calculate how much free space is available in the buffer */
+-		freespace = SHA256_BLOCK_LENGTH - usedspace;
++		freespace = PG_SHA256_BLOCK_LENGTH - usedspace;
+ 
+ 		if (len >= freespace)
+ 		{
+@@ -482,13 +496,13 @@ SHA256_Update(SHA256_CTX *context, const uint8 *data, size_t len)
+ 			return;
+ 		}
+ 	}
+-	while (len >= SHA256_BLOCK_LENGTH)
++	while (len >= PG_SHA256_BLOCK_LENGTH)
+ 	{
+ 		/* Process as many complete blocks as we can */
+ 		SHA256_Transform(context, data);
+-		context->bitcount += SHA256_BLOCK_LENGTH << 3;
+-		len -= SHA256_BLOCK_LENGTH;
+-		data += SHA256_BLOCK_LENGTH;
++		context->bitcount += PG_SHA256_BLOCK_LENGTH << 3;
++		len -= PG_SHA256_BLOCK_LENGTH;
++		data += PG_SHA256_BLOCK_LENGTH;
+ 	}
+ 	if (len > 0)
+ 	{
+@@ -501,11 +515,11 @@ SHA256_Update(SHA256_CTX *context, const uint8 *data, size_t len)
+ }
+ 
+ static void
+-SHA256_Last(SHA256_CTX *context)
++SHA256_Last(pg_sha256_ctx *context)
+ {
+ 	unsigned int usedspace;
+ 
+-	usedspace = (context->bitcount >> 3) % SHA256_BLOCK_LENGTH;
++	usedspace = (context->bitcount >> 3) % PG_SHA256_BLOCK_LENGTH;
+ #ifndef WORDS_BIGENDIAN
+ 	/* Convert FROM host byte order */
+ 	REVERSE64(context->bitcount, context->bitcount);
+@@ -515,41 +529,41 @@ SHA256_Last(SHA256_CTX *context)
+ 		/* Begin padding with a 1 bit: */
+ 		context->buffer[usedspace++] = 0x80;
+ 
+-		if (usedspace <= SHA256_SHORT_BLOCK_LENGTH)
++		if (usedspace <= PG_SHA256_SHORT_BLOCK_LENGTH)
+ 		{
+ 			/* Set-up for the last transform: */
+-			memset(&context->buffer[usedspace], 0, SHA256_SHORT_BLOCK_LENGTH - usedspace);
++			memset(&context->buffer[usedspace], 0, PG_SHA256_SHORT_BLOCK_LENGTH - usedspace);
+ 		}
+ 		else
+ 		{
+-			if (usedspace < SHA256_BLOCK_LENGTH)
++			if (usedspace < PG_SHA256_BLOCK_LENGTH)
+ 			{
+-				memset(&context->buffer[usedspace], 0, SHA256_BLOCK_LENGTH - usedspace);
++				memset(&context->buffer[usedspace], 0, PG_SHA256_BLOCK_LENGTH - usedspace);
+ 			}
+ 			/* Do second-to-last transform: */
+ 			SHA256_Transform(context, context->buffer);
+ 
+ 			/* And set-up for the last transform: */
+-			memset(context->buffer, 0, SHA256_SHORT_BLOCK_LENGTH);
++			memset(context->buffer, 0, PG_SHA256_SHORT_BLOCK_LENGTH);
+ 		}
+ 	}
+ 	else
+ 	{
+ 		/* Set-up for the last transform: */
+-		memset(context->buffer, 0, SHA256_SHORT_BLOCK_LENGTH);
++		memset(context->buffer, 0, PG_SHA256_SHORT_BLOCK_LENGTH);
+ 
+ 		/* Begin padding with a 1 bit: */
+ 		*context->buffer = 0x80;
+ 	}
+ 	/* Set the bit count: */
+-	*(uint64 *) &context->buffer[SHA256_SHORT_BLOCK_LENGTH] = context->bitcount;
++	*(uint64 *) &context->buffer[PG_SHA256_SHORT_BLOCK_LENGTH] = context->bitcount;
+ 
+ 	/* Final transform: */
+ 	SHA256_Transform(context, context->buffer);
+ }
+ 
+ void
+-SHA256_Final(uint8 digest[], SHA256_CTX *context)
++pg_sha256_final(pg_sha256_ctx *context, uint8 *digest)
+ {
+ 	/* If no digest buffer is passed, we don't bother doing this: */
+ 	if (digest != NULL)
+@@ -567,22 +581,22 @@ SHA256_Final(uint8 digest[], SHA256_CTX *context)
+ 			}
+ 		}
+ #endif
+-		memcpy(digest, context->state, SHA256_DIGEST_LENGTH);
++		memcpy(digest, context->state, PG_SHA256_DIGEST_LENGTH);
+ 	}
+ 
+ 	/* Clean up state data: */
+-	px_memset(context, 0, sizeof(*context));
++	memset(context, 0, sizeof(pg_sha256_ctx));
+ }
+ 
+ 
+ /*** SHA-512: *********************************************************/
+ void
+-SHA512_Init(SHA512_CTX *context)
++pg_sha512_init(pg_sha512_ctx *context)
+ {
+ 	if (context == NULL)
+ 		return;
+-	memcpy(context->state, sha512_initial_hash_value, SHA512_DIGEST_LENGTH);
+-	memset(context->buffer, 0, SHA512_BLOCK_LENGTH);
++	memcpy(context->state, sha512_initial_hash_value, PG_SHA512_DIGEST_LENGTH);
++	memset(context->buffer, 0, PG_SHA512_BLOCK_LENGTH);
+ 	context->bitcount[0] = context->bitcount[1] = 0;
+ }
+ 
+@@ -616,7 +630,7 @@ SHA512_Init(SHA512_CTX *context)
+ } while(0)
+ 
+ static void
+-SHA512_Transform(SHA512_CTX *context, const uint8 *data)
++SHA512_Transform(pg_sha512_ctx *context, const uint8 *data)
+ {
+ 	uint64		a,
+ 				b,
+@@ -684,7 +698,7 @@ SHA512_Transform(SHA512_CTX *context, const uint8 *data)
+ #else							/* SHA2_UNROLL_TRANSFORM */
+ 
+ static void
+-SHA512_Transform(SHA512_CTX *context, const uint8 *data)
++SHA512_Transform(pg_sha512_ctx *context, const uint8 *data)
+ {
+ 	uint64		a,
+ 				b,
+@@ -774,7 +788,7 @@ SHA512_Transform(SHA512_CTX *context, const uint8 *data)
+ #endif   /* SHA2_UNROLL_TRANSFORM */
+ 
+ void
+-SHA512_Update(SHA512_CTX *context, const uint8 *data, size_t len)
++pg_sha512_update(pg_sha512_ctx *context, const uint8 *data, size_t len)
+ {
+ 	size_t		freespace,
+ 				usedspace;
+@@ -783,11 +797,11 @@ SHA512_Update(SHA512_CTX *context, const uint8 *data, size_t len)
+ 	if (len == 0)
+ 		return;
+ 
+-	usedspace = (context->bitcount[0] >> 3) % SHA512_BLOCK_LENGTH;
++	usedspace = (context->bitcount[0] >> 3) % PG_SHA512_BLOCK_LENGTH;
+ 	if (usedspace > 0)
+ 	{
+ 		/* Calculate how much free space is available in the buffer */
+-		freespace = SHA512_BLOCK_LENGTH - usedspace;
++		freespace = PG_SHA512_BLOCK_LENGTH - usedspace;
+ 
+ 		if (len >= freespace)
+ 		{
+@@ -808,13 +822,13 @@ SHA512_Update(SHA512_CTX *context, const uint8 *data, size_t len)
+ 			return;
+ 		}
+ 	}
+-	while (len >= SHA512_BLOCK_LENGTH)
++	while (len >= PG_SHA512_BLOCK_LENGTH)
+ 	{
+ 		/* Process as many complete blocks as we can */
+ 		SHA512_Transform(context, data);
+-		ADDINC128(context->bitcount, SHA512_BLOCK_LENGTH << 3);
+-		len -= SHA512_BLOCK_LENGTH;
+-		data += SHA512_BLOCK_LENGTH;
++		ADDINC128(context->bitcount, PG_SHA512_BLOCK_LENGTH << 3);
++		len -= PG_SHA512_BLOCK_LENGTH;
++		data += PG_SHA512_BLOCK_LENGTH;
+ 	}
+ 	if (len > 0)
+ 	{
+@@ -827,11 +841,11 @@ SHA512_Update(SHA512_CTX *context, const uint8 *data, size_t len)
+ }
+ 
+ static void
+-SHA512_Last(SHA512_CTX *context)
++SHA512_Last(pg_sha512_ctx *context)
+ {
+ 	unsigned int usedspace;
+ 
+-	usedspace = (context->bitcount[0] >> 3) % SHA512_BLOCK_LENGTH;
++	usedspace = (context->bitcount[0] >> 3) % PG_SHA512_BLOCK_LENGTH;
+ #ifndef WORDS_BIGENDIAN
+ 	/* Convert FROM host byte order */
+ 	REVERSE64(context->bitcount[0], context->bitcount[0]);
+@@ -842,42 +856,42 @@ SHA512_Last(SHA512_CTX *context)
+ 		/* Begin padding with a 1 bit: */
+ 		context->buffer[usedspace++] = 0x80;
+ 
+-		if (usedspace <= SHA512_SHORT_BLOCK_LENGTH)
++		if (usedspace <= PG_SHA512_SHORT_BLOCK_LENGTH)
+ 		{
+ 			/* Set-up for the last transform: */
+-			memset(&context->buffer[usedspace], 0, SHA512_SHORT_BLOCK_LENGTH - usedspace);
++			memset(&context->buffer[usedspace], 0, PG_SHA512_SHORT_BLOCK_LENGTH - usedspace);
+ 		}
+ 		else
+ 		{
+-			if (usedspace < SHA512_BLOCK_LENGTH)
++			if (usedspace < PG_SHA512_BLOCK_LENGTH)
+ 			{
+-				memset(&context->buffer[usedspace], 0, SHA512_BLOCK_LENGTH - usedspace);
++				memset(&context->buffer[usedspace], 0, PG_SHA512_BLOCK_LENGTH - usedspace);
+ 			}
+ 			/* Do second-to-last transform: */
+ 			SHA512_Transform(context, context->buffer);
+ 
+ 			/* And set-up for the last transform: */
+-			memset(context->buffer, 0, SHA512_BLOCK_LENGTH - 2);
++			memset(context->buffer, 0, PG_SHA512_BLOCK_LENGTH - 2);
+ 		}
+ 	}
+ 	else
+ 	{
+ 		/* Prepare for final transform: */
+-		memset(context->buffer, 0, SHA512_SHORT_BLOCK_LENGTH);
++		memset(context->buffer, 0, PG_SHA512_SHORT_BLOCK_LENGTH);
+ 
+ 		/* Begin padding with a 1 bit: */
+ 		*context->buffer = 0x80;
+ 	}
+ 	/* Store the length of input data (in bits): */
+-	*(uint64 *) &context->buffer[SHA512_SHORT_BLOCK_LENGTH] = context->bitcount[1];
+-	*(uint64 *) &context->buffer[SHA512_SHORT_BLOCK_LENGTH + 8] = context->bitcount[0];
++	*(uint64 *) &context->buffer[PG_SHA512_SHORT_BLOCK_LENGTH] = context->bitcount[1];
++	*(uint64 *) &context->buffer[PG_SHA512_SHORT_BLOCK_LENGTH + 8] = context->bitcount[0];
+ 
+ 	/* Final transform: */
+ 	SHA512_Transform(context, context->buffer);
+ }
+ 
+ void
+-SHA512_Final(uint8 digest[], SHA512_CTX *context)
++pg_sha512_final(pg_sha512_ctx *context, uint8 *digest)
+ {
+ 	/* If no digest buffer is passed, we don't bother doing this: */
+ 	if (digest != NULL)
+@@ -896,38 +910,38 @@ SHA512_Final(uint8 digest[], SHA512_CTX *context)
+ 			}
+ 		}
+ #endif
+-		memcpy(digest, context->state, SHA512_DIGEST_LENGTH);
++		memcpy(digest, context->state, PG_SHA512_DIGEST_LENGTH);
+ 	}
+ 
+ 	/* Zero out state data */
+-	px_memset(context, 0, sizeof(*context));
++	memset(context, 0, sizeof(pg_sha512_ctx));
+ }
+ 
+ 
+ /*** SHA-384: *********************************************************/
+ void
+-SHA384_Init(SHA384_CTX *context)
++pg_sha384_init(pg_sha384_ctx *context)
+ {
+ 	if (context == NULL)
+ 		return;
+-	memcpy(context->state, sha384_initial_hash_value, SHA512_DIGEST_LENGTH);
+-	memset(context->buffer, 0, SHA384_BLOCK_LENGTH);
++	memcpy(context->state, sha384_initial_hash_value, PG_SHA512_DIGEST_LENGTH);
++	memset(context->buffer, 0, PG_SHA384_BLOCK_LENGTH);
+ 	context->bitcount[0] = context->bitcount[1] = 0;
+ }
+ 
+ void
+-SHA384_Update(SHA384_CTX *context, const uint8 *data, size_t len)
++pg_sha384_update(pg_sha384_ctx *context, const uint8 *data, size_t len)
+ {
+-	SHA512_Update((SHA512_CTX *) context, data, len);
++	pg_sha512_update((pg_sha512_ctx *) context, data, len);
+ }
+ 
+ void
+-SHA384_Final(uint8 digest[], SHA384_CTX *context)
++pg_sha384_final(pg_sha384_ctx *context, uint8 *digest)
+ {
+ 	/* If no digest buffer is passed, we don't bother doing this: */
+ 	if (digest != NULL)
+ 	{
+-		SHA512_Last((SHA512_CTX *) context);
++		SHA512_Last((pg_sha512_ctx *) context);
+ 
+ 		/* Save the hash data for output: */
+ #ifndef WORDS_BIGENDIAN
+@@ -941,32 +955,32 @@ SHA384_Final(uint8 digest[], SHA384_CTX *context)
+ 			}
+ 		}
+ #endif
+-		memcpy(digest, context->state, SHA384_DIGEST_LENGTH);
++		memcpy(digest, context->state, PG_SHA384_DIGEST_LENGTH);
+ 	}
+ 
+ 	/* Zero out state data */
+-	px_memset(context, 0, sizeof(*context));
++	memset(context, 0, sizeof(pg_sha384_ctx));
+ }
+ 
+ /*** SHA-224: *********************************************************/
+ void
+-SHA224_Init(SHA224_CTX *context)
++pg_sha224_init(pg_sha224_ctx *context)
+ {
+ 	if (context == NULL)
+ 		return;
+-	memcpy(context->state, sha224_initial_hash_value, SHA256_DIGEST_LENGTH);
+-	memset(context->buffer, 0, SHA256_BLOCK_LENGTH);
++	memcpy(context->state, sha224_initial_hash_value, PG_SHA256_DIGEST_LENGTH);
++	memset(context->buffer, 0, PG_SHA256_BLOCK_LENGTH);
+ 	context->bitcount = 0;
+ }
+ 
+ void
+-SHA224_Update(SHA224_CTX *context, const uint8 *data, size_t len)
++pg_sha224_update(pg_sha224_ctx *context, const uint8 *data, size_t len)
+ {
+-	SHA256_Update((SHA256_CTX *) context, data, len);
++	pg_sha256_update((pg_sha256_ctx *) context, data, len);
+ }
+ 
+ void
+-SHA224_Final(uint8 digest[], SHA224_CTX *context)
++pg_sha224_final(pg_sha224_ctx *context, uint8 *digest)
+ {
+ 	/* If no digest buffer is passed, we don't bother doing this: */
+ 	if (digest != NULL)
+@@ -984,9 +998,9 @@ SHA224_Final(uint8 digest[], SHA224_CTX *context)
+ 			}
+ 		}
+ #endif
+-		memcpy(digest, context->state, SHA224_DIGEST_LENGTH);
++		memcpy(digest, context->state, PG_SHA224_DIGEST_LENGTH);
+ 	}
+ 
+ 	/* Clean up state data: */
+-	px_memset(context, 0, sizeof(*context));
++	memset(context, 0, sizeof(pg_sha224_ctx));
+ }
+diff --git a/src/common/sha2_openssl.c b/src/common/sha2_openssl.c
+new file mode 100644
+index 000000000000..91d0c3924b93
+--- /dev/null
++++ b/src/common/sha2_openssl.c
+@@ -0,0 +1,102 @@
++/*-------------------------------------------------------------------------
++ *
++ * sha2_openssl.c
++ *	  Set of wrapper routines on top of OpenSSL to support SHA-224
++ *	  SHA-256, SHA-384 and SHA-512 functions.
++ *
++ * This should only be used if code is compiled with OpenSSL support.
++ *
++ * Portions Copyright (c) 2016, PostgreSQL Global Development Group
++ *
++ * IDENTIFICATION
++ *        src/common/sha2_openssl.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#ifndef FRONTEND
++#include "postgres.h"
++#else
++#include "postgres_fe.h"
++#endif
++
++#include <openssl/sha.h>
++
++#include "common/sha2.h"
++
++
++/* Interface routines for SHA-256 */
++void
++pg_sha256_init(pg_sha256_ctx *ctx)
++{
++	SHA256_Init((SHA256_CTX *) ctx);
++}
++
++void
++pg_sha256_update(pg_sha256_ctx *ctx, const uint8 *data, size_t len)
++{
++	SHA256_Update((SHA256_CTX *) ctx, data, len);
++}
++
++void
++pg_sha256_final(pg_sha256_ctx *ctx, uint8 *dest)
++{
++	SHA256_Final(dest, (SHA256_CTX *) ctx);
++}
++
++/* Interface routines for SHA-512 */
++void
++pg_sha512_init(pg_sha512_ctx *ctx)
++{
++	SHA512_Init((SHA512_CTX *) ctx);
++}
++
++void
++pg_sha512_update(pg_sha512_ctx *ctx, const uint8 *data, size_t len)
++{
++	SHA512_Update((SHA512_CTX *) ctx, data, len);
++}
++
++void
++pg_sha512_final(pg_sha512_ctx *ctx, uint8 *dest)
++{
++	SHA512_Final(dest, (SHA512_CTX *) ctx);
++}
++
++/* Interface routines for SHA-384 */
++void
++pg_sha384_init(pg_sha384_ctx *ctx)
++{
++	SHA384_Init((SHA512_CTX *) ctx);
++}
++
++void
++pg_sha384_update(pg_sha384_ctx *ctx, const uint8 *data, size_t len)
++{
++	SHA384_Update((SHA512_CTX *) ctx, data, len);
++}
++
++void
++pg_sha384_final(pg_sha384_ctx *ctx, uint8 *dest)
++{
++	SHA384_Final(dest, (SHA512_CTX *) ctx);
++}
++
++/* Interface routines for SHA-224 */
++void
++pg_sha224_init(pg_sha224_ctx *ctx)
++{
++	SHA224_Init((SHA256_CTX *) ctx);
++}
++
++void
++pg_sha224_update(pg_sha224_ctx *ctx, const uint8 *data, size_t len)
++{
++	SHA224_Update((SHA256_CTX *) ctx, data, len);
++}
++
++void
++pg_sha224_final(pg_sha224_ctx *ctx, uint8 *dest)
++{
++	SHA224_Final(dest, (SHA256_CTX *) ctx);
++}
+diff --git a/src/include/common/sha2.h b/src/include/common/sha2.h
+new file mode 100644
+index 000000000000..09107cfc3b82
+--- /dev/null
++++ b/src/include/common/sha2.h
+@@ -0,0 +1,115 @@
++/*-------------------------------------------------------------------------
++ *
++ * sha2.h
++ *	  Generic headers for SHA224, 256, 384 AND 512 functions of PostgreSQL.
++ *
++ * Portions Copyright (c) 2016, PostgreSQL Global Development Group
++ *
++ * IDENTIFICATION
++ *		  src/include/common/sha2.h
++ *
++ *-------------------------------------------------------------------------
++ */
++
++/* $OpenBSD: sha2.h,v 1.2 2004/04/28 23:11:57 millert Exp $ */
++
++/*
++ * FILE:	sha2.h
++ * AUTHOR:	Aaron D. Gifford <me@aarongifford.com>
++ *
++ * Copyright (c) 2000-2001, Aaron D. Gifford
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *	  notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *	  notice, this list of conditions and the following disclaimer in the
++ *	  documentation and/or other materials provided with the distribution.
++ * 3. Neither the name of the copyright holder nor the names of contributors
++ *	  may be used to endorse or promote products derived from this software
++ *	  without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTOR(S) ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTOR(S) BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ * $From: sha2.h,v 1.1 2001/11/08 00:02:01 adg Exp adg $
++ */
++
++#ifndef _PG_SHA2_H_
++#define _PG_SHA2_H_
++
++#ifdef USE_SSL
++#include <openssl/sha.h>
++#endif
++
++/*** SHA224/256/384/512 Various Length Definitions ***********************/
++#define PG_SHA224_BLOCK_LENGTH			64
++#define PG_SHA224_DIGEST_LENGTH			28
++#define PG_SHA224_DIGEST_STRING_LENGTH	(PG_SHA224_DIGEST_LENGTH * 2 + 1)
++#define PG_SHA256_BLOCK_LENGTH			64
++#define PG_SHA256_DIGEST_LENGTH			32
++#define PG_SHA256_DIGEST_STRING_LENGTH	(PG_SHA256_DIGEST_LENGTH * 2 + 1)
++#define PG_SHA384_BLOCK_LENGTH			128
++#define PG_SHA384_DIGEST_LENGTH			48
++#define PG_SHA384_DIGEST_STRING_LENGTH	(PG_SHA384_DIGEST_LENGTH * 2 + 1)
++#define PG_SHA512_BLOCK_LENGTH			128
++#define PG_SHA512_DIGEST_LENGTH			64
++#define PG_SHA512_DIGEST_STRING_LENGTH	(PG_SHA512_DIGEST_LENGTH * 2 + 1)
++
++/* Context Structures for SHA-1/224/256/384/512 */
++#ifdef USE_SSL
++typedef SHA256_CTX pg_sha256_ctx;
++typedef SHA512_CTX pg_sha512_ctx;
++typedef SHA256_CTX pg_sha224_ctx;
++typedef SHA512_CTX pg_sha384_ctx;
++#else
++typedef struct pg_sha256_ctx
++{
++	uint32		state[8];
++	uint64		bitcount;
++	uint8		buffer[PG_SHA256_BLOCK_LENGTH];
++} pg_sha256_ctx;
++typedef struct pg_sha512_ctx
++{
++	uint64		state[8];
++	uint64		bitcount[2];
++	uint8		buffer[PG_SHA512_BLOCK_LENGTH];
++} pg_sha512_ctx;
++typedef struct pg_sha256_ctx pg_sha224_ctx;
++typedef struct pg_sha512_ctx pg_sha384_ctx;
++#endif   /* USE_SSL */
++
++/* Interface routines for SHA224/256/384/512 */
++extern void pg_sha224_init(pg_sha224_ctx *ctx);
++extern void pg_sha224_update(pg_sha224_ctx *ctx, const uint8 *input0,
++				 size_t len);
++extern void pg_sha224_final(pg_sha224_ctx *ctx, uint8 *dest);
++
++extern void pg_sha256_init(pg_sha256_ctx *ctx);
++extern void pg_sha256_update(pg_sha256_ctx *ctx, const uint8 *input0,
++				 size_t len);
++extern void pg_sha256_final(pg_sha256_ctx *ctx, uint8 *dest);
++
++extern void pg_sha384_init(pg_sha384_ctx *ctx);
++extern void pg_sha384_update(pg_sha384_ctx *ctx,
++				 const uint8 *, size_t len);
++extern void pg_sha384_final(pg_sha384_ctx *ctx, uint8 *dest);
++
++extern void pg_sha512_init(pg_sha512_ctx *ctx);
++extern void pg_sha512_update(pg_sha512_ctx *ctx, const uint8 *input0,
++				 size_t len);
++extern void pg_sha512_final(pg_sha512_ctx *ctx, uint8 *dest);
++
++#endif   /* _PG_SHA2_H_ */
+diff --git a/src/tools/msvc/Mkvcbuild.pm b/src/tools/msvc/Mkvcbuild.pm
+index 51b5d5449a9a..282471176714 100644
+--- a/src/tools/msvc/Mkvcbuild.pm
++++ b/src/tools/msvc/Mkvcbuild.pm
+@@ -114,6 +114,15 @@ sub mkvcbuild
+ 	  md5.c pg_lzcompress.c pgfnames.c psprintf.c relpath.c rmtree.c
+ 	  string.c username.c wait_error.c);
+ 
++	if ($solution->{options}->{openssl})
++	{
++		push(@pgcommonallfiles, 'sha2_openssl.c');
++	}
++	else
++	{
++		push(@pgcommonallfiles, 'sha2.c');
++	}
++
+ 	our @pgcommonfrontendfiles = (
+ 		@pgcommonallfiles, qw(fe_memutils.c file_utils.c
+ 		  restricted_token.c));
+@@ -421,13 +430,14 @@ sub mkvcbuild
+ 	else
+ 	{
+ 		$pgcrypto->AddFiles(
+-			'contrib/pgcrypto',   'md5.c',
+-			'sha1.c',             'sha2.c',
+-			'internal.c',         'internal-sha2.c',
+-			'blf.c',              'rijndael.c',
+-			'pgp-mpi-internal.c', 'imath.c');
++			'contrib/pgcrypto', 'md5.c',
++			'sha1.c',           'internal.c',
++			'internal-sha2.c',  'blf.c',
++			'rijndael.c',       'pgp-mpi-internal.c',
++			'imath.c');
+ 	}
+ 	$pgcrypto->AddReference($postgres);
++	$pgcrypto->AddReference($libpgcommon);
+ 	$pgcrypto->AddLibrary('ws2_32.lib');
+ 	my $mf = Project::read_file('contrib/pgcrypto/Makefile');
+ 	GenerateContribSqlFiles('pgcrypto', $mf);

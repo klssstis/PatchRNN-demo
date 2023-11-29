@@ -1,0 +1,107 @@
+From 0188bb82531f1b0ae3648fb81a4bd4a4f6242127 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Wed, 24 Jun 2020 14:15:17 -0400
+Subject: [PATCH] Save slot's restart_lsn when invalidated due to size
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We put it aside as invalidated_at, which let us show "lost" in
+pg_replication slot.  Prior to this change, the state value was reported
+as NULL.
+
+Backpatch to 13.
+
+Author: Kyotaro Horiguchi <horikyota.ntt@gmail.com>
+Reviewed-by: Álvaro Herrera <alvherre@alvh.no-ip.org>
+Discussion: https://postgr.es/m/20200617.101707.1735599255100002667.horikyota.ntt@gmail.com
+Discussion: https://postgr.es/m/20200407.120905.1507671100168805403.horikyota.ntt@gmail.com
+---
+ src/backend/replication/slot.c            |  1 +
+ src/backend/replication/slotfuncs.c       | 11 ++++++++++-
+ src/include/access/xlog.h                 |  2 +-
+ src/include/replication/slot.h            |  3 +++
+ src/test/recovery/t/019_replslot_limit.pl |  2 +-
+ 5 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/replication/slot.c b/src/backend/replication/slot.c
+index a7bbcf34991a..e8761f3a1809 100644
+--- a/src/backend/replication/slot.c
++++ b/src/backend/replication/slot.c
+@@ -1226,6 +1226,7 @@ InvalidateObsoleteReplicationSlots(XLogSegNo oldestSegno)
+ 						(uint32) restart_lsn)));
+ 
+ 		SpinLockAcquire(&s->mutex);
++		s->data.invalidated_at = s->data.restart_lsn;
+ 		s->data.restart_lsn = InvalidXLogRecPtr;
+ 		SpinLockRelease(&s->mutex);
+ 		ReplicationSlotRelease();
+diff --git a/src/backend/replication/slotfuncs.c b/src/backend/replication/slotfuncs.c
+index 06e4955de73b..3fc54cb9bab1 100644
+--- a/src/backend/replication/slotfuncs.c
++++ b/src/backend/replication/slotfuncs.c
+@@ -283,6 +283,7 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
+ 		bool		nulls[PG_GET_REPLICATION_SLOTS_COLS];
+ 		WALAvailability walstate;
+ 		XLogSegNo	last_removed_seg;
++		XLogRecPtr	targetLSN;
+ 		int			i;
+ 
+ 		if (!slot->in_use)
+@@ -342,7 +343,15 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
+ 		else
+ 			nulls[i++] = true;
+ 
+-		walstate = GetWALAvailability(slot_contents.data.restart_lsn);
++		/*
++		 * Report availability from invalidated_at when the slot has been
++		 * invalidated; otherwise slots would appear as invalid without any
++		 * more clues as to what happened.
++		 */
++		targetLSN = XLogRecPtrIsInvalid(slot_contents.data.restart_lsn) ?
++			slot_contents.data.invalidated_at :
++			slot_contents.data.restart_lsn;
++		walstate = GetWALAvailability(targetLSN);
+ 
+ 		switch (walstate)
+ 		{
+diff --git a/src/include/access/xlog.h b/src/include/access/xlog.h
+index 347a38f57cf4..9702dce98aa2 100644
+--- a/src/include/access/xlog.h
++++ b/src/include/access/xlog.h
+@@ -326,7 +326,7 @@ extern void ShutdownXLOG(int code, Datum arg);
+ extern void InitXLOGAccess(void);
+ extern void CreateCheckPoint(int flags);
+ extern bool CreateRestartPoint(int flags);
+-extern WALAvailability GetWALAvailability(XLogRecPtr restart_lsn);
++extern WALAvailability GetWALAvailability(XLogRecPtr targetLSN);
+ extern XLogRecPtr CalculateMaxmumSafeLSN(void);
+ extern void XLogPutNextOid(Oid nextOid);
+ extern XLogRecPtr XLogRestorePoint(const char *rpName);
+diff --git a/src/include/replication/slot.h b/src/include/replication/slot.h
+index 917876010eb8..31362585ecb1 100644
+--- a/src/include/replication/slot.h
++++ b/src/include/replication/slot.h
+@@ -79,6 +79,9 @@ typedef struct ReplicationSlotPersistentData
+ 	/* oldest LSN that might be required by this replication slot */
+ 	XLogRecPtr	restart_lsn;
+ 
++	/* restart_lsn is copied here when the slot is invalidated */
++	XLogRecPtr	invalidated_at;
++
+ 	/*
+ 	 * Oldest LSN that the client has acked receipt for.  This is used as the
+ 	 * start_lsn point in case the client doesn't specify one, and also as a
+diff --git a/src/test/recovery/t/019_replslot_limit.pl b/src/test/recovery/t/019_replslot_limit.pl
+index cba7df920c0c..f1be984cc9a6 100644
+--- a/src/test/recovery/t/019_replslot_limit.pl
++++ b/src/test/recovery/t/019_replslot_limit.pl
+@@ -186,7 +186,7 @@
+ $result = $node_master->safe_psql('postgres',
+ 	"SELECT slot_name, active, restart_lsn IS NULL, wal_status, min_safe_lsn FROM pg_replication_slots WHERE slot_name = 'rep1'"
+ );
+-is($result, "rep1|f|t||", 'check that the slot became inactive');
++is($result, "rep1|f|t|lost|", 'check that the slot became inactive');
+ 
+ # The standby no longer can connect to the master
+ $logstart = get_log_size($node_standby);

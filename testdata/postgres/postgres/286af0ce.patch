@@ -1,0 +1,93 @@
+From 286af0ce12117bc673b97df6228d1a666594d247 Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Fri, 6 Sep 2019 08:22:32 -0400
+Subject: [PATCH] When performing a base backup, check for read errors.
+
+The old code didn't differentiate between a read error and a
+concurrent truncation. fread reports both of these by returning 0;
+you have to use feof() or ferror() to distinguish between them,
+which this code did not do.
+
+It might be a better idea to use read() rather than fread() here,
+so that we can display a less-generic error message, but I'm not
+sure that would qualify as a back-patchable bug fix, so just do
+this much for now.
+
+Jeevan Chalke, reviewed by Jeevan Ladhe and by me.
+
+Discussion: http://postgr.es/m/CA+TgmobG4ywMzL5oQq2a8YKp8x2p3p1LOMMcGqpS7aekT9+ETA@mail.gmail.com
+---
+ src/backend/replication/basebackup.c | 32 +++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/replication/basebackup.c b/src/backend/replication/basebackup.c
+index c91f66dcbeb7..6aab8d7b5f33 100644
+--- a/src/backend/replication/basebackup.c
++++ b/src/backend/replication/basebackup.c
+@@ -90,6 +90,18 @@ static char *statrelpath = NULL;
+  */
+ #define THROTTLING_FREQUENCY	8
+ 
++/*
++ * Checks whether we encountered any error in fread().  fread() doesn't give
++ * any clue what has happened, so we check with ferror().  Also, neither
++ * fread() nor ferror() set errno, so we just throw a generic error.
++ */
++#define CHECK_FREAD_ERROR(fp, filename) \
++do { \
++	if (ferror(fp)) \
++		ereport(ERROR, \
++				(errmsg("could not read from file \"%s\"", filename))); \
++} while (0)
++
+ /* The actual number of bytes, transfer of which may cause sleep. */
+ static uint64 throttling_sample;
+ 
+@@ -543,6 +555,8 @@ perform_base_backup(basebackup_options *opt)
+ 					break;
+ 			}
+ 
++			CHECK_FREAD_ERROR(fp, pathbuf);
++
+ 			if (len != wal_segment_size)
+ 			{
+ 				CheckXLogRemoved(segno, tli);
+@@ -1478,6 +1492,20 @@ sendFile(const char *readfilename, const char *tarfilename, struct stat *statbuf
+ 
+ 							if (fread(buf + BLCKSZ * i, 1, BLCKSZ, fp) != BLCKSZ)
+ 							{
++								/*
++								 * If we hit end-of-file, a concurrent
++								 * truncation must have occurred, so break out
++								 * of this loop just as if the initial fread()
++								 * returned 0. We'll drop through to the same
++								 * code that handles that case. (We must fix
++								 * up cnt first, though.)
++								 */
++								if (feof(fp))
++								{
++									cnt = BLCKSZ * i;
++									break;
++								}
++
+ 								ereport(ERROR,
+ 										(errcode_for_file_access(),
+ 										 errmsg("could not reread block %d of file \"%s\": %m",
+@@ -1529,7 +1557,7 @@ sendFile(const char *readfilename, const char *tarfilename, struct stat *statbuf
+ 		len += cnt;
+ 		throttle(cnt);
+ 
+-		if (len >= statbuf->st_size)
++		if (feof(fp) || len >= statbuf->st_size)
+ 		{
+ 			/*
+ 			 * Reached end of file. The file could be longer, if it was
+@@ -1540,6 +1568,8 @@ sendFile(const char *readfilename, const char *tarfilename, struct stat *statbuf
+ 		}
+ 	}
+ 
++	CHECK_FREAD_ERROR(fp, readfilename);
++
+ 	/* If the file was truncated while we were sending it, pad it with zeros */
+ 	if (len < statbuf->st_size)
+ 	{

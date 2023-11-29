@@ -1,0 +1,245 @@
+From 266b6acb312fc440c1c1a2036aa9da94916beac6 Mon Sep 17 00:00:00 2001
+From: Fujii Masao <fujii@postgresql.org>
+Date: Thu, 29 Mar 2018 04:56:52 +0900
+Subject: [PATCH] Make pg_rewind skip files and directories that are removed
+ during server start.
+
+The target cluster that was rewound needs to perform recovery from
+the checkpoint created at failover, which leads it to remove or recreate
+some files and directories that may have been copied from the source
+cluster. So pg_rewind can skip synchronizing such files and directories,
+and which reduces the amount of data transferred during a rewind
+without changing the usefulness of the operation.
+
+Author: Michael Paquier
+Reviewed-by: Anastasia Lubennikova, Stephen Frost and me
+
+Discussion: https://postgr.es/m/20180205071022.GA17337@paquier.xyz
+---
+ doc/src/sgml/ref/pg_rewind.sgml      |  14 ++-
+ src/backend/replication/basebackup.c |   3 +
+ src/bin/pg_rewind/filemap.c          | 144 ++++++++++++++++++++++++---
+ 3 files changed, 148 insertions(+), 13 deletions(-)
+
+diff --git a/doc/src/sgml/ref/pg_rewind.sgml b/doc/src/sgml/ref/pg_rewind.sgml
+index 8e4924982680..520d843f0ec9 100644
+--- a/doc/src/sgml/ref/pg_rewind.sgml
++++ b/doc/src/sgml/ref/pg_rewind.sgml
+@@ -231,7 +231,19 @@ PostgreSQL documentation
+      <para>
+       Copy all other files such as <filename>pg_xact</filename> and
+       configuration files from the source cluster to the target cluster
+-      (everything except the relation files).
++      (everything except the relation files). Similarly to base backups,
++      the contents of the directories <filename>pg_dynshmem/</filename>,
++      <filename>pg_notify/</filename>, <filename>pg_replslot/</filename>,
++      <filename>pg_serial/</filename>, <filename>pg_snapshots/</filename>,
++      <filename>pg_stat_tmp/</filename>, and
++      <filename>pg_subtrans/</filename> are omitted from the data copied
++      from the source cluster. Any file or directory beginning with
++      <filename>pgsql_tmp</filename> is omitted, as well as are
++      <filename>backup_label</filename>,
++      <filename>tablespace_map</filename>,
++      <filename>pg_internal.init</filename>,
++      <filename>postmaster.opts</filename> and
++      <filename>postmaster.pid</filename>.
+      </para>
+     </step>
+     <step>
+diff --git a/src/backend/replication/basebackup.c b/src/backend/replication/basebackup.c
+index 654d0832da2a..516eea57f8da 100644
+--- a/src/backend/replication/basebackup.c
++++ b/src/backend/replication/basebackup.c
+@@ -103,6 +103,9 @@ static TimestampTz throttled_last;
+  * The contents of these directories are removed or recreated during server
+  * start so they are not included in backups.  The directories themselves are
+  * kept and included as empty to preserve access permissions.
++ *
++ * Note: this list should be kept in sync with the filter lists in pg_rewind's
++ * filemap.c.
+  */
+ static const char *excludeDirContents[] =
+ {
+diff --git a/src/bin/pg_rewind/filemap.c b/src/bin/pg_rewind/filemap.c
+index 6122f177fe07..876a62ad5897 100644
+--- a/src/bin/pg_rewind/filemap.c
++++ b/src/bin/pg_rewind/filemap.c
+@@ -31,6 +31,83 @@ static char *datasegpath(RelFileNode rnode, ForkNumber forknum,
+ static int	path_cmp(const void *a, const void *b);
+ static int	final_filemap_cmp(const void *a, const void *b);
+ static void filemap_list_to_array(filemap_t *map);
++static bool check_file_excluded(const char *path, const char *type);
++
++/*
++ * The contents of these directories are removed or recreated during server
++ * start so they are not included in data processed by pg_rewind.
++ *
++ * Note: those lists should be kept in sync with what basebackup.c provides.
++ * Some of the values, contrary to what basebackup.c uses, are hardcoded as
++ * they are defined in backend-only headers.  So this list is maintained
++ * with a best effort in mind.
++ */
++static const char *excludeDirContents[] =
++{
++	/*
++	 * Skip temporary statistics files. PG_STAT_TMP_DIR must be skipped even
++	 * when stats_temp_directory is set because PGSS_TEXT_FILE is always
++	 * created there.
++	 */
++	"pg_stat_tmp",	/* defined as PG_STAT_TMP_DIR */
++
++	/*
++	 * It is generally not useful to backup the contents of this directory
++	 * even if the intention is to restore to another master. See backup.sgml
++	 * for a more detailed description.
++	 */
++	"pg_replslot",
++
++	/* Contents removed on startup, see dsm_cleanup_for_mmap(). */
++	"pg_dynshmem",	/* defined as PG_DYNSHMEM_DIR */
++
++	/* Contents removed on startup, see AsyncShmemInit(). */
++	"pg_notify",
++
++	/*
++	 * Old contents are loaded for possible debugging but are not required for
++	 * normal operation, see OldSerXidInit().
++	 */
++	"pg_serial",
++
++	/* Contents removed on startup, see DeleteAllExportedSnapshotFiles(). */
++	"pg_snapshots",
++
++	/* Contents zeroed on startup, see StartupSUBTRANS(). */
++	"pg_subtrans",
++
++	/* end of list */
++	NULL
++};
++
++/*
++ * List of files excluded from filemap processing.
++ */
++static const char *excludeFiles[] =
++{
++	/* Skip auto conf temporary file. */
++	"postgresql.auto.conf.tmp", /* defined as PG_AUTOCONF_FILENAME */
++
++	/* Skip current log file temporary file */
++	"current_logfiles.tmp",		/* defined as LOG_METAINFO_DATAFILE_TMP */
++
++	/* Skip relation cache because it is rebuilt on startup */
++	"pg_internal.init",			/* defined as RELCACHE_INIT_FILENAME */
++
++	/*
++	 * If there's a backup_label or tablespace_map file, it belongs to a
++	 * backup started by the user with pg_start_backup().  It is *not* correct
++	 * for this backup.  Our backup_label is written later on separately.
++	 */
++	"backup_label",				/* defined as BACKUP_LABEL_FILE */
++	"tablespace_map",			/* defined as TABLESPACE_MAP */
++
++	"postmaster.pid",
++	"postmaster.opts",
++
++	/* end of list */
++	NULL
++};
+ 
+ /*
+  * Create a new file map (stored in the global pointer "filemap").
+@@ -71,11 +148,8 @@ process_source_file(const char *path, file_type_t type, size_t newsize,
+ 
+ 	Assert(map->array == NULL);
+ 
+-	/*
+-	 * Completely ignore some special files in source and destination.
+-	 */
+-	if (strcmp(path, "postmaster.pid") == 0 ||
+-		strcmp(path, "postmaster.opts") == 0)
++	/* ignore any path matching the exclusion filters */
++	if (check_file_excluded(path, "source"))
+ 		return;
+ 
+ 	/*
+@@ -260,6 +334,14 @@ process_target_file(const char *path, file_type_t type, size_t oldsize,
+ 	filemap_t  *map = filemap;
+ 	file_entry_t *entry;
+ 
++	/*
++	 * Ignore any path matching the exclusion filters.  This is not actually
++	 * mandatory for target files, but this does not hurt and let's be
++	 * consistent with the source processing.
++	 */
++	if (check_file_excluded(path, "target"))
++		return;
++
+ 	snprintf(localpath, sizeof(localpath), "%s/%s", datadir_target, path);
+ 	if (lstat(localpath, &statbuf) < 0)
+ 	{
+@@ -286,13 +368,6 @@ process_target_file(const char *path, file_type_t type, size_t oldsize,
+ 		qsort(map->array, map->narray, sizeof(file_entry_t *), path_cmp);
+ 	}
+ 
+-	/*
+-	 * Completely ignore some special files
+-	 */
+-	if (strcmp(path, "postmaster.pid") == 0 ||
+-		strcmp(path, "postmaster.opts") == 0)
+-		return;
+-
+ 	/*
+ 	 * Like in process_source_file, pretend that xlog is always a  directory.
+ 	 */
+@@ -412,6 +487,51 @@ process_block_change(ForkNumber forknum, RelFileNode rnode, BlockNumber blkno)
+ 	}
+ }
+ 
++/*
++ * Is this the path of file that pg_rewind can skip copying?
++ */
++static bool
++check_file_excluded(const char *path, const char *type)
++{
++	char	localpath[MAXPGPATH];
++	int		excludeIdx;
++	const char	*filename;
++
++	/* check individual files... */
++	for (excludeIdx = 0; excludeFiles[excludeIdx] != NULL; excludeIdx++)
++	{
++		filename = last_dir_separator(path);
++		if (filename == NULL)
++			filename = path;
++		else
++			filename++;
++		if (strcmp(filename, excludeFiles[excludeIdx]) == 0)
++		{
++			pg_log(PG_DEBUG, "entry \"%s\" excluded from %s file list\n",
++				   path, type);
++			return true;
++		}
++	}
++
++	/*
++	 * ... And check some directories.  Note that this includes any contents
++	 * within the directories themselves.
++	 */
++	for (excludeIdx = 0; excludeDirContents[excludeIdx] != NULL; excludeIdx++)
++	{
++		snprintf(localpath, sizeof(localpath), "%s/",
++				 excludeDirContents[excludeIdx]);
++		if (strstr(path, localpath) == path)
++		{
++			pg_log(PG_DEBUG, "entry \"%s\" excluded from %s file list\n",
++				   path, type);
++			return true;
++		}
++	}
++
++	return false;
++}
++
+ /*
+  * Convert the linked list of entries in map->first/last to the array,
+  * map->array.

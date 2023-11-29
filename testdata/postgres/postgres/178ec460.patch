@@ -1,0 +1,436 @@
+From 178ec460db0a0ced46ac5a01a28a704ca6251e53 Mon Sep 17 00:00:00 2001
+From: Alexander Korotkov <akorotkov@postgresql.org>
+Date: Tue, 29 Jun 2021 23:18:09 +0300
+Subject: [PATCH] Fixes for multirange selectivity estimation
+
+ * Fix enumeration of the multirange operators in calc_multirangesel() and
+   calc_multirangesel() switches.
+ * Add more regression tests for matching to empty ranges/multiranges.
+
+Reported-by: Alexander Lakhin
+Discussion: https://postgr.es/m/c5269c65-f967-77c5-ff7c-15e621c47f6a%40gmail.com
+Author: Alexander Korotkov
+Backpatch-through: 14, where multiranges were introduced
+---
+ .../utils/adt/multirangetypes_selfuncs.c      |  38 ++--
+ src/test/regress/expected/multirangetypes.out | 210 ++++++++++++++++++
+ src/test/regress/sql/multirangetypes.sql      |  37 +++
+ 3 files changed, 272 insertions(+), 13 deletions(-)
+
+diff --git a/src/backend/utils/adt/multirangetypes_selfuncs.c b/src/backend/utils/adt/multirangetypes_selfuncs.c
+index 551176bc2137..191cc1f002f1 100644
+--- a/src/backend/utils/adt/multirangetypes_selfuncs.c
++++ b/src/backend/utils/adt/multirangetypes_selfuncs.c
+@@ -347,16 +347,15 @@ calc_multirangesel(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 		switch (operator)
+ 		{
+ 				/* these return false if either argument is empty */
+-			case OID_RANGE_OVERLAPS_MULTIRANGE_OP:
+ 			case OID_MULTIRANGE_OVERLAPS_RANGE_OP:
+ 			case OID_MULTIRANGE_OVERLAPS_MULTIRANGE_OP:
+-			case OID_RANGE_OVERLAPS_LEFT_MULTIRANGE_OP:
+ 			case OID_MULTIRANGE_OVERLAPS_LEFT_RANGE_OP:
+ 			case OID_MULTIRANGE_OVERLAPS_LEFT_MULTIRANGE_OP:
+-			case OID_RANGE_OVERLAPS_RIGHT_MULTIRANGE_OP:
+ 			case OID_MULTIRANGE_OVERLAPS_RIGHT_RANGE_OP:
+ 			case OID_MULTIRANGE_OVERLAPS_RIGHT_MULTIRANGE_OP:
++			case OID_MULTIRANGE_LEFT_RANGE_OP:
+ 			case OID_MULTIRANGE_LEFT_MULTIRANGE_OP:
++			case OID_MULTIRANGE_RIGHT_RANGE_OP:
+ 			case OID_MULTIRANGE_RIGHT_MULTIRANGE_OP:
+ 				/* nothing is less than an empty multirange */
+ 			case OID_MULTIRANGE_LESS_OP:
+@@ -367,7 +366,7 @@ calc_multirangesel(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 				 * only empty multiranges can be contained by an empty
+ 				 * multirange
+ 				 */
+-			case OID_MULTIRANGE_RANGE_CONTAINED_OP:
++			case OID_RANGE_MULTIRANGE_CONTAINED_OP:
+ 			case OID_MULTIRANGE_MULTIRANGE_CONTAINED_OP:
+ 				/* only empty ranges are <= an empty multirange */
+ 			case OID_MULTIRANGE_LESS_EQUAL_OP:
+@@ -388,8 +387,18 @@ calc_multirangesel(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 				break;
+ 
+ 				/* an element cannot be empty */
+-			case OID_MULTIRANGE_ELEM_CONTAINED_OP:
+ 			case OID_MULTIRANGE_CONTAINS_ELEM_OP:
++
++				/* filtered out by multirangesel() */
++			case OID_RANGE_OVERLAPS_MULTIRANGE_OP:
++			case OID_RANGE_OVERLAPS_LEFT_MULTIRANGE_OP:
++			case OID_RANGE_OVERLAPS_RIGHT_MULTIRANGE_OP:
++			case OID_RANGE_LEFT_MULTIRANGE_OP:
++			case OID_RANGE_RIGHT_MULTIRANGE_OP:
++			case OID_RANGE_CONTAINS_MULTIRANGE_OP:
++			case OID_MULTIRANGE_ELEM_CONTAINED_OP:
++			case OID_MULTIRANGE_RANGE_CONTAINED_OP:
++
+ 			default:
+ 				elog(ERROR, "unexpected operator %u", operator);
+ 				selec = 0.0;	/* keep compiler quiet */
+@@ -416,8 +425,7 @@ calc_multirangesel(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 		 * calculations, realizing that the histogram covers only the
+ 		 * non-null, non-empty values.
+ 		 */
+-		if (operator == OID_MULTIRANGE_ELEM_CONTAINED_OP ||
+-			operator == OID_MULTIRANGE_RANGE_CONTAINED_OP ||
++		if (operator == OID_RANGE_MULTIRANGE_CONTAINED_OP ||
+ 			operator == OID_MULTIRANGE_MULTIRANGE_CONTAINED_OP)
+ 		{
+ 			/* empty is contained by anything non-empty */
+@@ -575,7 +583,6 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 												 hist_lower, nhist, true);
+ 			break;
+ 
+-		case OID_RANGE_LEFT_MULTIRANGE_OP:
+ 		case OID_MULTIRANGE_LEFT_RANGE_OP:
+ 		case OID_MULTIRANGE_LEFT_MULTIRANGE_OP:
+ 			/* var << const when upper(var) < lower(const) */
+@@ -584,7 +591,6 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 											 hist_upper, nhist, false);
+ 			break;
+ 
+-		case OID_RANGE_RIGHT_MULTIRANGE_OP:
+ 		case OID_MULTIRANGE_RIGHT_RANGE_OP:
+ 		case OID_MULTIRANGE_RIGHT_MULTIRANGE_OP:
+ 			/* var >> const when lower(var) > upper(const) */
+@@ -593,7 +599,6 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 												 hist_lower, nhist, true);
+ 			break;
+ 
+-		case OID_RANGE_OVERLAPS_RIGHT_MULTIRANGE_OP:
+ 		case OID_MULTIRANGE_OVERLAPS_RIGHT_RANGE_OP:
+ 		case OID_MULTIRANGE_OVERLAPS_RIGHT_MULTIRANGE_OP:
+ 			/* compare lower bounds */
+@@ -602,7 +607,6 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 												 hist_lower, nhist, false);
+ 			break;
+ 
+-		case OID_RANGE_OVERLAPS_LEFT_MULTIRANGE_OP:
+ 		case OID_MULTIRANGE_OVERLAPS_LEFT_RANGE_OP:
+ 		case OID_MULTIRANGE_OVERLAPS_LEFT_MULTIRANGE_OP:
+ 			/* compare upper bounds */
+@@ -611,7 +615,6 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 											 hist_upper, nhist, true);
+ 			break;
+ 
+-		case OID_RANGE_OVERLAPS_MULTIRANGE_OP:
+ 		case OID_MULTIRANGE_OVERLAPS_RANGE_OP:
+ 		case OID_MULTIRANGE_OVERLAPS_MULTIRANGE_OP:
+ 		case OID_MULTIRANGE_CONTAINS_ELEM_OP:
+@@ -647,7 +650,6 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 											   lslot.values, lslot.nvalues);
+ 			break;
+ 
+-		case OID_MULTIRANGE_RANGE_CONTAINED_OP:
+ 		case OID_MULTIRANGE_MULTIRANGE_CONTAINED_OP:
+ 		case OID_RANGE_MULTIRANGE_CONTAINED_OP:
+ 			if (const_lower.infinite)
+@@ -675,6 +677,16 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 			}
+ 			break;
+ 
++			/* filtered out by multirangesel() */
++		case OID_RANGE_OVERLAPS_MULTIRANGE_OP:
++		case OID_RANGE_OVERLAPS_LEFT_MULTIRANGE_OP:
++		case OID_RANGE_OVERLAPS_RIGHT_MULTIRANGE_OP:
++		case OID_RANGE_LEFT_MULTIRANGE_OP:
++		case OID_RANGE_RIGHT_MULTIRANGE_OP:
++		case OID_RANGE_CONTAINS_MULTIRANGE_OP:
++		case OID_MULTIRANGE_ELEM_CONTAINED_OP:
++		case OID_MULTIRANGE_RANGE_CONTAINED_OP:
++
+ 		default:
+ 			elog(ERROR, "unknown multirange operator %u", operator);
+ 			hist_selec = -1.0;	/* keep compiler quiet */
+diff --git a/src/test/regress/expected/multirangetypes.out b/src/test/regress/expected/multirangetypes.out
+index 3e941aec68c4..af3ef4a258cd 100644
+--- a/src/test/regress/expected/multirangetypes.out
++++ b/src/test/regress/expected/multirangetypes.out
+@@ -2241,12 +2241,114 @@ analyze test_multirange_gist;
+ SET enable_seqscan    = t;
+ SET enable_indexscan  = f;
+ SET enable_bitmapscan = f;
++select count(*) from test_multirange_gist where mr = '{}'::int4multirange;
++ count 
++-------
++   500
++(1 row)
++
+ select count(*) from test_multirange_gist where mr @> 'empty'::int4range;
+  count 
+ -------
+   3700
+ (1 row)
+ 
++select count(*) from test_multirange_gist where mr && 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr <@ 'empty'::int4range;
++ count 
++-------
++   500
++(1 row)
++
++select count(*) from test_multirange_gist where mr << 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr >> 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr &< 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr &> 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr -|- 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr @> '{}'::int4multirange;
++ count 
++-------
++  3700
++(1 row)
++
++select count(*) from test_multirange_gist where mr @> '{}'::int4multirange;
++ count 
++-------
++  3700
++(1 row)
++
++select count(*) from test_multirange_gist where mr && '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr <@ '{}'::int4multirange;
++ count 
++-------
++   500
++(1 row)
++
++select count(*) from test_multirange_gist where mr << '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr >> '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr &< '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr &> '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr -|- '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
+ select count(*) from test_multirange_gist where mr = int4multirange(int4range(10,20), int4range(30,40), int4range(50,60));
+  count 
+ -------
+@@ -2365,6 +2467,114 @@ select count(*) from test_multirange_gist where mr -|- int4multirange(int4range(
+ SET enable_seqscan    = f;
+ SET enable_indexscan  = t;
+ SET enable_bitmapscan = f;
++select count(*) from test_multirange_gist where mr = '{}'::int4multirange;
++ count 
++-------
++   500
++(1 row)
++
++select count(*) from test_multirange_gist where mr @> 'empty'::int4range;
++ count 
++-------
++  3700
++(1 row)
++
++select count(*) from test_multirange_gist where mr && 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr <@ 'empty'::int4range;
++ count 
++-------
++   500
++(1 row)
++
++select count(*) from test_multirange_gist where mr << 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr >> 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr &< 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr &> 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr -|- 'empty'::int4range;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr @> '{}'::int4multirange;
++ count 
++-------
++  3700
++(1 row)
++
++select count(*) from test_multirange_gist where mr @> '{}'::int4multirange;
++ count 
++-------
++  3700
++(1 row)
++
++select count(*) from test_multirange_gist where mr && '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr <@ '{}'::int4multirange;
++ count 
++-------
++   500
++(1 row)
++
++select count(*) from test_multirange_gist where mr << '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr >> '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr &< '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr &> '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
++select count(*) from test_multirange_gist where mr -|- '{}'::int4multirange;
++ count 
++-------
++     0
++(1 row)
++
+ select count(*) from test_multirange_gist where mr @> 'empty'::int4range;
+  count 
+ -------
+diff --git a/src/test/regress/sql/multirangetypes.sql b/src/test/regress/sql/multirangetypes.sql
+index 3cbebedcd4a1..b91a23e0d5aa 100644
+--- a/src/test/regress/sql/multirangetypes.sql
++++ b/src/test/regress/sql/multirangetypes.sql
+@@ -435,7 +435,25 @@ SET enable_seqscan    = t;
+ SET enable_indexscan  = f;
+ SET enable_bitmapscan = f;
+ 
++select count(*) from test_multirange_gist where mr = '{}'::int4multirange;
+ select count(*) from test_multirange_gist where mr @> 'empty'::int4range;
++select count(*) from test_multirange_gist where mr && 'empty'::int4range;
++select count(*) from test_multirange_gist where mr <@ 'empty'::int4range;
++select count(*) from test_multirange_gist where mr << 'empty'::int4range;
++select count(*) from test_multirange_gist where mr >> 'empty'::int4range;
++select count(*) from test_multirange_gist where mr &< 'empty'::int4range;
++select count(*) from test_multirange_gist where mr &> 'empty'::int4range;
++select count(*) from test_multirange_gist where mr -|- 'empty'::int4range;
++select count(*) from test_multirange_gist where mr @> '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr @> '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr && '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr <@ '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr << '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr >> '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr &< '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr &> '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr -|- '{}'::int4multirange;
++
+ select count(*) from test_multirange_gist where mr = int4multirange(int4range(10,20), int4range(30,40), int4range(50,60));
+ select count(*) from test_multirange_gist where mr @> 10;
+ select count(*) from test_multirange_gist where mr @> int4range(10,20);
+@@ -461,6 +479,25 @@ SET enable_seqscan    = f;
+ SET enable_indexscan  = t;
+ SET enable_bitmapscan = f;
+ 
++select count(*) from test_multirange_gist where mr = '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr @> 'empty'::int4range;
++select count(*) from test_multirange_gist where mr && 'empty'::int4range;
++select count(*) from test_multirange_gist where mr <@ 'empty'::int4range;
++select count(*) from test_multirange_gist where mr << 'empty'::int4range;
++select count(*) from test_multirange_gist where mr >> 'empty'::int4range;
++select count(*) from test_multirange_gist where mr &< 'empty'::int4range;
++select count(*) from test_multirange_gist where mr &> 'empty'::int4range;
++select count(*) from test_multirange_gist where mr -|- 'empty'::int4range;
++select count(*) from test_multirange_gist where mr @> '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr @> '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr && '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr <@ '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr << '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr >> '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr &< '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr &> '{}'::int4multirange;
++select count(*) from test_multirange_gist where mr -|- '{}'::int4multirange;
++
+ select count(*) from test_multirange_gist where mr @> 'empty'::int4range;
+ select count(*) from test_multirange_gist where mr = int4multirange(int4range(10,20), int4range(30,40), int4range(50,60));
+ select count(*) from test_multirange_gist where mr @> 10;

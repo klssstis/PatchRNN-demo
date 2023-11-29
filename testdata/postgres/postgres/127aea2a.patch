@@ -1,0 +1,323 @@
+From 127aea2a65cd89c1c28357c6db199683e219491e Mon Sep 17 00:00:00 2001
+From: Thomas Munro <tmunro@postgresql.org>
+Date: Thu, 24 Mar 2022 20:58:20 +1300
+Subject: [PATCH] Add additional filtering options to pg_waldump.
+
+Allow filtering by RelFileNode, BlockNumber, ForkNum and FPW.
+
+Author: David Christensen <david.christensen@crunchydata.com>
+Reviewed-by: Japin Li <japinli@hotmail.com>
+Reviewed-by: Bharath Rupireddy <bharath.rupireddyforpostgres@gmail.com>
+Reviewed-by: Cary Huang <cary.huang@highgo.ca>
+Reviewed-by: Thomas Munro <thomas.munro@gmail.com>
+Discussion: https://postgr.es/m/lzzgmgm6e5.fsf%40veeddrois.attlocal.net
+---
+ doc/src/sgml/ref/pg_waldump.sgml |  49 +++++++++++
+ src/bin/pg_waldump/pg_waldump.c  | 144 ++++++++++++++++++++++++++++++-
+ 2 files changed, 192 insertions(+), 1 deletion(-)
+
+diff --git a/doc/src/sgml/ref/pg_waldump.sgml b/doc/src/sgml/ref/pg_waldump.sgml
+index 5735a161ce0e..981d3c90382d 100644
+--- a/doc/src/sgml/ref/pg_waldump.sgml
++++ b/doc/src/sgml/ref/pg_waldump.sgml
+@@ -100,6 +100,45 @@ PostgreSQL documentation
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry>
++      <term><option>-k <replaceable>block</replaceable></option></term>
++      <term><option>--block=<replaceable>block</replaceable></option></term>
++      <listitem>
++       <para>
++        Only display records that modify the given block.  The relation must
++        also be provided with <option>--relation</option> or
++        <option>-l</option>.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
++      <term><option>-F <replaceable>fork</replaceable></option></term>
++      <term><option>--fork=<replaceable>fork</replaceable></option></term>
++      <listitem>
++       <para>
++        If provided, only display records that modify blocks in the given fork.
++        The valid values are <literal>0</literal> for the main fork,
++        <literal>1</literal> for the free space map,
++        <literal>2</literal> for the visibility map,
++        and <literal>3</literal> for the init fork.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
++      <term><option>-l <replaceable>tblspc</replaceable>/<replaceable>db</replaceable>/<replaceable>rel</replaceable></option></term>
++      <term><option>--relation=<replaceable>tblspc</replaceable>/<replaceable>db</replaceable>/<replaceable>rel</replaceable></option></term>
++      <listitem>
++       <para>
++        Only display records that modify blocks in the given relation.  The
++        relation is specified with tablespace OID, database OID, and relfilenode
++        separated by slashes, for example <literal>1234/12345/12345</literal>.
++        This is the same format used for relations in the program's output.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry>
+       <term><option>-n <replaceable>limit</replaceable></option></term>
+       <term><option>--limit=<replaceable>limit</replaceable></option></term>
+@@ -183,6 +222,16 @@ PostgreSQL documentation
+        </listitem>
+      </varlistentry>
+ 
++     <varlistentry>
++       <term><option>-w</option></term>
++       <term><option>--fullpage</option></term>
++       <listitem>
++       <para>
++        Only display records that include full page images.
++       </para>
++       </listitem>
++     </varlistentry>
++
+      <varlistentry>
+       <term><option>-x <replaceable>xid</replaceable></option></term>
+       <term><option>--xid=<replaceable>xid</replaceable></option></term>
+diff --git a/src/bin/pg_waldump/pg_waldump.c b/src/bin/pg_waldump/pg_waldump.c
+index fc081adfb8c0..92238f30c9ee 100644
+--- a/src/bin/pg_waldump/pg_waldump.c
++++ b/src/bin/pg_waldump/pg_waldump.c
+@@ -31,6 +31,8 @@ static const char *progname;
+ static int	WalSegSz;
+ static volatile sig_atomic_t time_to_stop = false;
+ 
++static const RelFileNode emptyRelFileNode = {0, 0, 0};
++
+ typedef struct XLogDumpPrivate
+ {
+ 	TimeLineID	timeline;
+@@ -55,6 +57,13 @@ typedef struct XLogDumpConfig
+ 	bool		filter_by_rmgr_enabled;
+ 	TransactionId filter_by_xid;
+ 	bool		filter_by_xid_enabled;
++	RelFileNode filter_by_relation;
++	bool		filter_by_extended;
++	bool		filter_by_relation_enabled;
++	BlockNumber filter_by_relation_block;
++	bool		filter_by_relation_block_enabled;
++	ForkNumber	filter_by_relation_forknum;
++	bool		filter_by_fpw;
+ } XLogDumpConfig;
+ 
+ typedef struct Stats
+@@ -391,6 +400,59 @@ WALDumpReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
+ 	return count;
+ }
+ 
++/*
++ * Boolean to return whether the given WAL record matches a specific relation
++ * and optionally block.
++ */
++static bool
++XLogRecordMatchesRelationBlock(XLogReaderState *record,
++							   RelFileNode matchRnode,
++							   BlockNumber matchBlock,
++							   ForkNumber matchFork)
++{
++	int			block_id;
++
++	for (block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++)
++	{
++		RelFileNode rnode;
++		ForkNumber	forknum;
++		BlockNumber blk;
++
++		if (!XLogRecHasBlockRef(record, block_id))
++			continue;
++
++		XLogRecGetBlockTag(record, block_id, &rnode, &forknum, &blk);
++
++		if ((matchFork == InvalidForkNumber || matchFork == forknum) &&
++			(RelFileNodeEquals(matchRnode, emptyRelFileNode) ||
++			 RelFileNodeEquals(matchRnode, rnode)) &&
++			(matchBlock == InvalidBlockNumber || matchBlock == blk))
++			return true;
++	}
++
++	return false;
++}
++
++/*
++ * Boolean to return whether the given WAL record contains a full page write.
++ */
++static bool
++XLogRecordHasFPW(XLogReaderState *record)
++{
++	int			block_id;
++
++	for (block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++)
++	{
++		if (!XLogRecHasBlockRef(record, block_id))
++			continue;
++
++		if (XLogRecHasBlockImage(record, block_id))
++			return true;
++	}
++
++	return false;
++}
++
+ /*
+  * Calculate the size of a record, split into !FPI and FPI parts.
+  */
+@@ -765,6 +827,10 @@ usage(void)
+ 	printf(_("  -b, --bkp-details      output detailed information about backup blocks\n"));
+ 	printf(_("  -e, --end=RECPTR       stop reading at WAL location RECPTR\n"));
+ 	printf(_("  -f, --follow           keep retrying after reaching end of WAL\n"));
++	printf(_("  -k, --block=N          with --relation, only show records matching this block\n"));
++	printf(_("  -F, --fork=N           only show records matching a specific fork number\n"
++			 "                         (defaults to showing all)\n"));
++	printf(_("  -l, --relation=N/N/N   only show records that affect a specific relation\n"));
+ 	printf(_("  -n, --limit=N          number of records to display\n"));
+ 	printf(_("  -p, --path=PATH        directory in which to find log segment files or a\n"
+ 			 "                         directory with a ./pg_wal that contains such files\n"
+@@ -777,6 +843,7 @@ usage(void)
+ 			 "                         (default: 1 or the value used in STARTSEG)\n"));
+ 	printf(_("  -V, --version          output version information, then exit\n"));
+ 	printf(_("  -x, --xid=XID          only show records with transaction ID XID\n"));
++	printf(_("  -w, --fullpage         only show records with a full page write\n"));
+ 	printf(_("  -z, --stats[=record]   show statistics instead of records\n"
+ 			 "                         (optionally, show per-record statistics)\n"));
+ 	printf(_("  -?, --help             show this help, then exit\n"));
+@@ -800,12 +867,16 @@ main(int argc, char **argv)
+ 
+ 	static struct option long_options[] = {
+ 		{"bkp-details", no_argument, NULL, 'b'},
++		{"block", required_argument, NULL, 'k'},
+ 		{"end", required_argument, NULL, 'e'},
+ 		{"follow", no_argument, NULL, 'f'},
++		{"fork", required_argument, NULL, 'F'},
++		{"fullpage", no_argument, NULL, 'w'},
+ 		{"help", no_argument, NULL, '?'},
+ 		{"limit", required_argument, NULL, 'n'},
+ 		{"path", required_argument, NULL, 'p'},
+ 		{"quiet", no_argument, NULL, 'q'},
++		{"relation", required_argument, NULL, 'l'},
+ 		{"rmgr", required_argument, NULL, 'r'},
+ 		{"start", required_argument, NULL, 's'},
+ 		{"timeline", required_argument, NULL, 't'},
+@@ -858,6 +929,11 @@ main(int argc, char **argv)
+ 	config.filter_by_rmgr_enabled = false;
+ 	config.filter_by_xid = InvalidTransactionId;
+ 	config.filter_by_xid_enabled = false;
++	config.filter_by_extended = false;
++	config.filter_by_relation_enabled = false;
++	config.filter_by_relation_block_enabled = false;
++	config.filter_by_relation_forknum = InvalidForkNumber;
++	config.filter_by_fpw = false;
+ 	config.stats = false;
+ 	config.stats_per_record = false;
+ 
+@@ -870,7 +946,7 @@ main(int argc, char **argv)
+ 		goto bad_argument;
+ 	}
+ 
+-	while ((option = getopt_long(argc, argv, "be:fn:p:qr:s:t:x:z",
++	while ((option = getopt_long(argc, argv, "be:fF:k:l:n:p:qr:s:t:wx:z",
+ 								 long_options, &optindex)) != -1)
+ 	{
+ 		switch (option)
+@@ -890,6 +966,47 @@ main(int argc, char **argv)
+ 			case 'f':
+ 				config.follow = true;
+ 				break;
++			case 'F':
++				{
++					unsigned int forknum;
++
++					if (sscanf(optarg, "%u", &forknum) != 1 ||
++						forknum > MAX_FORKNUM)
++					{
++						pg_log_error("could not parse valid fork number (0..%d) \"%s\"",
++									 MAX_FORKNUM, optarg);
++						goto bad_argument;
++					}
++					config.filter_by_relation_forknum = (ForkNumber) forknum;
++					config.filter_by_extended = true;
++				}
++				break;
++			case 'k':
++				if (sscanf(optarg, "%u", &config.filter_by_relation_block) != 1 ||
++					!BlockNumberIsValid(config.filter_by_relation_block))
++				{
++					pg_log_error("could not parse valid block number \"%s\"", optarg);
++					goto bad_argument;
++				}
++				config.filter_by_relation_block_enabled = true;
++				config.filter_by_extended = true;
++				break;
++			case 'l':
++				if (sscanf(optarg, "%u/%u/%u",
++						   &config.filter_by_relation.spcNode,
++						   &config.filter_by_relation.dbNode,
++						   &config.filter_by_relation.relNode) != 3 ||
++					!OidIsValid(config.filter_by_relation.spcNode) ||
++					!OidIsValid(config.filter_by_relation.relNode))
++				{
++					pg_log_error("could not parse valid relation from \"%s\""
++								 " (expecting \"tablespace OID/database OID/"
++								 "relation filenode\")", optarg);
++					goto bad_argument;
++				}
++				config.filter_by_relation_enabled = true;
++				config.filter_by_extended = true;
++				break;
+ 			case 'n':
+ 				if (sscanf(optarg, "%d", &config.stop_after_records) != 1)
+ 				{
+@@ -947,6 +1064,9 @@ main(int argc, char **argv)
+ 					goto bad_argument;
+ 				}
+ 				break;
++			case 'w':
++				config.filter_by_fpw = true;
++				break;
+ 			case 'x':
+ 				if (sscanf(optarg, "%u", &config.filter_by_xid) != 1)
+ 				{
+@@ -976,6 +1096,13 @@ main(int argc, char **argv)
+ 		}
+ 	}
+ 
++	if (config.filter_by_relation_block_enabled &&
++		!config.filter_by_relation_enabled)
++	{
++		pg_log_error("--block option requires --relation option to be specified");
++		goto bad_argument;
++	}
++
+ 	if ((optind + 2) < argc)
+ 	{
+ 		pg_log_error("too many command-line arguments (first is \"%s\")",
+@@ -1148,6 +1275,21 @@ main(int argc, char **argv)
+ 			config.filter_by_xid != record->xl_xid)
+ 			continue;
+ 
++		/* check for extended filtering */
++		if (config.filter_by_extended &&
++			!XLogRecordMatchesRelationBlock(xlogreader_state,
++											config.filter_by_relation_enabled ?
++											config.filter_by_relation :
++											emptyRelFileNode,
++											config.filter_by_relation_block_enabled ?
++											config.filter_by_relation_block :
++											InvalidBlockNumber,
++											config.filter_by_relation_forknum))
++			continue;
++
++		if (config.filter_by_fpw && !XLogRecordHasFPW(xlogreader_state))
++			continue;
++
+ 		/* perform any per-record work */
+ 		if (!config.quiet)
+ 		{

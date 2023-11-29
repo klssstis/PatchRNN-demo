@@ -1,0 +1,4177 @@
+From 215b43cdc8d6b4a1700886a39df1ee735cb0274d Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 18 Jan 2017 12:58:20 -0500
+Subject: [PATCH] Improve RLS planning by marking individual quals with
+ security levels.
+
+In an RLS query, we must ensure that security filter quals are evaluated
+before ordinary query quals, in case the latter contain "leaky" functions
+that could expose the contents of sensitive rows.  The original
+implementation of RLS planning ensured this by pushing the scan of a
+secured table into a sub-query that it marked as a security-barrier view.
+Unfortunately this results in very inefficient plans in many cases, because
+the sub-query cannot be flattened and gets planned independently of the
+rest of the query.
+
+To fix, drop the use of sub-queries to enforce RLS qual order, and instead
+mark each qual (RestrictInfo) with a security_level field establishing its
+priority for evaluation.  Quals must be evaluated in security_level order,
+except that "leakproof" quals can be allowed to go ahead of quals of lower
+security_level, if it's helpful to do so.  This has to be enforced within
+the ordering of any one list of quals to be evaluated at a table scan node,
+and we also have to ensure that quals are not chosen for early evaluation
+(i.e., use as an index qual or TID scan qual) if they're not allowed to go
+ahead of other quals at the scan node.
+
+This is sufficient to fix the problem for RLS quals, since we only support
+RLS policies on simple tables and thus RLS quals will always exist at the
+table scan level only.  Eventually these qual ordering rules should be
+enforced for join quals as well, which would permit improving planning for
+explicit security-barrier views; but that's a task for another patch.
+
+Note that FDWs would need to be aware of these rules --- and not, for
+example, send an insecure qual for remote execution --- but since we do
+not yet allow RLS policies on foreign tables, the case doesn't arise.
+This will need to be addressed before we can allow such policies.
+
+Patch by me, reviewed by Stephen Frost and Dean Rasheed.
+
+Discussion: https://postgr.es/m/8185.1477432701@sss.pgh.pa.us
+---
+ src/backend/nodes/copyfuncs.c                 |   2 +
+ src/backend/nodes/equalfuncs.c                |   1 +
+ src/backend/nodes/outfuncs.c                  |   6 +
+ src/backend/optimizer/README                  | 102 ++
+ src/backend/optimizer/path/allpaths.c         | 166 ++--
+ src/backend/optimizer/path/equivclass.c       |  61 +-
+ src/backend/optimizer/path/indxpath.c         |  26 +-
+ src/backend/optimizer/path/tidpath.c          |  25 +-
+ src/backend/optimizer/plan/createplan.c       |  53 +-
+ src/backend/optimizer/plan/initsplan.c        |  90 +-
+ src/backend/optimizer/plan/planner.c          | 125 +--
+ src/backend/optimizer/prep/Makefile           |   2 +-
+ src/backend/optimizer/prep/prepjointree.c     |   1 +
+ src/backend/optimizer/prep/prepsecurity.c     | 486 ----------
+ src/backend/optimizer/prep/prepunion.c        |  71 +-
+ src/backend/optimizer/util/clauses.c          |  14 +-
+ src/backend/optimizer/util/orclauses.c        |   3 +
+ src/backend/optimizer/util/relnode.c          |  14 +
+ src/backend/optimizer/util/restrictinfo.c     | 125 +--
+ src/include/nodes/relation.h                  |  22 +
+ src/include/optimizer/planmain.h              |   4 +-
+ src/include/optimizer/prep.h                  |   5 -
+ src/include/optimizer/restrictinfo.h          |   8 +-
+ .../expected/test_rls_hooks.out               |  24 +-
+ src/test/regress/expected/equivclass.out      |  42 +
+ src/test/regress/expected/rowsecurity.out     | 877 +++++++-----------
+ src/test/regress/expected/updatable_views.out | 304 ++----
+ src/test/regress/sql/equivclass.sql           |  32 +
+ src/test/regress/sql/updatable_views.sql      |   4 +-
+ 29 files changed, 1137 insertions(+), 1558 deletions(-)
+ delete mode 100644 src/backend/optimizer/prep/prepsecurity.c
+
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index 7107bbf16428..9f6a7e615413 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -2027,6 +2027,8 @@ _copyRestrictInfo(const RestrictInfo *from)
+ 	COPY_SCALAR_FIELD(outerjoin_delayed);
+ 	COPY_SCALAR_FIELD(can_join);
+ 	COPY_SCALAR_FIELD(pseudoconstant);
++	COPY_SCALAR_FIELD(leakproof);
++	COPY_SCALAR_FIELD(security_level);
+ 	COPY_BITMAPSET_FIELD(clause_relids);
+ 	COPY_BITMAPSET_FIELD(required_relids);
+ 	COPY_BITMAPSET_FIELD(outer_relids);
+diff --git a/src/backend/nodes/equalfuncs.c b/src/backend/nodes/equalfuncs.c
+index ec4bbfc770b3..78ed3c773e5a 100644
+--- a/src/backend/nodes/equalfuncs.c
++++ b/src/backend/nodes/equalfuncs.c
+@@ -805,6 +805,7 @@ _equalRestrictInfo(const RestrictInfo *a, const RestrictInfo *b)
+ 	COMPARE_NODE_FIELD(clause);
+ 	COMPARE_SCALAR_FIELD(is_pushed_down);
+ 	COMPARE_SCALAR_FIELD(outerjoin_delayed);
++	COMPARE_SCALAR_FIELD(security_level);
+ 	COMPARE_BITMAPSET_FIELD(required_relids);
+ 	COMPARE_BITMAPSET_FIELD(outer_relids);
+ 	COMPARE_BITMAPSET_FIELD(nullable_relids);
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index cf0a6059e91f..c2ba38ecd671 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -2059,6 +2059,7 @@ _outPlannerInfo(StringInfo str, const PlannerInfo *node)
+ 	WRITE_FLOAT_FIELD(total_table_pages, "%.0f");
+ 	WRITE_FLOAT_FIELD(tuple_fraction, "%.4f");
+ 	WRITE_FLOAT_FIELD(limit_tuples, "%.0f");
++	WRITE_UINT_FIELD(qual_security_level);
+ 	WRITE_BOOL_FIELD(hasInheritedTarget);
+ 	WRITE_BOOL_FIELD(hasJoinRTEs);
+ 	WRITE_BOOL_FIELD(hasLateralRTEs);
+@@ -2112,6 +2113,7 @@ _outRelOptInfo(StringInfo str, const RelOptInfo *node)
+ 	WRITE_BOOL_FIELD(useridiscurrent);
+ 	/* we don't try to print fdwroutine or fdw_private */
+ 	WRITE_NODE_FIELD(baserestrictinfo);
++	WRITE_UINT_FIELD(baserestrict_min_security);
+ 	WRITE_NODE_FIELD(joininfo);
+ 	WRITE_BOOL_FIELD(has_eclass_joins);
+ }
+@@ -2195,6 +2197,8 @@ _outEquivalenceClass(StringInfo str, const EquivalenceClass *node)
+ 	WRITE_BOOL_FIELD(ec_below_outer_join);
+ 	WRITE_BOOL_FIELD(ec_broken);
+ 	WRITE_UINT_FIELD(ec_sortref);
++	WRITE_UINT_FIELD(ec_min_security);
++	WRITE_UINT_FIELD(ec_max_security);
+ }
+ 
+ static void
+@@ -2261,6 +2265,8 @@ _outRestrictInfo(StringInfo str, const RestrictInfo *node)
+ 	WRITE_BOOL_FIELD(outerjoin_delayed);
+ 	WRITE_BOOL_FIELD(can_join);
+ 	WRITE_BOOL_FIELD(pseudoconstant);
++	WRITE_BOOL_FIELD(leakproof);
++	WRITE_UINT_FIELD(security_level);
+ 	WRITE_BITMAPSET_FIELD(clause_relids);
+ 	WRITE_BITMAPSET_FIELD(required_relids);
+ 	WRITE_BITMAPSET_FIELD(outer_relids);
+diff --git a/src/backend/optimizer/README b/src/backend/optimizer/README
+index 775bcc3b73b4..199873970281 100644
+--- a/src/backend/optimizer/README
++++ b/src/backend/optimizer/README
+@@ -877,6 +877,108 @@ lateral reference.  (Perhaps now that that stuff works, we could relax the
+ pullup restriction?)
+ 
+ 
++Security-level constraints on qual clauses
++------------------------------------------
++
++To support row-level security and security-barrier views efficiently,
++we mark qual clauses (RestrictInfo nodes) with a "security_level" field.
++The basic concept is that a qual with a lower security_level must be
++evaluated before one with a higher security_level.  This ensures that
++"leaky" quals that might expose sensitive data are not evaluated until
++after the security barrier quals that are supposed to filter out
++security-sensitive rows.  However, many qual conditions are "leakproof",
++that is we trust the functions they use to not expose data.  To avoid
++unnecessarily inefficient plans, a leakproof qual is not delayed by
++security-level considerations, even if it has a higher syntactic
++security_level than another qual.
++
++In a query that contains no use of RLS or security-barrier views, all
++quals will have security_level zero, so that none of these restrictions
++kick in; we don't even need to check leakproofness of qual conditions.
++
++If there are security-barrier quals, they get security_level zero (and
++possibly higher, if there are multiple layers of barriers).  Regular quals
++coming from the query text get a security_level one more than the highest
++level used for barrier quals.
++
++When new qual clauses are generated by EquivalenceClass processing,
++they must be assigned a security_level.  This is trickier than it seems.
++One's first instinct is that it would be safe to use the largest level
++found among the source quals for the EquivalenceClass, but that isn't
++safe at all, because it allows unwanted delays of security-barrier quals.
++Consider a barrier qual "t.x = t.y" plus a query qual "t.x = constant",
++and suppose there is another query qual "leaky_function(t.z)" that
++we mustn't evaluate before the barrier qual has been checked.
++We will have an EC {t.x, t.y, constant} which will lead us to replace
++the EC quals with "t.x = constant AND t.y = constant".  (We do not want
++to give up that behavior, either, since the latter condition could allow
++use of an index on t.y, which we would never discover from the original
++quals.)  If these generated quals are assigned the same security_level as
++the query quals, then it's possible for the leaky_function qual to be
++evaluated first, allowing leaky_function to see data from rows that
++possibly don't pass the barrier condition.
++
++Instead, our handling of security levels with ECs works like this:
++* Quals are not accepted as source clauses for ECs in the first place
++unless they are leakproof or have security_level zero.
++* EC-derived quals are assigned the minimum (not maximum) security_level
++found among the EC's source clauses.
++* If the maximum security_level found among the EC's source clauses is
++above zero, then the equality operators selected for derived quals must
++be leakproof.  When no such operator can be found, the EC is treated as
++"broken" and we fall back to emitting its source clauses without any
++additional derived quals.
++
++These rules together ensure that an untrusted qual clause (one with
++security_level above zero) cannot cause an EC to generate a leaky derived
++clause.  This makes it safe to use the minimum not maximum security_level
++for derived clauses.  The rules could result in poor plans due to not
++being able to generate derived clauses at all, but the risk of that is
++small in practice because most btree equality operators are leakproof.
++Also, by making exceptions for level-zero quals, we ensure that there is
++no plan degradation when no barrier quals are present.
++
++Once we have security levels assigned to all clauses, enforcement
++of barrier-qual ordering restrictions boils down to two rules:
++
++* Table scan plan nodes must not select quals for early execution
++(for example, use them as index qualifiers in an indexscan) unless
++they are leakproof or have security_level no higher than any other
++qual that is due to be executed at the same plan node.  (Use the
++utility function restriction_is_securely_promotable() to check
++whether it's okay to select a qual for early execution.)
++
++* Normal execution of a list of quals must execute them in an order
++that satisfies the same security rule, ie higher security_levels must
++be evaluated later unless leakproof.  (This is handled in a single place
++by order_qual_clauses() in createplan.c.)
++
++order_qual_clauses() uses a heuristic to decide exactly what to do with
++leakproof clauses.  Normally it sorts clauses by security_level then cost,
++being careful that the sort is stable so that we don't reorder clauses
++without a clear reason.  But this could result in a very expensive qual
++being done before a cheaper one that is of higher security_level.
++If the cheaper qual is leaky we have no choice, but if it is leakproof
++we could put it first.  We choose to sort leakproof quals as if they
++have security_level zero, but only when their cost is less than 10X
++cpu_operator_cost; that restriction alleviates the opposite problem of
++doing expensive quals first just because they're leakproof.
++
++Additional rules will be needed to support safe handling of join quals
++when there is a mix of security levels among join quals; for example, it
++will be necessary to prevent leaky higher-security-level quals from being
++evaluated at a lower join level than other quals of lower security level.
++Currently there is no need to consider that since security-prioritized
++quals can only be single-table restriction quals coming from RLS policies
++or security-barrier views, and security-barrier view subqueries are never
++flattened into the parent query.  Hence enforcement of security-prioritized
++quals only happens at the table scan level.  With extra rules for safe
++handling of security levels among join quals, it should be possible to let
++security-barrier views be flattened into the parent query, allowing more
++flexibility of planning while still preserving required ordering of qual
++evaluation.  But that will come later.
++
++
+ Post scan/join planning
+ -----------------------
+ 
+diff --git a/src/backend/optimizer/path/allpaths.c b/src/backend/optimizer/path/allpaths.c
+index 46d7d064d41a..da68d0d61fc4 100644
+--- a/src/backend/optimizer/path/allpaths.c
++++ b/src/backend/optimizer/path/allpaths.c
+@@ -896,9 +896,11 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
+ 		RangeTblEntry *childRTE;
+ 		RelOptInfo *childrel;
+ 		List	   *childquals;
+-		Node	   *childqual;
++		Index		cq_min_security;
++		bool		have_const_false_cq;
+ 		ListCell   *parentvars;
+ 		ListCell   *childvars;
++		ListCell   *lc;
+ 
+ 		/* append_rel_list contains all append rels; ignore others */
+ 		if (appinfo->parent_relid != parentRTindex)
+@@ -921,34 +923,113 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
+ 		 * constraint exclusion; so do that first and then check to see if we
+ 		 * can disregard this child.
+ 		 *
+-		 * As of 8.4, the child rel's targetlist might contain non-Var
+-		 * expressions, which means that substitution into the quals could
+-		 * produce opportunities for const-simplification, and perhaps even
+-		 * pseudoconstant quals.  To deal with this, we strip the RestrictInfo
+-		 * nodes, do the substitution, do const-simplification, and then
+-		 * reconstitute the RestrictInfo layer.
++		 * The child rel's targetlist might contain non-Var expressions, which
++		 * means that substitution into the quals could produce opportunities
++		 * for const-simplification, and perhaps even pseudoconstant quals.
++		 * Therefore, transform each RestrictInfo separately to see if it
++		 * reduces to a constant or pseudoconstant.  (We must process them
++		 * separately to keep track of the security level of each qual.)
++		 */
++		childquals = NIL;
++		cq_min_security = UINT_MAX;
++		have_const_false_cq = false;
++		foreach(lc, rel->baserestrictinfo)
++		{
++			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
++			Node	   *childqual;
++			bool		pseudoconstant;
++
++			Assert(IsA(rinfo, RestrictInfo));
++			childqual = adjust_appendrel_attrs(root,
++											   (Node *) rinfo->clause,
++											   appinfo);
++			childqual = eval_const_expressions(root, childqual);
++			/* check for flat-out constant */
++			if (childqual && IsA(childqual, Const))
++			{
++				if (((Const *) childqual)->constisnull ||
++					!DatumGetBool(((Const *) childqual)->constvalue))
++				{
++					/* Restriction reduces to constant FALSE or NULL */
++					have_const_false_cq = true;
++					break;
++				}
++				/* Restriction reduces to constant TRUE, so drop it */
++				continue;
++			}
++			/* check for pseudoconstant (no Vars or volatile functions) */
++			pseudoconstant =
++				!contain_vars_of_level(childqual, 0) &&
++				!contain_volatile_functions(childqual);
++			if (pseudoconstant)
++			{
++				/* tell createplan.c to check for gating quals */
++				root->hasPseudoConstantQuals = true;
++			}
++			/* reconstitute RestrictInfo with appropriate properties */
++			childquals = lappend(childquals,
++								 make_restrictinfo((Expr *) childqual,
++												   rinfo->is_pushed_down,
++												   rinfo->outerjoin_delayed,
++												   pseudoconstant,
++												   rinfo->security_level,
++												   NULL, NULL, NULL));
++			/* track minimum security level among child quals */
++			cq_min_security = Min(cq_min_security, rinfo->security_level);
++		}
++
++		/*
++		 * In addition to the quals inherited from the parent, we might have
++		 * securityQuals associated with this particular child node.
++		 * (Currently this can only happen in appendrels originating from
++		 * UNION ALL; inheritance child tables don't have their own
++		 * securityQuals, see expand_inherited_rtentry().)	Pull any such
++		 * securityQuals up into the baserestrictinfo for the child.  This is
++		 * similar to process_security_barrier_quals() for the parent rel,
++		 * except that we can't make any general deductions from such quals,
++		 * since they don't hold for the whole appendrel.
++		 */
++		if (childRTE->securityQuals)
++		{
++			Index		security_level = 0;
++
++			foreach(lc, childRTE->securityQuals)
++			{
++				List	   *qualset = (List *) lfirst(lc);
++				ListCell   *lc2;
++
++				foreach(lc2, qualset)
++				{
++					Expr	   *qual = (Expr *) lfirst(lc2);
++
++					/* not likely that we'd see constants here, so no check */
++					childquals = lappend(childquals,
++										 make_restrictinfo(qual,
++														   true, false, false,
++														   security_level,
++														   NULL, NULL, NULL));
++					cq_min_security = Min(cq_min_security, security_level);
++				}
++				security_level++;
++			}
++			Assert(security_level <= root->qual_security_level);
++		}
++
++		/*
++		 * OK, we've got all the baserestrictinfo quals for this child.
+ 		 */
+-		childquals = get_all_actual_clauses(rel->baserestrictinfo);
+-		childquals = (List *) adjust_appendrel_attrs(root,
+-													 (Node *) childquals,
+-													 appinfo);
+-		childqual = eval_const_expressions(root, (Node *)
+-										   make_ands_explicit(childquals));
+-		if (childqual && IsA(childqual, Const) &&
+-			(((Const *) childqual)->constisnull ||
+-			 !DatumGetBool(((Const *) childqual)->constvalue)))
++		childrel->baserestrictinfo = childquals;
++		childrel->baserestrict_min_security = cq_min_security;
++
++		if (have_const_false_cq)
+ 		{
+ 			/*
+-			 * Restriction reduces to constant FALSE or constant NULL after
++			 * Some restriction clause reduced to constant FALSE or NULL after
+ 			 * substitution, so this child need not be scanned.
+ 			 */
+ 			set_dummy_rel_pathlist(childrel);
+ 			continue;
+ 		}
+-		childquals = make_ands_implicit((Expr *) childqual);
+-		childquals = make_restrictinfos_from_actual_clauses(root,
+-															childquals);
+-		childrel->baserestrictinfo = childquals;
+ 
+ 		if (relation_excluded_by_constraints(root, childrel, childRTE))
+ 		{
+@@ -1712,6 +1793,7 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
+ 			}
+ 		}
+ 		rel->baserestrictinfo = upperrestrictlist;
++		/* We don't bother recomputing baserestrict_min_security */
+ 	}
+ 
+ 	pfree(safetyInfo.unsafeColumns);
+@@ -2640,46 +2722,6 @@ subquery_push_qual(Query *subquery, RangeTblEntry *rte, Index rti, Node *qual)
+ 		recurse_push_qual(subquery->setOperations, subquery,
+ 						  rte, rti, qual);
+ 	}
+-	else if (IsA(qual, CurrentOfExpr))
+-	{
+-		/*
+-		 * This is possible when a WHERE CURRENT OF expression is applied to a
+-		 * table with row-level security.  In that case, the subquery should
+-		 * contain precisely one rtable entry for the table, and we can safely
+-		 * push the expression down into the subquery.  This will cause a TID
+-		 * scan subquery plan to be generated allowing the target relation to
+-		 * be updated.
+-		 *
+-		 * Someday we might also be able to use a WHERE CURRENT OF expression
+-		 * on a view, but currently the rewriter prevents that, so we should
+-		 * never see any other case here, but generate sane error messages in
+-		 * case it does somehow happen.
+-		 */
+-		if (subquery->rtable == NIL)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+-					 errmsg("WHERE CURRENT OF is not supported on a view with no underlying relation")));
+-
+-		if (list_length(subquery->rtable) > 1)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+-					 errmsg("WHERE CURRENT OF is not supported on a view with more than one underlying relation")));
+-
+-		if (subquery->hasAggs || subquery->groupClause || subquery->groupingSets || subquery->havingQual)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+-					 errmsg("WHERE CURRENT OF is not supported on a view with grouping or aggregation")));
+-
+-		/*
+-		 * Adjust the CURRENT OF expression to refer to the underlying table
+-		 * in the subquery, and attach it to the subquery's WHERE clause.
+-		 */
+-		qual = copyObject(qual);
+-		((CurrentOfExpr *) qual)->cvarno = 1;
+-
+-		subquery->jointree->quals =
+-			make_and_qual(subquery->jointree->quals, qual);
+-	}
+ 	else
+ 	{
+ 		/*
+@@ -2708,7 +2750,7 @@ subquery_push_qual(Query *subquery, RangeTblEntry *rte, Index rti, Node *qual)
+ 				make_and_qual(subquery->jointree->quals, qual);
+ 
+ 		/*
+-		 * We need not change the subquery's hasAggs or hasSublinks flags,
++		 * We need not change the subquery's hasAggs or hasSubLinks flags,
+ 		 * since we can't be pushing down any aggregates that weren't there
+ 		 * before, and we don't push down subselects at all.
+ 		 */
+diff --git a/src/backend/optimizer/path/equivclass.c b/src/backend/optimizer/path/equivclass.c
+index 6703dc384d6f..a329dd1e10d7 100644
+--- a/src/backend/optimizer/path/equivclass.c
++++ b/src/backend/optimizer/path/equivclass.c
+@@ -16,6 +16,8 @@
+  */
+ #include "postgres.h"
+ 
++#include <limits.h>
++
+ #include "access/stratnum.h"
+ #include "catalog/pg_type.h"
+ #include "nodes/makefuncs.h"
+@@ -78,9 +80,16 @@ static bool reconsider_full_join_clause(PlannerInfo *root,
+  * care to mark an EquivalenceClass if it came from any such clauses.  Also,
+  * we have to check that both sides are either pseudo-constants or strict
+  * functions of Vars, else they might not both go to NULL above the outer
+- * join.  (This is the reason why we need a failure return.  It's more
++ * join.  (This is the main reason why we need a failure return.  It's more
+  * convenient to check this case here than at the call sites...)
+  *
++ * We also reject proposed equivalence clauses if they contain leaky functions
++ * and have security_level above zero.  The EC evaluation rules require us to
++ * apply certain tests at certain joining levels, and we can't tolerate
++ * delaying any test on security_level grounds.  By rejecting candidate clauses
++ * that might require security delays, we ensure it's safe to apply an EC
++ * clause as soon as it's supposed to be applied.
++ *
+  * On success return, we have also initialized the clause's left_ec/right_ec
+  * fields to point to the EquivalenceClass representing it.  This saves lookup
+  * effort later.
+@@ -120,6 +129,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
+ 	Assert(restrictinfo->left_ec == NULL);
+ 	Assert(restrictinfo->right_ec == NULL);
+ 
++	/* Reject if it is potentially postponable by security considerations */
++	if (restrictinfo->security_level > 0 && !restrictinfo->leakproof)
++		return false;
++
+ 	/* Extract info from given clause */
+ 	Assert(is_opclause(clause));
+ 	opno = ((OpExpr *) clause)->opno;
+@@ -275,6 +288,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
+ 		{
+ 			ec1->ec_sources = lappend(ec1->ec_sources, restrictinfo);
+ 			ec1->ec_below_outer_join |= below_outer_join;
++			ec1->ec_min_security = Min(ec1->ec_min_security,
++									   restrictinfo->security_level);
++			ec1->ec_max_security = Max(ec1->ec_max_security,
++									   restrictinfo->security_level);
+ 			/* mark the RI as associated with this eclass */
+ 			restrictinfo->left_ec = ec1;
+ 			restrictinfo->right_ec = ec1;
+@@ -306,6 +323,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
+ 		ec1->ec_has_const |= ec2->ec_has_const;
+ 		/* can't need to set has_volatile */
+ 		ec1->ec_below_outer_join |= ec2->ec_below_outer_join;
++		ec1->ec_min_security = Min(ec1->ec_min_security,
++								   ec2->ec_min_security);
++		ec1->ec_max_security = Max(ec1->ec_max_security,
++								   ec2->ec_max_security);
+ 		ec2->ec_merged = ec1;
+ 		root->eq_classes = list_delete_ptr(root->eq_classes, ec2);
+ 		/* just to avoid debugging confusion w/ dangling pointers: */
+@@ -315,6 +336,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
+ 		ec2->ec_relids = NULL;
+ 		ec1->ec_sources = lappend(ec1->ec_sources, restrictinfo);
+ 		ec1->ec_below_outer_join |= below_outer_join;
++		ec1->ec_min_security = Min(ec1->ec_min_security,
++								   restrictinfo->security_level);
++		ec1->ec_max_security = Max(ec1->ec_max_security,
++								   restrictinfo->security_level);
+ 		/* mark the RI as associated with this eclass */
+ 		restrictinfo->left_ec = ec1;
+ 		restrictinfo->right_ec = ec1;
+@@ -329,6 +354,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
+ 							false, item2_type);
+ 		ec1->ec_sources = lappend(ec1->ec_sources, restrictinfo);
+ 		ec1->ec_below_outer_join |= below_outer_join;
++		ec1->ec_min_security = Min(ec1->ec_min_security,
++								   restrictinfo->security_level);
++		ec1->ec_max_security = Max(ec1->ec_max_security,
++								   restrictinfo->security_level);
+ 		/* mark the RI as associated with this eclass */
+ 		restrictinfo->left_ec = ec1;
+ 		restrictinfo->right_ec = ec1;
+@@ -343,6 +372,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
+ 							false, item1_type);
+ 		ec2->ec_sources = lappend(ec2->ec_sources, restrictinfo);
+ 		ec2->ec_below_outer_join |= below_outer_join;
++		ec2->ec_min_security = Min(ec2->ec_min_security,
++								   restrictinfo->security_level);
++		ec2->ec_max_security = Max(ec2->ec_max_security,
++								   restrictinfo->security_level);
+ 		/* mark the RI as associated with this eclass */
+ 		restrictinfo->left_ec = ec2;
+ 		restrictinfo->right_ec = ec2;
+@@ -366,6 +399,8 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
+ 		ec->ec_below_outer_join = below_outer_join;
+ 		ec->ec_broken = false;
+ 		ec->ec_sortref = 0;
++		ec->ec_min_security = restrictinfo->security_level;
++		ec->ec_max_security = restrictinfo->security_level;
+ 		ec->ec_merged = NULL;
+ 		em1 = add_eq_member(ec, item1, item1_relids, item1_nullable_relids,
+ 							false, item1_type);
+@@ -639,6 +674,8 @@ get_eclass_for_sort_expr(PlannerInfo *root,
+ 	newec->ec_below_outer_join = false;
+ 	newec->ec_broken = false;
+ 	newec->ec_sortref = sortref;
++	newec->ec_min_security = UINT_MAX;
++	newec->ec_max_security = 0;
+ 	newec->ec_merged = NULL;
+ 
+ 	if (newec->ec_has_volatile && sortref == 0) /* should not happen */
+@@ -834,6 +871,7 @@ generate_base_implied_equalities_const(PlannerInfo *root,
+ 								 bms_copy(ec->ec_relids),
+ 								 bms_union(cur_em->em_nullable_relids,
+ 										   const_em->em_nullable_relids),
++								 ec->ec_min_security,
+ 								 ec->ec_below_outer_join,
+ 								 cur_em->em_is_const);
+ 	}
+@@ -890,6 +928,7 @@ generate_base_implied_equalities_no_const(PlannerInfo *root,
+ 									 bms_copy(ec->ec_relids),
+ 									 bms_union(prev_em->em_nullable_relids,
+ 											   cur_em->em_nullable_relids),
++									 ec->ec_min_security,
+ 									 ec->ec_below_outer_join,
+ 									 false);
+ 		}
+@@ -1313,7 +1352,13 @@ select_equality_operator(EquivalenceClass *ec, Oid lefttype, Oid righttype)
+ 
+ 		opno = get_opfamily_member(opfamily, lefttype, righttype,
+ 								   BTEqualStrategyNumber);
+-		if (OidIsValid(opno))
++		if (!OidIsValid(opno))
++			continue;
++		/* If no barrier quals in query, don't worry about leaky operators */
++		if (ec->ec_max_security == 0)
++			return opno;
++		/* Otherwise, insist that selected operators be leakproof */
++		if (get_func_leakproof(get_opcode(opno)))
+ 			return opno;
+ 	}
+ 	return InvalidOid;
+@@ -1380,7 +1425,8 @@ create_join_clause(PlannerInfo *root,
+ 										bms_union(leftem->em_relids,
+ 												  rightem->em_relids),
+ 										bms_union(leftem->em_nullable_relids,
+-											   rightem->em_nullable_relids));
++												rightem->em_nullable_relids),
++										ec->ec_min_security);
+ 
+ 	/* Mark the clause as redundant, or not */
+ 	rinfo->parent_ec = parent_ec;
+@@ -1691,7 +1737,8 @@ reconsider_outer_join_clause(PlannerInfo *root, RestrictInfo *rinfo,
+ 												   innervar,
+ 												   cur_em->em_expr,
+ 												   bms_copy(inner_relids),
+-											bms_copy(inner_nullable_relids));
++											 bms_copy(inner_nullable_relids),
++												   cur_ec->ec_min_security);
+ 			if (process_equivalence(root, newrinfo, true))
+ 				match = true;
+ 		}
+@@ -1833,7 +1880,8 @@ reconsider_full_join_clause(PlannerInfo *root, RestrictInfo *rinfo)
+ 													   leftvar,
+ 													   cur_em->em_expr,
+ 													   bms_copy(left_relids),
+-											 bms_copy(left_nullable_relids));
++											  bms_copy(left_nullable_relids),
++													cur_ec->ec_min_security);
+ 				if (process_equivalence(root, newrinfo, true))
+ 					matchleft = true;
+ 			}
+@@ -1847,7 +1895,8 @@ reconsider_full_join_clause(PlannerInfo *root, RestrictInfo *rinfo)
+ 													   rightvar,
+ 													   cur_em->em_expr,
+ 													   bms_copy(right_relids),
+-											bms_copy(right_nullable_relids));
++											 bms_copy(right_nullable_relids),
++													cur_ec->ec_min_security);
+ 				if (process_equivalence(root, newrinfo, true))
+ 					matchright = true;
+ 			}
+diff --git a/src/backend/optimizer/path/indxpath.c b/src/backend/optimizer/path/indxpath.c
+index 0a5c05033a0c..528346898812 100644
+--- a/src/backend/optimizer/path/indxpath.c
++++ b/src/backend/optimizer/path/indxpath.c
+@@ -2143,6 +2143,23 @@ match_clause_to_index(IndexOptInfo *index,
+ {
+ 	int			indexcol;
+ 
++	/*
++	 * Never match pseudoconstants to indexes.  (Normally a match could not
++	 * happen anyway, since a pseudoconstant clause couldn't contain a Var,
++	 * but what if someone builds an expression index on a constant? It's not
++	 * totally unreasonable to do so with a partial index, either.)
++	 */
++	if (rinfo->pseudoconstant)
++		return;
++
++	/*
++	 * If clause can't be used as an indexqual because it must wait till after
++	 * some lower-security-level restriction clause, reject it.
++	 */
++	if (!restriction_is_securely_promotable(rinfo, index->rel))
++		return;
++
++	/* OK, check each index column for a match */
+ 	for (indexcol = 0; indexcol < index->ncolumns; indexcol++)
+ 	{
+ 		if (match_clause_to_indexcol(index,
+@@ -2237,15 +2254,6 @@ match_clause_to_indexcol(IndexOptInfo *index,
+ 	Oid			expr_coll;
+ 	bool		plain_op;
+ 
+-	/*
+-	 * Never match pseudoconstants to indexes.  (Normally this could not
+-	 * happen anyway, since a pseudoconstant clause couldn't contain a Var,
+-	 * but what if someone builds an expression index on a constant? It's not
+-	 * totally unreasonable to do so with a partial index, either.)
+-	 */
+-	if (rinfo->pseudoconstant)
+-		return false;
+-
+ 	/* First check for boolean-index cases. */
+ 	if (IsBooleanOpfamily(opfamily))
+ 	{
+diff --git a/src/backend/optimizer/path/tidpath.c b/src/backend/optimizer/path/tidpath.c
+index 240ade6708b8..a2fe661075fd 100644
+--- a/src/backend/optimizer/path/tidpath.c
++++ b/src/backend/optimizer/path/tidpath.c
+@@ -43,12 +43,13 @@
+ #include "optimizer/clauses.h"
+ #include "optimizer/pathnode.h"
+ #include "optimizer/paths.h"
++#include "optimizer/restrictinfo.h"
+ 
+ 
+ static bool IsTidEqualClause(OpExpr *node, int varno);
+ static bool IsTidEqualAnyClause(ScalarArrayOpExpr *node, int varno);
+ static List *TidQualFromExpr(Node *expr, int varno);
+-static List *TidQualFromRestrictinfo(List *restrictinfo, int varno);
++static List *TidQualFromBaseRestrictinfo(RelOptInfo *rel);
+ 
+ 
+ /*
+@@ -216,24 +217,26 @@ TidQualFromExpr(Node *expr, int varno)
+ }
+ 
+ /*
+- *	Extract a set of CTID conditions from the given restrictinfo list
+- *
+- *	This is essentially identical to the AND case of TidQualFromExpr,
+- *	except for the format of the input.
++ *	Extract a set of CTID conditions from the rel's baserestrictinfo list
+  */
+ static List *
+-TidQualFromRestrictinfo(List *restrictinfo, int varno)
++TidQualFromBaseRestrictinfo(RelOptInfo *rel)
+ {
+ 	List	   *rlst = NIL;
+ 	ListCell   *l;
+ 
+-	foreach(l, restrictinfo)
++	foreach(l, rel->baserestrictinfo)
+ 	{
+ 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(l);
+ 
+-		if (!IsA(rinfo, RestrictInfo))
+-			continue;			/* probably should never happen */
+-		rlst = TidQualFromExpr((Node *) rinfo->clause, varno);
++		/*
++		 * If clause must wait till after some lower-security-level
++		 * restriction clause, reject it.
++		 */
++		if (!restriction_is_securely_promotable(rinfo, rel))
++			continue;
++
++		rlst = TidQualFromExpr((Node *) rinfo->clause, rel->relid);
+ 		if (rlst)
+ 			break;
+ 	}
+@@ -259,7 +262,7 @@ create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel)
+ 	 */
+ 	required_outer = rel->lateral_relids;
+ 
+-	tidquals = TidQualFromRestrictinfo(rel->baserestrictinfo, rel->relid);
++	tidquals = TidQualFromBaseRestrictinfo(rel);
+ 
+ 	if (tidquals)
+ 		add_path(rel, (Path *) create_tidscan_path(root, rel, tidquals,
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index c7bcd9b84c8e..c4ada214ed25 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -4500,21 +4500,32 @@ get_switched_clauses(List *clauses, Relids outerrelids)
+  *		plan node, sort the list into the order we want to check the quals
+  *		in at runtime.
+  *
++ * When security barrier quals are used in the query, we may have quals with
++ * different security levels in the list.  Quals of lower security_level
++ * must go before quals of higher security_level, except that we can grant
++ * exceptions to move up quals that are leakproof.  When security level
++ * doesn't force the decision, we prefer to order clauses by estimated
++ * execution cost, cheapest first.
++ *
+  * Ideally the order should be driven by a combination of execution cost and
+  * selectivity, but it's not immediately clear how to account for both,
+  * and given the uncertainty of the estimates the reliability of the decisions
+- * would be doubtful anyway.  So we just order by estimated per-tuple cost,
+- * being careful not to change the order when (as is often the case) the
+- * estimates are identical.
++ * would be doubtful anyway.  So we just order by security level then
++ * estimated per-tuple cost, being careful not to change the order when
++ * (as is often the case) the estimates are identical.
+  *
+  * Although this will work on either bare clauses or RestrictInfos, it's
+  * much faster to apply it to RestrictInfos, since it can re-use cost
+- * information that is cached in RestrictInfos.
++ * information that is cached in RestrictInfos.  XXX in the bare-clause
++ * case, we are also not able to apply security considerations.  That is
++ * all right for the moment, because the bare-clause case doesn't occur
++ * anywhere that barrier quals could be present, but it would be better to
++ * get rid of it.
+  *
+  * Note: some callers pass lists that contain entries that will later be
+  * removed; this is the easiest way to let this routine see RestrictInfos
+- * instead of bare clauses.  It's OK because we only sort by cost, but
+- * a cost/selectivity combination would likely do the wrong thing.
++ * instead of bare clauses.  This is another reason why trying to consider
++ * selectivity in the ordering would likely do the wrong thing.
+  */
+ static List *
+ order_qual_clauses(PlannerInfo *root, List *clauses)
+@@ -4523,6 +4534,7 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
+ 	{
+ 		Node	   *clause;
+ 		Cost		cost;
++		Index		security_level;
+ 	} QualItem;
+ 	int			nitems = list_length(clauses);
+ 	QualItem   *items;
+@@ -4548,6 +4560,27 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
+ 		cost_qual_eval_node(&qcost, clause, root);
+ 		items[i].clause = clause;
+ 		items[i].cost = qcost.per_tuple;
++		if (IsA(clause, RestrictInfo))
++		{
++			RestrictInfo *rinfo = (RestrictInfo *) clause;
++
++			/*
++			 * If a clause is leakproof, it doesn't have to be constrained by
++			 * its nominal security level.  If it's also reasonably cheap
++			 * (here defined as 10X cpu_operator_cost), pretend it has
++			 * security_level 0, which will allow it to go in front of
++			 * more-expensive quals of lower security levels.  Of course, that
++			 * will also force it to go in front of cheaper quals of its own
++			 * security level, which is not so great, but we can alleviate
++			 * that risk by applying the cost limit cutoff.
++			 */
++			if (rinfo->leakproof && items[i].cost < 10 * cpu_operator_cost)
++				items[i].security_level = 0;
++			else
++				items[i].security_level = rinfo->security_level;
++		}
++		else
++			items[i].security_level = 0;
+ 		i++;
+ 	}
+ 
+@@ -4564,9 +4597,13 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
+ 		/* insert newitem into the already-sorted subarray */
+ 		for (j = i; j > 0; j--)
+ 		{
+-			if (newitem.cost >= items[j - 1].cost)
++			QualItem   *olditem = &items[j - 1];
++
++			if (newitem.security_level > olditem->security_level ||
++				(newitem.security_level == olditem->security_level &&
++				 newitem.cost >= olditem->cost))
+ 				break;
+-			items[j] = items[j - 1];
++			items[j] = *olditem;
+ 		}
+ 		items[j] = newitem;
+ 	}
+diff --git a/src/backend/optimizer/plan/initsplan.c b/src/backend/optimizer/plan/initsplan.c
+index 6ceb80192e10..c170e9614f60 100644
+--- a/src/backend/optimizer/plan/initsplan.c
++++ b/src/backend/optimizer/plan/initsplan.c
+@@ -51,6 +51,9 @@ static List *deconstruct_recurse(PlannerInfo *root, Node *jtnode,
+ 					bool below_outer_join,
+ 					Relids *qualscope, Relids *inner_join_rels,
+ 					List **postponed_qual_list);
++static void process_security_barrier_quals(PlannerInfo *root,
++							   int rti, Relids qualscope,
++							   bool below_outer_join);
+ static SpecialJoinInfo *make_outerjoininfo(PlannerInfo *root,
+ 				   Relids left_rels, Relids right_rels,
+ 				   Relids inner_join_rels,
+@@ -60,6 +63,7 @@ static void distribute_qual_to_rels(PlannerInfo *root, Node *clause,
+ 						bool is_deduced,
+ 						bool below_outer_join,
+ 						JoinType jointype,
++						Index security_level,
+ 						Relids qualscope,
+ 						Relids ojscope,
+ 						Relids outerjoin_nonnullable,
+@@ -745,8 +749,14 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode, bool below_outer_join,
+ 	{
+ 		int			varno = ((RangeTblRef *) jtnode)->rtindex;
+ 
+-		/* No quals to deal with, just return correct result */
++		/* qualscope is just the one RTE */
+ 		*qualscope = bms_make_singleton(varno);
++		/* Deal with any securityQuals attached to the RTE */
++		if (root->qual_security_level > 0)
++			process_security_barrier_quals(root,
++										   varno,
++										   *qualscope,
++										   below_outer_join);
+ 		/* A single baserel does not create an inner join */
+ 		*inner_join_rels = NULL;
+ 		joinlist = list_make1(jtnode);
+@@ -810,6 +820,7 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode, bool below_outer_join,
+ 			if (bms_is_subset(pq->relids, *qualscope))
+ 				distribute_qual_to_rels(root, pq->qual,
+ 										false, below_outer_join, JOIN_INNER,
++										root->qual_security_level,
+ 										*qualscope, NULL, NULL, NULL,
+ 										NULL);
+ 			else
+@@ -825,6 +836,7 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode, bool below_outer_join,
+ 
+ 			distribute_qual_to_rels(root, qual,
+ 									false, below_outer_join, JOIN_INNER,
++									root->qual_security_level,
+ 									*qualscope, NULL, NULL, NULL,
+ 									postponed_qual_list);
+ 		}
+@@ -1002,6 +1014,7 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode, bool below_outer_join,
+ 
+ 			distribute_qual_to_rels(root, qual,
+ 									false, below_outer_join, j->jointype,
++									root->qual_security_level,
+ 									*qualscope,
+ 									ojscope, nonnullable_rels, NULL,
+ 									postponed_qual_list);
+@@ -1058,6 +1071,67 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode, bool below_outer_join,
+ 	return joinlist;
+ }
+ 
++/*
++ * process_security_barrier_quals
++ *	  Transfer security-barrier quals into relation's baserestrictinfo list.
++ *
++ * The rewriter put any relevant security-barrier conditions into the RTE's
++ * securityQuals field, but it's now time to copy them into the rel's
++ * baserestrictinfo.
++ *
++ * In inheritance cases, we only consider quals attached to the parent rel
++ * here; they will be valid for all children too, so it's okay to consider
++ * them for purposes like equivalence class creation.  Quals attached to
++ * individual child rels will be dealt with during path creation.
++ */
++static void
++process_security_barrier_quals(PlannerInfo *root,
++							   int rti, Relids qualscope,
++							   bool below_outer_join)
++{
++	RangeTblEntry *rte = root->simple_rte_array[rti];
++	Index		security_level = 0;
++	ListCell   *lc;
++
++	/*
++	 * Each element of the securityQuals list has been preprocessed into an
++	 * implicitly-ANDed list of clauses.  All the clauses in a given sublist
++	 * should get the same security level, but successive sublists get higher
++	 * levels.
++	 */
++	foreach(lc, rte->securityQuals)
++	{
++		List	   *qualset = (List *) lfirst(lc);
++		ListCell   *lc2;
++
++		foreach(lc2, qualset)
++		{
++			Node	   *qual = (Node *) lfirst(lc2);
++
++			/*
++			 * We cheat to the extent of passing ojscope = qualscope rather
++			 * than its more logical value of NULL.  The only effect this has
++			 * is to force a Var-free qual to be evaluated at the rel rather
++			 * than being pushed up to top of tree, which we don't want.
++			 */
++			distribute_qual_to_rels(root, qual,
++									false,
++									below_outer_join,
++									JOIN_INNER,
++									security_level,
++									qualscope,
++									qualscope,
++									NULL,
++									NULL,
++									NULL);
++		}
++		security_level++;
++	}
++
++	/* Assert that qual_security_level is higher than anything we just used */
++	Assert(security_level <= root->qual_security_level);
++}
++
+ /*
+  * make_outerjoininfo
+  *	  Build a SpecialJoinInfo for the current outer join
+@@ -1516,6 +1590,7 @@ compute_semijoin_info(SpecialJoinInfo *sjinfo, List *clause)
+  * 'below_outer_join': TRUE if the qual is from a JOIN/ON that is below the
+  *		nullable side of a higher-level outer join
+  * 'jointype': type of join the qual is from (JOIN_INNER for a WHERE clause)
++ * 'security_level': security_level to assign to the qual
+  * 'qualscope': set of baserels the qual's syntactic scope covers
+  * 'ojscope': NULL if not an outer-join qual, else the minimum set of baserels
+  *		needed to form this join
+@@ -1545,6 +1620,7 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
+ 						bool is_deduced,
+ 						bool below_outer_join,
+ 						JoinType jointype,
++						Index security_level,
+ 						Relids qualscope,
+ 						Relids ojscope,
+ 						Relids outerjoin_nonnullable,
+@@ -1794,6 +1870,7 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
+ 									 is_pushed_down,
+ 									 outerjoin_delayed,
+ 									 pseudoconstant,
++									 security_level,
+ 									 relids,
+ 									 outerjoin_nonnullable,
+ 									 nullable_relids);
+@@ -2142,6 +2219,9 @@ distribute_restrictinfo_to_rels(PlannerInfo *root,
+ 			/* Add clause to rel's restriction list */
+ 			rel->baserestrictinfo = lappend(rel->baserestrictinfo,
+ 											restrictinfo);
++			/* Update security level info */
++			rel->baserestrict_min_security = Min(rel->baserestrict_min_security,
++											   restrictinfo->security_level);
+ 			break;
+ 		case BMS_MULTIPLE:
+ 
+@@ -2189,6 +2269,8 @@ distribute_restrictinfo_to_rels(PlannerInfo *root,
+  * caller because this function is used after deconstruct_jointree, so we
+  * don't have knowledge of where the clause items came from.)
+  *
++ * "security_level" is the security level to assign to the new restrictinfo.
++ *
+  * "both_const" indicates whether both items are known pseudo-constant;
+  * in this case it is worth applying eval_const_expressions() in case we
+  * can produce constant TRUE or constant FALSE.  (Otherwise it's not,
+@@ -2209,6 +2291,7 @@ process_implied_equality(PlannerInfo *root,
+ 						 Expr *item2,
+ 						 Relids qualscope,
+ 						 Relids nullable_relids,
++						 Index security_level,
+ 						 bool below_outer_join,
+ 						 bool both_const)
+ {
+@@ -2247,6 +2330,7 @@ process_implied_equality(PlannerInfo *root,
+ 	 */
+ 	distribute_qual_to_rels(root, (Node *) clause,
+ 							true, below_outer_join, JOIN_INNER,
++							security_level,
+ 							qualscope, NULL, NULL, nullable_relids,
+ 							NULL);
+ }
+@@ -2270,7 +2354,8 @@ build_implied_join_equality(Oid opno,
+ 							Expr *item1,
+ 							Expr *item2,
+ 							Relids qualscope,
+-							Relids nullable_relids)
++							Relids nullable_relids,
++							Index security_level)
+ {
+ 	RestrictInfo *restrictinfo;
+ 	Expr	   *clause;
+@@ -2294,6 +2379,7 @@ build_implied_join_equality(Oid opno,
+ 									 true,		/* is_pushed_down */
+ 									 false,		/* outerjoin_delayed */
+ 									 false,		/* pseudoconstant */
++									 security_level,	/* security_level */
+ 									 qualscope, /* required_relids */
+ 									 NULL,		/* outer_relids */
+ 									 nullable_relids);	/* nullable_relids */
+diff --git a/src/backend/optimizer/plan/planner.c b/src/backend/optimizer/plan/planner.c
+index f936710171c7..25f2c5a61471 100644
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -490,6 +490,7 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
+ 	root->processed_tlist = NIL;
+ 	root->grouping_map = NULL;
+ 	root->minmax_aggs = NIL;
++	root->qual_security_level = 0;
+ 	root->hasInheritedTarget = false;
+ 	root->hasRecursion = hasRecursion;
+ 	if (hasRecursion)
+@@ -669,6 +670,7 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
+ 	{
+ 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(l);
+ 		int			kind;
++		ListCell   *lcsq;
+ 
+ 		if (rte->rtekind == RTE_RELATION)
+ 		{
+@@ -704,6 +706,19 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
+ 			rte->values_lists = (List *)
+ 				preprocess_expression(root, (Node *) rte->values_lists, kind);
+ 		}
++
++		/*
++		 * Process each element of the securityQuals list as if it were a
++		 * separate qual expression (as indeed it is).  We need to do it this
++		 * way to get proper canonicalization of AND/OR structure.  Note that
++		 * this converts each element into an implicit-AND sublist.
++		 */
++		foreach(lcsq, rte->securityQuals)
++		{
++			lfirst(lcsq) = preprocess_expression(root,
++												 (Node *) lfirst(lcsq),
++												 EXPRKIND_QUAL);
++		}
+ 	}
+ 
+ 	/*
+@@ -978,7 +993,6 @@ inheritance_planner(PlannerInfo *root)
+ {
+ 	Query	   *parse = root->parse;
+ 	int			parentRTindex = parse->resultRelation;
+-	Bitmapset  *resultRTindexes;
+ 	Bitmapset  *subqueryRTindexes;
+ 	Bitmapset  *modifiableARIindexes;
+ 	int			nominalRelation = -1;
+@@ -1012,26 +1026,7 @@ inheritance_planner(PlannerInfo *root)
+ 	 * at least O(N^3) work expended here; and (2) would greatly complicate
+ 	 * management of the rowMarks list.
+ 	 *
+-	 * Note that any RTEs with security barrier quals will be turned into
+-	 * subqueries during planning, and so we must create copies of them too,
+-	 * except where they are target relations, which will each only be used in
+-	 * a single plan.
+-	 *
+-	 * To begin with, we'll need a bitmapset of the target relation relids.
+-	 */
+-	resultRTindexes = bms_make_singleton(parentRTindex);
+-	foreach(lc, root->append_rel_list)
+-	{
+-		AppendRelInfo *appinfo = (AppendRelInfo *) lfirst(lc);
+-
+-		if (appinfo->parent_relid == parentRTindex)
+-			resultRTindexes = bms_add_member(resultRTindexes,
+-											 appinfo->child_relid);
+-	}
+-
+-	/*
+-	 * Now, generate a bitmapset of the relids of the subquery RTEs, including
+-	 * security-barrier RTEs that will become subqueries, as just explained.
++	 * To begin with, generate a bitmapset of the relids of the subquery RTEs.
+ 	 */
+ 	subqueryRTindexes = NULL;
+ 	rti = 1;
+@@ -1039,9 +1034,7 @@ inheritance_planner(PlannerInfo *root)
+ 	{
+ 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+ 
+-		if (rte->rtekind == RTE_SUBQUERY ||
+-			(rte->securityQuals != NIL &&
+-			 !bms_is_member(rti, resultRTindexes)))
++		if (rte->rtekind == RTE_SUBQUERY)
+ 			subqueryRTindexes = bms_add_member(subqueryRTindexes, rti);
+ 		rti++;
+ 	}
+@@ -1079,6 +1072,8 @@ inheritance_planner(PlannerInfo *root)
+ 	{
+ 		AppendRelInfo *appinfo = (AppendRelInfo *) lfirst(lc);
+ 		PlannerInfo *subroot;
++		RangeTblEntry *parent_rte;
++		RangeTblEntry *child_rte;
+ 		RelOptInfo *sub_final_rel;
+ 		Path	   *subpath;
+ 
+@@ -1104,6 +1099,15 @@ inheritance_planner(PlannerInfo *root)
+ 								   (Node *) parse,
+ 								   appinfo);
+ 
++		/*
++		 * If there are securityQuals attached to the parent, move them to the
++		 * child rel (they've already been transformed properly for that).
++		 */
++		parent_rte = rt_fetch(parentRTindex, subroot->parse->rtable);
++		child_rte = rt_fetch(appinfo->child_relid, subroot->parse->rtable);
++		child_rte->securityQuals = parent_rte->securityQuals;
++		parent_rte->securityQuals = NIL;
++
+ 		/*
+ 		 * The rowMarks list might contain references to subquery RTEs, so
+ 		 * make a copy that we can apply ChangeVarNodes to.  (Fortunately, the
+@@ -1151,11 +1155,11 @@ inheritance_planner(PlannerInfo *root)
+ 
+ 		/*
+ 		 * If this isn't the first child Query, generate duplicates of all
+-		 * subquery (or subquery-to-be) RTEs, and adjust Var numbering to
+-		 * reference the duplicates.  To simplify the loop logic, we scan the
+-		 * original rtable not the copy just made by adjust_appendrel_attrs;
+-		 * that should be OK since subquery RTEs couldn't contain any
+-		 * references to the target rel.
++		 * subquery RTEs, and adjust Var numbering to reference the
++		 * duplicates. To simplify the loop logic, we scan the original rtable
++		 * not the copy just made by adjust_appendrel_attrs; that should be OK
++		 * since subquery RTEs couldn't contain any references to the target
++		 * rel.
+ 		 */
+ 		if (final_rtable != NIL && subqueryRTindexes != NULL)
+ 		{
+@@ -1172,9 +1176,9 @@ inheritance_planner(PlannerInfo *root)
+ 
+ 					/*
+ 					 * The RTE can't contain any references to its own RT
+-					 * index, except in the security barrier quals, so we can
+-					 * save a few cycles by applying ChangeVarNodes before we
+-					 * append the RTE to the rangetable.
++					 * index, except in its securityQuals, so we can save a
++					 * few cycles by applying ChangeVarNodes to the rest of
++					 * the rangetable before we append the RTE to it.
+ 					 */
+ 					newrti = list_length(subroot->parse->rtable) + 1;
+ 					ChangeVarNodes((Node *) subroot->parse, rti, newrti, 0);
+@@ -1212,12 +1216,6 @@ inheritance_planner(PlannerInfo *root)
+ 		/* Generate Path(s) for accessing this result relation */
+ 		grouping_planner(subroot, true, 0.0 /* retrieve all tuples */ );
+ 
+-		/*
+-		 * Planning may have modified the query result relation (if there were
+-		 * security barrier quals on the result RTE).
+-		 */
+-		appinfo->child_relid = subroot->parse->resultRelation;
+-
+ 		/*
+ 		 * We'll use the first child relation (even if it's excluded) as the
+ 		 * nominal target relation of the ModifyTable node.  Because of the
+@@ -1256,41 +1254,9 @@ inheritance_planner(PlannerInfo *root)
+ 		if (final_rtable == NIL)
+ 			final_rtable = subroot->parse->rtable;
+ 		else
+-		{
+-			List	   *tmp_rtable = NIL;
+-			ListCell   *cell1,
+-					   *cell2;
+-
+-			/*
+-			 * Check to see if any of the original RTEs were turned into
+-			 * subqueries during planning.  Currently, this should only ever
+-			 * happen due to securityQuals being involved which push a
+-			 * relation down under a subquery, to ensure that the security
+-			 * barrier quals are evaluated first.
+-			 *
+-			 * When this happens, we want to use the new subqueries in the
+-			 * final rtable.
+-			 */
+-			forboth(cell1, final_rtable, cell2, subroot->parse->rtable)
+-			{
+-				RangeTblEntry *rte1 = (RangeTblEntry *) lfirst(cell1);
+-				RangeTblEntry *rte2 = (RangeTblEntry *) lfirst(cell2);
+-
+-				if (rte1->rtekind == RTE_RELATION &&
+-					rte2->rtekind == RTE_SUBQUERY)
+-				{
+-					/* Should only be when there are securityQuals today */
+-					Assert(rte1->securityQuals != NIL);
+-					tmp_rtable = lappend(tmp_rtable, rte2);
+-				}
+-				else
+-					tmp_rtable = lappend(tmp_rtable, rte1);
+-			}
+-
+-			final_rtable = list_concat(tmp_rtable,
++			final_rtable = list_concat(final_rtable,
+ 									   list_copy_tail(subroot->parse->rtable,
+ 												 list_length(final_rtable)));
+-		}
+ 
+ 		/*
+ 		 * We need to collect all the RelOptInfos from all child plans into
+@@ -1634,12 +1600,6 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
+ 												 parse->resultRelation,
+ 												 parse->rtable);
+ 
+-		/*
+-		 * Expand any rangetable entries that have security barrier quals.
+-		 * This may add new security barrier subquery RTEs to the rangetable.
+-		 */
+-		expand_security_quals(root, tlist);
+-
+ 		/*
+ 		 * We are now done hacking up the query's targetlist.  Most of the
+ 		 * remaining planning work will be done with the PathTarget
+@@ -2297,17 +2257,8 @@ select_rowmark_type(RangeTblEntry *rte, LockClauseStrength strength)
+ 
+ 				/*
+ 				 * We don't need a tuple lock, only the ability to re-fetch
+-				 * the row.  Regular tables support ROW_MARK_REFERENCE, but if
+-				 * this RTE has security barrier quals, it will be turned into
+-				 * a subquery during planning, so use ROW_MARK_COPY.
+-				 *
+-				 * This is only necessary for LCS_NONE, since real tuple locks
+-				 * on an RTE with security barrier quals are supported by
+-				 * pushing the lock down into the subquery --- see
+-				 * expand_security_qual.
++				 * the row.
+ 				 */
+-				if (rte->securityQuals != NIL)
+-					return ROW_MARK_COPY;
+ 				return ROW_MARK_REFERENCE;
+ 				break;
+ 			case LCS_FORKEYSHARE:
+diff --git a/src/backend/optimizer/prep/Makefile b/src/backend/optimizer/prep/Makefile
+index 5195d9b0ba7a..86301bfbd32a 100644
+--- a/src/backend/optimizer/prep/Makefile
++++ b/src/backend/optimizer/prep/Makefile
+@@ -12,6 +12,6 @@ subdir = src/backend/optimizer/prep
+ top_builddir = ../../../..
+ include $(top_builddir)/src/Makefile.global
+ 
+-OBJS = prepjointree.o prepqual.o prepsecurity.o preptlist.o prepunion.o
++OBJS = prepjointree.o prepqual.o preptlist.o prepunion.o
+ 
+ include $(top_srcdir)/src/backend/common.mk
+diff --git a/src/backend/optimizer/prep/prepjointree.c b/src/backend/optimizer/prep/prepjointree.c
+index 7cb1bc9a62c5..6911177b68a7 100644
+--- a/src/backend/optimizer/prep/prepjointree.c
++++ b/src/backend/optimizer/prep/prepjointree.c
+@@ -913,6 +913,7 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
+ 	subroot->processed_tlist = NIL;
+ 	subroot->grouping_map = NULL;
+ 	subroot->minmax_aggs = NIL;
++	subroot->qual_security_level = 0;
+ 	subroot->hasInheritedTarget = false;
+ 	subroot->hasRecursion = false;
+ 	subroot->wt_param_id = -1;
+diff --git a/src/backend/optimizer/prep/prepsecurity.c b/src/backend/optimizer/prep/prepsecurity.c
+deleted file mode 100644
+index 455d2a066c8c..000000000000
+--- a/src/backend/optimizer/prep/prepsecurity.c
++++ /dev/null
+@@ -1,486 +0,0 @@
+-/*-------------------------------------------------------------------------
+- *
+- * prepsecurity.c
+- *	  Routines for preprocessing security barrier quals.
+- *
+- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+- * Portions Copyright (c) 1994, Regents of the University of California
+- *
+- *
+- * IDENTIFICATION
+- *	  src/backend/optimizer/prep/prepsecurity.c
+- *
+- *-------------------------------------------------------------------------
+- */
+-#include "postgres.h"
+-
+-#include "access/heapam.h"
+-#include "access/sysattr.h"
+-#include "catalog/heap.h"
+-#include "nodes/makefuncs.h"
+-#include "nodes/nodeFuncs.h"
+-#include "optimizer/prep.h"
+-#include "parser/analyze.h"
+-#include "parser/parsetree.h"
+-#include "rewrite/rewriteManip.h"
+-#include "utils/rel.h"
+-
+-
+-typedef struct
+-{
+-	int			rt_index;		/* Index of security barrier RTE */
+-	int			sublevels_up;	/* Current nesting depth */
+-	Relation	rel;			/* RTE relation at rt_index */
+-	List	   *targetlist;		/* Targetlist for new subquery RTE */
+-	List	   *colnames;		/* Column names in subquery RTE */
+-	List	   *vars_processed; /* List of Vars already processed */
+-} security_barrier_replace_vars_context;
+-
+-static void expand_security_qual(PlannerInfo *root, List *tlist, int rt_index,
+-					 RangeTblEntry *rte, Node *qual, bool targetRelation);
+-
+-static void security_barrier_replace_vars(Node *node,
+-							  security_barrier_replace_vars_context *context);
+-
+-static bool security_barrier_replace_vars_walker(Node *node,
+-							 security_barrier_replace_vars_context *context);
+-
+-
+-/*
+- * expand_security_quals -
+- *	  expands any security barrier quals on RTEs in the query rtable, turning
+- *	  them into security barrier subqueries.
+- *
+- * Any given RTE may have multiple security barrier quals in a list, from which
+- * we create a set of nested subqueries to isolate each security barrier from
+- * the others, providing protection against malicious user-defined security
+- * barriers.  The first security barrier qual in the list will be used in the
+- * innermost subquery.
+- *
+- * In practice, the only RTEs that will have security barrier quals are those
+- * that refer to tables with row-level security, or which are the target
+- * relation of an update to an auto-updatable security barrier view.  RTEs
+- * that read from a security barrier view will have already been expanded by
+- * the rewriter.
+- */
+-void
+-expand_security_quals(PlannerInfo *root, List *tlist)
+-{
+-	Query	   *parse = root->parse;
+-	int			rt_index;
+-	ListCell   *cell;
+-
+-	/*
+-	 * Process each RTE in the rtable list.
+-	 *
+-	 * We only ever modify entries in place and append to the rtable, so it is
+-	 * safe to use a foreach loop here.
+-	 */
+-	rt_index = 0;
+-	foreach(cell, parse->rtable)
+-	{
+-		bool		targetRelation = false;
+-		RangeTblEntry *rte = (RangeTblEntry *) lfirst(cell);
+-
+-		rt_index++;
+-
+-		if (rte->securityQuals == NIL)
+-			continue;
+-
+-		/*
+-		 * Ignore any RTEs that aren't used in the query (such RTEs may be
+-		 * present for permissions checks).
+-		 */
+-		if (rt_index != parse->resultRelation &&
+-			!rangeTableEntry_used((Node *) parse, rt_index, 0))
+-			continue;
+-
+-		/*
+-		 * If this RTE is the target then we need to make a copy of it before
+-		 * expanding it.  The unexpanded copy will become the new target, and
+-		 * the original RTE will be expanded to become the source of rows to
+-		 * update/delete.
+-		 */
+-		if (rt_index == parse->resultRelation)
+-		{
+-			RangeTblEntry *newrte = copyObject(rte);
+-
+-			/*
+-			 * We need to let expand_security_qual know if this is the target
+-			 * relation, as it has additional work to do in that case.
+-			 *
+-			 * Capture that information here as we're about to replace
+-			 * parse->resultRelation.
+-			 */
+-			targetRelation = true;
+-
+-			parse->rtable = lappend(parse->rtable, newrte);
+-			parse->resultRelation = list_length(parse->rtable);
+-
+-			/*
+-			 * Wipe out any copied security barrier quals on the new target to
+-			 * prevent infinite recursion.
+-			 */
+-			newrte->securityQuals = NIL;
+-
+-			/*
+-			 * There's no need to do permissions checks twice, so wipe out the
+-			 * permissions info for the original RTE (we prefer to keep the
+-			 * bits set on the result RTE).
+-			 */
+-			rte->requiredPerms = 0;
+-			rte->checkAsUser = InvalidOid;
+-			rte->selectedCols = NULL;
+-			rte->insertedCols = NULL;
+-			rte->updatedCols = NULL;
+-
+-			/*
+-			 * For the most part, Vars referencing the original relation
+-			 * should remain as they are, meaning that they pull OLD values
+-			 * from the expanded RTE.  But in the RETURNING list and in any
+-			 * WITH CHECK OPTION quals, we want such Vars to represent NEW
+-			 * values, so change them to reference the new RTE.
+-			 */
+-			ChangeVarNodes((Node *) parse->returningList, rt_index,
+-						   parse->resultRelation, 0);
+-
+-			ChangeVarNodes((Node *) parse->withCheckOptions, rt_index,
+-						   parse->resultRelation, 0);
+-		}
+-
+-		/*
+-		 * Process each security barrier qual in turn, starting with the
+-		 * innermost one (the first in the list) and working outwards.
+-		 *
+-		 * We remove each qual from the list before processing it, so that its
+-		 * variables aren't modified by expand_security_qual.  Also we don't
+-		 * necessarily want the attributes referred to by the qual to be
+-		 * exposed by the newly built subquery.
+-		 */
+-		while (rte->securityQuals != NIL)
+-		{
+-			Node	   *qual = (Node *) linitial(rte->securityQuals);
+-
+-			rte->securityQuals = list_delete_first(rte->securityQuals);
+-
+-			ChangeVarNodes(qual, rt_index, 1, 0);
+-			expand_security_qual(root, tlist, rt_index, rte, qual,
+-								 targetRelation);
+-		}
+-	}
+-}
+-
+-
+-/*
+- * expand_security_qual -
+- *	  expand the specified security barrier qual on a query RTE, turning the
+- *	  RTE into a security barrier subquery.
+- */
+-static void
+-expand_security_qual(PlannerInfo *root, List *tlist, int rt_index,
+-					 RangeTblEntry *rte, Node *qual, bool targetRelation)
+-{
+-	Query	   *parse = root->parse;
+-	Oid			relid = rte->relid;
+-	Query	   *subquery;
+-	RangeTblEntry *subrte;
+-	RangeTblRef *subrtr;
+-	PlanRowMark *rc;
+-	security_barrier_replace_vars_context context;
+-	ListCell   *cell;
+-
+-	/*
+-	 * There should only be 2 possible cases:
+-	 *
+-	 * 1. A relation RTE, which we turn into a subquery RTE containing all
+-	 * referenced columns.
+-	 *
+-	 * 2. A subquery RTE (either from a prior call to this function or from an
+-	 * expanded view).  In this case we build a new subquery on top of it to
+-	 * isolate this security barrier qual from any other quals.
+-	 */
+-	switch (rte->rtekind)
+-	{
+-		case RTE_RELATION:
+-
+-			/*
+-			 * Turn the relation RTE into a security barrier subquery RTE,
+-			 * moving all permissions checks down into the subquery.
+-			 */
+-			subquery = makeNode(Query);
+-			subquery->commandType = CMD_SELECT;
+-			subquery->querySource = QSRC_INSTEAD_RULE;
+-
+-			subrte = copyObject(rte);
+-			subrte->inFromCl = true;
+-			subrte->securityQuals = NIL;
+-			subquery->rtable = list_make1(subrte);
+-
+-			subrtr = makeNode(RangeTblRef);
+-			subrtr->rtindex = 1;
+-			subquery->jointree = makeFromExpr(list_make1(subrtr), qual);
+-			subquery->hasSubLinks = checkExprHasSubLink(qual);
+-
+-			rte->rtekind = RTE_SUBQUERY;
+-			rte->relid = InvalidOid;
+-			rte->subquery = subquery;
+-			rte->security_barrier = true;
+-			rte->inh = false;	/* must not be set for a subquery */
+-
+-			/* the permissions checks have now been moved down */
+-			rte->requiredPerms = 0;
+-			rte->checkAsUser = InvalidOid;
+-			rte->selectedCols = NULL;
+-			rte->insertedCols = NULL;
+-			rte->updatedCols = NULL;
+-
+-			/*
+-			 * Now deal with any PlanRowMark on this RTE by requesting a lock
+-			 * of the same strength on the RTE copied down to the subquery.
+-			 *
+-			 * Note that we can only push down user-defined quals if they are
+-			 * only using leakproof (and therefore trusted) functions and
+-			 * operators.  As a result, we may end up locking more rows than
+-			 * strictly necessary (and, in the worst case, we could end up
+-			 * locking all rows which pass the securityQuals).  This is
+-			 * currently documented behavior, but it'd be nice to come up with
+-			 * a better solution some day.
+-			 */
+-			rc = get_plan_rowmark(root->rowMarks, rt_index);
+-			if (rc != NULL)
+-			{
+-				if (rc->strength != LCS_NONE)
+-					applyLockingClause(subquery, 1, rc->strength,
+-									   rc->waitPolicy, false);
+-				root->rowMarks = list_delete_ptr(root->rowMarks, rc);
+-			}
+-
+-			/*
+-			 * When we are replacing the target relation with a subquery, we
+-			 * need to make sure to add a locking clause explicitly to the
+-			 * generated subquery since there won't be any row marks against
+-			 * the target relation itself.
+-			 */
+-			if (targetRelation)
+-				applyLockingClause(subquery, 1, LCS_FORUPDATE,
+-								   LockWaitBlock, false);
+-
+-			/*
+-			 * Replace any variables in the outer query that refer to the
+-			 * original relation RTE with references to columns that we will
+-			 * expose in the new subquery, building the subquery's targetlist
+-			 * as we go.  Also replace any references in the translated_vars
+-			 * lists of any appendrels.
+-			 */
+-			context.rt_index = rt_index;
+-			context.sublevels_up = 0;
+-			context.rel = heap_open(relid, NoLock);
+-			context.targetlist = NIL;
+-			context.colnames = NIL;
+-			context.vars_processed = NIL;
+-
+-			security_barrier_replace_vars((Node *) parse, &context);
+-			security_barrier_replace_vars((Node *) tlist, &context);
+-			security_barrier_replace_vars((Node *) root->append_rel_list,
+-										  &context);
+-
+-			heap_close(context.rel, NoLock);
+-
+-			/* Now we know what columns the subquery needs to expose */
+-			rte->subquery->targetList = context.targetlist;
+-			rte->eref = makeAlias(rte->eref->aliasname, context.colnames);
+-
+-			break;
+-
+-		case RTE_SUBQUERY:
+-
+-			/*
+-			 * Build a new subquery that includes all the same columns as the
+-			 * original subquery.
+-			 */
+-			subquery = makeNode(Query);
+-			subquery->commandType = CMD_SELECT;
+-			subquery->querySource = QSRC_INSTEAD_RULE;
+-			subquery->targetList = NIL;
+-
+-			foreach(cell, rte->subquery->targetList)
+-			{
+-				TargetEntry *tle;
+-				Var		   *var;
+-
+-				tle = (TargetEntry *) lfirst(cell);
+-				var = makeVarFromTargetEntry(1, tle);
+-
+-				tle = makeTargetEntry((Expr *) var,
+-									  list_length(subquery->targetList) + 1,
+-									  pstrdup(tle->resname),
+-									  tle->resjunk);
+-				subquery->targetList = lappend(subquery->targetList, tle);
+-			}
+-
+-			subrte = makeNode(RangeTblEntry);
+-			subrte->rtekind = RTE_SUBQUERY;
+-			subrte->subquery = rte->subquery;
+-			subrte->security_barrier = rte->security_barrier;
+-			subrte->eref = copyObject(rte->eref);
+-			subrte->inFromCl = true;
+-			subquery->rtable = list_make1(subrte);
+-
+-			subrtr = makeNode(RangeTblRef);
+-			subrtr->rtindex = 1;
+-			subquery->jointree = makeFromExpr(list_make1(subrtr), qual);
+-			subquery->hasSubLinks = checkExprHasSubLink(qual);
+-
+-			rte->subquery = subquery;
+-			rte->security_barrier = true;
+-
+-			break;
+-
+-		default:
+-			elog(ERROR, "invalid range table entry for security barrier qual");
+-	}
+-}
+-
+-
+-/*
+- * security_barrier_replace_vars -
+- *	  Apply security barrier variable replacement to an expression tree.
+- *
+- * This also builds/updates a targetlist with entries for each replacement
+- * variable that needs to be exposed by the security barrier subquery RTE.
+- *
+- * NOTE: although this has the form of a walker, we cheat and modify the
+- * nodes in-place.  The given expression tree should have been copied
+- * earlier to ensure that no unwanted side-effects occur!
+- */
+-static void
+-security_barrier_replace_vars(Node *node,
+-							  security_barrier_replace_vars_context *context)
+-{
+-	/*
+-	 * Must be prepared to start with a Query or a bare expression tree; if
+-	 * it's a Query, go straight to query_tree_walker to make sure that
+-	 * sublevels_up doesn't get incremented prematurely.
+-	 */
+-	if (node && IsA(node, Query))
+-		query_tree_walker((Query *) node,
+-						  security_barrier_replace_vars_walker,
+-						  (void *) context, 0);
+-	else
+-		security_barrier_replace_vars_walker(node, context);
+-}
+-
+-static bool
+-security_barrier_replace_vars_walker(Node *node,
+-							  security_barrier_replace_vars_context *context)
+-{
+-	if (node == NULL)
+-		return false;
+-
+-	if (IsA(node, Var))
+-	{
+-		Var		   *var = (Var *) node;
+-
+-		/*
+-		 * Note that the same Var may be present in different lists, so we
+-		 * need to take care not to process it multiple times.
+-		 */
+-		if (var->varno == context->rt_index &&
+-			var->varlevelsup == context->sublevels_up &&
+-			!list_member_ptr(context->vars_processed, var))
+-		{
+-			/*
+-			 * Found a matching variable. Make sure that it is in the subquery
+-			 * targetlist and map its attno accordingly.
+-			 */
+-			AttrNumber	attno;
+-			ListCell   *l;
+-			TargetEntry *tle;
+-			char	   *attname;
+-			Var		   *newvar;
+-
+-			/* Search for the base attribute in the subquery targetlist */
+-			attno = InvalidAttrNumber;
+-			foreach(l, context->targetlist)
+-			{
+-				tle = (TargetEntry *) lfirst(l);
+-				attno++;
+-
+-				Assert(IsA(tle->expr, Var));
+-				if (((Var *) tle->expr)->varattno == var->varattno &&
+-					((Var *) tle->expr)->varcollid == var->varcollid)
+-				{
+-					/* Map the variable onto this subquery targetlist entry */
+-					var->varattno = var->varoattno = attno;
+-					/* Mark this var as having been processed */
+-					context->vars_processed = lappend(context->vars_processed, var);
+-					return false;
+-				}
+-			}
+-
+-			/* Not in the subquery targetlist, so add it. Get its name. */
+-			if (var->varattno < 0)
+-			{
+-				Form_pg_attribute att_tup;
+-
+-				att_tup = SystemAttributeDefinition(var->varattno,
+-										   context->rel->rd_rel->relhasoids);
+-				attname = NameStr(att_tup->attname);
+-			}
+-			else if (var->varattno == InvalidAttrNumber)
+-			{
+-				attname = "wholerow";
+-			}
+-			else if (var->varattno <= context->rel->rd_att->natts)
+-			{
+-				Form_pg_attribute att_tup;
+-
+-				att_tup = context->rel->rd_att->attrs[var->varattno - 1];
+-				attname = NameStr(att_tup->attname);
+-			}
+-			else
+-			{
+-				elog(ERROR, "invalid attribute number %d in security_barrier_replace_vars", var->varattno);
+-			}
+-
+-			/* New variable for subquery targetlist */
+-			newvar = copyObject(var);
+-			newvar->varno = newvar->varnoold = 1;
+-			newvar->varlevelsup = 0;
+-
+-			attno = list_length(context->targetlist) + 1;
+-			tle = makeTargetEntry((Expr *) newvar,
+-								  attno,
+-								  pstrdup(attname),
+-								  false);
+-
+-			context->targetlist = lappend(context->targetlist, tle);
+-
+-			context->colnames = lappend(context->colnames,
+-										makeString(pstrdup(attname)));
+-
+-			/* Update the outer query's variable */
+-			var->varattno = var->varoattno = attno;
+-
+-			/* Remember this Var so that we don't process it again */
+-			context->vars_processed = lappend(context->vars_processed, var);
+-		}
+-		return false;
+-	}
+-
+-	if (IsA(node, Query))
+-	{
+-		/* Recurse into subselects */
+-		bool		result;
+-
+-		context->sublevels_up++;
+-		result = query_tree_walker((Query *) node,
+-								   security_barrier_replace_vars_walker,
+-								   (void *) context, 0);
+-		context->sublevels_up--;
+-		return result;
+-	}
+-
+-	return expression_tree_walker(node, security_barrier_replace_vars_walker,
+-								  (void *) context);
+-}
+diff --git a/src/backend/optimizer/prep/prepunion.c b/src/backend/optimizer/prep/prepunion.c
+index 1bbbc297948d..06e843dff078 100644
+--- a/src/backend/optimizer/prep/prepunion.c
++++ b/src/backend/optimizer/prep/prepunion.c
+@@ -56,7 +56,6 @@ typedef struct
+ {
+ 	PlannerInfo *root;
+ 	AppendRelInfo *appinfo;
+-	int			sublevels_up;
+ } adjust_appendrel_attrs_context;
+ 
+ static Path *recurse_set_operations(Node *setOp, PlannerInfo *root,
+@@ -1467,12 +1466,19 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
+ 		 * We copy most fields of the parent's RTE, but replace relation OID
+ 		 * and relkind, and set inh = false.  Also, set requiredPerms to zero
+ 		 * since all required permissions checks are done on the original RTE.
++		 * Likewise, set the child's securityQuals to empty, because we only
++		 * want to apply the parent's RLS conditions regardless of what RLS
++		 * properties individual children may have.  (This is an intentional
++		 * choice to make inherited RLS work like regular permissions checks.)
++		 * The parent securityQuals will be propagated to children along with
++		 * other base restriction clauses, so we don't need to do it here.
+ 		 */
+ 		childrte = copyObject(rte);
+ 		childrte->relid = childOID;
+ 		childrte->relkind = newrelation->rd_rel->relkind;
+ 		childrte->inh = false;
+ 		childrte->requiredPerms = 0;
++		childrte->securityQuals = NIL;
+ 		parse->rtable = lappend(parse->rtable, childrte);
+ 		childRTindex = list_length(parse->rtable);
+ 
+@@ -1541,7 +1547,8 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
+ 	/*
+ 	 * If all the children were temp tables, pretend it's a non-inheritance
+ 	 * situation.  The duplicate RTE we added for the parent table is
+-	 * harmless, so we don't bother to get rid of it.
++	 * harmless, so we don't bother to get rid of it; ditto for the useless
++	 * PlanRowMark node.
+ 	 */
+ 	if (list_length(appinfos) < 2)
+ 	{
+@@ -1717,9 +1724,8 @@ translate_col_privs(const Bitmapset *parent_privs,
+  *	  child rel instead.  We also update rtindexes appearing outside Vars,
+  *	  such as resultRelation and jointree relids.
+  *
+- * Note: this is applied after conversion of sublinks to subplans in the
+- * query jointree, but there may still be sublinks in the security barrier
+- * quals of RTEs, so we do need to cope with recursion into sub-queries.
++ * Note: this is only applied after conversion of sublinks to subplans,
++ * so we don't need to cope with recursion into sub-queries.
+  *
+  * Note: this is not hugely different from what pullup_replace_vars() does;
+  * maybe we should try to fold the two routines together.
+@@ -1732,12 +1738,9 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
+ 
+ 	context.root = root;
+ 	context.appinfo = appinfo;
+-	context.sublevels_up = 0;
+ 
+ 	/*
+-	 * Must be prepared to start with a Query or a bare expression tree; if
+-	 * it's a Query, go straight to query_tree_walker to make sure that
+-	 * sublevels_up doesn't get incremented prematurely.
++	 * Must be prepared to start with a Query or a bare expression tree.
+ 	 */
+ 	if (node && IsA(node, Query))
+ 	{
+@@ -1776,7 +1779,7 @@ adjust_appendrel_attrs_mutator(Node *node,
+ 	{
+ 		Var		   *var = (Var *) copyObject(node);
+ 
+-		if (var->varlevelsup == context->sublevels_up &&
++		if (var->varlevelsup == 0 &&
+ 			var->varno == appinfo->parent_relid)
+ 		{
+ 			var->varno = appinfo->child_relid;
+@@ -1793,7 +1796,6 @@ adjust_appendrel_attrs_mutator(Node *node,
+ 				if (newnode == NULL)
+ 					elog(ERROR, "attribute %d of relation \"%s\" does not exist",
+ 						 var->varattno, get_rel_name(appinfo->parent_reloid));
+-				((Var *) newnode)->varlevelsup += context->sublevels_up;
+ 				return newnode;
+ 			}
+ 			else if (var->varattno == 0)
+@@ -1836,17 +1838,10 @@ adjust_appendrel_attrs_mutator(Node *node,
+ 					RowExpr    *rowexpr;
+ 					List	   *fields;
+ 					RangeTblEntry *rte;
+-					ListCell   *lc;
+ 
+ 					rte = rt_fetch(appinfo->parent_relid,
+ 								   context->root->parse->rtable);
+ 					fields = (List *) copyObject(appinfo->translated_vars);
+-					foreach(lc, fields)
+-					{
+-						Var		   *field = (Var *) lfirst(lc);
+-
+-						field->varlevelsup += context->sublevels_up;
+-					}
+ 					rowexpr = makeNode(RowExpr);
+ 					rowexpr->args = fields;
+ 					rowexpr->row_typeid = var->vartype;
+@@ -1865,8 +1860,7 @@ adjust_appendrel_attrs_mutator(Node *node,
+ 	{
+ 		CurrentOfExpr *cexpr = (CurrentOfExpr *) copyObject(node);
+ 
+-		if (context->sublevels_up == 0 &&
+-			cexpr->cvarno == appinfo->parent_relid)
++		if (cexpr->cvarno == appinfo->parent_relid)
+ 			cexpr->cvarno = appinfo->child_relid;
+ 		return (Node *) cexpr;
+ 	}
+@@ -1874,8 +1868,7 @@ adjust_appendrel_attrs_mutator(Node *node,
+ 	{
+ 		RangeTblRef *rtr = (RangeTblRef *) copyObject(node);
+ 
+-		if (context->sublevels_up == 0 &&
+-			rtr->rtindex == appinfo->parent_relid)
++		if (rtr->rtindex == appinfo->parent_relid)
+ 			rtr->rtindex = appinfo->child_relid;
+ 		return (Node *) rtr;
+ 	}
+@@ -1888,8 +1881,7 @@ adjust_appendrel_attrs_mutator(Node *node,
+ 											  adjust_appendrel_attrs_mutator,
+ 												 (void *) context);
+ 		/* now fix JoinExpr's rtindex (probably never happens) */
+-		if (context->sublevels_up == 0 &&
+-			j->rtindex == appinfo->parent_relid)
++		if (j->rtindex == appinfo->parent_relid)
+ 			j->rtindex = appinfo->child_relid;
+ 		return (Node *) j;
+ 	}
+@@ -1902,7 +1894,7 @@ adjust_appendrel_attrs_mutator(Node *node,
+ 											  adjust_appendrel_attrs_mutator,
+ 														 (void *) context);
+ 		/* now fix PlaceHolderVar's relid sets */
+-		if (phv->phlevelsup == context->sublevels_up)
++		if (phv->phlevelsup == 0)
+ 			phv->phrels = adjust_relid_set(phv->phrels,
+ 										   appinfo->parent_relid,
+ 										   appinfo->child_relid);
+@@ -1973,29 +1965,12 @@ adjust_appendrel_attrs_mutator(Node *node,
+ 		return (Node *) newinfo;
+ 	}
+ 
+-	if (IsA(node, Query))
+-	{
+-		/*
+-		 * Recurse into sublink subqueries. This should only be possible in
+-		 * security barrier quals of top-level RTEs. All other sublinks should
+-		 * have already been converted to subplans during expression
+-		 * preprocessing, but this doesn't happen for security barrier quals,
+-		 * since they are destined to become quals of a subquery RTE, which
+-		 * will be recursively planned, and so should not be preprocessed at
+-		 * this stage.
+-		 *
+-		 * We don't explicitly Assert() for securityQuals here simply because
+-		 * it's not trivial to do so.
+-		 */
+-		Query	   *newnode;
+-
+-		context->sublevels_up++;
+-		newnode = query_tree_mutator((Query *) node,
+-									 adjust_appendrel_attrs_mutator,
+-									 (void *) context, 0);
+-		context->sublevels_up--;
+-		return (Node *) newnode;
+-	}
++	/*
++	 * NOTE: we do not need to recurse into sublinks, because they should
++	 * already have been converted to subplans before we see them.
++	 */
++	Assert(!IsA(node, SubLink));
++	Assert(!IsA(node, Query));
+ 
+ 	return expression_tree_mutator(node, adjust_appendrel_attrs_mutator,
+ 								   (void *) context);
+diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
+index 59ccdf43d499..9e122e383d89 100644
+--- a/src/backend/optimizer/util/clauses.c
++++ b/src/backend/optimizer/util/clauses.c
+@@ -1500,10 +1500,8 @@ contain_context_dependent_node_walker(Node *node, int *flags)
+  *
+  * Returns true if the clause contains any non-leakproof functions that are
+  * passed Var nodes of the current query level, and which might therefore leak
+- * data.  Qualifiers from outside a security_barrier view that might leak data
+- * in this way should not be pushed down into the view in case the contents of
+- * tuples intended to be filtered out by the view are revealed by the leaky
+- * functions.
++ * data.  Such clauses must be applied after any lower-level security barrier
++ * clauses.
+  */
+ bool
+ contain_leaked_vars(Node *clause)
+@@ -1598,10 +1596,10 @@ contain_leaked_vars_walker(Node *node, void *context)
+ 		case T_CurrentOfExpr:
+ 
+ 			/*
+-			 * WHERE CURRENT OF doesn't contain function calls.  Moreover, it
+-			 * is important that this can be pushed down into a
+-			 * security_barrier view, since the planner must always generate a
+-			 * TID scan when CURRENT OF is present -- c.f. cost_tidscan.
++			 * WHERE CURRENT OF doesn't contain leaky function calls.
++			 * Moreover, it is essential that this is considered non-leaky,
++			 * since the planner must always generate a TID scan when CURRENT
++			 * OF is present -- c.f. cost_tidscan.
+ 			 */
+ 			return false;
+ 
+diff --git a/src/backend/optimizer/util/orclauses.c b/src/backend/optimizer/util/orclauses.c
+index e36e30f25960..c965bb678d31 100644
+--- a/src/backend/optimizer/util/orclauses.c
++++ b/src/backend/optimizer/util/orclauses.c
+@@ -270,6 +270,7 @@ consider_new_or_clause(PlannerInfo *root, RelOptInfo *rel,
+ 								 true,
+ 								 false,
+ 								 false,
++								 join_or_rinfo->security_level,
+ 								 NULL,
+ 								 NULL,
+ 								 NULL);
+@@ -296,6 +297,8 @@ consider_new_or_clause(PlannerInfo *root, RelOptInfo *rel,
+ 	 * OK, add it to the rel's restriction-clause list.
+ 	 */
+ 	rel->baserestrictinfo = lappend(rel->baserestrictinfo, or_rinfo);
++	rel->baserestrict_min_security = Min(rel->baserestrict_min_security,
++										 or_rinfo->security_level);
+ 
+ 	/*
+ 	 * Adjust the original join OR clause's cached selectivity to compensate
+diff --git a/src/backend/optimizer/util/relnode.c b/src/backend/optimizer/util/relnode.c
+index 7a8674df82fd..adc1db94f414 100644
+--- a/src/backend/optimizer/util/relnode.c
++++ b/src/backend/optimizer/util/relnode.c
+@@ -14,6 +14,8 @@
+  */
+ #include "postgres.h"
+ 
++#include <limits.h>
++
+ #include "miscadmin.h"
+ #include "optimizer/clauses.h"
+ #include "optimizer/cost.h"
+@@ -135,6 +137,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptKind reloptkind)
+ 	rel->baserestrictinfo = NIL;
+ 	rel->baserestrictcost.startup = 0;
+ 	rel->baserestrictcost.per_tuple = 0;
++	rel->baserestrict_min_security = UINT_MAX;
+ 	rel->joininfo = NIL;
+ 	rel->has_eclass_joins = false;
+ 
+@@ -172,6 +175,16 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptKind reloptkind)
+ 	/* Save the finished struct in the query's simple_rel_array */
+ 	root->simple_rel_array[relid] = rel;
+ 
++	/*
++	 * This is a convenient spot at which to note whether rels participating
++	 * in the query have any securityQuals attached.  If so, increase
++	 * root->qual_security_level to ensure it's larger than the maximum
++	 * security level needed for securityQuals.
++	 */
++	if (rte->securityQuals)
++		root->qual_security_level = Max(root->qual_security_level,
++										list_length(rte->securityQuals));
++
+ 	/*
+ 	 * If this rel is an appendrel parent, recurse to build "other rel"
+ 	 * RelOptInfos for its children.  They are "other rels" because they are
+@@ -407,6 +420,7 @@ build_join_rel(PlannerInfo *root,
+ 	joinrel->baserestrictinfo = NIL;
+ 	joinrel->baserestrictcost.startup = 0;
+ 	joinrel->baserestrictcost.per_tuple = 0;
++	joinrel->baserestrict_min_security = UINT_MAX;
+ 	joinrel->joininfo = NIL;
+ 	joinrel->has_eclass_joins = false;
+ 
+diff --git a/src/backend/optimizer/util/restrictinfo.c b/src/backend/optimizer/util/restrictinfo.c
+index 60d377776d2c..8f10520f8132 100644
+--- a/src/backend/optimizer/util/restrictinfo.c
++++ b/src/backend/optimizer/util/restrictinfo.c
+@@ -24,6 +24,7 @@ static RestrictInfo *make_restrictinfo_internal(Expr *clause,
+ 						   bool is_pushed_down,
+ 						   bool outerjoin_delayed,
+ 						   bool pseudoconstant,
++						   Index security_level,
+ 						   Relids required_relids,
+ 						   Relids outer_relids,
+ 						   Relids nullable_relids);
+@@ -31,6 +32,7 @@ static Expr *make_sub_restrictinfos(Expr *clause,
+ 					   bool is_pushed_down,
+ 					   bool outerjoin_delayed,
+ 					   bool pseudoconstant,
++					   Index security_level,
+ 					   Relids required_relids,
+ 					   Relids outer_relids,
+ 					   Relids nullable_relids);
+@@ -43,7 +45,7 @@ static Expr *make_sub_restrictinfos(Expr *clause,
+  *
+  * The is_pushed_down, outerjoin_delayed, and pseudoconstant flags for the
+  * RestrictInfo must be supplied by the caller, as well as the correct values
+- * for outer_relids and nullable_relids.
++ * for security_level, outer_relids, and nullable_relids.
+  * required_relids can be NULL, in which case it defaults to the actual clause
+  * contents (i.e., clause_relids).
+  *
+@@ -56,6 +58,7 @@ make_restrictinfo(Expr *clause,
+ 				  bool is_pushed_down,
+ 				  bool outerjoin_delayed,
+ 				  bool pseudoconstant,
++				  Index security_level,
+ 				  Relids required_relids,
+ 				  Relids outer_relids,
+ 				  Relids nullable_relids)
+@@ -69,6 +72,7 @@ make_restrictinfo(Expr *clause,
+ 													   is_pushed_down,
+ 													   outerjoin_delayed,
+ 													   pseudoconstant,
++													   security_level,
+ 													   required_relids,
+ 													   outer_relids,
+ 													   nullable_relids);
+@@ -81,64 +85,12 @@ make_restrictinfo(Expr *clause,
+ 									  is_pushed_down,
+ 									  outerjoin_delayed,
+ 									  pseudoconstant,
++									  security_level,
+ 									  required_relids,
+ 									  outer_relids,
+ 									  nullable_relids);
+ }
+ 
+-/*
+- * make_restrictinfos_from_actual_clauses
+- *
+- * Given a list of implicitly-ANDed restriction clauses, produce a list
+- * of RestrictInfo nodes.  This is used to reconstitute the RestrictInfo
+- * representation after doing transformations of a list of clauses.
+- *
+- * We assume that the clauses are relation-level restrictions and therefore
+- * we don't have to worry about is_pushed_down, outerjoin_delayed,
+- * outer_relids, and nullable_relids (these can be assumed true, false,
+- * NULL, and NULL, respectively).
+- * We do take care to recognize pseudoconstant clauses properly.
+- */
+-List *
+-make_restrictinfos_from_actual_clauses(PlannerInfo *root,
+-									   List *clause_list)
+-{
+-	List	   *result = NIL;
+-	ListCell   *l;
+-
+-	foreach(l, clause_list)
+-	{
+-		Expr	   *clause = (Expr *) lfirst(l);
+-		bool		pseudoconstant;
+-		RestrictInfo *rinfo;
+-
+-		/*
+-		 * It's pseudoconstant if it contains no Vars and no volatile
+-		 * functions.  We probably can't see any sublinks here, so
+-		 * contain_var_clause() would likely be enough, but for safety use
+-		 * contain_vars_of_level() instead.
+-		 */
+-		pseudoconstant =
+-			!contain_vars_of_level((Node *) clause, 0) &&
+-			!contain_volatile_functions((Node *) clause);
+-		if (pseudoconstant)
+-		{
+-			/* tell createplan.c to check for gating quals */
+-			root->hasPseudoConstantQuals = true;
+-		}
+-
+-		rinfo = make_restrictinfo(clause,
+-								  true,
+-								  false,
+-								  pseudoconstant,
+-								  NULL,
+-								  NULL,
+-								  NULL);
+-		result = lappend(result, rinfo);
+-	}
+-	return result;
+-}
+-
+ /*
+  * make_restrictinfo_internal
+  *
+@@ -150,6 +102,7 @@ make_restrictinfo_internal(Expr *clause,
+ 						   bool is_pushed_down,
+ 						   bool outerjoin_delayed,
+ 						   bool pseudoconstant,
++						   Index security_level,
+ 						   Relids required_relids,
+ 						   Relids outer_relids,
+ 						   Relids nullable_relids)
+@@ -162,9 +115,20 @@ make_restrictinfo_internal(Expr *clause,
+ 	restrictinfo->outerjoin_delayed = outerjoin_delayed;
+ 	restrictinfo->pseudoconstant = pseudoconstant;
+ 	restrictinfo->can_join = false;		/* may get set below */
++	restrictinfo->security_level = security_level;
+ 	restrictinfo->outer_relids = outer_relids;
+ 	restrictinfo->nullable_relids = nullable_relids;
+ 
++	/*
++	 * If it's potentially delayable by lower-level security quals, figure out
++	 * whether it's leakproof.  We can skip testing this for level-zero quals,
++	 * since they would never get delayed on security grounds anyway.
++	 */
++	if (security_level > 0)
++		restrictinfo->leakproof = !contain_leaked_vars((Node *) clause);
++	else
++		restrictinfo->leakproof = false;		/* really, "don't know" */
++
+ 	/*
+ 	 * If it's a binary opclause, set up left/right relids info. In any case
+ 	 * set up the total clause relids info.
+@@ -250,7 +214,7 @@ make_restrictinfo_internal(Expr *clause,
+  *
+  * The same is_pushed_down, outerjoin_delayed, and pseudoconstant flag
+  * values can be applied to all RestrictInfo nodes in the result.  Likewise
+- * for outer_relids and nullable_relids.
++ * for security_level, outer_relids, and nullable_relids.
+  *
+  * The given required_relids are attached to our top-level output,
+  * but any OR-clause constituents are allowed to default to just the
+@@ -261,6 +225,7 @@ make_sub_restrictinfos(Expr *clause,
+ 					   bool is_pushed_down,
+ 					   bool outerjoin_delayed,
+ 					   bool pseudoconstant,
++					   Index security_level,
+ 					   Relids required_relids,
+ 					   Relids outer_relids,
+ 					   Relids nullable_relids)
+@@ -276,6 +241,7 @@ make_sub_restrictinfos(Expr *clause,
+ 													is_pushed_down,
+ 													outerjoin_delayed,
+ 													pseudoconstant,
++													security_level,
+ 													NULL,
+ 													outer_relids,
+ 													nullable_relids));
+@@ -284,6 +250,7 @@ make_sub_restrictinfos(Expr *clause,
+ 												   is_pushed_down,
+ 												   outerjoin_delayed,
+ 												   pseudoconstant,
++												   security_level,
+ 												   required_relids,
+ 												   outer_relids,
+ 												   nullable_relids);
+@@ -299,6 +266,7 @@ make_sub_restrictinfos(Expr *clause,
+ 													 is_pushed_down,
+ 													 outerjoin_delayed,
+ 													 pseudoconstant,
++													 security_level,
+ 													 required_relids,
+ 													 outer_relids,
+ 													 nullable_relids));
+@@ -310,6 +278,7 @@ make_sub_restrictinfos(Expr *clause,
+ 												   is_pushed_down,
+ 												   outerjoin_delayed,
+ 												   pseudoconstant,
++												   security_level,
+ 												   required_relids,
+ 												   outer_relids,
+ 												   nullable_relids);
+@@ -330,42 +299,36 @@ restriction_is_or_clause(RestrictInfo *restrictinfo)
+ }
+ 
+ /*
+- * get_actual_clauses
++ * restriction_is_securely_promotable
+  *
+- * Returns a list containing the bare clauses from 'restrictinfo_list'.
+- *
+- * This is only to be used in cases where none of the RestrictInfos can
+- * be pseudoconstant clauses (for instance, it's OK on indexqual lists).
++ * Returns true if it's okay to evaluate this clause "early", that is before
++ * other restriction clauses attached to the specified relation.
+  */
+-List *
+-get_actual_clauses(List *restrictinfo_list)
++bool
++restriction_is_securely_promotable(RestrictInfo *restrictinfo,
++								   RelOptInfo *rel)
+ {
+-	List	   *result = NIL;
+-	ListCell   *l;
+-
+-	foreach(l, restrictinfo_list)
+-	{
+-		RestrictInfo *rinfo = (RestrictInfo *) lfirst(l);
+-
+-		Assert(IsA(rinfo, RestrictInfo));
+-
+-		Assert(!rinfo->pseudoconstant);
+-
+-		result = lappend(result, rinfo->clause);
+-	}
+-	return result;
++	/*
++	 * It's okay if there are no baserestrictinfo clauses for the rel that
++	 * would need to go before this one, *or* if this one is leakproof.
++	 */
++	if (restrictinfo->security_level <= rel->baserestrict_min_security ||
++		restrictinfo->leakproof)
++		return true;
++	else
++		return false;
+ }
+ 
+ /*
+- * get_all_actual_clauses
++ * get_actual_clauses
+  *
+  * Returns a list containing the bare clauses from 'restrictinfo_list'.
+  *
+- * This loses the distinction between regular and pseudoconstant clauses,
+- * so be careful what you use it for.
++ * This is only to be used in cases where none of the RestrictInfos can
++ * be pseudoconstant clauses (for instance, it's OK on indexqual lists).
+  */
+ List *
+-get_all_actual_clauses(List *restrictinfo_list)
++get_actual_clauses(List *restrictinfo_list)
+ {
+ 	List	   *result = NIL;
+ 	ListCell   *l;
+@@ -376,6 +339,8 @@ get_all_actual_clauses(List *restrictinfo_list)
+ 
+ 		Assert(IsA(rinfo, RestrictInfo));
+ 
++		Assert(!rinfo->pseudoconstant);
++
+ 		result = lappend(result, rinfo->clause);
+ 	}
+ 	return result;
+diff --git a/src/include/nodes/relation.h b/src/include/nodes/relation.h
+index e1d31c795a02..1e950c4afd3b 100644
+--- a/src/include/nodes/relation.h
++++ b/src/include/nodes/relation.h
+@@ -286,6 +286,9 @@ typedef struct PlannerInfo
+ 	double		tuple_fraction; /* tuple_fraction passed to query_planner */
+ 	double		limit_tuples;	/* limit_tuples passed to query_planner */
+ 
++	Index		qual_security_level;	/* minimum security_level for quals */
++	/* Note: qual_security_level is zero if there are no securityQuals */
++
+ 	bool		hasInheritedTarget;		/* true if parse->resultRelation is an
+ 										 * inheritance child rel */
+ 	bool		hasJoinRTEs;	/* true if any RTEs are RTE_JOIN kind */
+@@ -443,6 +446,8 @@ typedef struct PlannerInfo
+  *					participates (only used for base rels)
+  *		baserestrictcost - Estimated cost of evaluating the baserestrictinfo
+  *					clauses at a single tuple (only used for base rels)
++ *		baserestrict_min_security - Smallest security_level found among
++ *					clauses in baserestrictinfo
+  *		joininfo  - List of RestrictInfo nodes, containing info about each
+  *					join clause in which this relation participates (but
+  *					note this excludes clauses that might be derivable from
+@@ -539,6 +544,8 @@ typedef struct RelOptInfo
+ 	List	   *baserestrictinfo;		/* RestrictInfo structures (if base
+ 										 * rel) */
+ 	QualCost	baserestrictcost;		/* cost of evaluating the above */
++	Index		baserestrict_min_security;		/* min security_level found in
++												 * baserestrictinfo */
+ 	List	   *joininfo;		/* RestrictInfo structures for join clauses
+ 								 * involving this rel */
+ 	bool		has_eclass_joins;		/* T means joininfo is incomplete */
+@@ -713,6 +720,8 @@ typedef struct EquivalenceClass
+ 	bool		ec_below_outer_join;	/* equivalence applies below an OJ */
+ 	bool		ec_broken;		/* failed to generate needed clauses? */
+ 	Index		ec_sortref;		/* originating sortclause label, or 0 */
++	Index		ec_min_security;	/* minimum security_level in ec_sources */
++	Index		ec_max_security;	/* maximum security_level in ec_sources */
+ 	struct EquivalenceClass *ec_merged; /* set if merged into another EC */
+ } EquivalenceClass;
+ 
+@@ -1560,6 +1569,15 @@ typedef struct LimitPath
+  * outer join(s). A clause that is not outerjoin_delayed can be enforced
+  * anywhere it is computable.
+  *
++ * To handle security-barrier conditions efficiently, we mark RestrictInfo
++ * nodes with a security_level field, in which higher values identify clauses
++ * coming from less-trusted sources.  The exact semantics are that a clause
++ * cannot be evaluated before another clause with a lower security_level value
++ * unless the first clause is leakproof.  As with outer-join clauses, this
++ * creates a reason for clauses to sometimes need to be evaluated higher in
++ * the join tree than their contents would suggest; and even at a single plan
++ * node, this rule constrains the order of application of clauses.
++ *
+  * In general, the referenced clause might be arbitrarily complex.  The
+  * kinds of clauses we can handle as indexscan quals, mergejoin clauses,
+  * or hashjoin clauses are limited (e.g., no volatile functions).  The code
+@@ -1614,6 +1632,10 @@ typedef struct RestrictInfo
+ 
+ 	bool		pseudoconstant; /* see comment above */
+ 
++	bool		leakproof;		/* TRUE if known to contain no leaked Vars */
++
++	Index		security_level; /* see comment above */
++
+ 	/* The set of relids (varnos) actually referenced in the clause: */
+ 	Relids		clause_relids;
+ 
+diff --git a/src/include/optimizer/planmain.h b/src/include/optimizer/planmain.h
+index 8468b0c47f51..94ef84bca9cb 100644
+--- a/src/include/optimizer/planmain.h
++++ b/src/include/optimizer/planmain.h
+@@ -87,6 +87,7 @@ extern void process_implied_equality(PlannerInfo *root,
+ 						 Expr *item2,
+ 						 Relids qualscope,
+ 						 Relids nullable_relids,
++						 Index security_level,
+ 						 bool below_outer_join,
+ 						 bool both_const);
+ extern RestrictInfo *build_implied_join_equality(Oid opno,
+@@ -94,7 +95,8 @@ extern RestrictInfo *build_implied_join_equality(Oid opno,
+ 							Expr *item1,
+ 							Expr *item2,
+ 							Relids qualscope,
+-							Relids nullable_relids);
++							Relids nullable_relids,
++							Index security_level);
+ extern void match_foreign_keys_to_quals(PlannerInfo *root);
+ 
+ /*
+diff --git a/src/include/optimizer/prep.h b/src/include/optimizer/prep.h
+index 05f6ee0d5d27..2b20b36f74f0 100644
+--- a/src/include/optimizer/prep.h
++++ b/src/include/optimizer/prep.h
+@@ -35,11 +35,6 @@ extern Relids get_relids_for_join(PlannerInfo *root, int joinrelid);
+ extern Node *negate_clause(Node *node);
+ extern Expr *canonicalize_qual(Expr *qual);
+ 
+-/*
+- * prototypes for prepsecurity.c
+- */
+-extern void expand_security_quals(PlannerInfo *root, List *tlist);
+-
+ /*
+  * prototypes for preptlist.c
+  */
+diff --git a/src/include/optimizer/restrictinfo.h b/src/include/optimizer/restrictinfo.h
+index 2dba51fb7820..31b9a7928593 100644
+--- a/src/include/optimizer/restrictinfo.h
++++ b/src/include/optimizer/restrictinfo.h
+@@ -19,20 +19,20 @@
+ 
+ /* Convenience macro for the common case of a valid-everywhere qual */
+ #define make_simple_restrictinfo(clause)  \
+-	make_restrictinfo(clause, true, false, false, NULL, NULL, NULL)
++	make_restrictinfo(clause, true, false, false, 0, NULL, NULL, NULL)
+ 
+ extern RestrictInfo *make_restrictinfo(Expr *clause,
+ 				  bool is_pushed_down,
+ 				  bool outerjoin_delayed,
+ 				  bool pseudoconstant,
++				  Index security_level,
+ 				  Relids required_relids,
+ 				  Relids outer_relids,
+ 				  Relids nullable_relids);
+-extern List *make_restrictinfos_from_actual_clauses(PlannerInfo *root,
+-									   List *clause_list);
+ extern bool restriction_is_or_clause(RestrictInfo *restrictinfo);
++extern bool restriction_is_securely_promotable(RestrictInfo *restrictinfo,
++								   RelOptInfo *rel);
+ extern List *get_actual_clauses(List *restrictinfo_list);
+-extern List *get_all_actual_clauses(List *restrictinfo_list);
+ extern List *extract_actual_clauses(List *restrictinfo_list,
+ 					   bool pseudoconstant);
+ extern void extract_actual_join_clauses(List *restrictinfo_list,
+diff --git a/src/test/modules/test_rls_hooks/expected/test_rls_hooks.out b/src/test/modules/test_rls_hooks/expected/test_rls_hooks.out
+index 19284c18d483..b8c6d385814e 100644
+--- a/src/test/modules/test_rls_hooks/expected/test_rls_hooks.out
++++ b/src/test/modules/test_rls_hooks/expected/test_rls_hooks.out
+@@ -145,13 +145,11 @@ ERROR:  new row violates row-level security policy for table "rls_test_permissiv
+ SET ROLE regress_s1;
+ -- With both internal and hook policies, restrictive
+ EXPLAIN (costs off) SELECT * FROM rls_test_restrictive;
+-                          QUERY PLAN                           
+----------------------------------------------------------------
+- Subquery Scan on rls_test_restrictive
+-   Filter: ((rls_test_restrictive.data % 2) = 0)
+-   ->  Seq Scan on rls_test_restrictive rls_test_restrictive_1
+-         Filter: ("current_user"() = supervisor)
+-(4 rows)
++                            QUERY PLAN                            
++------------------------------------------------------------------
++ Seq Scan on rls_test_restrictive
++   Filter: (("current_user"() = supervisor) AND ((data % 2) = 0))
++(2 rows)
+ 
+ SELECT * FROM rls_test_restrictive;
+   username  | supervisor | data 
+@@ -173,13 +171,11 @@ ERROR:  new row violates row-level security policy for table "rls_test_restricti
+ -- With both internal and hook policies, both permissive
+ -- and restrictive hook policies
+ EXPLAIN (costs off) SELECT * FROM rls_test_both;
+-                                        QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+- Subquery Scan on rls_test_both
+-   Filter: (((rls_test_both.data % 2) = 0) OR ("current_user"() = rls_test_both.username))
+-   ->  Seq Scan on rls_test_both rls_test_both_1
+-         Filter: ("current_user"() = supervisor)
+-(4 rows)
++                                             QUERY PLAN                                              
++-----------------------------------------------------------------------------------------------------
++ Seq Scan on rls_test_both
++   Filter: (("current_user"() = supervisor) AND (((data % 2) = 0) OR ("current_user"() = username)))
++(2 rows)
+ 
+ SELECT * FROM rls_test_both;
+  username | supervisor | data 
+diff --git a/src/test/regress/expected/equivclass.out b/src/test/regress/expected/equivclass.out
+index 0391b8eec19f..564218b767a8 100644
+--- a/src/test/regress/expected/equivclass.out
++++ b/src/test/regress/expected/equivclass.out
+@@ -381,3 +381,45 @@ explain (costs off)
+                      Index Cond: (ff = '42'::bigint)
+ (14 rows)
+ 
++-- check effects of row-level security
++set enable_nestloop = on;
++set enable_mergejoin = off;
++alter table ec1 enable row level security;
++create policy p1 on ec1 using (f1 < '5'::int8alias1);
++create user regress_user_ectest;
++grant select on ec0 to regress_user_ectest;
++grant select on ec1 to regress_user_ectest;
++-- without any RLS, we'll treat {a.ff, b.ff, 43} as an EquivalenceClass
++explain (costs off)
++  select * from ec0 a, ec1 b
++  where a.ff = b.ff and a.ff = 43::bigint::int8alias1;
++                 QUERY PLAN                  
++---------------------------------------------
++ Nested Loop
++   ->  Index Scan using ec0_pkey on ec0 a
++         Index Cond: (ff = '43'::int8alias1)
++   ->  Index Scan using ec1_pkey on ec1 b
++         Index Cond: (ff = '43'::int8alias1)
++(5 rows)
++
++set session authorization regress_user_ectest;
++-- with RLS active, the non-leakproof a.ff = 43 clause is not treated
++-- as a suitable source for an EquivalenceClass; currently, this is true
++-- even though the RLS clause has nothing to do directly with the EC
++explain (costs off)
++  select * from ec0 a, ec1 b
++  where a.ff = b.ff and a.ff = 43::bigint::int8alias1;
++                 QUERY PLAN                  
++---------------------------------------------
++ Nested Loop
++   ->  Index Scan using ec0_pkey on ec0 a
++         Index Cond: (ff = '43'::int8alias1)
++   ->  Index Scan using ec1_pkey on ec1 b
++         Index Cond: (ff = a.ff)
++         Filter: (f1 < '5'::int8alias1)
++(6 rows)
++
++reset session authorization;
++revoke select on ec0 from regress_user_ectest;
++revoke select on ec1 from regress_user_ectest;
++drop user regress_user_ectest;
+diff --git a/src/test/regress/expected/rowsecurity.out b/src/test/regress/expected/rowsecurity.out
+index 471e405c7ab4..25407bf9dddc 100644
+--- a/src/test/regress/expected/rowsecurity.out
++++ b/src/test/regress/expected/rowsecurity.out
+@@ -265,32 +265,28 @@ NOTICE:  f_leak => awesome science fiction
+ (5 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM document WHERE f_leak(dtitle);
+-                        QUERY PLAN                        
+-----------------------------------------------------------
+- Subquery Scan on document
+-   Filter: f_leak(document.dtitle)
+-   ->  Seq Scan on document document_1
+-         Filter: (dlevel <= $0)
+-         InitPlan 1 (returns $0)
+-           ->  Index Scan using uaccount_pkey on uaccount
+-                 Index Cond: (pguser = CURRENT_USER)
+-(7 rows)
++                     QUERY PLAN                     
++----------------------------------------------------
++ Seq Scan on document
++   Filter: ((dlevel <= $0) AND f_leak(dtitle))
++   InitPlan 1 (returns $0)
++     ->  Index Scan using uaccount_pkey on uaccount
++           Index Cond: (pguser = CURRENT_USER)
++(5 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle);
+-                              QUERY PLAN                              
+-----------------------------------------------------------------------
++                        QUERY PLAN                         
++-----------------------------------------------------------
+  Hash Join
+    Hash Cond: (category.cid = document.cid)
++   InitPlan 1 (returns $0)
++     ->  Index Scan using uaccount_pkey on uaccount
++           Index Cond: (pguser = CURRENT_USER)
+    ->  Seq Scan on category
+    ->  Hash
+-         ->  Subquery Scan on document
+-               Filter: f_leak(document.dtitle)
+-               ->  Seq Scan on document document_1
+-                     Filter: (dlevel <= $0)
+-                     InitPlan 1 (returns $0)
+-                       ->  Index Scan using uaccount_pkey on uaccount
+-                             Index Cond: (pguser = CURRENT_USER)
+-(11 rows)
++         ->  Seq Scan on document
++               Filter: ((dlevel <= $0) AND f_leak(dtitle))
++(9 rows)
+ 
+ -- viewpoint from regress_rls_dave
+ SET SESSION AUTHORIZATION regress_rls_dave;
+@@ -333,32 +329,28 @@ NOTICE:  f_leak => awesome technology book
+ (7 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM document WHERE f_leak(dtitle);
+-                                   QUERY PLAN                                    
+----------------------------------------------------------------------------------
+- Subquery Scan on document
+-   Filter: f_leak(document.dtitle)
+-   ->  Seq Scan on document document_1
+-         Filter: ((cid <> 44) AND (cid <> 44) AND (cid < 50) AND (dlevel <= $0))
+-         InitPlan 1 (returns $0)
+-           ->  Index Scan using uaccount_pkey on uaccount
+-                 Index Cond: (pguser = CURRENT_USER)
+-(7 rows)
++                                          QUERY PLAN                                          
++----------------------------------------------------------------------------------------------
++ Seq Scan on document
++   Filter: ((cid <> 44) AND (cid <> 44) AND (cid < 50) AND (dlevel <= $0) AND f_leak(dtitle))
++   InitPlan 1 (returns $0)
++     ->  Index Scan using uaccount_pkey on uaccount
++           Index Cond: (pguser = CURRENT_USER)
++(5 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle);
+-                                         QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
++                                                QUERY PLAN                                                
++----------------------------------------------------------------------------------------------------------
+  Hash Join
+    Hash Cond: (category.cid = document.cid)
++   InitPlan 1 (returns $0)
++     ->  Index Scan using uaccount_pkey on uaccount
++           Index Cond: (pguser = CURRENT_USER)
+    ->  Seq Scan on category
+    ->  Hash
+-         ->  Subquery Scan on document
+-               Filter: f_leak(document.dtitle)
+-               ->  Seq Scan on document document_1
+-                     Filter: ((cid <> 44) AND (cid <> 44) AND (cid < 50) AND (dlevel <= $0))
+-                     InitPlan 1 (returns $0)
+-                       ->  Index Scan using uaccount_pkey on uaccount
+-                             Index Cond: (pguser = CURRENT_USER)
+-(11 rows)
++         ->  Seq Scan on document
++               Filter: ((cid <> 44) AND (cid <> 44) AND (cid < 50) AND (dlevel <= $0) AND f_leak(dtitle))
++(9 rows)
+ 
+ -- 44 would technically fail for both p2r and p1r, but we should get an error
+ -- back from p1r for this because it sorts first
+@@ -431,25 +423,21 @@ NOTICE:  f_leak => great manga
+ (3 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM document WHERE f_leak(dtitle);
+-                QUERY PLAN                
+-------------------------------------------
+- Subquery Scan on document
+-   Filter: f_leak(document.dtitle)
+-   ->  Seq Scan on document document_1
+-         Filter: (dauthor = CURRENT_USER)
+-(4 rows)
++                       QUERY PLAN                        
++---------------------------------------------------------
++ Seq Scan on document
++   Filter: ((dauthor = CURRENT_USER) AND f_leak(dtitle))
++(2 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle);
+-                    QUERY PLAN                    
+---------------------------------------------------
++                          QUERY PLAN                           
++---------------------------------------------------------------
+  Nested Loop
+-   ->  Subquery Scan on document
+-         Filter: f_leak(document.dtitle)
+-         ->  Seq Scan on document document_1
+-               Filter: (dauthor = CURRENT_USER)
++   ->  Seq Scan on document
++         Filter: ((dauthor = CURRENT_USER) AND f_leak(dtitle))
+    ->  Index Scan using category_pkey on category
+          Index Cond: (cid = document.cid)
+-(7 rows)
++(5 rows)
+ 
+ -- interaction of FK/PK constraints
+ SET SESSION AUTHORIZATION regress_rls_alice;
+@@ -698,18 +686,16 @@ NOTICE:  f_leak => yyy
+ (5 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE f_leak(b);
+-             QUERY PLAN              
+--------------------------------------
+- Subquery Scan on t1
+-   Filter: f_leak(t1.b)
+-   ->  Append
+-         ->  Seq Scan on t1 t1_1
+-               Filter: ((a % 2) = 0)
+-         ->  Seq Scan on t2
+-               Filter: ((a % 2) = 0)
+-         ->  Seq Scan on t3
+-               Filter: ((a % 2) = 0)
+-(9 rows)
++                  QUERY PLAN                   
++-----------------------------------------------
++ Append
++   ->  Seq Scan on t1
++         Filter: (((a % 2) = 0) AND f_leak(b))
++   ->  Seq Scan on t2
++         Filter: (((a % 2) = 0) AND f_leak(b))
++   ->  Seq Scan on t3
++         Filter: (((a % 2) = 0) AND f_leak(b))
++(7 rows)
+ 
+ -- reference to system column
+ SELECT oid, * FROM t1;
+@@ -769,20 +755,17 @@ SELECT * FROM t1 FOR SHARE;
+ (5 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM t1 FOR SHARE;
+-                      QUERY PLAN                       
+--------------------------------------------------------
++             QUERY PLAN              
++-------------------------------------
+  LockRows
+-   ->  Subquery Scan on t1
+-         ->  LockRows
+-               ->  Result
+-                     ->  Append
+-                           ->  Seq Scan on t1 t1_1
+-                                 Filter: ((a % 2) = 0)
+-                           ->  Seq Scan on t2
+-                                 Filter: ((a % 2) = 0)
+-                           ->  Seq Scan on t3
+-                                 Filter: ((a % 2) = 0)
+-(11 rows)
++   ->  Append
++         ->  Seq Scan on t1
++               Filter: ((a % 2) = 0)
++         ->  Seq Scan on t2
++               Filter: ((a % 2) = 0)
++         ->  Seq Scan on t3
++               Filter: ((a % 2) = 0)
++(8 rows)
+ 
+ SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
+ NOTICE:  f_leak => bbb
+@@ -800,21 +783,17 @@ NOTICE:  f_leak => yyy
+ (5 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
+-                      QUERY PLAN                       
+--------------------------------------------------------
++                     QUERY PLAN                      
++-----------------------------------------------------
+  LockRows
+-   ->  Subquery Scan on t1
+-         Filter: f_leak(t1.b)
+-         ->  LockRows
+-               ->  Result
+-                     ->  Append
+-                           ->  Seq Scan on t1 t1_1
+-                                 Filter: ((a % 2) = 0)
+-                           ->  Seq Scan on t2
+-                                 Filter: ((a % 2) = 0)
+-                           ->  Seq Scan on t3
+-                                 Filter: ((a % 2) = 0)
+-(12 rows)
++   ->  Append
++         ->  Seq Scan on t1
++               Filter: (((a % 2) = 0) AND f_leak(b))
++         ->  Seq Scan on t2
++               Filter: (((a % 2) = 0) AND f_leak(b))
++         ->  Seq Scan on t3
++               Filter: (((a % 2) = 0) AND f_leak(b))
++(8 rows)
+ 
+ -- union all query
+ SELECT a, b, oid FROM t2 UNION ALL SELECT a, b, oid FROM t3;
+@@ -1024,21 +1003,14 @@ NOTICE:  f_leak => a87ff679a2f3e71d9181a67b7542122c
+ (2 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM only s1 WHERE f_leak(b);
+-                        QUERY PLAN                        
+-----------------------------------------------------------
+- Subquery Scan on s1
+-   Filter: f_leak(s1.b)
+-   ->  Hash Join
+-         Hash Cond: (s1_1.a = s2.x)
+-         ->  Seq Scan on s1 s1_1
+-         ->  Hash
+-               ->  HashAggregate
+-                     Group Key: s2.x
+-                     ->  Subquery Scan on s2
+-                           Filter: (s2.y ~~ '%2f%'::text)
+-                           ->  Seq Scan on s2 s2_1
+-                                 Filter: ((x % 2) = 0)
+-(12 rows)
++                        QUERY PLAN                         
++-----------------------------------------------------------
++ Seq Scan on s1
++   Filter: ((hashed SubPlan 1) AND f_leak(b))
++   SubPlan 1
++     ->  Seq Scan on s2
++           Filter: (((x % 2) = 0) AND (y ~~ '%2f%'::text))
++(5 rows)
+ 
+ SET SESSION AUTHORIZATION regress_rls_alice;
+ ALTER POLICY p1 ON s1 USING (a in (select x from v2)); -- using VIEW in RLS policy
+@@ -1053,21 +1025,14 @@ NOTICE:  f_leak => 1679091c5a880faf6fb5e6087eb1b2dc
+ (2 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM s1 WHERE f_leak(b);
+-                        QUERY PLAN                        
+-----------------------------------------------------------
+- Subquery Scan on s1
+-   Filter: f_leak(s1.b)
+-   ->  Hash Join
+-         Hash Cond: (s1_1.a = s2.x)
+-         ->  Seq Scan on s1 s1_1
+-         ->  Hash
+-               ->  HashAggregate
+-                     Group Key: s2.x
+-                     ->  Subquery Scan on s2
+-                           Filter: (s2.y ~~ '%af%'::text)
+-                           ->  Seq Scan on s2 s2_1
+-                                 Filter: ((x % 2) = 0)
+-(12 rows)
++                        QUERY PLAN                         
++-----------------------------------------------------------
++ Seq Scan on s1
++   Filter: ((hashed SubPlan 1) AND f_leak(b))
++   SubPlan 1
++     ->  Seq Scan on s2
++           Filter: (((x % 2) = 0) AND (y ~~ '%af%'::text))
++(5 rows)
+ 
+ SELECT (SELECT x FROM s1 LIMIT 1) xx, * FROM s2 WHERE y like '%28%';
+  xx | x  |                y                 
+@@ -1078,24 +1043,18 @@ SELECT (SELECT x FROM s1 LIMIT 1) xx, * FROM s2 WHERE y like '%28%';
+ (3 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT (SELECT x FROM s1 LIMIT 1) xx, * FROM s2 WHERE y like '%28%';
+-                             QUERY PLAN                             
+---------------------------------------------------------------------
+- Subquery Scan on s2
+-   Filter: (s2.y ~~ '%28%'::text)
+-   ->  Seq Scan on s2 s2_1
+-         Filter: ((x % 2) = 0)
+-   SubPlan 1
++                               QUERY PLAN                                
++-------------------------------------------------------------------------
++ Seq Scan on s2
++   Filter: (((x % 2) = 0) AND (y ~~ '%28%'::text))
++   SubPlan 2
+      ->  Limit
+-           ->  Subquery Scan on s1
+-                 ->  Nested Loop Semi Join
+-                       Join Filter: (s1_1.a = s2_2.x)
+-                       ->  Seq Scan on s1 s1_1
+-                       ->  Materialize
+-                             ->  Subquery Scan on s2_2
+-                                   Filter: (s2_2.y ~~ '%af%'::text)
+-                                   ->  Seq Scan on s2 s2_3
+-                                         Filter: ((x % 2) = 0)
+-(15 rows)
++           ->  Seq Scan on s1
++                 Filter: (hashed SubPlan 1)
++                 SubPlan 1
++                   ->  Seq Scan on s2 s2_1
++                         Filter: (((x % 2) = 0) AND (y ~~ '%af%'::text))
++(9 rows)
+ 
+ SET SESSION AUTHORIZATION regress_rls_alice;
+ ALTER POLICY p2 ON s2 USING (x in (select a from s1 where b like '%d2%'));
+@@ -1239,28 +1198,19 @@ EXPLAIN (COSTS OFF) EXECUTE p2(2);
+ --
+ SET SESSION AUTHORIZATION regress_rls_bob;
+ EXPLAIN (COSTS OFF) UPDATE t1 SET b = b || b WHERE f_leak(b);
+-                QUERY PLAN                 
+--------------------------------------------
+- Update on t1 t1_3
+-   Update on t1 t1_3
+-   Update on t2 t1
+-   Update on t3 t1
+-   ->  Subquery Scan on t1
+-         Filter: f_leak(t1.b)
+-         ->  LockRows
+-               ->  Seq Scan on t1 t1_4
+-                     Filter: ((a % 2) = 0)
+-   ->  Subquery Scan on t1_1
+-         Filter: f_leak(t1_1.b)
+-         ->  LockRows
+-               ->  Seq Scan on t2
+-                     Filter: ((a % 2) = 0)
+-   ->  Subquery Scan on t1_2
+-         Filter: f_leak(t1_2.b)
+-         ->  LockRows
+-               ->  Seq Scan on t3
+-                     Filter: ((a % 2) = 0)
+-(19 rows)
++                  QUERY PLAN                   
++-----------------------------------------------
++ Update on t1
++   Update on t1
++   Update on t2
++   Update on t3
++   ->  Seq Scan on t1
++         Filter: (((a % 2) = 0) AND f_leak(b))
++   ->  Seq Scan on t2
++         Filter: (((a % 2) = 0) AND f_leak(b))
++   ->  Seq Scan on t3
++         Filter: (((a % 2) = 0) AND f_leak(b))
++(10 rows)
+ 
+ UPDATE t1 SET b = b || b WHERE f_leak(b);
+ NOTICE:  f_leak => bbb
+@@ -1269,15 +1219,12 @@ NOTICE:  f_leak => bcd
+ NOTICE:  f_leak => def
+ NOTICE:  f_leak => yyy
+ EXPLAIN (COSTS OFF) UPDATE only t1 SET b = b || '_updt' WHERE f_leak(b);
+-                QUERY PLAN                 
+--------------------------------------------
+- Update on t1 t1_1
+-   ->  Subquery Scan on t1
+-         Filter: f_leak(t1.b)
+-         ->  LockRows
+-               ->  Seq Scan on t1 t1_2
+-                     Filter: ((a % 2) = 0)
+-(6 rows)
++                  QUERY PLAN                   
++-----------------------------------------------
++ Update on t1
++   ->  Seq Scan on t1
++         Filter: (((a % 2) = 0) AND f_leak(b))
++(3 rows)
+ 
+ UPDATE only t1 SET b = b || '_updt' WHERE f_leak(b);
+ NOTICE:  f_leak => bbbbbb
+@@ -1325,89 +1272,63 @@ NOTICE:  f_leak => yyyyyy
+ -- updates with from clause
+ EXPLAIN (COSTS OFF) UPDATE t2 SET b=t2.b FROM t3
+ WHERE t2.a = 3 and t3.a = 2 AND f_leak(t2.b) AND f_leak(t3.b);
+-                          QUERY PLAN                           
+----------------------------------------------------------------
+- Update on t2 t2_1
++                           QUERY PLAN                            
++-----------------------------------------------------------------
++ Update on t2
+    ->  Nested Loop
+-         ->  Subquery Scan on t2
+-               Filter: f_leak(t2.b)
+-               ->  LockRows
+-                     ->  Seq Scan on t2 t2_2
+-                           Filter: ((a = 3) AND ((a % 2) = 1))
++         ->  Seq Scan on t2
++               Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
+          ->  Seq Scan on t3
+-               Filter: (f_leak(b) AND (a = 2))
+-(9 rows)
++               Filter: ((a = 2) AND f_leak(b))
++(6 rows)
+ 
+ UPDATE t2 SET b=t2.b FROM t3
+ WHERE t2.a = 3 and t3.a = 2 AND f_leak(t2.b) AND f_leak(t3.b);
+ NOTICE:  f_leak => cde
+-NOTICE:  f_leak => xxx
+-NOTICE:  f_leak => zzz
+ NOTICE:  f_leak => yyyyyy
+ EXPLAIN (COSTS OFF) UPDATE t1 SET b=t1.b FROM t2
+ WHERE t1.a = 3 and t2.a = 3 AND f_leak(t1.b) AND f_leak(t2.b);
+-                          QUERY PLAN                           
+----------------------------------------------------------------
+- Update on t1 t1_3
+-   Update on t1 t1_3
+-   Update on t2 t1
+-   Update on t3 t1
++                           QUERY PLAN                            
++-----------------------------------------------------------------
++ Update on t1
++   Update on t1
++   Update on t2 t2_1
++   Update on t3
+    ->  Nested Loop
+-         ->  Subquery Scan on t1
+-               Filter: f_leak(t1.b)
+-               ->  LockRows
+-                     ->  Seq Scan on t1 t1_4
+-                           Filter: ((a = 3) AND ((a % 2) = 0))
+-         ->  Subquery Scan on t2
+-               Filter: f_leak(t2.b)
+-               ->  Seq Scan on t2 t2_3
+-                     Filter: ((a = 3) AND ((a % 2) = 1))
++         ->  Seq Scan on t1
++               Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
++         ->  Seq Scan on t2
++               Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
+    ->  Nested Loop
+-         ->  Subquery Scan on t1_1
+-               Filter: f_leak(t1_1.b)
+-               ->  LockRows
+-                     ->  Seq Scan on t2 t2_4
+-                           Filter: ((a = 3) AND ((a % 2) = 0))
+-         ->  Subquery Scan on t2_1
+-               Filter: f_leak(t2_1.b)
+-               ->  Seq Scan on t2 t2_5
+-                     Filter: ((a = 3) AND ((a % 2) = 1))
++         ->  Seq Scan on t2 t2_1
++               Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
++         ->  Seq Scan on t2
++               Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
+    ->  Nested Loop
+-         ->  Subquery Scan on t1_2
+-               Filter: f_leak(t1_2.b)
+-               ->  LockRows
+-                     ->  Seq Scan on t3
+-                           Filter: ((a = 3) AND ((a % 2) = 0))
+-         ->  Subquery Scan on t2_2
+-               Filter: f_leak(t2_2.b)
+-               ->  Seq Scan on t2 t2_6
+-                     Filter: ((a = 3) AND ((a % 2) = 1))
+-(34 rows)
++         ->  Seq Scan on t3
++               Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
++         ->  Seq Scan on t2
++               Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
++(19 rows)
+ 
+ UPDATE t1 SET b=t1.b FROM t2
+ WHERE t1.a = 3 and t2.a = 3 AND f_leak(t1.b) AND f_leak(t2.b);
+ EXPLAIN (COSTS OFF) UPDATE t2 SET b=t2.b FROM t1
+ WHERE t1.a = 3 and t2.a = 3 AND f_leak(t1.b) AND f_leak(t2.b);
+-                             QUERY PLAN                              
+----------------------------------------------------------------------
+- Update on t2 t2_1
++                              QUERY PLAN                               
++-----------------------------------------------------------------------
++ Update on t2
+    ->  Nested Loop
+-         ->  Subquery Scan on t2
+-               Filter: f_leak(t2.b)
+-               ->  LockRows
+-                     ->  Seq Scan on t2 t2_2
+-                           Filter: ((a = 3) AND ((a % 2) = 1))
+-         ->  Subquery Scan on t1
+-               Filter: f_leak(t1.b)
+-               ->  Result
+-                     ->  Append
+-                           ->  Seq Scan on t1 t1_1
+-                                 Filter: ((a = 3) AND ((a % 2) = 0))
+-                           ->  Seq Scan on t2 t2_3
+-                                 Filter: ((a = 3) AND ((a % 2) = 0))
+-                           ->  Seq Scan on t3
+-                                 Filter: ((a = 3) AND ((a % 2) = 0))
+-(17 rows)
++         ->  Seq Scan on t2
++               Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
++         ->  Append
++               ->  Seq Scan on t1
++                     Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
++               ->  Seq Scan on t2 t2_1
++                     Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
++               ->  Seq Scan on t3
++                     Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
++(11 rows)
+ 
+ UPDATE t2 SET b=t2.b FROM t1
+ WHERE t1.a = 3 and t2.a = 3 AND f_leak(t1.b) AND f_leak(t2.b);
+@@ -1416,21 +1337,16 @@ NOTICE:  f_leak => cde
+ EXPLAIN (COSTS OFF) UPDATE t2 t2_1 SET b = t2_2.b FROM t2 t2_2
+ WHERE t2_1.a = 3 AND t2_2.a = t2_1.a AND t2_2.b = t2_1.b
+ AND f_leak(t2_1.b) AND f_leak(t2_2.b) RETURNING *, t2_1, t2_2;
+-                          QUERY PLAN                           
+----------------------------------------------------------------
+- Update on t2 t2_1_1
++                           QUERY PLAN                            
++-----------------------------------------------------------------
++ Update on t2 t2_1
+    ->  Nested Loop
+          Join Filter: (t2_1.b = t2_2.b)
+-         ->  Subquery Scan on t2_1
+-               Filter: f_leak(t2_1.b)
+-               ->  LockRows
+-                     ->  Seq Scan on t2 t2_1_2
+-                           Filter: ((a = 3) AND ((a % 2) = 1))
+-         ->  Subquery Scan on t2_2
+-               Filter: f_leak(t2_2.b)
+-               ->  Seq Scan on t2 t2_2_1
+-                     Filter: ((a = 3) AND ((a % 2) = 1))
+-(12 rows)
++         ->  Seq Scan on t2 t2_1
++               Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
++         ->  Seq Scan on t2 t2_2
++               Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
++(7 rows)
+ 
+ UPDATE t2 t2_1 SET b = t2_2.b FROM t2 t2_2
+ WHERE t2_1.a = 3 AND t2_2.a = t2_1.a AND t2_2.b = t2_1.b
+@@ -1445,61 +1361,46 @@ NOTICE:  f_leak => cde
+ EXPLAIN (COSTS OFF) UPDATE t1 t1_1 SET b = t1_2.b FROM t1 t1_2
+ WHERE t1_1.a = 4 AND t1_2.a = t1_1.a AND t1_2.b = t1_1.b
+ AND f_leak(t1_1.b) AND f_leak(t1_2.b) RETURNING *, t1_1, t1_2;
+-                          QUERY PLAN                           
+----------------------------------------------------------------
+- Update on t1 t1_1_3
+-   Update on t1 t1_1_3
+-   Update on t2 t1_1
+-   Update on t3 t1_1
++                              QUERY PLAN                               
++-----------------------------------------------------------------------
++ Update on t1 t1_1
++   Update on t1 t1_1
++   Update on t2 t1_1_1
++   Update on t3 t1_1_2
+    ->  Nested Loop
+          Join Filter: (t1_1.b = t1_2.b)
+-         ->  Subquery Scan on t1_1
+-               Filter: f_leak(t1_1.b)
+-               ->  LockRows
+-                     ->  Seq Scan on t1 t1_1_4
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
+-         ->  Subquery Scan on t1_2
+-               Filter: f_leak(t1_2.b)
+-               ->  Append
+-                     ->  Seq Scan on t1 t1_2_3
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
+-                     ->  Seq Scan on t2 t1_2_4
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
+-                     ->  Seq Scan on t3 t1_2_5
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
++         ->  Seq Scan on t1 t1_1
++               Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
++         ->  Append
++               ->  Seq Scan on t1 t1_2
++                     Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
++               ->  Seq Scan on t2 t1_2_1
++                     Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
++               ->  Seq Scan on t3 t1_2_2
++                     Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+    ->  Nested Loop
+-         Join Filter: (t1_1_1.b = t1_2_1.b)
+-         ->  Subquery Scan on t1_1_1
+-               Filter: f_leak(t1_1_1.b)
+-               ->  LockRows
+-                     ->  Seq Scan on t2 t1_1_5
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
+-         ->  Subquery Scan on t1_2_1
+-               Filter: f_leak(t1_2_1.b)
+-               ->  Append
+-                     ->  Seq Scan on t1 t1_2_6
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
+-                     ->  Seq Scan on t2 t1_2_7
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
+-                     ->  Seq Scan on t3 t1_2_8
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
++         Join Filter: (t1_1_1.b = t1_2.b)
++         ->  Seq Scan on t2 t1_1_1
++               Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
++         ->  Append
++               ->  Seq Scan on t1 t1_2
++                     Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
++               ->  Seq Scan on t2 t1_2_1
++                     Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
++               ->  Seq Scan on t3 t1_2_2
++                     Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+    ->  Nested Loop
+-         Join Filter: (t1_1_2.b = t1_2_2.b)
+-         ->  Subquery Scan on t1_1_2
+-               Filter: f_leak(t1_1_2.b)
+-               ->  LockRows
+-                     ->  Seq Scan on t3 t1_1_6
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
+-         ->  Subquery Scan on t1_2_2
+-               Filter: f_leak(t1_2_2.b)
+-               ->  Append
+-                     ->  Seq Scan on t1 t1_2_9
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
+-                     ->  Seq Scan on t2 t1_2_10
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
+-                     ->  Seq Scan on t3 t1_2_11
+-                           Filter: ((a = 4) AND ((a % 2) = 0))
+-(52 rows)
++         Join Filter: (t1_1_2.b = t1_2.b)
++         ->  Seq Scan on t3 t1_1_2
++               Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
++         ->  Append
++               ->  Seq Scan on t1 t1_2
++                     Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
++               ->  Seq Scan on t2 t1_2_1
++                     Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
++               ->  Seq Scan on t3 t1_2_2
++                     Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
++(37 rows)
+ 
+ UPDATE t1 t1_1 SET b = t1_2.b FROM t1 t1_2
+ WHERE t1_1.a = 4 AND t1_2.a = t1_1.a AND t1_2.b = t1_1.b
+@@ -1537,39 +1438,27 @@ SELECT * FROM t1 ORDER BY a,b;
+ SET SESSION AUTHORIZATION regress_rls_bob;
+ SET row_security TO ON;
+ EXPLAIN (COSTS OFF) DELETE FROM only t1 WHERE f_leak(b);
+-                QUERY PLAN                 
+--------------------------------------------
+- Delete on t1 t1_1
+-   ->  Subquery Scan on t1
+-         Filter: f_leak(t1.b)
+-         ->  LockRows
+-               ->  Seq Scan on t1 t1_2
+-                     Filter: ((a % 2) = 0)
+-(6 rows)
++                  QUERY PLAN                   
++-----------------------------------------------
++ Delete on t1
++   ->  Seq Scan on t1
++         Filter: (((a % 2) = 0) AND f_leak(b))
++(3 rows)
+ 
+ EXPLAIN (COSTS OFF) DELETE FROM t1 WHERE f_leak(b);
+-                QUERY PLAN                 
+--------------------------------------------
+- Delete on t1 t1_3
+-   Delete on t1 t1_3
+-   Delete on t2 t1
+-   Delete on t3 t1
+-   ->  Subquery Scan on t1
+-         Filter: f_leak(t1.b)
+-         ->  LockRows
+-               ->  Seq Scan on t1 t1_4
+-                     Filter: ((a % 2) = 0)
+-   ->  Subquery Scan on t1_1
+-         Filter: f_leak(t1_1.b)
+-         ->  LockRows
+-               ->  Seq Scan on t2
+-                     Filter: ((a % 2) = 0)
+-   ->  Subquery Scan on t1_2
+-         Filter: f_leak(t1_2.b)
+-         ->  LockRows
+-               ->  Seq Scan on t3
+-                     Filter: ((a % 2) = 0)
+-(19 rows)
++                  QUERY PLAN                   
++-----------------------------------------------
++ Delete on t1
++   Delete on t1
++   Delete on t2
++   Delete on t3
++   ->  Seq Scan on t1
++         Filter: (((a % 2) = 0) AND f_leak(b))
++   ->  Seq Scan on t2
++         Filter: (((a % 2) = 0) AND f_leak(b))
++   ->  Seq Scan on t3
++         Filter: (((a % 2) = 0) AND f_leak(b))
++(10 rows)
+ 
+ DELETE FROM only t1 WHERE f_leak(b) RETURNING oid, *, t1;
+ NOTICE:  f_leak => bbbbbb_updt
+@@ -1634,30 +1523,22 @@ INSERT INTO bv1 VALUES (11, 'xxx'); -- should fail RLS check
+ ERROR:  new row violates row-level security policy for table "b1"
+ INSERT INTO bv1 VALUES (12, 'xxx'); -- ok
+ EXPLAIN (COSTS OFF) UPDATE bv1 SET b = 'yyy' WHERE a = 4 AND f_leak(b);
+-                                QUERY PLAN                                 
+----------------------------------------------------------------------------
+- Update on b1 b1_1
+-   ->  Subquery Scan on b1
+-         Filter: f_leak(b1.b)
+-         ->  Subquery Scan on b1_2
+-               ->  LockRows
+-                     ->  Seq Scan on b1 b1_3
+-                           Filter: ((a > 0) AND (a = 4) AND ((a % 2) = 0))
+-(7 rows)
++                              QUERY PLAN                               
++-----------------------------------------------------------------------
++ Update on b1
++   ->  Seq Scan on b1
++         Filter: ((a > 0) AND (a = 4) AND ((a % 2) = 0) AND f_leak(b))
++(3 rows)
+ 
+ UPDATE bv1 SET b = 'yyy' WHERE a = 4 AND f_leak(b);
+ NOTICE:  f_leak => a87ff679a2f3e71d9181a67b7542122c
+ EXPLAIN (COSTS OFF) DELETE FROM bv1 WHERE a = 6 AND f_leak(b);
+-                                QUERY PLAN                                 
+----------------------------------------------------------------------------
+- Delete on b1 b1_1
+-   ->  Subquery Scan on b1
+-         Filter: f_leak(b1.b)
+-         ->  Subquery Scan on b1_2
+-               ->  LockRows
+-                     ->  Seq Scan on b1 b1_3
+-                           Filter: ((a > 0) AND (a = 6) AND ((a % 2) = 0))
+-(7 rows)
++                              QUERY PLAN                               
++-----------------------------------------------------------------------
++ Delete on b1
++   ->  Seq Scan on b1
++         Filter: ((a > 0) AND (a = 6) AND ((a % 2) = 0) AND f_leak(b))
++(3 rows)
+ 
+ DELETE FROM bv1 WHERE a = 6 AND f_leak(b);
+ NOTICE:  f_leak => 1679091c5a880faf6fb5e6087eb1b2dc
+@@ -1848,53 +1729,45 @@ NOTICE:  f_leak => dad
+ (2 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM z1 WHERE f_leak(b);
+-          QUERY PLAN           
+--------------------------------
+- Subquery Scan on z1
+-   Filter: f_leak(z1.b)
+-   ->  Seq Scan on z1 z1_1
+-         Filter: ((a % 2) = 0)
+-(4 rows)
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 0) AND f_leak(b))
++(2 rows)
+ 
+ PREPARE plancache_test AS SELECT * FROM z1 WHERE f_leak(b);
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test;
+-          QUERY PLAN           
+--------------------------------
+- Subquery Scan on z1
+-   Filter: f_leak(z1.b)
+-   ->  Seq Scan on z1 z1_1
+-         Filter: ((a % 2) = 0)
+-(4 rows)
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 0) AND f_leak(b))
++(2 rows)
+ 
+ PREPARE plancache_test2 AS WITH q AS (SELECT * FROM z1 WHERE f_leak(b)) SELECT * FROM q,z2;
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test2;
+-              QUERY PLAN               
+----------------------------------------
++                   QUERY PLAN                    
++-------------------------------------------------
+  Nested Loop
+    CTE q
+-     ->  Subquery Scan on z1
+-           Filter: f_leak(z1.b)
+-           ->  Seq Scan on z1 z1_1
+-                 Filter: ((a % 2) = 0)
++     ->  Seq Scan on z1
++           Filter: (((a % 2) = 0) AND f_leak(b))
+    ->  CTE Scan on q
+    ->  Materialize
+          ->  Seq Scan on z2
+-(9 rows)
++(7 rows)
+ 
+ PREPARE plancache_test3 AS WITH q AS (SELECT * FROM z2) SELECT * FROM q,z1 WHERE f_leak(z1.b);
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test3;
+-                QUERY PLAN                 
+--------------------------------------------
++                     QUERY PLAN                      
++-----------------------------------------------------
+  Nested Loop
+    CTE q
+      ->  Seq Scan on z2
+    ->  CTE Scan on q
+    ->  Materialize
+-         ->  Subquery Scan on z1
+-               Filter: f_leak(z1.b)
+-               ->  Seq Scan on z1 z1_1
+-                     Filter: ((a % 2) = 0)
+-(9 rows)
++         ->  Seq Scan on z1
++               Filter: (((a % 2) = 0) AND f_leak(b))
++(7 rows)
+ 
+ SET ROLE regress_rls_group1;
+ SELECT * FROM z1 WHERE f_leak(b);
+@@ -1907,50 +1780,42 @@ NOTICE:  f_leak => dad
+ (2 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM z1 WHERE f_leak(b);
+-          QUERY PLAN           
+--------------------------------
+- Subquery Scan on z1
+-   Filter: f_leak(z1.b)
+-   ->  Seq Scan on z1 z1_1
+-         Filter: ((a % 2) = 0)
+-(4 rows)
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 0) AND f_leak(b))
++(2 rows)
+ 
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test;
+-          QUERY PLAN           
+--------------------------------
+- Subquery Scan on z1
+-   Filter: f_leak(z1.b)
+-   ->  Seq Scan on z1 z1_1
+-         Filter: ((a % 2) = 0)
+-(4 rows)
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 0) AND f_leak(b))
++(2 rows)
+ 
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test2;
+-              QUERY PLAN               
+----------------------------------------
++                   QUERY PLAN                    
++-------------------------------------------------
+  Nested Loop
+    CTE q
+-     ->  Subquery Scan on z1
+-           Filter: f_leak(z1.b)
+-           ->  Seq Scan on z1 z1_1
+-                 Filter: ((a % 2) = 0)
++     ->  Seq Scan on z1
++           Filter: (((a % 2) = 0) AND f_leak(b))
+    ->  CTE Scan on q
+    ->  Materialize
+          ->  Seq Scan on z2
+-(9 rows)
++(7 rows)
+ 
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test3;
+-                QUERY PLAN                 
+--------------------------------------------
++                     QUERY PLAN                      
++-----------------------------------------------------
+  Nested Loop
+    CTE q
+      ->  Seq Scan on z2
+    ->  CTE Scan on q
+    ->  Materialize
+-         ->  Subquery Scan on z1
+-               Filter: f_leak(z1.b)
+-               ->  Seq Scan on z1 z1_1
+-                     Filter: ((a % 2) = 0)
+-(9 rows)
++         ->  Seq Scan on z1
++               Filter: (((a % 2) = 0) AND f_leak(b))
++(7 rows)
+ 
+ SET SESSION AUTHORIZATION regress_rls_carol;
+ SELECT * FROM z1 WHERE f_leak(b);
+@@ -1963,50 +1828,42 @@ NOTICE:  f_leak => ccc
+ (2 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM z1 WHERE f_leak(b);
+-          QUERY PLAN           
+--------------------------------
+- Subquery Scan on z1
+-   Filter: f_leak(z1.b)
+-   ->  Seq Scan on z1 z1_1
+-         Filter: ((a % 2) = 1)
+-(4 rows)
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 1) AND f_leak(b))
++(2 rows)
+ 
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test;
+-          QUERY PLAN           
+--------------------------------
+- Subquery Scan on z1
+-   Filter: f_leak(z1.b)
+-   ->  Seq Scan on z1 z1_1
+-         Filter: ((a % 2) = 1)
+-(4 rows)
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 1) AND f_leak(b))
++(2 rows)
+ 
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test2;
+-              QUERY PLAN               
+----------------------------------------
++                   QUERY PLAN                    
++-------------------------------------------------
+  Nested Loop
+    CTE q
+-     ->  Subquery Scan on z1
+-           Filter: f_leak(z1.b)
+-           ->  Seq Scan on z1 z1_1
+-                 Filter: ((a % 2) = 1)
++     ->  Seq Scan on z1
++           Filter: (((a % 2) = 1) AND f_leak(b))
+    ->  CTE Scan on q
+    ->  Materialize
+          ->  Seq Scan on z2
+-(9 rows)
++(7 rows)
+ 
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test3;
+-                QUERY PLAN                 
+--------------------------------------------
++                     QUERY PLAN                      
++-----------------------------------------------------
+  Nested Loop
+    CTE q
+      ->  Seq Scan on z2
+    ->  CTE Scan on q
+    ->  Materialize
+-         ->  Subquery Scan on z1
+-               Filter: f_leak(z1.b)
+-               ->  Seq Scan on z1 z1_1
+-                     Filter: ((a % 2) = 1)
+-(9 rows)
++         ->  Seq Scan on z1
++               Filter: (((a % 2) = 1) AND f_leak(b))
++(7 rows)
+ 
+ SET ROLE regress_rls_group2;
+ SELECT * FROM z1 WHERE f_leak(b);
+@@ -2019,50 +1876,42 @@ NOTICE:  f_leak => ccc
+ (2 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM z1 WHERE f_leak(b);
+-          QUERY PLAN           
+--------------------------------
+- Subquery Scan on z1
+-   Filter: f_leak(z1.b)
+-   ->  Seq Scan on z1 z1_1
+-         Filter: ((a % 2) = 1)
+-(4 rows)
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 1) AND f_leak(b))
++(2 rows)
+ 
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test;
+-          QUERY PLAN           
+--------------------------------
+- Subquery Scan on z1
+-   Filter: f_leak(z1.b)
+-   ->  Seq Scan on z1 z1_1
+-         Filter: ((a % 2) = 1)
+-(4 rows)
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 1) AND f_leak(b))
++(2 rows)
+ 
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test2;
+-              QUERY PLAN               
+----------------------------------------
++                   QUERY PLAN                    
++-------------------------------------------------
+  Nested Loop
+    CTE q
+-     ->  Subquery Scan on z1
+-           Filter: f_leak(z1.b)
+-           ->  Seq Scan on z1 z1_1
+-                 Filter: ((a % 2) = 1)
++     ->  Seq Scan on z1
++           Filter: (((a % 2) = 1) AND f_leak(b))
+    ->  CTE Scan on q
+    ->  Materialize
+          ->  Seq Scan on z2
+-(9 rows)
++(7 rows)
+ 
+ EXPLAIN (COSTS OFF) EXECUTE plancache_test3;
+-                QUERY PLAN                 
+--------------------------------------------
++                     QUERY PLAN                      
++-----------------------------------------------------
+  Nested Loop
+    CTE q
+      ->  Seq Scan on z2
+    ->  CTE Scan on q
+    ->  Materialize
+-         ->  Subquery Scan on z1
+-               Filter: f_leak(z1.b)
+-               ->  Seq Scan on z1 z1_1
+-                     Filter: ((a % 2) = 1)
+-(9 rows)
++         ->  Seq Scan on z1
++               Filter: (((a % 2) = 1) AND f_leak(b))
++(7 rows)
+ 
+ --
+ -- Views should follow policy for view owner.
+@@ -2133,13 +1982,11 @@ NOTICE:  f_leak => dad
+ (2 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
+-          QUERY PLAN           
+--------------------------------
+- Subquery Scan on z1
+-   Filter: f_leak(z1.b)
+-   ->  Seq Scan on z1 z1_1
+-         Filter: ((a % 2) = 0)
+-(4 rows)
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 0) AND f_leak(b))
++(2 rows)
+ 
+ -- Query as role that is not owner of table but is owner of view.
+ -- Should return records based on view owner policies.
+@@ -2154,13 +2001,11 @@ NOTICE:  f_leak => dad
+ (2 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
+-          QUERY PLAN           
+--------------------------------
+- Subquery Scan on z1
+-   Filter: f_leak(z1.b)
+-   ->  Seq Scan on z1 z1_1
+-         Filter: ((a % 2) = 0)
+-(4 rows)
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 0) AND f_leak(b))
++(2 rows)
+ 
+ -- Query as role that is not the owner of the table or view without permissions.
+ SET SESSION AUTHORIZATION regress_rls_carol;
+@@ -2181,13 +2026,11 @@ NOTICE:  f_leak => dad
+ (2 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
+-          QUERY PLAN           
+--------------------------------
+- Subquery Scan on z1
+-   Filter: f_leak(z1.b)
+-   ->  Seq Scan on z1 z1_1
+-         Filter: ((a % 2) = 0)
+-(4 rows)
++               QUERY PLAN                
++-----------------------------------------
++ Seq Scan on z1
++   Filter: (((a % 2) = 0) AND f_leak(b))
++(2 rows)
+ 
+ SET SESSION AUTHORIZATION regress_rls_bob;
+ DROP VIEW rls_view;
+@@ -2333,13 +2176,11 @@ SET SESSION AUTHORIZATION regress_rls_bob;
+ CREATE VIEW rls_sbv WITH (security_barrier) AS
+     SELECT * FROM y1 WHERE f_leak(b);
+ EXPLAIN (COSTS OFF) SELECT * FROM rls_sbv WHERE (a = 1);
+-                        QUERY PLAN                        
+-----------------------------------------------------------
+- Subquery Scan on y1
+-   Filter: f_leak(y1.b)
+-   ->  Seq Scan on y1 y1_1
+-         Filter: ((a = 1) AND ((a > 2) OR ((a % 2) = 0)))
+-(4 rows)
++                            QUERY PLAN                            
++------------------------------------------------------------------
++ Seq Scan on y1
++   Filter: ((a = 1) AND ((a > 2) OR ((a % 2) = 0)) AND f_leak(b))
++(2 rows)
+ 
+ DROP VIEW rls_sbv;
+ --
+@@ -2384,13 +2225,11 @@ NOTICE:  f_leak => 98f13708210194c475687be6106a3b84
+ (14 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM y2 WHERE f_leak(b);
+-                            QUERY PLAN                             
+--------------------------------------------------------------------
+- Subquery Scan on y2
+-   Filter: f_leak(y2.b)
+-   ->  Seq Scan on y2 y2_1
+-         Filter: (((a % 4) = 0) OR ((a % 3) = 0) OR ((a % 2) = 0))
+-(4 rows)
++                                 QUERY PLAN                                  
++-----------------------------------------------------------------------------
++ Seq Scan on y2
++   Filter: ((((a % 4) = 0) OR ((a % 3) = 0) OR ((a % 2) = 0)) AND f_leak(b))
++(2 rows)
+ 
+ --
+ -- Qual push-down of leaky functions, when not referring to table
+@@ -2485,17 +2324,15 @@ NOTICE:  f_leak => 98f13708210194c475687be6106a3b84
+ (0 rows)
+ 
+ EXPLAIN (COSTS OFF) SELECT * FROM y2 JOIN test_qual_pushdown ON (b = abc) WHERE f_leak(b);
+-                                  QUERY PLAN                                   
+--------------------------------------------------------------------------------
++                                       QUERY PLAN                                        
++-----------------------------------------------------------------------------------------
+  Hash Join
+    Hash Cond: (test_qual_pushdown.abc = y2.b)
+    ->  Seq Scan on test_qual_pushdown
+    ->  Hash
+-         ->  Subquery Scan on y2
+-               Filter: f_leak(y2.b)
+-               ->  Seq Scan on y2 y2_1
+-                     Filter: (((a % 4) = 0) OR ((a % 3) = 0) OR ((a % 2) = 0))
+-(8 rows)
++         ->  Seq Scan on y2
++               Filter: ((((a % 4) = 0) OR ((a % 3) = 0) OR ((a % 2) = 0)) AND f_leak(b))
++(6 rows)
+ 
+ DROP TABLE test_qual_pushdown;
+ --
+@@ -2581,15 +2418,13 @@ NOTICE:  f_leak => 98f13708210194c475687be6106a3b84
+ (11 rows)
+ 
+ EXPLAIN (COSTS OFF) WITH cte1 AS (SELECT * FROM t1 WHERE f_leak(b)) SELECT * FROM cte1;
+-              QUERY PLAN               
+----------------------------------------
++                   QUERY PLAN                    
++-------------------------------------------------
+  CTE Scan on cte1
+    CTE cte1
+-     ->  Subquery Scan on t1
+-           Filter: f_leak(t1.b)
+-           ->  Seq Scan on t1 t1_1
+-                 Filter: ((a % 2) = 0)
+-(6 rows)
++     ->  Seq Scan on t1
++           Filter: (((a % 2) = 0) AND f_leak(b))
++(4 rows)
+ 
+ WITH cte1 AS (UPDATE t1 SET a = a + 1 RETURNING *) SELECT * FROM cte1; --fail
+ ERROR:  new row violates row-level security policy for table "t1"
+@@ -3100,17 +2935,13 @@ SELECT * FROM current_check;
+ 
+ -- Plan should be a subquery TID scan
+ EXPLAIN (COSTS OFF) UPDATE current_check SET payload = payload WHERE CURRENT OF current_check_cursor;
+-                             QUERY PLAN                              
+----------------------------------------------------------------------
+- Update on current_check current_check_1
+-   ->  Subquery Scan on current_check
+-         ->  Subquery Scan on current_check_2
+-               Filter: ((current_check_2.currentid % 2) = 0)
+-               ->  LockRows
+-                     ->  Tid Scan on current_check current_check_3
+-                           TID Cond: CURRENT OF current_check_cursor
+-                           Filter: (currentid = 4)
+-(8 rows)
++                         QUERY PLAN                          
++-------------------------------------------------------------
++ Update on current_check
++   ->  Tid Scan on current_check
++         TID Cond: CURRENT OF current_check_cursor
++         Filter: ((currentid = 4) AND ((currentid % 2) = 0))
++(4 rows)
+ 
+ -- Similarly can only delete row 4
+ FETCH ABSOLUTE 1 FROM current_check_cursor;
+diff --git a/src/test/regress/expected/updatable_views.out b/src/test/regress/expected/updatable_views.out
+index 6fba613f0f55..2da3c069e112 100644
+--- a/src/test/regress/expected/updatable_views.out
++++ b/src/test/regress/expected/updatable_views.out
+@@ -1896,26 +1896,20 @@ EXPLAIN (costs off) SELECT * FROM rw_view1 WHERE snoop(person);
+ (4 rows)
+ 
+ EXPLAIN (costs off) UPDATE rw_view1 SET person=person WHERE snoop(person);
+-                        QUERY PLAN                         
+------------------------------------------------------------
+- Update on base_tbl base_tbl_1
+-   ->  Subquery Scan on base_tbl
+-         Filter: snoop(base_tbl.person)
+-         ->  LockRows
+-               ->  Seq Scan on base_tbl base_tbl_2
+-                     Filter: (visibility = 'public'::text)
+-(6 rows)
++                            QUERY PLAN                             
++-------------------------------------------------------------------
++ Update on base_tbl
++   ->  Seq Scan on base_tbl
++         Filter: ((visibility = 'public'::text) AND snoop(person))
++(3 rows)
+ 
+ EXPLAIN (costs off) DELETE FROM rw_view1 WHERE NOT snoop(person);
+-                        QUERY PLAN                         
+------------------------------------------------------------
+- Delete on base_tbl base_tbl_1
+-   ->  Subquery Scan on base_tbl
+-         Filter: (NOT snoop(base_tbl.person))
+-         ->  LockRows
+-               ->  Seq Scan on base_tbl base_tbl_2
+-                     Filter: (visibility = 'public'::text)
+-(6 rows)
++                               QUERY PLAN                                
++-------------------------------------------------------------------------
++ Delete on base_tbl
++   ->  Seq Scan on base_tbl
++         Filter: ((visibility = 'public'::text) AND (NOT snoop(person)))
++(3 rows)
+ 
+ -- security barrier view on top of security barrier view
+ CREATE VIEW rw_view2 WITH (security_barrier = true) AS
+@@ -1978,30 +1972,20 @@ EXPLAIN (costs off) SELECT * FROM rw_view2 WHERE snoop(person);
+ (6 rows)
+ 
+ EXPLAIN (costs off) UPDATE rw_view2 SET person=person WHERE snoop(person);
+-                           QUERY PLAN                            
+------------------------------------------------------------------
+- Update on base_tbl base_tbl_1
+-   ->  Subquery Scan on base_tbl
+-         Filter: snoop(base_tbl.person)
+-         ->  Subquery Scan on base_tbl_2
+-               Filter: snoop(base_tbl_2.person)
+-               ->  LockRows
+-                     ->  Seq Scan on base_tbl base_tbl_3
+-                           Filter: (visibility = 'public'::text)
+-(8 rows)
++                                     QUERY PLAN                                      
++-------------------------------------------------------------------------------------
++ Update on base_tbl
++   ->  Seq Scan on base_tbl
++         Filter: ((visibility = 'public'::text) AND snoop(person) AND snoop(person))
++(3 rows)
+ 
+ EXPLAIN (costs off) DELETE FROM rw_view2 WHERE NOT snoop(person);
+-                           QUERY PLAN                            
+------------------------------------------------------------------
+- Delete on base_tbl base_tbl_1
+-   ->  Subquery Scan on base_tbl
+-         Filter: (NOT snoop(base_tbl.person))
+-         ->  Subquery Scan on base_tbl_2
+-               Filter: snoop(base_tbl_2.person)
+-               ->  LockRows
+-                     ->  Seq Scan on base_tbl base_tbl_3
+-                           Filter: (visibility = 'public'::text)
+-(8 rows)
++                                        QUERY PLAN                                         
++-------------------------------------------------------------------------------------------
++ Delete on base_tbl
++   ->  Seq Scan on base_tbl
++         Filter: ((visibility = 'public'::text) AND snoop(person) AND (NOT snoop(person)))
++(3 rows)
+ 
+ DROP TABLE base_tbl CASCADE;
+ NOTICE:  drop cascades to 2 other objects
+@@ -2026,18 +2010,16 @@ SELECT * FROM rw_view1;
+ (1 row)
+ 
+ EXPLAIN (costs off) DELETE FROM rw_view1 WHERE id = 1 AND snoop(data);
+-                               QUERY PLAN                                
+--------------------------------------------------------------------------
++                            QUERY PLAN                             
++-------------------------------------------------------------------
+  Update on base_tbl base_tbl_1
+    ->  Nested Loop
+          ->  Index Scan using base_tbl_pkey on base_tbl base_tbl_1
+                Index Cond: (id = 1)
+-         ->  Subquery Scan on base_tbl
+-               Filter: snoop(base_tbl.data)
+-               ->  Index Scan using base_tbl_pkey on base_tbl base_tbl_2
+-                     Index Cond: (id = 1)
+-                     Filter: (NOT deleted)
+-(9 rows)
++         ->  Index Scan using base_tbl_pkey on base_tbl
++               Index Cond: (id = 1)
++               Filter: ((NOT deleted) AND snoop(data))
++(7 rows)
+ 
+ DELETE FROM rw_view1 WHERE id = 1 AND snoop(data);
+ NOTICE:  snooped value: Row 1
+@@ -2114,85 +2096,45 @@ SELECT * FROM v1 WHERE a=8;
+ (4 rows)
+ 
+ EXPLAIN (VERBOSE, COSTS OFF)
+-UPDATE v1 SET a=100 WHERE snoop(a) AND leakproof(a) AND a = 3;
+-                                                             QUERY PLAN                                                             
+-------------------------------------------------------------------------------------------------------------------------------------
+- Update on public.t1 t1_4
+-   Update on public.t1 t1_4
+-   Update on public.t11 t1
+-   Update on public.t12 t1
+-   Update on public.t111 t1
+-   ->  Subquery Scan on t1
++UPDATE v1 SET a=100 WHERE snoop(a) AND leakproof(a) AND a < 7 AND a != 6;
++                                                        QUERY PLAN                                                         
++---------------------------------------------------------------------------------------------------------------------------
++ Update on public.t1
++   Update on public.t1
++   Update on public.t11
++   Update on public.t12
++   Update on public.t111
++   ->  Index Scan using t1_a_idx on public.t1
+          Output: 100, t1.b, t1.c, t1.ctid
+-         Filter: snoop(t1.a)
+-         ->  LockRows
+-               Output: t1_5.ctid, t1_5.a, t1_5.b, t1_5.c, t1_5.ctid, t12.ctid, t12.tableoid
+-               ->  Nested Loop Semi Join
+-                     Output: t1_5.ctid, t1_5.a, t1_5.b, t1_5.c, t1_5.ctid, t12.ctid, t12.tableoid
+-                     ->  Seq Scan on public.t1 t1_5
+-                           Output: t1_5.ctid, t1_5.a, t1_5.b, t1_5.c
+-                           Filter: ((t1_5.a > 5) AND (t1_5.a = 3) AND leakproof(t1_5.a))
+-                     ->  Append
+-                           ->  Seq Scan on public.t12
+-                                 Output: t12.ctid, t12.tableoid, t12.a
+-                                 Filter: (t12.a = 3)
+-                           ->  Seq Scan on public.t111
+-                                 Output: t111.ctid, t111.tableoid, t111.a
+-                                 Filter: (t111.a = 3)
+-   ->  Subquery Scan on t1_1
+-         Output: 100, t1_1.b, t1_1.c, t1_1.d, t1_1.ctid
+-         Filter: snoop(t1_1.a)
+-         ->  LockRows
+-               Output: t11.ctid, t11.a, t11.b, t11.c, t11.d, t11.ctid, t12_1.ctid, t12_1.tableoid
+-               ->  Nested Loop Semi Join
+-                     Output: t11.ctid, t11.a, t11.b, t11.c, t11.d, t11.ctid, t12_1.ctid, t12_1.tableoid
+-                     ->  Seq Scan on public.t11
+-                           Output: t11.ctid, t11.a, t11.b, t11.c, t11.d
+-                           Filter: ((t11.a > 5) AND (t11.a = 3) AND leakproof(t11.a))
+-                     ->  Append
+-                           ->  Seq Scan on public.t12 t12_1
+-                                 Output: t12_1.ctid, t12_1.tableoid, t12_1.a
+-                                 Filter: (t12_1.a = 3)
+-                           ->  Seq Scan on public.t111 t111_1
+-                                 Output: t111_1.ctid, t111_1.tableoid, t111_1.a
+-                                 Filter: (t111_1.a = 3)
+-   ->  Subquery Scan on t1_2
+-         Output: 100, t1_2.b, t1_2.c, t1_2.e, t1_2.ctid
+-         Filter: snoop(t1_2.a)
+-         ->  LockRows
+-               Output: t12_2.ctid, t12_2.a, t12_2.b, t12_2.c, t12_2.e, t12_2.ctid, t12_3.ctid, t12_3.tableoid
+-               ->  Nested Loop Semi Join
+-                     Output: t12_2.ctid, t12_2.a, t12_2.b, t12_2.c, t12_2.e, t12_2.ctid, t12_3.ctid, t12_3.tableoid
+-                     ->  Seq Scan on public.t12 t12_2
+-                           Output: t12_2.ctid, t12_2.a, t12_2.b, t12_2.c, t12_2.e
+-                           Filter: ((t12_2.a > 5) AND (t12_2.a = 3) AND leakproof(t12_2.a))
+-                     ->  Append
+-                           ->  Seq Scan on public.t12 t12_3
+-                                 Output: t12_3.ctid, t12_3.tableoid, t12_3.a
+-                                 Filter: (t12_3.a = 3)
+-                           ->  Seq Scan on public.t111 t111_2
+-                                 Output: t111_2.ctid, t111_2.tableoid, t111_2.a
+-                                 Filter: (t111_2.a = 3)
+-   ->  Subquery Scan on t1_3
+-         Output: 100, t1_3.b, t1_3.c, t1_3.d, t1_3.e, t1_3.ctid
+-         Filter: snoop(t1_3.a)
+-         ->  LockRows
+-               Output: t111_3.ctid, t111_3.a, t111_3.b, t111_3.c, t111_3.d, t111_3.e, t111_3.ctid, t12_4.ctid, t12_4.tableoid
+-               ->  Nested Loop Semi Join
+-                     Output: t111_3.ctid, t111_3.a, t111_3.b, t111_3.c, t111_3.d, t111_3.e, t111_3.ctid, t12_4.ctid, t12_4.tableoid
+-                     ->  Seq Scan on public.t111 t111_3
+-                           Output: t111_3.ctid, t111_3.a, t111_3.b, t111_3.c, t111_3.d, t111_3.e
+-                           Filter: ((t111_3.a > 5) AND (t111_3.a = 3) AND leakproof(t111_3.a))
+-                     ->  Append
+-                           ->  Seq Scan on public.t12 t12_4
+-                                 Output: t12_4.ctid, t12_4.tableoid, t12_4.a
+-                                 Filter: (t12_4.a = 3)
+-                           ->  Seq Scan on public.t111 t111_4
+-                                 Output: t111_4.ctid, t111_4.tableoid, t111_4.a
+-                                 Filter: (t111_4.a = 3)
+-(73 rows)
+-
+-UPDATE v1 SET a=100 WHERE snoop(a) AND leakproof(a) AND a = 3;
++         Index Cond: ((t1.a > 5) AND (t1.a < 7))
++         Filter: ((t1.a <> 6) AND (alternatives: SubPlan 1 or hashed SubPlan 2) AND snoop(t1.a) AND leakproof(t1.a))
++         SubPlan 1
++           ->  Append
++                 ->  Seq Scan on public.t12 t12_1
++                       Filter: (t12_1.a = t1.a)
++                 ->  Seq Scan on public.t111 t111_1
++                       Filter: (t111_1.a = t1.a)
++         SubPlan 2
++           ->  Append
++                 ->  Seq Scan on public.t12 t12_2
++                       Output: t12_2.a
++                 ->  Seq Scan on public.t111 t111_2
++                       Output: t111_2.a
++   ->  Index Scan using t11_a_idx on public.t11
++         Output: 100, t11.b, t11.c, t11.d, t11.ctid
++         Index Cond: ((t11.a > 5) AND (t11.a < 7))
++         Filter: ((t11.a <> 6) AND (alternatives: SubPlan 1 or hashed SubPlan 2) AND snoop(t11.a) AND leakproof(t11.a))
++   ->  Index Scan using t12_a_idx on public.t12
++         Output: 100, t12.b, t12.c, t12.e, t12.ctid
++         Index Cond: ((t12.a > 5) AND (t12.a < 7))
++         Filter: ((t12.a <> 6) AND (alternatives: SubPlan 1 or hashed SubPlan 2) AND snoop(t12.a) AND leakproof(t12.a))
++   ->  Index Scan using t111_a_idx on public.t111
++         Output: 100, t111.b, t111.c, t111.d, t111.e, t111.ctid
++         Index Cond: ((t111.a > 5) AND (t111.a < 7))
++         Filter: ((t111.a <> 6) AND (alternatives: SubPlan 1 or hashed SubPlan 2) AND snoop(t111.a) AND leakproof(t111.a))
++(33 rows)
++
++UPDATE v1 SET a=100 WHERE snoop(a) AND leakproof(a) AND a < 7 AND a != 6;
+ SELECT * FROM v1 WHERE a=100; -- Nothing should have been changed to 100
+  a | b | c | d 
+ ---+---+---+---
+@@ -2205,82 +2147,42 @@ SELECT * FROM t1 WHERE a=100; -- Nothing should have been changed to 100
+ 
+ EXPLAIN (VERBOSE, COSTS OFF)
+ UPDATE v1 SET a=a+1 WHERE snoop(a) AND leakproof(a) AND a = 8;
+-                                                             QUERY PLAN                                                             
+-------------------------------------------------------------------------------------------------------------------------------------
+- Update on public.t1 t1_4
+-   Update on public.t1 t1_4
+-   Update on public.t11 t1
+-   Update on public.t12 t1
+-   Update on public.t111 t1
+-   ->  Subquery Scan on t1
++                                               QUERY PLAN                                                
++---------------------------------------------------------------------------------------------------------
++ Update on public.t1
++   Update on public.t1
++   Update on public.t11
++   Update on public.t12
++   Update on public.t111
++   ->  Index Scan using t1_a_idx on public.t1
+          Output: (t1.a + 1), t1.b, t1.c, t1.ctid
+-         Filter: snoop(t1.a)
+-         ->  LockRows
+-               Output: t1_5.a, t1_5.ctid, t1_5.b, t1_5.c, t1_5.ctid, t12.ctid, t12.tableoid
+-               ->  Nested Loop Semi Join
+-                     Output: t1_5.a, t1_5.ctid, t1_5.b, t1_5.c, t1_5.ctid, t12.ctid, t12.tableoid
+-                     ->  Seq Scan on public.t1 t1_5
+-                           Output: t1_5.a, t1_5.ctid, t1_5.b, t1_5.c
+-                           Filter: ((t1_5.a > 5) AND (t1_5.a = 8) AND leakproof(t1_5.a))
+-                     ->  Append
+-                           ->  Seq Scan on public.t12
+-                                 Output: t12.ctid, t12.tableoid, t12.a
+-                                 Filter: (t12.a = 8)
+-                           ->  Seq Scan on public.t111
+-                                 Output: t111.ctid, t111.tableoid, t111.a
+-                                 Filter: (t111.a = 8)
+-   ->  Subquery Scan on t1_1
+-         Output: (t1_1.a + 1), t1_1.b, t1_1.c, t1_1.d, t1_1.ctid
+-         Filter: snoop(t1_1.a)
+-         ->  LockRows
+-               Output: t11.a, t11.ctid, t11.b, t11.c, t11.d, t11.ctid, t12_1.ctid, t12_1.tableoid
+-               ->  Nested Loop Semi Join
+-                     Output: t11.a, t11.ctid, t11.b, t11.c, t11.d, t11.ctid, t12_1.ctid, t12_1.tableoid
+-                     ->  Seq Scan on public.t11
+-                           Output: t11.a, t11.ctid, t11.b, t11.c, t11.d
+-                           Filter: ((t11.a > 5) AND (t11.a = 8) AND leakproof(t11.a))
+-                     ->  Append
+-                           ->  Seq Scan on public.t12 t12_1
+-                                 Output: t12_1.ctid, t12_1.tableoid, t12_1.a
+-                                 Filter: (t12_1.a = 8)
+-                           ->  Seq Scan on public.t111 t111_1
+-                                 Output: t111_1.ctid, t111_1.tableoid, t111_1.a
+-                                 Filter: (t111_1.a = 8)
+-   ->  Subquery Scan on t1_2
+-         Output: (t1_2.a + 1), t1_2.b, t1_2.c, t1_2.e, t1_2.ctid
+-         Filter: snoop(t1_2.a)
+-         ->  LockRows
+-               Output: t12_2.a, t12_2.ctid, t12_2.b, t12_2.c, t12_2.e, t12_2.ctid, t12_3.ctid, t12_3.tableoid
+-               ->  Nested Loop Semi Join
+-                     Output: t12_2.a, t12_2.ctid, t12_2.b, t12_2.c, t12_2.e, t12_2.ctid, t12_3.ctid, t12_3.tableoid
+-                     ->  Seq Scan on public.t12 t12_2
+-                           Output: t12_2.a, t12_2.ctid, t12_2.b, t12_2.c, t12_2.e
+-                           Filter: ((t12_2.a > 5) AND (t12_2.a = 8) AND leakproof(t12_2.a))
+-                     ->  Append
+-                           ->  Seq Scan on public.t12 t12_3
+-                                 Output: t12_3.ctid, t12_3.tableoid, t12_3.a
+-                                 Filter: (t12_3.a = 8)
+-                           ->  Seq Scan on public.t111 t111_2
+-                                 Output: t111_2.ctid, t111_2.tableoid, t111_2.a
+-                                 Filter: (t111_2.a = 8)
+-   ->  Subquery Scan on t1_3
+-         Output: (t1_3.a + 1), t1_3.b, t1_3.c, t1_3.d, t1_3.e, t1_3.ctid
+-         Filter: snoop(t1_3.a)
+-         ->  LockRows
+-               Output: t111_3.a, t111_3.ctid, t111_3.b, t111_3.c, t111_3.d, t111_3.e, t111_3.ctid, t12_4.ctid, t12_4.tableoid
+-               ->  Nested Loop Semi Join
+-                     Output: t111_3.a, t111_3.ctid, t111_3.b, t111_3.c, t111_3.d, t111_3.e, t111_3.ctid, t12_4.ctid, t12_4.tableoid
+-                     ->  Seq Scan on public.t111 t111_3
+-                           Output: t111_3.a, t111_3.ctid, t111_3.b, t111_3.c, t111_3.d, t111_3.e
+-                           Filter: ((t111_3.a > 5) AND (t111_3.a = 8) AND leakproof(t111_3.a))
+-                     ->  Append
+-                           ->  Seq Scan on public.t12 t12_4
+-                                 Output: t12_4.ctid, t12_4.tableoid, t12_4.a
+-                                 Filter: (t12_4.a = 8)
+-                           ->  Seq Scan on public.t111 t111_4
+-                                 Output: t111_4.ctid, t111_4.tableoid, t111_4.a
+-                                 Filter: (t111_4.a = 8)
+-(73 rows)
++         Index Cond: ((t1.a > 5) AND (t1.a = 8))
++         Filter: ((alternatives: SubPlan 1 or hashed SubPlan 2) AND snoop(t1.a) AND leakproof(t1.a))
++         SubPlan 1
++           ->  Append
++                 ->  Seq Scan on public.t12 t12_1
++                       Filter: (t12_1.a = t1.a)
++                 ->  Seq Scan on public.t111 t111_1
++                       Filter: (t111_1.a = t1.a)
++         SubPlan 2
++           ->  Append
++                 ->  Seq Scan on public.t12 t12_2
++                       Output: t12_2.a
++                 ->  Seq Scan on public.t111 t111_2
++                       Output: t111_2.a
++   ->  Index Scan using t11_a_idx on public.t11
++         Output: (t11.a + 1), t11.b, t11.c, t11.d, t11.ctid
++         Index Cond: ((t11.a > 5) AND (t11.a = 8))
++         Filter: ((alternatives: SubPlan 1 or hashed SubPlan 2) AND snoop(t11.a) AND leakproof(t11.a))
++   ->  Index Scan using t12_a_idx on public.t12
++         Output: (t12.a + 1), t12.b, t12.c, t12.e, t12.ctid
++         Index Cond: ((t12.a > 5) AND (t12.a = 8))
++         Filter: ((alternatives: SubPlan 1 or hashed SubPlan 2) AND snoop(t12.a) AND leakproof(t12.a))
++   ->  Index Scan using t111_a_idx on public.t111
++         Output: (t111.a + 1), t111.b, t111.c, t111.d, t111.e, t111.ctid
++         Index Cond: ((t111.a > 5) AND (t111.a = 8))
++         Filter: ((alternatives: SubPlan 1 or hashed SubPlan 2) AND snoop(t111.a) AND leakproof(t111.a))
++(33 rows)
+ 
+ UPDATE v1 SET a=a+1 WHERE snoop(a) AND leakproof(a) AND a = 8;
+ NOTICE:  snooped value: 8
+diff --git a/src/test/regress/sql/equivclass.sql b/src/test/regress/sql/equivclass.sql
+index 17fad673e920..0e4aa0cd2c55 100644
+--- a/src/test/regress/sql/equivclass.sql
++++ b/src/test/regress/sql/equivclass.sql
+@@ -222,3 +222,35 @@ explain (costs off)
+      union all
+      select ff + 4 as x from ec1) as ss1
+   where ss1.x = ec1.f1 and ec1.ff = 42::int8;
++
++-- check effects of row-level security
++set enable_nestloop = on;
++set enable_mergejoin = off;
++
++alter table ec1 enable row level security;
++create policy p1 on ec1 using (f1 < '5'::int8alias1);
++
++create user regress_user_ectest;
++grant select on ec0 to regress_user_ectest;
++grant select on ec1 to regress_user_ectest;
++
++-- without any RLS, we'll treat {a.ff, b.ff, 43} as an EquivalenceClass
++explain (costs off)
++  select * from ec0 a, ec1 b
++  where a.ff = b.ff and a.ff = 43::bigint::int8alias1;
++
++set session authorization regress_user_ectest;
++
++-- with RLS active, the non-leakproof a.ff = 43 clause is not treated
++-- as a suitable source for an EquivalenceClass; currently, this is true
++-- even though the RLS clause has nothing to do directly with the EC
++explain (costs off)
++  select * from ec0 a, ec1 b
++  where a.ff = b.ff and a.ff = 43::bigint::int8alias1;
++
++reset session authorization;
++
++revoke select on ec0 from regress_user_ectest;
++revoke select on ec1 from regress_user_ectest;
++
++drop user regress_user_ectest;
+diff --git a/src/test/regress/sql/updatable_views.sql b/src/test/regress/sql/updatable_views.sql
+index bb9a3a61746f..ffc64d2de9ab 100644
+--- a/src/test/regress/sql/updatable_views.sql
++++ b/src/test/regress/sql/updatable_views.sql
+@@ -1001,8 +1001,8 @@ SELECT * FROM v1 WHERE a=3; -- should not see anything
+ SELECT * FROM v1 WHERE a=8;
+ 
+ EXPLAIN (VERBOSE, COSTS OFF)
+-UPDATE v1 SET a=100 WHERE snoop(a) AND leakproof(a) AND a = 3;
+-UPDATE v1 SET a=100 WHERE snoop(a) AND leakproof(a) AND a = 3;
++UPDATE v1 SET a=100 WHERE snoop(a) AND leakproof(a) AND a < 7 AND a != 6;
++UPDATE v1 SET a=100 WHERE snoop(a) AND leakproof(a) AND a < 7 AND a != 6;
+ 
+ SELECT * FROM v1 WHERE a=100; -- Nothing should have been changed to 100
+ SELECT * FROM t1 WHERE a=100; -- Nothing should have been changed to 100

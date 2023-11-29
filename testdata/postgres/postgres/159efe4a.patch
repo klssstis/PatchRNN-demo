@@ -1,0 +1,104 @@
+From 159efe4af4509741c25d6b95ddd9fda86facce42 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 19 Feb 2018 16:00:18 -0500
+Subject: [PATCH] Fix misbehavior of CTE-used-in-a-subplan during EPQ rechecks.
+
+An updating query that reads a CTE within an InitPlan or SubPlan could get
+incorrect results if it updates rows that are concurrently being modified.
+This is caused by CteScanNext supposing that nothing inside its recursive
+ExecProcNode call could change which read pointer is selected in the CTE's
+shared tuplestore.  While that's normally true because of scoping
+considerations, it can break down if an EPQ plan tree gets built during the
+call, because EvalPlanQualStart builds execution trees for all subplans
+whether they're going to be used during the recheck or not.  And it seems
+like a pretty shaky assumption anyway, so let's just reselect our own read
+pointer here.
+
+Per bug #14870 from Andrei Gorita.  This has been broken since CTEs were
+implemented, so back-patch to all supported branches.
+
+Discussion: https://postgr.es/m/20171024155358.1471.82377@wrigleys.postgresql.org
+---
+ src/backend/executor/nodeCtescan.c             | 13 +++++++++++++
+ src/test/isolation/expected/eval-plan-qual.out | 15 +++++++++++++++
+ src/test/isolation/specs/eval-plan-qual.spec   |  9 +++++++++
+ 3 files changed, 37 insertions(+)
+
+diff --git a/src/backend/executor/nodeCtescan.c b/src/backend/executor/nodeCtescan.c
+index 218619c760d6..24700dd3965b 100644
+--- a/src/backend/executor/nodeCtescan.c
++++ b/src/backend/executor/nodeCtescan.c
+@@ -107,6 +107,13 @@ CteScanNext(CteScanState *node)
+ 			return NULL;
+ 		}
+ 
++		/*
++		 * There are corner cases where the subplan could change which
++		 * tuplestore read pointer is active, so be sure to reselect ours
++		 * before storing the tuple we got.
++		 */
++		tuplestore_select_read_pointer(tuplestorestate, node->readptr);
++
+ 		/*
+ 		 * Append a copy of the returned tuple to tuplestore.  NOTE: because
+ 		 * our read pointer is certainly in EOF state, its read position will
+@@ -178,6 +185,12 @@ ExecInitCteScan(CteScan *node, EState *estate, int eflags)
+ 	 * we might be asked to rescan the CTE even though upper levels didn't
+ 	 * tell us to be prepared to do it efficiently.  Annoying, since this
+ 	 * prevents truncation of the tuplestore.  XXX FIXME
++	 *
++	 * Note: if we are in an EPQ recheck plan tree, it's likely that no access
++	 * to the tuplestore is needed at all, making this even more annoying.
++	 * It's not worth improving that as long as all the read pointers would
++	 * have REWIND anyway, but if we ever improve this logic then that aspect
++	 * should be considered too.
+ 	 */
+ 	eflags |= EXEC_FLAG_REWIND;
+ 
+diff --git a/src/test/isolation/expected/eval-plan-qual.out b/src/test/isolation/expected/eval-plan-qual.out
+index eb40717679cb..fed01459cf0e 100644
+--- a/src/test/isolation/expected/eval-plan-qual.out
++++ b/src/test/isolation/expected/eval-plan-qual.out
+@@ -217,3 +217,18 @@ id             data           id             data
+ 9              0              9              0              
+ 10             0              10             0              
+ step c1: COMMIT;
++
++starting permutation: wrtwcte multireadwcte c1 c2
++step wrtwcte: UPDATE table_a SET value = 'tableAValue2' WHERE id = 1;
++step multireadwcte: 
++	WITH updated AS (
++	  UPDATE table_a SET value = 'tableAValue3' WHERE id = 1 RETURNING id
++	)
++	SELECT (SELECT id FROM updated) AS subid, * FROM updated;
++ <waiting ...>
++step c1: COMMIT;
++step c2: COMMIT;
++step multireadwcte: <... completed>
++subid          id             
++
++1              1              
+diff --git a/src/test/isolation/specs/eval-plan-qual.spec b/src/test/isolation/specs/eval-plan-qual.spec
+index d2b34ec7cc27..51ab61dc862c 100644
+--- a/src/test/isolation/specs/eval-plan-qual.spec
++++ b/src/test/isolation/specs/eval-plan-qual.spec
+@@ -139,6 +139,14 @@ step "readwcte"	{
+ 	SELECT * FROM cte2;
+ }
+ 
++# this test exercises a different CTE misbehavior, cf bug #14870
++step "multireadwcte"	{
++	WITH updated AS (
++	  UPDATE table_a SET value = 'tableAValue3' WHERE id = 1 RETURNING id
++	)
++	SELECT (SELECT id FROM updated) AS subid, * FROM updated;
++}
++
+ teardown	{ COMMIT; }
+ 
+ permutation "wx1" "wx2" "c1" "c2" "read"
+@@ -151,3 +159,4 @@ permutation "wx2" "lockwithvalues" "c2" "c1" "read"
+ permutation "updateforss" "readforss" "c1" "c2"
+ permutation "wrtwcte" "readwcte" "c1" "c2"
+ permutation "wrjt" "selectjoinforupdate" "c2" "c1"
++permutation "wrtwcte" "multireadwcte" "c1" "c2"

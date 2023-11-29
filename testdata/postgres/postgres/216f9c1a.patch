@@ -1,0 +1,252 @@
+From 216f9c1ab3a4f333632ce576e1dc1e3643427eb8 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sun, 25 Sep 2022 17:10:58 -0400
+Subject: [PATCH] Fix tupdesc lifespan bug with
+ AfterTriggersTableData.storeslot.
+
+Commit 25936fd46 adjusted things so that the "storeslot" we use
+for remapping trigger tuples would have adequate lifespan, but it
+neglected to consider the lifespan of the tuple descriptor that
+the slot depends on.  It turns out that in at least some cases, the
+tupdesc we are passing is a refcounted tupdesc, and the refcount for
+the slot's reference can get assigned to a resource owner having
+different lifespan than the slot does.  That leads to an error like
+"tupdesc reference 0x7fdef236a1b8 is not owned by resource owner
+SubTransaction".  Worse, because of a second oversight in the same
+commit, we'd try to free the same tupdesc refcount again while
+cleaning up after that error, leading to recursive errors and an
+"ERRORDATA_STACK_SIZE exceeded" PANIC.
+
+To fix the initial problem, let's just make a non-refcounted copy
+of the tupdesc we're supposed to use.  That seems likely to guard
+against additional problems, since there's no strong reason for
+this code to assume that what it's given is a refcounted tupdesc;
+in which case there's an independent hazard of the tupdesc having
+shorter lifespan than the slot does.  (I didn't bother trying to
+free said copy, since it should go away anyway when the (sub)
+transaction context is cleaned up.)
+
+The other issue can be fixed by making the code added to
+AfterTriggerFreeQuery work like the rest of that function, ie be
+sure that it doesn't try to free the same slot twice in the event
+of recursive error cleanup.
+
+While here, also clean up minor stylistic issues in the test case
+added by 25936fd46: don't use "create or replace function", as any
+name collision within the tests is likely to have ill effects
+that that won't mask; and don't use function names as generic as
+trigger_function1, especially if you're not going to drop them
+at the end of the test stanza.
+
+Per bug #17607 from Thomas Mc Kay.  Back-patch to v12, as the
+previous fix was.
+
+Discussion: https://postgr.es/m/17607-bd8ccc81226f7f80@postgresql.org
+---
+ src/backend/commands/trigger.c         | 15 ++++++---
+ src/test/regress/expected/triggers.out | 38 ++++++++++++++++++----
+ src/test/regress/sql/triggers.sql      | 45 ++++++++++++++++++++++----
+ 3 files changed, 82 insertions(+), 16 deletions(-)
+
+diff --git a/src/backend/commands/trigger.c b/src/backend/commands/trigger.c
+index 0ec8d84a1b54..0fcf090f22f3 100644
+--- a/src/backend/commands/trigger.c
++++ b/src/backend/commands/trigger.c
+@@ -4775,11 +4775,13 @@ GetAfterTriggersStoreSlot(AfterTriggersTableData *table,
+ 		MemoryContext oldcxt;
+ 
+ 		/*
+-		 * We only need this slot only until AfterTriggerEndQuery, but making
+-		 * it last till end-of-subxact is good enough.  It'll be freed by
+-		 * AfterTriggerFreeQuery().
++		 * We need this slot only until AfterTriggerEndQuery, but making it
++		 * last till end-of-subxact is good enough.  It'll be freed by
++		 * AfterTriggerFreeQuery().  However, the passed-in tupdesc might have
++		 * a different lifespan, so we'd better make a copy of that.
+ 		 */
+ 		oldcxt = MemoryContextSwitchTo(CurTransactionContext);
++		tupdesc = CreateTupleDescCopy(tupdesc);
+ 		table->storeslot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
+ 		MemoryContextSwitchTo(oldcxt);
+ 	}
+@@ -5098,7 +5100,12 @@ AfterTriggerFreeQuery(AfterTriggersQueryData *qs)
+ 		if (ts)
+ 			tuplestore_end(ts);
+ 		if (table->storeslot)
+-			ExecDropSingleTupleTableSlot(table->storeslot);
++		{
++			TupleTableSlot *slot = table->storeslot;
++
++			table->storeslot = NULL;
++			ExecDropSingleTupleTableSlot(slot);
++		}
+ 	}
+ 
+ 	/*
+diff --git a/src/test/regress/expected/triggers.out b/src/test/regress/expected/triggers.out
+index 641f5e67c475..8b8eadd18127 100644
+--- a/src/test/regress/expected/triggers.out
++++ b/src/test/regress/expected/triggers.out
+@@ -3468,7 +3468,7 @@ insert into convslot_test_parent(col1) values ('1');
+ insert into convslot_test_child(col1) values ('1');
+ insert into convslot_test_parent(col1) values ('3');
+ insert into convslot_test_child(col1) values ('3');
+-create or replace function trigger_function1()
++create function convslot_trig1()
+ returns trigger
+ language plpgsql
+ AS $$
+@@ -3478,7 +3478,7 @@ raise notice 'trigger = %, old_table = %',
+           (select string_agg(old_table::text, ', ' order by col1) from old_table);
+ return null;
+ end; $$;
+-create or replace function trigger_function2()
++create function convslot_trig2()
+ returns trigger
+ language plpgsql
+ AS $$
+@@ -3490,10 +3490,10 @@ return null;
+ end; $$;
+ create trigger but_trigger after update on convslot_test_child
+ referencing new table as new_table
+-for each statement execute function trigger_function2();
++for each statement execute function convslot_trig2();
+ update convslot_test_parent set col1 = col1 || '1';
+ NOTICE:  trigger = but_trigger, new table = (11,tutu), (31,tutu)
+-create or replace function trigger_function3()
++create function convslot_trig3()
+ returns trigger
+ language plpgsql
+ AS $$
+@@ -3506,16 +3506,42 @@ return null;
+ end; $$;
+ create trigger but_trigger2 after update on convslot_test_child
+ referencing old table as old_table new table as new_table
+-for each statement execute function trigger_function3();
++for each statement execute function convslot_trig3();
+ update convslot_test_parent set col1 = col1 || '1';
+ NOTICE:  trigger = but_trigger, new table = (111,tutu), (311,tutu)
+ NOTICE:  trigger = but_trigger2, old_table = (11,tutu), (31,tutu), new table = (111,tutu), (311,tutu)
+ create trigger bdt_trigger after delete on convslot_test_child
+ referencing old table as old_table
+-for each statement execute function trigger_function1();
++for each statement execute function convslot_trig1();
+ delete from convslot_test_parent;
+ NOTICE:  trigger = bdt_trigger, old_table = (111,tutu), (311,tutu)
+ drop table convslot_test_child, convslot_test_parent;
++drop function convslot_trig1();
++drop function convslot_trig2();
++drop function convslot_trig3();
++-- Bug #17607: variant of above in which trigger function raises an error;
++-- we don't see any ill effects unless trigger tuple requires mapping
++create table convslot_test_parent (id int primary key, val int)
++partition by range (id);
++create table convslot_test_part (val int, id int not null);
++alter table convslot_test_parent
++  attach partition convslot_test_part for values from (1) to (1000);
++create function convslot_trig4() returns trigger as
++$$begin raise exception 'BOOM!'; end$$ language plpgsql;
++create trigger convslot_test_parent_update
++    after update on convslot_test_parent
++    referencing old table as old_rows new table as new_rows
++    for each statement execute procedure convslot_trig4();
++insert into convslot_test_parent (id, val) values (1, 2);
++begin;
++savepoint svp;
++update convslot_test_parent set val = 3;  -- error expected
++ERROR:  BOOM!
++CONTEXT:  PL/pgSQL function convslot_trig4() line 1 at RAISE
++rollback to savepoint svp;
++rollback;
++drop table convslot_test_parent;
++drop function convslot_trig4();
+ -- Test trigger renaming on partitioned tables
+ create table grandparent (id int, primary key (id)) partition by range (id);
+ create table middle partition of grandparent for values from (1) to (10)
+diff --git a/src/test/regress/sql/triggers.sql b/src/test/regress/sql/triggers.sql
+index 9d21bbe2a943..4d8504fb246a 100644
+--- a/src/test/regress/sql/triggers.sql
++++ b/src/test/regress/sql/triggers.sql
+@@ -2615,7 +2615,7 @@ insert into convslot_test_child(col1) values ('1');
+ insert into convslot_test_parent(col1) values ('3');
+ insert into convslot_test_child(col1) values ('3');
+ 
+-create or replace function trigger_function1()
++create function convslot_trig1()
+ returns trigger
+ language plpgsql
+ AS $$
+@@ -2626,7 +2626,7 @@ raise notice 'trigger = %, old_table = %',
+ return null;
+ end; $$;
+ 
+-create or replace function trigger_function2()
++create function convslot_trig2()
+ returns trigger
+ language plpgsql
+ AS $$
+@@ -2639,11 +2639,11 @@ end; $$;
+ 
+ create trigger but_trigger after update on convslot_test_child
+ referencing new table as new_table
+-for each statement execute function trigger_function2();
++for each statement execute function convslot_trig2();
+ 
+ update convslot_test_parent set col1 = col1 || '1';
+ 
+-create or replace function trigger_function3()
++create function convslot_trig3()
+ returns trigger
+ language plpgsql
+ AS $$
+@@ -2657,15 +2657,48 @@ end; $$;
+ 
+ create trigger but_trigger2 after update on convslot_test_child
+ referencing old table as old_table new table as new_table
+-for each statement execute function trigger_function3();
++for each statement execute function convslot_trig3();
+ update convslot_test_parent set col1 = col1 || '1';
+ 
+ create trigger bdt_trigger after delete on convslot_test_child
+ referencing old table as old_table
+-for each statement execute function trigger_function1();
++for each statement execute function convslot_trig1();
+ delete from convslot_test_parent;
+ 
+ drop table convslot_test_child, convslot_test_parent;
++drop function convslot_trig1();
++drop function convslot_trig2();
++drop function convslot_trig3();
++
++-- Bug #17607: variant of above in which trigger function raises an error;
++-- we don't see any ill effects unless trigger tuple requires mapping
++
++create table convslot_test_parent (id int primary key, val int)
++partition by range (id);
++
++create table convslot_test_part (val int, id int not null);
++
++alter table convslot_test_parent
++  attach partition convslot_test_part for values from (1) to (1000);
++
++create function convslot_trig4() returns trigger as
++$$begin raise exception 'BOOM!'; end$$ language plpgsql;
++
++create trigger convslot_test_parent_update
++    after update on convslot_test_parent
++    referencing old table as old_rows new table as new_rows
++    for each statement execute procedure convslot_trig4();
++
++insert into convslot_test_parent (id, val) values (1, 2);
++
++begin;
++savepoint svp;
++update convslot_test_parent set val = 3;  -- error expected
++rollback to savepoint svp;
++rollback;
++
++drop table convslot_test_parent;
++drop function convslot_trig4();
+ 
+ -- Test trigger renaming on partitioned tables
+ create table grandparent (id int, primary key (id)) partition by range (id);
