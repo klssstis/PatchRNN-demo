@@ -1,0 +1,89 @@
+From 7d8f6986b83c9a56f6ea11c959cdd8f52e1b543d Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Fri, 31 Mar 2017 21:01:20 -0400
+Subject: [PATCH] Fix parallel query so it doesn't spoil row estimates above
+ Gather.
+
+Commit 45be99f8cd5d606086e0a458c9c72910ba8a613d removed GatherPath's
+num_workers field, but this is entirely bogus.  Normally, a path's
+parallel_workers flag is supposed to indicate the number of workers
+that it wants, and should be 0 for a non-partial path.  In that
+commit, I mistakenly thought that GatherPath could also use that field
+to indicate the number of workers that it would try to start, but
+that's disastrous, because then it can propagate up to higher nodes in
+the plan tree, which will then get incorrect rowcounts because the
+parallel_workers flag is involved in computing those values.  Repair
+by putting the separate field back.
+
+Report by Tomas Vondra.  Patch by me, reviewed by Amit Kapila.
+
+Discussion: http://postgr.es/m/f91b4a44-f739-04bd-c4b6-f135bd643669@2ndquadrant.com
+---
+ src/backend/nodes/outfuncs.c            | 1 +
+ src/backend/optimizer/plan/createplan.c | 2 +-
+ src/backend/optimizer/util/pathnode.c   | 7 ++++---
+ src/include/nodes/relation.h            | 1 +
+ 4 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index bbb63a4bfae9..0b45c25a4995 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -1870,6 +1870,7 @@ _outGatherPath(StringInfo str, const GatherPath *node)
+ 
+ 	WRITE_NODE_FIELD(subpath);
+ 	WRITE_BOOL_FIELD(single_copy);
++	WRITE_INT_FIELD(num_workers);
+ }
+ 
+ static void
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index d357479829f5..ed06a8de7873 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -1446,7 +1446,7 @@ create_gather_plan(PlannerInfo *root, GatherPath *best_path)
+ 
+ 	gather_plan = make_gather(tlist,
+ 							  NIL,
+-							  best_path->path.parallel_workers,
++							  best_path->num_workers,
+ 							  best_path->single_copy,
+ 							  subplan);
+ 
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index 999ebcee704f..c6298072c9b5 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -1742,16 +1742,17 @@ create_gather_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
+ 														  required_outer);
+ 	pathnode->path.parallel_aware = false;
+ 	pathnode->path.parallel_safe = false;
+-	pathnode->path.parallel_workers = subpath->parallel_workers;
++	pathnode->path.parallel_workers = 0;
+ 	pathnode->path.pathkeys = NIL;		/* Gather has unordered result */
+ 
+ 	pathnode->subpath = subpath;
++	pathnode->num_workers = subpath->parallel_workers;
+ 	pathnode->single_copy = false;
+ 
+-	if (pathnode->path.parallel_workers == 0)
++	if (pathnode->num_workers == 0)
+ 	{
+-		pathnode->path.parallel_workers = 1;
+ 		pathnode->path.pathkeys = subpath->pathkeys;
++		pathnode->num_workers = 1;
+ 		pathnode->single_copy = true;
+ 	}
+ 
+diff --git a/src/include/nodes/relation.h b/src/include/nodes/relation.h
+index 8930edf8264e..ebf9480f3773 100644
+--- a/src/include/nodes/relation.h
++++ b/src/include/nodes/relation.h
+@@ -1228,6 +1228,7 @@ typedef struct GatherPath
+ 	Path		path;
+ 	Path	   *subpath;		/* path for each worker */
+ 	bool		single_copy;	/* don't execute path more than once */
++	int			num_workers;	/* number of workers sought to help */
+ } GatherPath;
+ 
+ /*

@@ -1,0 +1,156 @@
+From 7c34555f8c39eeefcc45b3c3f027d7a063d738fc Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 25 Jul 2022 15:45:24 -0400
+Subject: [PATCH] Add test for session_preload_libraries and parameter
+ permissions checks.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We weren't exercising the session_preload_libraries option in any
+meaningful way.  auto_explain is a good testbed for doing so, since
+it's one of the primary use-cases for session_preload_libraries.
+Hence, adjust its TAP test to load the library via
+session_preload_libraries not shared_preload_libraries.  While at it,
+feed test-specific settings to the backend via PGOPTIONS rather than
+tediously rewriting postgresql.conf.
+
+Also, since auto_explain has some PGC_SUSET parameters, we can use it
+to provide a test case for the permissions-checking bug just fixed
+by commit b35617de3.
+
+Back-patch to v15 so that we have coverage for the permissions issue
+in that branch too.  To do that, I back-patched the refactoring
+recently done by commit 550bc0a6c.
+
+Dagfinn Ilmari Mannsåker and Tom Lane
+
+Discussion: https://postgr.es/m/CABwTF4VEpwTHhRQ+q5MiC5ucngN-whN-PdcKeufX7eLSoAfbZA@mail.gmail.com
+---
+ contrib/auto_explain/t/001_auto_explain.pl | 74 ++++++++++++++--------
+ 1 file changed, 48 insertions(+), 26 deletions(-)
+
+diff --git a/contrib/auto_explain/t/001_auto_explain.pl b/contrib/auto_explain/t/001_auto_explain.pl
+index 1d952fb54d36..bfe783ec521d 100644
+--- a/contrib/auto_explain/t/001_auto_explain.pl
++++ b/contrib/auto_explain/t/001_auto_explain.pl
+@@ -9,45 +9,28 @@
+ use Test::More;
+ 
+ # Runs the specified query and returns the emitted server log.
+-# If any parameters are specified, these are set in postgresql.conf,
+-# and reset after the query is run.
++# params is an optional hash mapping GUC names to values;
++# any such settings are transmitted to the backend via PGOPTIONS.
+ sub query_log
+ {
+ 	my ($node, $sql, $params) = @_;
+ 	$params ||= {};
+ 
+-	if (keys %$params)
+-	{
+-		for my $key (keys %$params)
+-		{
+-			$node->append_conf('postgresql.conf', "$key = $params->{$key}\n");
+-		}
+-		$node->reload;
+-	}
++	local $ENV{PGOPTIONS} = join " ",
++	  map { "-c $_=$params->{$_}" } keys %$params;
+ 
+ 	my $log    = $node->logfile();
+ 	my $offset = -s $log;
+ 
+ 	$node->safe_psql("postgres", $sql);
+ 
+-	my $log_contents = slurp_file($log, $offset);
+-
+-	if (keys %$params)
+-	{
+-		for my $key (keys %$params)
+-		{
+-			$node->adjust_conf('postgresql.conf', $key, undef);
+-		}
+-		$node->reload;
+-	}
+-
+-	return $log_contents;
++	return slurp_file($log, $offset);
+ }
+ 
+ my $node = PostgreSQL::Test::Cluster->new('main');
+ $node->init;
+ $node->append_conf('postgresql.conf',
+-	"shared_preload_libraries = 'auto_explain'");
++	"session_preload_libraries = 'auto_explain'");
+ $node->append_conf('postgresql.conf', "auto_explain.log_min_duration = 0");
+ $node->append_conf('postgresql.conf', "auto_explain.log_analyze = on");
+ $node->start;
+@@ -126,12 +109,12 @@ sub query_log
+ # JSON format.
+ $log_contents = query_log(
+ 	$node,
+-	"SELECT * FROM pg_proc;",
++	"SELECT * FROM pg_class;",
+ 	{ "auto_explain.log_format" => "json" });
+ 
+ like(
+ 	$log_contents,
+-	qr/"Query Text": "SELECT \* FROM pg_proc;"/,
++	qr/"Query Text": "SELECT \* FROM pg_class;"/,
+ 	"query text logged, json mode");
+ 
+ unlike(
+@@ -141,7 +124,7 @@ sub query_log
+ 
+ like(
+ 	$log_contents,
+-	qr/"Node Type": "Seq Scan"[^}]*"Relation Name": "pg_proc"/s,
++	qr/"Node Type": "Seq Scan"[^}]*"Relation Name": "pg_class"/s,
+ 	"sequential scan logged, json mode");
+ 
+ # Prepared query in JSON format.
+@@ -160,4 +143,43 @@ sub query_log
+ 	qr/"Node Type": "Index Scan"[^}]*"Index Name": "pg_class_relname_nsp_index"/s,
+ 	"index scan logged, json mode");
+ 
++# Check that PGC_SUSET parameters can be set by non-superuser if granted,
++# otherwise not
++
++$node->safe_psql(
++	"postgres", q{
++CREATE USER regress_user1;
++GRANT SET ON PARAMETER auto_explain.log_format TO regress_user1;
++});
++
++$ENV{PGUSER} = "regress_user1";
++
++$log_contents = query_log(
++	$node,
++	"SELECT * FROM pg_database;",
++	{ "auto_explain.log_format" => "json" });
++
++like(
++	$log_contents,
++	qr/"Query Text": "SELECT \* FROM pg_database;"/,
++	"query text logged, json mode selected by non-superuser");
++
++$log_contents = query_log(
++	$node,
++	"SELECT * FROM pg_database;",
++	{ "auto_explain.log_level" => "log" });
++
++like(
++	$log_contents,
++	qr/WARNING:  permission denied to set parameter "auto_explain\.log_level"/,
++	"permission failure logged");
++
++$ENV{PGUSER} = undef;
++
++$node->safe_psql(
++	"postgres", q{
++REVOKE SET ON PARAMETER auto_explain.log_format FROM regress_user1;
++DROP USER regress_user1;
++});
++
+ done_testing();

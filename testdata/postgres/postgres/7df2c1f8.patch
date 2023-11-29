@@ -1,0 +1,546 @@
+From 7df2c1f8daeb361133ac8bdeaf59ceb0484e315a Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 30 Aug 2017 09:29:55 -0400
+Subject: [PATCH] Force rescanning of parallel-aware scan nodes below a
+ Gather[Merge].
+
+The ExecReScan machinery contains various optimizations for postponing
+or skipping rescans of plan subtrees; for example a HashAgg node may
+conclude that it can re-use the table it built before, instead of
+re-reading its input subtree.  But that is wrong if the input contains
+a parallel-aware table scan node, since the portion of the table scanned
+by the leader process is likely to vary from one rescan to the next.
+This explains the timing-dependent buildfarm failures we saw after
+commit a2b70c89c.
+
+The established mechanism for showing that a plan node's output is
+potentially variable is to mark it as depending on some runtime Param.
+Hence, to fix this, invent a dummy Param (one that has a PARAM_EXEC
+parameter number, but carries no actual value) associated with each Gather
+or GatherMerge node, mark parallel-aware nodes below that node as dependent
+on that Param, and arrange for ExecReScanGather[Merge] to flag that Param
+as changed whenever the Gather[Merge] node is rescanned.
+
+This solution breaks an undocumented assumption made by the parallel
+executor logic, namely that all rescans of nodes below a Gather[Merge]
+will happen synchronously during the ReScan of the top node itself.
+But that's fundamentally contrary to the design of the ExecReScan code,
+and so was doomed to fail someday anyway (even if you want to argue
+that the bug being fixed here wasn't a failure of that assumption).
+A follow-on patch will address that issue.  In the meantime, the worst
+that's expected to happen is that given very bad timing luck, the leader
+might have to do all the work during a rescan, because workers think
+they have nothing to do, if they are able to start up before the eventual
+ReScan of the leader's parallel-aware table scan node has reset the
+shared scan state.
+
+Although this problem exists in 9.6, there does not seem to be any way
+for it to manifest there.  Without GatherMerge, it seems that a plan tree
+that has a rescan-short-circuiting node below Gather will always also
+have one above it that will short-circuit in the same cases, preventing
+the Gather from being rescanned.  Hence we won't take the risk of
+back-patching this change into 9.6.  But v10 needs it.
+
+Discussion: https://postgr.es/m/CAA4eK1JkByysFJNh9M349u_nNjqETuEnY_y1VUc_kJiU0bxtaQ@mail.gmail.com
+---
+ src/backend/executor/nodeGather.c       | 22 +++++++-
+ src/backend/executor/nodeGatherMerge.c  | 22 +++++++-
+ src/backend/nodes/copyfuncs.c           |  2 +
+ src/backend/nodes/outfuncs.c            |  2 +
+ src/backend/nodes/readfuncs.c           |  2 +
+ src/backend/optimizer/README            | 21 ++++---
+ src/backend/optimizer/plan/createplan.c |  8 ++-
+ src/backend/optimizer/plan/planner.c    |  6 ++
+ src/backend/optimizer/plan/subselect.c  | 73 +++++++++++++++++++++++--
+ src/include/nodes/plannodes.h           | 15 ++++-
+ src/include/nodes/relation.h            |  6 +-
+ 11 files changed, 155 insertions(+), 24 deletions(-)
+
+diff --git a/src/backend/executor/nodeGather.c b/src/backend/executor/nodeGather.c
+index a0f5a60d9322..58f88a5724d9 100644
+--- a/src/backend/executor/nodeGather.c
++++ b/src/backend/executor/nodeGather.c
+@@ -432,6 +432,9 @@ ExecShutdownGather(GatherState *node)
+ void
+ ExecReScanGather(GatherState *node)
+ {
++	Gather	   *gather = (Gather *) node->ps.plan;
++	PlanState  *outerPlan = outerPlanState(node);
++
+ 	/*
+ 	 * Re-initialize the parallel workers to perform rescan of relation. We
+ 	 * want to gracefully shutdown all the workers so that they should be able
+@@ -445,5 +448,22 @@ ExecReScanGather(GatherState *node)
+ 	if (node->pei)
+ 		ExecParallelReinitialize(node->pei);
+ 
+-	ExecReScan(node->ps.lefttree);
++	/*
++	 * Set child node's chgParam to tell it that the next scan might deliver a
++	 * different set of rows within the leader process.  (The overall rowset
++	 * shouldn't change, but the leader process's subset might; hence nodes
++	 * between here and the parallel table scan node mustn't optimize on the
++	 * assumption of an unchanging rowset.)
++	 */
++	if (gather->rescan_param >= 0)
++		outerPlan->chgParam = bms_add_member(outerPlan->chgParam,
++											 gather->rescan_param);
++
++
++	/*
++	 * if chgParam of subnode is not null then plan will be re-scanned by
++	 * first ExecProcNode.
++	 */
++	if (outerPlan->chgParam == NULL)
++		ExecReScan(outerPlan);
+ }
+diff --git a/src/backend/executor/nodeGatherMerge.c b/src/backend/executor/nodeGatherMerge.c
+index 2526c584fd0d..f50841699c4f 100644
+--- a/src/backend/executor/nodeGatherMerge.c
++++ b/src/backend/executor/nodeGatherMerge.c
+@@ -327,6 +327,9 @@ ExecShutdownGatherMergeWorkers(GatherMergeState *node)
+ void
+ ExecReScanGatherMerge(GatherMergeState *node)
+ {
++	GatherMerge *gm = (GatherMerge *) node->ps.plan;
++	PlanState  *outerPlan = outerPlanState(node);
++
+ 	/*
+ 	 * Re-initialize the parallel workers to perform rescan of relation. We
+ 	 * want to gracefully shutdown all the workers so that they should be able
+@@ -341,7 +344,24 @@ ExecReScanGatherMerge(GatherMergeState *node)
+ 	if (node->pei)
+ 		ExecParallelReinitialize(node->pei);
+ 
+-	ExecReScan(node->ps.lefttree);
++	/*
++	 * Set child node's chgParam to tell it that the next scan might deliver a
++	 * different set of rows within the leader process.  (The overall rowset
++	 * shouldn't change, but the leader process's subset might; hence nodes
++	 * between here and the parallel table scan node mustn't optimize on the
++	 * assumption of an unchanging rowset.)
++	 */
++	if (gm->rescan_param >= 0)
++		outerPlan->chgParam = bms_add_member(outerPlan->chgParam,
++											 gm->rescan_param);
++
++
++	/*
++	 * if chgParam of subnode is not null then plan will be re-scanned by
++	 * first ExecProcNode.
++	 */
++	if (outerPlan->chgParam == NULL)
++		ExecReScan(outerPlan);
+ }
+ 
+ /*
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index 72041693dfda..f9ddf4ed7658 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -361,6 +361,7 @@ _copyGather(const Gather *from)
+ 	 * copy remainder of node
+ 	 */
+ 	COPY_SCALAR_FIELD(num_workers);
++	COPY_SCALAR_FIELD(rescan_param);
+ 	COPY_SCALAR_FIELD(single_copy);
+ 	COPY_SCALAR_FIELD(invisible);
+ 
+@@ -384,6 +385,7 @@ _copyGatherMerge(const GatherMerge *from)
+ 	 * copy remainder of node
+ 	 */
+ 	COPY_SCALAR_FIELD(num_workers);
++	COPY_SCALAR_FIELD(rescan_param);
+ 	COPY_SCALAR_FIELD(numCols);
+ 	COPY_POINTER_FIELD(sortColIdx, from->numCols * sizeof(AttrNumber));
+ 	COPY_POINTER_FIELD(sortOperators, from->numCols * sizeof(Oid));
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index 5ce3c7c59992..9ee3e23761c8 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -479,6 +479,7 @@ _outGather(StringInfo str, const Gather *node)
+ 	_outPlanInfo(str, (const Plan *) node);
+ 
+ 	WRITE_INT_FIELD(num_workers);
++	WRITE_INT_FIELD(rescan_param);
+ 	WRITE_BOOL_FIELD(single_copy);
+ 	WRITE_BOOL_FIELD(invisible);
+ }
+@@ -493,6 +494,7 @@ _outGatherMerge(StringInfo str, const GatherMerge *node)
+ 	_outPlanInfo(str, (const Plan *) node);
+ 
+ 	WRITE_INT_FIELD(num_workers);
++	WRITE_INT_FIELD(rescan_param);
+ 	WRITE_INT_FIELD(numCols);
+ 
+ 	appendStringInfoString(str, " :sortColIdx");
+diff --git a/src/backend/nodes/readfuncs.c b/src/backend/nodes/readfuncs.c
+index 86c811de49c5..67b9e19d29b4 100644
+--- a/src/backend/nodes/readfuncs.c
++++ b/src/backend/nodes/readfuncs.c
+@@ -2163,6 +2163,7 @@ _readGather(void)
+ 	ReadCommonPlan(&local_node->plan);
+ 
+ 	READ_INT_FIELD(num_workers);
++	READ_INT_FIELD(rescan_param);
+ 	READ_BOOL_FIELD(single_copy);
+ 	READ_BOOL_FIELD(invisible);
+ 
+@@ -2180,6 +2181,7 @@ _readGatherMerge(void)
+ 	ReadCommonPlan(&local_node->plan);
+ 
+ 	READ_INT_FIELD(num_workers);
++	READ_INT_FIELD(rescan_param);
+ 	READ_INT_FIELD(numCols);
+ 	READ_ATTRNUMBER_ARRAY(sortColIdx, local_node->numCols);
+ 	READ_OID_ARRAY(sortOperators, local_node->numCols);
+diff --git a/src/backend/optimizer/README b/src/backend/optimizer/README
+index fc0fca410712..62242e8564e2 100644
+--- a/src/backend/optimizer/README
++++ b/src/backend/optimizer/README
+@@ -374,6 +374,7 @@ RelOptInfo      - a relation or joined relations
+   MaterialPath  - a Material plan node
+   UniquePath    - remove duplicate rows (either by hashing or sorting)
+   GatherPath    - collect the results of parallel workers
++  GatherMergePath - collect parallel results, preserving their common sort order
+   ProjectionPath - a Result plan node with child (used for projection)
+   ProjectSetPath - a ProjectSet plan node applied to some sub-path
+   SortPath      - a Sort plan node applied to some sub-path
+@@ -1030,7 +1031,7 @@ either by an entire query or some portion of the query in such a way that
+ some of that work can be done by one or more worker processes, which are
+ called parallel workers.  Parallel workers are a subtype of dynamic
+ background workers; see src/backend/access/transam/README.parallel for a
+-fuller description.  Academic literature on parallel query suggests that
++fuller description.  The academic literature on parallel query suggests
+ that parallel execution strategies can be divided into essentially two
+ categories: pipelined parallelism, where the execution of the query is
+ divided into multiple stages and each stage is handled by a separate
+@@ -1046,16 +1047,14 @@ that the underlying table be partitioned.  It only requires that (1)
+ there is some method of dividing the data from at least one of the base
+ tables involved in the relation across multiple processes, (2) allowing
+ each process to handle its own portion of the data, and then (3)
+-collecting the results.  Requirements (2) and (3) is satisfied by the
+-executor node Gather, which launches any number of worker processes and
+-executes its single child plan in all of them (and perhaps in the leader
+-also, if the children aren't generating enough data to keep the leader
+-busy).  Requirement (1) is handled by the SeqScan node: when invoked
+-with parallel_aware = true, this node will, in effect, partition the
+-table on a block by block basis, returning a subset of the tuples from
+-the relation in each worker where that SeqScan is executed.  A similar
+-scheme could be (and probably should be) implemented for bitmap heap
+-scans.
++collecting the results.  Requirements (2) and (3) are satisfied by the
++executor node Gather (or GatherMerge), which launches any number of worker
++processes and executes its single child plan in all of them, and perhaps
++in the leader also, if the children aren't generating enough data to keep
++the leader busy.  Requirement (1) is handled by the table scan node: when
++invoked with parallel_aware = true, this node will, in effect, partition
++the table on a block by block basis, returning a subset of the tuples from
++the relation in each worker where that scan node is executed.
+ 
+ Just as we do for non-parallel access methods, we build Paths to
+ represent access strategies that can be used in a parallel plan.  These
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index 5c934f223da0..28216629aa46 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -267,7 +267,7 @@ static Unique *make_unique_from_sortclauses(Plan *lefttree, List *distinctList);
+ static Unique *make_unique_from_pathkeys(Plan *lefttree,
+ 						  List *pathkeys, int numCols);
+ static Gather *make_gather(List *qptlist, List *qpqual,
+-			int nworkers, bool single_copy, Plan *subplan);
++			int nworkers, int rescan_param, bool single_copy, Plan *subplan);
+ static SetOp *make_setop(SetOpCmd cmd, SetOpStrategy strategy, Plan *lefttree,
+ 		   List *distinctList, AttrNumber flagColIdx, int firstFlag,
+ 		   long numGroups);
+@@ -1471,6 +1471,7 @@ create_gather_plan(PlannerInfo *root, GatherPath *best_path)
+ 	gather_plan = make_gather(tlist,
+ 							  NIL,
+ 							  best_path->num_workers,
++							  SS_assign_special_param(root),
+ 							  best_path->single_copy,
+ 							  subplan);
+ 
+@@ -1505,6 +1506,9 @@ create_gather_merge_plan(PlannerInfo *root, GatherMergePath *best_path)
+ 	gm_plan->num_workers = best_path->num_workers;
+ 	copy_generic_path_info(&gm_plan->plan, &best_path->path);
+ 
++	/* Assign the rescan Param. */
++	gm_plan->rescan_param = SS_assign_special_param(root);
++
+ 	/* Gather Merge is pointless with no pathkeys; use Gather instead. */
+ 	Assert(pathkeys != NIL);
+ 
+@@ -6238,6 +6242,7 @@ static Gather *
+ make_gather(List *qptlist,
+ 			List *qpqual,
+ 			int nworkers,
++			int rescan_param,
+ 			bool single_copy,
+ 			Plan *subplan)
+ {
+@@ -6249,6 +6254,7 @@ make_gather(List *qptlist,
+ 	plan->lefttree = subplan;
+ 	plan->righttree = NULL;
+ 	node->num_workers = nworkers;
++	node->rescan_param = rescan_param;
+ 	node->single_copy = single_copy;
+ 	node->invisible = false;
+ 
+diff --git a/src/backend/optimizer/plan/planner.c b/src/backend/optimizer/plan/planner.c
+index fdef00ab39c2..966230256eaa 100644
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -374,6 +374,12 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
+ 		gather->single_copy = true;
+ 		gather->invisible = (force_parallel_mode == FORCE_PARALLEL_REGRESS);
+ 
++		/*
++		 * Since this Gather has no parallel-aware descendants to signal to,
++		 * we don't need a rescan Param.
++		 */
++		gather->rescan_param = -1;
++
+ 		/*
+ 		 * Ideally we'd use cost_gather here, but setting up dummy path data
+ 		 * to satisfy it doesn't seem much cleaner than knowing what it does.
+diff --git a/src/backend/optimizer/plan/subselect.c b/src/backend/optimizer/plan/subselect.c
+index ffbd3eeed758..1103984779b9 100644
+--- a/src/backend/optimizer/plan/subselect.c
++++ b/src/backend/optimizer/plan/subselect.c
+@@ -79,6 +79,7 @@ static Node *process_sublinks_mutator(Node *node,
+ 						 process_sublinks_context *context);
+ static Bitmapset *finalize_plan(PlannerInfo *root,
+ 			  Plan *plan,
++			  int gather_param,
+ 			  Bitmapset *valid_params,
+ 			  Bitmapset *scan_params);
+ static bool finalize_primnode(Node *node, finalize_primnode_context *context);
+@@ -2217,12 +2218,15 @@ void
+ SS_finalize_plan(PlannerInfo *root, Plan *plan)
+ {
+ 	/* No setup needed, just recurse through plan tree. */
+-	(void) finalize_plan(root, plan, root->outer_params, NULL);
++	(void) finalize_plan(root, plan, -1, root->outer_params, NULL);
+ }
+ 
+ /*
+  * Recursive processing of all nodes in the plan tree
+  *
++ * gather_param is the rescan_param of an ancestral Gather/GatherMerge,
++ * or -1 if there is none.
++ *
+  * valid_params is the set of param IDs supplied by outer plan levels
+  * that are valid to reference in this plan node or its children.
+  *
+@@ -2249,7 +2253,9 @@ SS_finalize_plan(PlannerInfo *root, Plan *plan)
+  * can be handled more cleanly.
+  */
+ static Bitmapset *
+-finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
++finalize_plan(PlannerInfo *root, Plan *plan,
++			  int gather_param,
++			  Bitmapset *valid_params,
+ 			  Bitmapset *scan_params)
+ {
+ 	finalize_primnode_context context;
+@@ -2302,6 +2308,18 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
+ 	finalize_primnode((Node *) plan->targetlist, &context);
+ 	finalize_primnode((Node *) plan->qual, &context);
+ 
++	/*
++	 * If it's a parallel-aware scan node, mark it as dependent on the parent
++	 * Gather/GatherMerge's rescan Param.
++	 */
++	if (plan->parallel_aware)
++	{
++		if (gather_param < 0)
++			elog(ERROR, "parallel-aware plan node is not below a Gather");
++		context.paramids =
++			bms_add_member(context.paramids, gather_param);
++	}
++
+ 	/* Check additional node-type-specific fields */
+ 	switch (nodeTag(plan))
+ 	{
+@@ -2512,6 +2530,7 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
+ 						bms_add_members(context.paramids,
+ 										finalize_plan(root,
+ 													  (Plan *) lfirst(lc),
++													  gather_param,
+ 													  valid_params,
+ 													  scan_params));
+ 				}
+@@ -2542,6 +2561,7 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
+ 						bms_add_members(context.paramids,
+ 										finalize_plan(root,
+ 													  (Plan *) lfirst(l),
++													  gather_param,
+ 													  valid_params,
+ 													  scan_params));
+ 				}
+@@ -2558,6 +2578,7 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
+ 						bms_add_members(context.paramids,
+ 										finalize_plan(root,
+ 													  (Plan *) lfirst(l),
++													  gather_param,
+ 													  valid_params,
+ 													  scan_params));
+ 				}
+@@ -2574,6 +2595,7 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
+ 						bms_add_members(context.paramids,
+ 										finalize_plan(root,
+ 													  (Plan *) lfirst(l),
++													  gather_param,
+ 													  valid_params,
+ 													  scan_params));
+ 				}
+@@ -2590,6 +2612,7 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
+ 						bms_add_members(context.paramids,
+ 										finalize_plan(root,
+ 													  (Plan *) lfirst(l),
++													  gather_param,
+ 													  valid_params,
+ 													  scan_params));
+ 				}
+@@ -2606,6 +2629,7 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
+ 						bms_add_members(context.paramids,
+ 										finalize_plan(root,
+ 													  (Plan *) lfirst(l),
++													  gather_param,
+ 													  valid_params,
+ 													  scan_params));
+ 				}
+@@ -2697,13 +2721,51 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
+ 							  &context);
+ 			break;
+ 
++		case T_Gather:
++			/* child nodes are allowed to reference rescan_param, if any */
++			locally_added_param = ((Gather *) plan)->rescan_param;
++			if (locally_added_param >= 0)
++			{
++				valid_params = bms_add_member(bms_copy(valid_params),
++											  locally_added_param);
++
++				/*
++				 * We currently don't support nested Gathers.  The issue so
++				 * far as this function is concerned would be how to identify
++				 * which child nodes depend on which Gather.
++				 */
++				Assert(gather_param < 0);
++				/* Pass down rescan_param to child parallel-aware nodes */
++				gather_param = locally_added_param;
++			}
++			/* rescan_param does *not* get added to scan_params */
++			break;
++
++		case T_GatherMerge:
++			/* child nodes are allowed to reference rescan_param, if any */
++			locally_added_param = ((GatherMerge *) plan)->rescan_param;
++			if (locally_added_param >= 0)
++			{
++				valid_params = bms_add_member(bms_copy(valid_params),
++											  locally_added_param);
++
++				/*
++				 * We currently don't support nested Gathers.  The issue so
++				 * far as this function is concerned would be how to identify
++				 * which child nodes depend on which Gather.
++				 */
++				Assert(gather_param < 0);
++				/* Pass down rescan_param to child parallel-aware nodes */
++				gather_param = locally_added_param;
++			}
++			/* rescan_param does *not* get added to scan_params */
++			break;
++
+ 		case T_ProjectSet:
+ 		case T_Hash:
+ 		case T_Material:
+ 		case T_Sort:
+ 		case T_Unique:
+-		case T_Gather:
+-		case T_GatherMerge:
+ 		case T_SetOp:
+ 		case T_Group:
+ 			/* no node-type-specific fields need fixing */
+@@ -2717,6 +2779,7 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
+ 	/* Process left and right child plans, if any */
+ 	child_params = finalize_plan(root,
+ 								 plan->lefttree,
++								 gather_param,
+ 								 valid_params,
+ 								 scan_params);
+ 	context.paramids = bms_add_members(context.paramids, child_params);
+@@ -2726,6 +2789,7 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
+ 		/* right child can reference nestloop_params as well as valid_params */
+ 		child_params = finalize_plan(root,
+ 									 plan->righttree,
++									 gather_param,
+ 									 bms_union(nestloop_params, valid_params),
+ 									 scan_params);
+ 		/* ... and they don't count as parameters used at my level */
+@@ -2737,6 +2801,7 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
+ 		/* easy case */
+ 		child_params = finalize_plan(root,
+ 									 plan->righttree,
++									 gather_param,
+ 									 valid_params,
+ 									 scan_params);
+ 	}
+diff --git a/src/include/nodes/plannodes.h b/src/include/nodes/plannodes.h
+index 7c51e7f9d21f..a382331f4197 100644
+--- a/src/include/nodes/plannodes.h
++++ b/src/include/nodes/plannodes.h
+@@ -825,13 +825,21 @@ typedef struct Unique
+ 
+ /* ------------
+  *		gather node
++ *
++ * Note: rescan_param is the ID of a PARAM_EXEC parameter slot.  That slot
++ * will never actually contain a value, but the Gather node must flag it as
++ * having changed whenever it is rescanned.  The child parallel-aware scan
++ * nodes are marked as depending on that parameter, so that the rescan
++ * machinery is aware that their output is likely to change across rescans.
++ * In some cases we don't need a rescan Param, so rescan_param is set to -1.
+  * ------------
+  */
+ typedef struct Gather
+ {
+ 	Plan		plan;
+-	int			num_workers;
+-	bool		single_copy;
++	int			num_workers;	/* planned number of worker processes */
++	int			rescan_param;	/* ID of Param that signals a rescan, or -1 */
++	bool		single_copy;	/* don't execute plan more than once */
+ 	bool		invisible;		/* suppress EXPLAIN display (for testing)? */
+ } Gather;
+ 
+@@ -842,7 +850,8 @@ typedef struct Gather
+ typedef struct GatherMerge
+ {
+ 	Plan		plan;
+-	int			num_workers;
++	int			num_workers;	/* planned number of worker processes */
++	int			rescan_param;	/* ID of Param that signals a rescan, or -1 */
+ 	/* remaining fields are just like the sort-key info in struct Sort */
+ 	int			numCols;		/* number of sort-key columns */
+ 	AttrNumber *sortColIdx;		/* their indexes in the target list */
+diff --git a/src/include/nodes/relation.h b/src/include/nodes/relation.h
+index 3ccc9d1b037c..a39e59d8ac93 100644
+--- a/src/include/nodes/relation.h
++++ b/src/include/nodes/relation.h
+@@ -1268,9 +1268,9 @@ typedef struct GatherPath
+ } GatherPath;
+ 
+ /*
+- * GatherMergePath runs several copies of a plan in parallel and
+- * collects the results. For gather merge parallel leader always execute the
+- * plan.
++ * GatherMergePath runs several copies of a plan in parallel and collects
++ * the results, preserving their common sort order.  For gather merge, the
++ * parallel leader always executes the plan too, so we don't need single_copy.
+  */
+ typedef struct GatherMergePath
+ {

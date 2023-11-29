@@ -1,0 +1,276 @@
+From 7c83a3bf51489e5b48c567c2ac54fed030d23c52 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Wed, 8 Sep 2021 12:19:50 -0700
+Subject: [PATCH] process startup: Split single user code out of
+ PostgresMain().
+
+It was harder than necessary to understand PostgresMain() because the code for
+a normal backend was interspersed with single-user mode specific code. Split
+most of the single-user mode code into its own function
+PostgresSingleUserMain(), that does all the necessary setup for single-user
+mode, and then hands off after that to PostgresMain().
+
+There still is some single-user mode code in InitPostgres(), and it'd likely
+be worth moving at least some of it out. But that's for later.
+
+Reviewed-By: Kyotaro Horiguchi <horikyota.ntt@gmail.com>
+Author: Andres Freund <andres@anarazel.de>
+Discussion: https://postgr.es/m/20210802164124.ufo5buo4apl6yuvs@alap3.anarazel.de
+---
+ src/backend/main/main.c             |   5 +-
+ src/backend/postmaster/postmaster.c |   8 +-
+ src/backend/tcop/postgres.c         | 152 +++++++++++++++-------------
+ src/include/tcop/tcopprot.h         |   5 +-
+ 4 files changed, 90 insertions(+), 80 deletions(-)
+
+diff --git a/src/backend/main/main.c b/src/backend/main/main.c
+index 3a2a0d598cd9..ad84a45e28c0 100644
+--- a/src/backend/main/main.c
++++ b/src/backend/main/main.c
+@@ -192,9 +192,8 @@ main(int argc, char *argv[])
+ 	else if (argc > 1 && strcmp(argv[1], "--describe-config") == 0)
+ 		GucInfoMain();
+ 	else if (argc > 1 && strcmp(argv[1], "--single") == 0)
+-		PostgresMain(argc, argv,
+-					 NULL,		/* no dbname */
+-					 strdup(get_user_name_or_exit(progname)));
++		PostgresSingleUserMain(argc, argv,
++							   strdup(get_user_name_or_exit(progname)));
+ 	else
+ 		PostmasterMain(argc, argv);
+ 	/* the functions above should not return */
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index 2ab7ed7dc395..e2a76ba0558c 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -4551,19 +4551,13 @@ BackendInitialize(Port *port)
+ static void
+ BackendRun(Port *port)
+ {
+-	char	   *av[2];
+-	const int	ac = 1;
+-
+-	av[0] = "postgres";
+-	av[1] = NULL;
+-
+ 	/*
+ 	 * Make sure we aren't in PostmasterContext anymore.  (We can't delete it
+ 	 * just yet, though, because InitPostgres will need the HBA data.)
+ 	 */
+ 	MemoryContextSwitchTo(TopMemoryContext);
+ 
+-	PostgresMain(ac, av, port->database_name, port->user_name);
++	PostgresMain(port->database_name, port->user_name);
+ }
+ 
+ 
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index d85e10d9cef0..0775abe35de4 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -3654,7 +3654,7 @@ get_stats_option_name(const char *arg)
+ 
+ /* ----------------------------------------------------------------
+  * process_postgres_switches
+- *	   Parse command line arguments for PostgresMain
++ *	   Parse command line arguments for backends
+  *
+  * This is called twice, once for the "secure" options coming from the
+  * postmaster or command line, and once for the "insecure" options coming
+@@ -3915,40 +3915,30 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
+ }
+ 
+ 
+-/* ----------------------------------------------------------------
+- * PostgresMain
+- *	   postgres main loop -- all backends, interactive or otherwise start here
++/*
++ * PostgresSingleUserMain
++ *     Entry point for single user mode. argc/argv are the command line
++ *     arguments to be used.
+  *
+- * argc/argv are the command line arguments to be used.  (When being forked
+- * by the postmaster, these are not the original argv array of the process.)
+- * dbname is the name of the database to connect to, or NULL if the database
+- * name should be extracted from the command line arguments or defaulted.
+- * username is the PostgreSQL user name to be used for the session.
+- * ----------------------------------------------------------------
++ * Performs single user specific setup then calls PostgresMain() to actually
++ * process queries. Single user mode specific setup should go here, rather
++ * than PostgresMain() or InitPostgres() when reasonably possible.
+  */
+ void
+-PostgresMain(int argc, char *argv[],
+-			 const char *dbname,
+-			 const char *username)
++PostgresSingleUserMain(int argc, char *argv[],
++					   const char *username)
+ {
+-	int			firstchar;
+-	StringInfoData input_message;
+-	sigjmp_buf	local_sigjmp_buf;
+-	volatile bool send_ready_for_query = true;
+-	bool		idle_in_transaction_timeout_enabled = false;
+-	bool		idle_session_timeout_enabled = false;
++	const char *dbname = NULL;
+ 
+-	/* Initialize startup process environment if necessary. */
+-	if (!IsUnderPostmaster)
+-		InitStandaloneProcess(argv[0]);
++	Assert(!IsUnderPostmaster);
+ 
+-	SetProcessingMode(InitProcessing);
++	/* Initialize startup process environment. */
++	InitStandaloneProcess(argv[0]);
+ 
+ 	/*
+ 	 * Set default values for command-line options.
+ 	 */
+-	if (!IsUnderPostmaster)
+-		InitializeGUCOptions();
++	InitializeGUCOptions();
+ 
+ 	/*
+ 	 * Parse command-line options.
+@@ -3966,12 +3956,75 @@ PostgresMain(int argc, char *argv[],
+ 							progname)));
+ 	}
+ 
+-	/* Acquire configuration parameters, unless inherited from postmaster */
+-	if (!IsUnderPostmaster)
+-	{
+-		if (!SelectConfigFiles(userDoption, progname))
+-			proc_exit(1);
+-	}
++	/* Acquire configuration parameters */
++	if (!SelectConfigFiles(userDoption, progname))
++		proc_exit(1);
++
++	/*
++	 * Validate we have been given a reasonable-looking DataDir and change
++	 * into it.
++	 */
++	checkDataDir();
++	ChangeToDataDir();
++
++	/*
++	 * Create lockfile for data directory.
++	 */
++	CreateDataDirLockFile(false);
++
++	/* read control file (error checking and contains config ) */
++	LocalProcessControlFile(false);
++
++	/* Initialize MaxBackends */
++	InitializeMaxBackends();
++
++	CreateSharedMemoryAndSemaphores();
++
++	/*
++	 * Remember stand-alone backend startup time,roughly at the same point
++	 * during startup that postmaster does so.
++	 */
++	PgStartTime = GetCurrentTimestamp();
++
++	/*
++	 * Create a per-backend PGPROC struct in shared memory. We must do this
++	 * before we can use LWLocks.
++	 */
++	InitProcess();
++
++	/*
++	 * Now that sufficient infrastructure has been initialized, PostgresMain()
++	 * can do the rest.
++	 */
++	PostgresMain(dbname, username);
++}
++
++
++/* ----------------------------------------------------------------
++ * PostgresMain
++ *	   postgres main loop -- all backends, interactive or otherwise loop here
++ *
++ * dbname is the name of the database to connect to, username is the
++ * PostgreSQL user name to be used for the session.
++ *
++ * NB: Single user mode specific setup should go to PostgresSingleUserMain()
++ * if reasonably possible.
++ * ----------------------------------------------------------------
++ */
++void
++PostgresMain(const char *dbname, const char *username)
++{
++	int			firstchar;
++	StringInfoData input_message;
++	sigjmp_buf	local_sigjmp_buf;
++	volatile bool send_ready_for_query = true;
++	bool		idle_in_transaction_timeout_enabled = false;
++	bool		idle_session_timeout_enabled = false;
++
++	AssertArg(dbname != NULL);
++	AssertArg(username != NULL);
++
++	SetProcessingMode(InitProcessing);
+ 
+ 	/*
+ 	 * Set up signal handlers.  (InitPostmasterChild or InitStandaloneProcess
+@@ -4029,43 +4082,6 @@ PostgresMain(int argc, char *argv[],
+ 									 * platforms */
+ 	}
+ 
+-	if (!IsUnderPostmaster)
+-	{
+-		/*
+-		 * Validate we have been given a reasonable-looking DataDir (if under
+-		 * postmaster, assume postmaster did this already).
+-		 */
+-		checkDataDir();
+-
+-		/* Change into DataDir (if under postmaster, was done already) */
+-		ChangeToDataDir();
+-
+-		/*
+-		 * Create lockfile for data directory.
+-		 */
+-		CreateDataDirLockFile(false);
+-
+-		/* read control file (error checking and contains config ) */
+-		LocalProcessControlFile(false);
+-
+-		/* Initialize MaxBackends (if under postmaster, was done already) */
+-		InitializeMaxBackends();
+-
+-		CreateSharedMemoryAndSemaphores();
+-
+-		/*
+-		 * Remember stand-alone backend startup time, roughly at the same
+-		 * point during startup that postmaster does so.
+-		 */
+-		PgStartTime = GetCurrentTimestamp();
+-
+-		/*
+-		 * Create a per-backend PGPROC struct in shared memory. We must do
+-		 * this before we can use LWLocks.
+-		 */
+-		InitProcess();
+-	}
+-
+ 	/* Early initialization */
+ 	BaseInit();
+ 
+diff --git a/src/include/tcop/tcopprot.h b/src/include/tcop/tcopprot.h
+index 968345404e54..5c77075aeddb 100644
+--- a/src/include/tcop/tcopprot.h
++++ b/src/include/tcop/tcopprot.h
+@@ -75,8 +75,9 @@ extern void ProcessClientWriteInterrupt(bool blocked);
+ 
+ extern void process_postgres_switches(int argc, char *argv[],
+ 									  GucContext ctx, const char **dbname);
+-extern void PostgresMain(int argc, char *argv[],
+-						 const char *dbname,
++extern void PostgresSingleUserMain(int argc, char *argv[],
++								   const char *username) pg_attribute_noreturn();
++extern void PostgresMain(const char *dbname,
+ 						 const char *username) pg_attribute_noreturn();
+ extern long get_stack_depth_rlimit(void);
+ extern void ResetUsage(void);

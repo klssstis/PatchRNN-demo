@@ -1,0 +1,864 @@
+From 7c079d7417a8f2d4bf5144732e2f85117db9214f Mon Sep 17 00:00:00 2001
+From: Peter Eisentraut <peter@eisentraut.org>
+Date: Fri, 25 Jan 2019 11:27:59 +0100
+Subject: [PATCH] Allow generalized expression syntax for partition bounds
+
+Previously, only literals were allowed.  This change allows general
+expressions, including functions calls, which are evaluated at the
+time the DDL command is executed.
+
+Besides offering some more functionality, it simplifies the parser
+structures and removes some inconsistencies in how the literals were
+handled.
+
+Author: Kyotaro Horiguchi, Tom Lane, Amit Langote
+Reviewed-by: Peter Eisentraut <peter.eisentraut@2ndquadrant.com>
+Discussion: https://www.postgresql.org/message-id/flat/9f88b5e0-6da2-5227-20d0-0d7012beaa1c@lab.ntt.co.jp/
+---
+ doc/src/sgml/ref/alter_table.sgml          |   6 +-
+ doc/src/sgml/ref/create_table.sgml         |  19 +-
+ src/backend/commands/tablecmds.c           |   9 +
+ src/backend/optimizer/util/clauses.c       |   4 +-
+ src/backend/parser/gram.y                  |  60 +-----
+ src/backend/parser/parse_agg.c             |  10 +
+ src/backend/parser/parse_expr.c            |   5 +
+ src/backend/parser/parse_func.c            |   3 +
+ src/backend/parser/parse_utilcmd.c         | 213 ++++++++++++++-------
+ src/include/optimizer/clauses.h            |   3 +
+ src/include/parser/parse_node.h            |   1 +
+ src/include/utils/partcache.h              |   6 +
+ src/test/regress/expected/create_table.out |  91 +++++++--
+ src/test/regress/sql/create_table.sql      |  51 ++++-
+ 14 files changed, 314 insertions(+), 167 deletions(-)
+
+diff --git a/doc/src/sgml/ref/alter_table.sgml b/doc/src/sgml/ref/alter_table.sgml
+index 0d1feaf828cc..0aa0f093f235 100644
+--- a/doc/src/sgml/ref/alter_table.sgml
++++ b/doc/src/sgml/ref/alter_table.sgml
+@@ -86,9 +86,9 @@ ALTER TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceable>
+ 
+ <phrase>and <replaceable class="parameter">partition_bound_spec</replaceable> is:</phrase>
+ 
+-IN ( { <replaceable class="parameter">numeric_literal</replaceable> | <replaceable class="parameter">string_literal</replaceable> | TRUE | FALSE | NULL } [, ...] ) |
+-FROM ( { <replaceable class="parameter">numeric_literal</replaceable> | <replaceable class="parameter">string_literal</replaceable> | TRUE | FALSE | MINVALUE | MAXVALUE } [, ...] )
+-  TO ( { <replaceable class="parameter">numeric_literal</replaceable> | <replaceable class="parameter">string_literal</replaceable> | TRUE | FALSE | MINVALUE | MAXVALUE } [, ...] ) |
++IN ( <replaceable class="parameter">partition_bound_expr</replaceable> [, ...] ) |
++FROM ( { <replaceable class="parameter">partition_bound_expr</replaceable> | MINVALUE | MAXVALUE } [, ...] )
++  TO ( { <replaceable class="parameter">partition_bound_expr</replaceable> | MINVALUE | MAXVALUE } [, ...] ) |
+ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REMAINDER <replaceable class="parameter">numeric_literal</replaceable> )
+ 
+ <phrase>and <replaceable class="parameter">column_constraint</replaceable> is:</phrase>
+diff --git a/doc/src/sgml/ref/create_table.sgml b/doc/src/sgml/ref/create_table.sgml
+index 857515ec8f25..22dbc07b2381 100644
+--- a/doc/src/sgml/ref/create_table.sgml
++++ b/doc/src/sgml/ref/create_table.sgml
+@@ -87,9 +87,9 @@ class="parameter">referential_action</replaceable> ] [ ON UPDATE <replaceable cl
+ 
+ <phrase>and <replaceable class="parameter">partition_bound_spec</replaceable> is:</phrase>
+ 
+-IN ( { <replaceable class="parameter">numeric_literal</replaceable> | <replaceable class="parameter">string_literal</replaceable> | TRUE | FALSE | NULL } [, ...] ) |
+-FROM ( { <replaceable class="parameter">numeric_literal</replaceable> | <replaceable class="parameter">string_literal</replaceable> | TRUE | FALSE | MINVALUE | MAXVALUE } [, ...] )
+-  TO ( { <replaceable class="parameter">numeric_literal</replaceable> | <replaceable class="parameter">string_literal</replaceable> | TRUE | FALSE | MINVALUE | MAXVALUE } [, ...] ) |
++IN ( <replaceable class="parameter">partition_bound_expr</replaceable> [, ...] ) |
++FROM ( { <replaceable class="parameter">partition_bound_expr</replaceable> | MINVALUE | MAXVALUE } [, ...] )
++  TO ( { <replaceable class="parameter">partition_bound_expr</replaceable> | MINVALUE | MAXVALUE } [, ...] ) |
+ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REMAINDER <replaceable class="parameter">numeric_literal</replaceable> )
+ 
+ <phrase><replaceable class="parameter">index_parameters</replaceable> in <literal>UNIQUE</literal>, <literal>PRIMARY KEY</literal>, and <literal>EXCLUDE</literal> constraints are:</phrase>
+@@ -413,12 +413,13 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
+      </para>
+ 
+      <para>
+-      Each of the values specified in
+-      the <replaceable class="parameter">partition_bound_spec</replaceable> is
+-      a literal, <literal>NULL</literal>, <literal>MINVALUE</literal>, or
+-      <literal>MAXVALUE</literal>.  Each literal value must be either a
+-      numeric constant that is coercible to the corresponding partition key
+-      column's type, or a string literal that is valid input for that type.
++      <replaceable class="parameter">partition_bound_expr</replaceable> is
++      any variable-free expression (subqueries, window functions, aggregate
++      functions, and set-returning functions are not allowed).  Its data type
++      must match the data type of the corresponding partition key column.
++      The expression is evaluated once at table creation time, so it can
++      even contain volatile expressions such as
++      <literal><function>CURRENT_TIMESTAMP</function></literal>.
+      </para>
+ 
+      <para>
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index e010586dd67e..36fdcc0d52cd 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -830,6 +830,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+ 					defaultPartOid;
+ 		Relation	parent,
+ 					defaultRel = NULL;
++		RangeTblEntry *rte;
+ 
+ 		/* Already have strong enough lock on the parent */
+ 		parent = table_open(parentId, NoLock);
+@@ -872,6 +873,14 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+ 		pstate = make_parsestate(NULL);
+ 		pstate->p_sourcetext = queryString;
+ 
++		/*
++		 * Add an RTE containing this relation, so that transformExpr called
++		 * on partition bound expressions is able to report errors using a
++		 * proper context.
++		 */
++		rte = addRangeTableEntryForRelation(pstate, rel, AccessShareLock,
++											NULL, false, false);
++		addRTEtoQuery(pstate, rte, false, true, true);
+ 		bound = transformPartitionBound(pstate, parent, stmt->partbound);
+ 
+ 		/*
+diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
+index f0ef1029d109..94b8fa0c3dda 100644
+--- a/src/backend/optimizer/util/clauses.c
++++ b/src/backend/optimizer/util/clauses.c
+@@ -150,8 +150,6 @@ static Node *substitute_actual_parameters(Node *expr, int nargs, List *args,
+ static Node *substitute_actual_parameters_mutator(Node *node,
+ 									 substitute_actual_parameters_context *context);
+ static void sql_inline_error_callback(void *arg);
+-static Expr *evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
+-			  Oid result_collation);
+ static Query *substitute_actual_srf_parameters(Query *expr,
+ 								 int nargs, List *args);
+ static Node *substitute_actual_srf_parameters_mutator(Node *node,
+@@ -5045,7 +5043,7 @@ sql_inline_error_callback(void *arg)
+  * We use the executor's routine ExecEvalExpr() to avoid duplication of
+  * code and ensure we get the same result as the executor would get.
+  */
+-static Expr *
++Expr *
+ evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
+ 			  Oid result_collation)
+ {
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 6535550c72e3..c1faf4152ca1 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -581,8 +581,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ %type <partelem>	part_elem
+ %type <list>		part_params
+ %type <partboundspec> PartitionBoundSpec
+-%type <node>		partbound_datum PartitionRangeDatum
+-%type <list>		hash_partbound partbound_datum_list range_datum_list
++%type <list>		hash_partbound
+ %type <defelt>		hash_partbound_elem
+ 
+ /*
+@@ -2731,7 +2730,7 @@ PartitionBoundSpec:
+ 				}
+ 
+ 			/* a LIST partition */
+-			| FOR VALUES IN_P '(' partbound_datum_list ')'
++			| FOR VALUES IN_P '(' expr_list ')'
+ 				{
+ 					PartitionBoundSpec *n = makeNode(PartitionBoundSpec);
+ 
+@@ -2744,7 +2743,7 @@ PartitionBoundSpec:
+ 				}
+ 
+ 			/* a RANGE partition */
+-			| FOR VALUES FROM '(' range_datum_list ')' TO '(' range_datum_list ')'
++			| FOR VALUES FROM '(' expr_list ')' TO '(' expr_list ')'
+ 				{
+ 					PartitionBoundSpec *n = makeNode(PartitionBoundSpec);
+ 
+@@ -2787,59 +2786,6 @@ hash_partbound:
+ 			}
+ 		;
+ 
+-partbound_datum:
+-			Sconst			{ $$ = makeStringConst($1, @1); }
+-			| NumericOnly	{ $$ = makeAConst($1, @1); }
+-			| TRUE_P		{ $$ = makeStringConst(pstrdup("true"), @1); }
+-			| FALSE_P		{ $$ = makeStringConst(pstrdup("false"), @1); }
+-			| NULL_P		{ $$ = makeNullAConst(@1); }
+-		;
+-
+-partbound_datum_list:
+-			partbound_datum						{ $$ = list_make1($1); }
+-			| partbound_datum_list ',' partbound_datum
+-												{ $$ = lappend($1, $3); }
+-		;
+-
+-range_datum_list:
+-			PartitionRangeDatum					{ $$ = list_make1($1); }
+-			| range_datum_list ',' PartitionRangeDatum
+-												{ $$ = lappend($1, $3); }
+-		;
+-
+-PartitionRangeDatum:
+-			MINVALUE
+-				{
+-					PartitionRangeDatum *n = makeNode(PartitionRangeDatum);
+-
+-					n->kind = PARTITION_RANGE_DATUM_MINVALUE;
+-					n->value = NULL;
+-					n->location = @1;
+-
+-					$$ = (Node *) n;
+-				}
+-			| MAXVALUE
+-				{
+-					PartitionRangeDatum *n = makeNode(PartitionRangeDatum);
+-
+-					n->kind = PARTITION_RANGE_DATUM_MAXVALUE;
+-					n->value = NULL;
+-					n->location = @1;
+-
+-					$$ = (Node *) n;
+-				}
+-			| partbound_datum
+-				{
+-					PartitionRangeDatum *n = makeNode(PartitionRangeDatum);
+-
+-					n->kind = PARTITION_RANGE_DATUM_VALUE;
+-					n->value = $1;
+-					n->location = @1;
+-
+-					$$ = (Node *) n;
+-				}
+-		;
+-
+ /*****************************************************************************
+  *
+  *	ALTER TYPE
+diff --git a/src/backend/parser/parse_agg.c b/src/backend/parser/parse_agg.c
+index 669fe82c48a4..8ed381686674 100644
+--- a/src/backend/parser/parse_agg.c
++++ b/src/backend/parser/parse_agg.c
+@@ -506,6 +506,13 @@ check_agglevels_and_constraints(ParseState *pstate, Node *expr)
+ 			else
+ 				err = _("grouping operations are not allowed in trigger WHEN conditions");
+ 
++			break;
++		case EXPR_KIND_PARTITION_BOUND:
++			if (isAgg)
++				err = _("aggregate functions are not allowed in partition bound");
++			else
++				err = _("grouping operations are not allowed in partition bound");
++
+ 			break;
+ 		case EXPR_KIND_PARTITION_EXPRESSION:
+ 			if (isAgg)
+@@ -904,6 +911,9 @@ transformWindowFuncCall(ParseState *pstate, WindowFunc *wfunc,
+ 		case EXPR_KIND_TRIGGER_WHEN:
+ 			err = _("window functions are not allowed in trigger WHEN conditions");
+ 			break;
++		case EXPR_KIND_PARTITION_BOUND:
++			err = _("window functions are not allowed in partition bound");
++			break;
+ 		case EXPR_KIND_PARTITION_EXPRESSION:
+ 			err = _("window functions are not allowed in partition key expressions");
+ 			break;
+diff --git a/src/backend/parser/parse_expr.c b/src/backend/parser/parse_expr.c
+index a47697a42153..3e0a762c41e6 100644
+--- a/src/backend/parser/parse_expr.c
++++ b/src/backend/parser/parse_expr.c
+@@ -1843,6 +1843,9 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
+ 		case EXPR_KIND_TRIGGER_WHEN:
+ 			err = _("cannot use subquery in trigger WHEN condition");
+ 			break;
++		case EXPR_KIND_PARTITION_BOUND:
++			err = _("cannot use subquery in partition bound");
++			break;
+ 		case EXPR_KIND_PARTITION_EXPRESSION:
+ 			err = _("cannot use subquery in partition key expression");
+ 			break;
+@@ -3474,6 +3477,8 @@ ParseExprKindName(ParseExprKind exprKind)
+ 			return "EXECUTE";
+ 		case EXPR_KIND_TRIGGER_WHEN:
+ 			return "WHEN";
++		case EXPR_KIND_PARTITION_BOUND:
++			return "partition bound";
+ 		case EXPR_KIND_PARTITION_EXPRESSION:
+ 			return "PARTITION BY";
+ 		case EXPR_KIND_CALL_ARGUMENT:
+diff --git a/src/backend/parser/parse_func.c b/src/backend/parser/parse_func.c
+index 7213f5be17a6..5222231b5118 100644
+--- a/src/backend/parser/parse_func.c
++++ b/src/backend/parser/parse_func.c
+@@ -2364,6 +2364,9 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
+ 		case EXPR_KIND_TRIGGER_WHEN:
+ 			err = _("set-returning functions are not allowed in trigger WHEN conditions");
+ 			break;
++		case EXPR_KIND_PARTITION_BOUND:
++			err = _("set-returning functions are not allowed in partition bound");
++			break;
+ 		case EXPR_KIND_PARTITION_EXPRESSION:
+ 			err = _("set-returning functions are not allowed in partition key expressions");
+ 			break;
+diff --git a/src/backend/parser/parse_utilcmd.c b/src/backend/parser/parse_utilcmd.c
+index 1084af2eedb4..445e81a1afb7 100644
+--- a/src/backend/parser/parse_utilcmd.c
++++ b/src/backend/parser/parse_utilcmd.c
+@@ -50,7 +50,9 @@
+ #include "miscadmin.h"
+ #include "nodes/makefuncs.h"
+ #include "nodes/nodeFuncs.h"
++#include "optimizer/clauses.h"
+ #include "optimizer/planner.h"
++#include "optimizer/var.h"
+ #include "parser/analyze.h"
+ #include "parser/parse_clause.h"
+ #include "parser/parse_coerce.h"
+@@ -139,9 +141,12 @@ static void transformConstraintAttrs(CreateStmtContext *cxt,
+ static void transformColumnType(CreateStmtContext *cxt, ColumnDef *column);
+ static void setSchemaName(char *context_schema, char **stmt_schema_name);
+ static void transformPartitionCmd(CreateStmtContext *cxt, PartitionCmd *cmd);
++static List *transformPartitionRangeBounds(ParseState *pstate, List *blist,
++							  Relation parent);
+ static void validateInfiniteBounds(ParseState *pstate, List *blist);
+-static Const *transformPartitionBoundValue(ParseState *pstate, A_Const *con,
+-							 const char *colName, Oid colType, int32 colTypmod);
++static Const *transformPartitionBoundValue(ParseState *pstate, Node *con,
++							 const char *colName, Oid colType, int32 colTypmod,
++							 Oid partCollation);
+ 
+ 
+ /*
+@@ -3625,6 +3630,7 @@ transformPartitionBound(ParseState *pstate, Relation parent,
+ 		char	   *colname;
+ 		Oid			coltype;
+ 		int32		coltypmod;
++		Oid			partcollation;
+ 
+ 		if (spec->strategy != PARTITION_STRATEGY_LIST)
+ 			ereport(ERROR,
+@@ -3644,17 +3650,19 @@ transformPartitionBound(ParseState *pstate, Relation parent,
+ 		/* Need its type data too */
+ 		coltype = get_partition_col_typid(key, 0);
+ 		coltypmod = get_partition_col_typmod(key, 0);
++		partcollation = get_partition_col_collation(key, 0);
+ 
+ 		result_spec->listdatums = NIL;
+ 		foreach(cell, spec->listdatums)
+ 		{
+-			A_Const    *con = castNode(A_Const, lfirst(cell));
++			Node	   *expr = lfirst(cell);
+ 			Const	   *value;
+ 			ListCell   *cell2;
+ 			bool		duplicate;
+ 
+-			value = transformPartitionBoundValue(pstate, con,
+-												 colname, coltype, coltypmod);
++			value = transformPartitionBoundValue(pstate, expr,
++												 colname, coltype, coltypmod,
++												 partcollation);
+ 
+ 			/* Don't add to the result if the value is a duplicate */
+ 			duplicate = false;
+@@ -3677,11 +3685,6 @@ transformPartitionBound(ParseState *pstate, Relation parent,
+ 	}
+ 	else if (strategy == PARTITION_STRATEGY_RANGE)
+ 	{
+-		ListCell   *cell1,
+-				   *cell2;
+-		int			i,
+-					j;
+-
+ 		if (spec->strategy != PARTITION_STRATEGY_RANGE)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+@@ -3698,23 +3701,78 @@ transformPartitionBound(ParseState *pstate, Relation parent,
+ 					 errmsg("TO must specify exactly one value per partitioning column")));
+ 
+ 		/*
+-		 * Once we see MINVALUE or MAXVALUE for one column, the remaining
+-		 * columns must be the same.
++		 * Convert raw parse nodes into PartitionRangeDatum nodes and perform
++		 * any necessary validation.
++		 */
++		result_spec->lowerdatums =
++					transformPartitionRangeBounds(pstate, spec->lowerdatums,
++												  parent);
++		result_spec->upperdatums =
++					transformPartitionRangeBounds(pstate, spec->upperdatums,
++												  parent);
++	}
++	else
++		elog(ERROR, "unexpected partition strategy: %d", (int) strategy);
++
++	return result_spec;
++}
++
++/*
++ * transformPartitionRangeBounds
++ *		This converts the expressions for range partition bounds from the raw
++ *		grammar representation to PartitionRangeDatum structs
++ */
++static List *
++transformPartitionRangeBounds(ParseState *pstate, List *blist,
++							  Relation parent)
++{
++	List	   *result = NIL;
++	PartitionKey key = RelationGetPartitionKey(parent);
++	List	   *partexprs = get_partition_exprs(key);
++	ListCell   *lc;
++	int			i,
++				j;
++
++	i = j = 0;
++	foreach(lc, blist)
++	{
++		Node *expr = lfirst(lc);
++		PartitionRangeDatum *prd = NULL;
++
++		/*
++		 * Infinite range bounds -- "minvalue" and "maxvalue" -- get passed
++		 * in as ColumnRefs.
+ 		 */
+-		validateInfiniteBounds(pstate, spec->lowerdatums);
+-		validateInfiniteBounds(pstate, spec->upperdatums);
++		if (IsA(expr, ColumnRef))
++		{
++			ColumnRef *cref = (ColumnRef *) expr;
++			char *cname = NULL;
++
++			if (list_length(cref->fields) == 1 &&
++				IsA(linitial(cref->fields), String))
++				cname = strVal(linitial(cref->fields));
+ 
+-		/* Transform all the constants */
+-		i = j = 0;
+-		result_spec->lowerdatums = result_spec->upperdatums = NIL;
+-		forboth(cell1, spec->lowerdatums, cell2, spec->upperdatums)
++			Assert(cname != NULL);
++			if (strcmp("minvalue", cname) == 0)
++			{
++				prd = makeNode(PartitionRangeDatum);
++				prd->kind = PARTITION_RANGE_DATUM_MINVALUE;
++				prd->value = NULL;
++			}
++			else if (strcmp("maxvalue", cname) == 0)
++			{
++				prd = makeNode(PartitionRangeDatum);
++				prd->kind = PARTITION_RANGE_DATUM_MAXVALUE;
++				prd->value = NULL;
++			}
++		}
++
++		if (prd == NULL)
+ 		{
+-			PartitionRangeDatum *ldatum = (PartitionRangeDatum *) lfirst(cell1);
+-			PartitionRangeDatum *rdatum = (PartitionRangeDatum *) lfirst(cell2);
+ 			char	   *colname;
+ 			Oid			coltype;
+ 			int32		coltypmod;
+-			A_Const    *con;
++			Oid			partcollation;
+ 			Const	   *value;
+ 
+ 			/* Get the column's name in case we need to output an error */
+@@ -3729,50 +3787,38 @@ transformPartitionBound(ParseState *pstate, Relation parent,
+ 											 false, false);
+ 				++j;
+ 			}
++
+ 			/* Need its type data too */
+ 			coltype = get_partition_col_typid(key, i);
+ 			coltypmod = get_partition_col_typmod(key, i);
++			partcollation = get_partition_col_collation(key, i);
+ 
+-			if (ldatum->value)
+-			{
+-				con = castNode(A_Const, ldatum->value);
+-				value = transformPartitionBoundValue(pstate, con,
+-													 colname,
+-													 coltype, coltypmod);
+-				if (value->constisnull)
+-					ereport(ERROR,
+-							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+-							 errmsg("cannot specify NULL in range bound")));
+-				ldatum = copyObject(ldatum);	/* don't scribble on input */
+-				ldatum->value = (Node *) value;
+-			}
+-
+-			if (rdatum->value)
+-			{
+-				con = castNode(A_Const, rdatum->value);
+-				value = transformPartitionBoundValue(pstate, con,
+-													 colname,
+-													 coltype, coltypmod);
+-				if (value->constisnull)
+-					ereport(ERROR,
+-							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+-							 errmsg("cannot specify NULL in range bound")));
+-				rdatum = copyObject(rdatum);	/* don't scribble on input */
+-				rdatum->value = (Node *) value;
+-			}
+-
+-			result_spec->lowerdatums = lappend(result_spec->lowerdatums,
+-											   ldatum);
+-			result_spec->upperdatums = lappend(result_spec->upperdatums,
+-											   rdatum);
+-
++			value = transformPartitionBoundValue(pstate, expr,
++												 colname,
++												 coltype, coltypmod,
++												 partcollation);
++			if (value->constisnull)
++				ereport(ERROR,
++						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
++						 errmsg("cannot specify NULL in range bound")));
++			prd = makeNode(PartitionRangeDatum);
++			prd->kind = PARTITION_RANGE_DATUM_VALUE;
++			prd->value = (Node *) value;
+ 			++i;
+ 		}
++
++		prd->location = exprLocation(expr);
++
++		result = lappend(result, prd);
+ 	}
+-	else
+-		elog(ERROR, "unexpected partition strategy: %d", (int) strategy);
+ 
+-	return result_spec;
++	/*
++	 * Once we see MINVALUE or MAXVALUE for one column, the remaining
++	 * columns must be the same.
++	 */
++	validateInfiniteBounds(pstate, result);
++
++	return result;
+ }
+ 
+ /*
+@@ -3821,13 +3867,34 @@ validateInfiniteBounds(ParseState *pstate, List *blist)
+  * Transform one constant in a partition bound spec
+  */
+ static Const *
+-transformPartitionBoundValue(ParseState *pstate, A_Const *con,
+-							 const char *colName, Oid colType, int32 colTypmod)
++transformPartitionBoundValue(ParseState *pstate, Node *val,
++							 const char *colName, Oid colType, int32 colTypmod,
++							 Oid partCollation)
+ {
+ 	Node	   *value;
+ 
+-	/* Make it into a Const */
+-	value = (Node *) make_const(pstate, &con->val, con->location);
++	/* Transform raw parsetree */
++	value = transformExpr(pstate, val, EXPR_KIND_PARTITION_BOUND);
++
++	/*
++	 * Check that the input expression's collation is compatible with one
++	 * specified for the parent's partition key (partcollation).  Don't
++	 * throw an error if it's the default collation which we'll replace with
++	 * the parent's collation anyway.
++	 */
++	if (IsA(value, CollateExpr))
++	{
++		Oid		exprCollOid = exprCollation(value);
++
++		if (OidIsValid(exprCollOid) &&
++			exprCollOid != DEFAULT_COLLATION_OID &&
++			exprCollOid != partCollation)
++			ereport(ERROR,
++					(errcode(ERRCODE_DATATYPE_MISMATCH),
++					 errmsg("collation of partition bound value for column \"%s\" does not match partition key collation \"%s\"",
++							colName, get_collation_name(partCollation)),
++					 parser_errposition(pstate, exprLocation(value))));
++	}
+ 
+ 	/* Coerce to correct type */
+ 	value = coerce_to_target_type(pstate,
+@@ -3843,21 +3910,27 @@ transformPartitionBoundValue(ParseState *pstate, A_Const *con,
+ 				(errcode(ERRCODE_DATATYPE_MISMATCH),
+ 				 errmsg("specified value cannot be cast to type %s for column \"%s\"",
+ 						format_type_be(colType), colName),
+-				 parser_errposition(pstate, con->location)));
++				 parser_errposition(pstate, exprLocation(val))));
+ 
+ 	/* Simplify the expression, in case we had a coercion */
+ 	if (!IsA(value, Const))
+ 		value = (Node *) expression_planner((Expr *) value);
+ 
+-	/* Fail if we don't have a constant (i.e., non-immutable coercion) */
+-	if (!IsA(value, Const))
++	/* Make sure the expression does not refer to any vars. */
++	if (contain_var_clause(value))
+ 		ereport(ERROR,
+-				(errcode(ERRCODE_DATATYPE_MISMATCH),
+-				 errmsg("specified value cannot be cast to type %s for column \"%s\"",
+-						format_type_be(colType), colName),
+-				 errdetail("The cast requires a non-immutable conversion."),
+-				 errhint("Try putting the literal value in single quotes."),
+-				 parser_errposition(pstate, con->location)));
++				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
++				 errmsg("cannot use column references in partition bound expression"),
++				 parser_errposition(pstate, exprLocation(value))));
++
++	/*
++	 * Evaluate the expression, assigning the partition key's collation to the
++	 * resulting Const expression.
++	 */
++	value = (Node *) evaluate_expr((Expr *) value, colType, colTypmod,
++								   partCollation);
++	if (!IsA(value, Const))
++		elog(ERROR, "could not evaluate partition bound expression");
+ 
+ 	return (Const *) value;
+ }
+diff --git a/src/include/optimizer/clauses.h b/src/include/optimizer/clauses.h
+index 5c8580e47896..6891d0dc9c06 100644
+--- a/src/include/optimizer/clauses.h
++++ b/src/include/optimizer/clauses.h
+@@ -82,6 +82,9 @@ extern Node *eval_const_expressions(PlannerInfo *root, Node *node);
+ 
+ extern Node *estimate_expression_value(PlannerInfo *root, Node *node);
+ 
++extern Expr *evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
++						   Oid result_collation);
++
+ extern Query *inline_set_returning_function(PlannerInfo *root,
+ 							  RangeTblEntry *rte);
+ 
+diff --git a/src/include/parser/parse_node.h b/src/include/parser/parse_node.h
+index d28210af324d..b95489379c51 100644
+--- a/src/include/parser/parse_node.h
++++ b/src/include/parser/parse_node.h
+@@ -68,6 +68,7 @@ typedef enum ParseExprKind
+ 	EXPR_KIND_EXECUTE_PARAMETER,	/* parameter value in EXECUTE */
+ 	EXPR_KIND_TRIGGER_WHEN,		/* WHEN condition in CREATE TRIGGER */
+ 	EXPR_KIND_POLICY,			/* USING or WITH CHECK expr in policy */
++	EXPR_KIND_PARTITION_BOUND,	/* partition bound expression */
+ 	EXPR_KIND_PARTITION_EXPRESSION, /* PARTITION BY expression */
+ 	EXPR_KIND_CALL_ARGUMENT,		/* procedure argument in CALL */
+ 	EXPR_KIND_COPY_WHERE		/* WHERE condition in COPY FROM */
+diff --git a/src/include/utils/partcache.h b/src/include/utils/partcache.h
+index d058a1d19481..7c2f973f68ef 100644
+--- a/src/include/utils/partcache.h
++++ b/src/include/utils/partcache.h
+@@ -93,4 +93,10 @@ get_partition_col_typmod(PartitionKey key, int col)
+ 	return key->parttypmod[col];
+ }
+ 
++static inline Oid
++get_partition_col_collation(PartitionKey key, int col)
++{
++	return key->partcollation[col];
++}
++
+ #endif							/* PARTCACHE_H */
+diff --git a/src/test/regress/expected/create_table.out b/src/test/regress/expected/create_table.out
+index 7e52c27e3fe3..bcab214401e3 100644
+--- a/src/test/regress/expected/create_table.out
++++ b/src/test/regress/expected/create_table.out
+@@ -460,19 +460,42 @@ DROP TABLE partitioned, partitioned2;
+ CREATE TABLE list_parted (
+ 	a int
+ ) PARTITION BY LIST (a);
+--- syntax allows only string literal, numeric literal and null to be
+--- specified for a partition bound value
+ CREATE TABLE part_1 PARTITION OF list_parted FOR VALUES IN ('1');
+ CREATE TABLE part_2 PARTITION OF list_parted FOR VALUES IN (2);
++CREATE TABLE part_3 PARTITION OF list_parted FOR VALUES IN ((2+1));
+ CREATE TABLE part_null PARTITION OF list_parted FOR VALUES IN (null);
+-CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES IN (int '1');
+-ERROR:  syntax error at or near "int"
+-LINE 1: ... fail_part PARTITION OF list_parted FOR VALUES IN (int '1');
+-                                                              ^
+-CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES IN ('1'::int);
+-ERROR:  syntax error at or near "::"
+-LINE 1: ...fail_part PARTITION OF list_parted FOR VALUES IN ('1'::int);
+-                                                                ^
++\d+ list_parted
++                          Partitioned table "public.list_parted"
++ Column |  Type   | Collation | Nullable | Default | Storage | Stats target | Description 
++--------+---------+-----------+----------+---------+---------+--------------+-------------
++ a      | integer |           |          |         | plain   |              | 
++Partition key: LIST (a)
++Partitions: part_1 FOR VALUES IN (1),
++            part_2 FOR VALUES IN (2),
++            part_3 FOR VALUES IN (3),
++            part_null FOR VALUES IN (NULL)
++
++-- forbidden expressions for partition bound
++CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (somename);
++ERROR:  column "somename" does not exist
++LINE 1: ...expr_fail PARTITION OF list_parted FOR VALUES IN (somename);
++                                                             ^
++CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (a);
++ERROR:  cannot use column references in partition bound expression
++LINE 1: ..._bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (a);
++                                                                    ^
++CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (sum(a));
++ERROR:  aggregate functions are not allowed in partition bound
++LINE 1: ...s_expr_fail PARTITION OF list_parted FOR VALUES IN (sum(a));
++                                                               ^
++CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN ((select 1));
++ERROR:  cannot use subquery in partition bound
++LINE 1: ...expr_fail PARTITION OF list_parted FOR VALUES IN ((select 1)...
++                                                             ^
++CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (generate_series(4, 6));
++ERROR:  set-returning functions are not allowed in partition bound
++LINE 1: ...expr_fail PARTITION OF list_parted FOR VALUES IN (generate_s...
++                                                             ^
+ -- syntax does not allow empty list of values for list partitions
+ CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES IN ();
+ ERROR:  syntax error at or near ")"
+@@ -501,19 +524,15 @@ ERROR:  specified value cannot be cast to type boolean for column "a"
+ LINE 1: ...REATE TABLE bools_true PARTITION OF bools FOR VALUES IN (1);
+                                                                     ^
+ DROP TABLE bools;
+--- specified literal can be cast, but cast isn't immutable
++-- specified literal can be cast, and the cast might not be immutable
+ CREATE TABLE moneyp (
+ 	a money
+ ) PARTITION BY LIST (a);
+ CREATE TABLE moneyp_10 PARTITION OF moneyp FOR VALUES IN (10);
+-ERROR:  specified value cannot be cast to type money for column "a"
+-LINE 1: ...EATE TABLE moneyp_10 PARTITION OF moneyp FOR VALUES IN (10);
+-                                                                   ^
+-DETAIL:  The cast requires a non-immutable conversion.
+-HINT:  Try putting the literal value in single quotes.
+-CREATE TABLE moneyp_10 PARTITION OF moneyp FOR VALUES IN ('10');
++CREATE TABLE moneyp_11 PARTITION OF moneyp FOR VALUES IN ('11');
++CREATE TABLE moneyp_12 PARTITION OF moneyp FOR VALUES IN (to_char(12, '99')::int);
+ DROP TABLE moneyp;
+--- immutable cast should work, though
++-- cast is immutable
+ CREATE TABLE bigintp (
+ 	a bigint
+ ) PARTITION BY LIST (a);
+@@ -774,6 +793,29 @@ create table parted_collate_must_match1 partition of parted_collate_must_match
+ create table parted_collate_must_match2 partition of parted_collate_must_match
+   (b collate "POSIX") for values from ('m') to ('z');
+ drop table parted_collate_must_match;
++-- check that specifying incompatible collations for partition bound
++-- expressions fails promptly
++create table test_part_coll_posix (a text) partition by range (a collate "POSIX");
++-- fail
++create table test_part_coll partition of test_part_coll_posix for values from ('a' collate "C") to ('g');
++ERROR:  collation of partition bound value for column "a" does not match partition key collation "POSIX"
++LINE 1: ...artition of test_part_coll_posix for values from ('a' collat...
++                                                             ^
++-- ok
++create table test_part_coll partition of test_part_coll_posix for values from ('a' collate "POSIX") to ('g');
++-- ok
++create table test_part_coll2 partition of test_part_coll_posix for values from ('g') to ('m');
++-- using a cast expression uses the target type's default collation
++-- fail
++create table test_part_coll_cast partition of test_part_coll_posix for values from (name 'm' collate "C") to ('s');
++ERROR:  collation of partition bound value for column "a" does not match partition key collation "POSIX"
++LINE 1: ...ion of test_part_coll_posix for values from (name 'm' collat...
++                                                             ^
++-- ok
++create table test_part_coll_cast partition of test_part_coll_posix for values from (name 'm' collate "POSIX") to ('s');
++-- ok; partition collation silently overrides the default collation of type 'name'
++create table test_part_coll_cast2 partition of test_part_coll_posix for values from (name 's') to ('z');
++drop table test_part_coll_posix;
+ -- Partition bound in describe output
+ \d+ part_b
+                                    Table "public.part_b"
+@@ -963,3 +1005,16 @@ CONTEXT:  SQL statement "create table tab_part_create_1 partition of tab_part_cr
+ PL/pgSQL function func_part_create() line 3 at EXECUTE
+ drop table tab_part_create;
+ drop function func_part_create();
++-- test using a volatile expression as partition bound
++create table volatile_partbound_test (partkey timestamp) partition by range (partkey);
++create table volatile_partbound_test1 partition of volatile_partbound_test for values from (minvalue) to (current_timestamp);
++create table volatile_partbound_test2 partition of volatile_partbound_test for values from (current_timestamp) to (maxvalue);
++-- this should go into the partition volatile_partbound_test2
++insert into volatile_partbound_test values (current_timestamp);
++select tableoid::regclass from volatile_partbound_test;
++         tableoid         
++--------------------------
++ volatile_partbound_test2
++(1 row)
++
++drop table volatile_partbound_test;
+diff --git a/src/test/regress/sql/create_table.sql b/src/test/regress/sql/create_table.sql
+index a2cae9663c1a..cf6141ab6b2f 100644
+--- a/src/test/regress/sql/create_table.sql
++++ b/src/test/regress/sql/create_table.sql
+@@ -436,13 +436,18 @@ DROP TABLE partitioned, partitioned2;
+ CREATE TABLE list_parted (
+ 	a int
+ ) PARTITION BY LIST (a);
+--- syntax allows only string literal, numeric literal and null to be
+--- specified for a partition bound value
+ CREATE TABLE part_1 PARTITION OF list_parted FOR VALUES IN ('1');
+ CREATE TABLE part_2 PARTITION OF list_parted FOR VALUES IN (2);
++CREATE TABLE part_3 PARTITION OF list_parted FOR VALUES IN ((2+1));
+ CREATE TABLE part_null PARTITION OF list_parted FOR VALUES IN (null);
+-CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES IN (int '1');
+-CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES IN ('1'::int);
++\d+ list_parted
++
++-- forbidden expressions for partition bound
++CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (somename);
++CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (a);
++CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (sum(a));
++CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN ((select 1));
++CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (generate_series(4, 6));
+ 
+ -- syntax does not allow empty list of values for list partitions
+ CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES IN ();
+@@ -462,15 +467,16 @@ CREATE TABLE bools (
+ CREATE TABLE bools_true PARTITION OF bools FOR VALUES IN (1);
+ DROP TABLE bools;
+ 
+--- specified literal can be cast, but cast isn't immutable
++-- specified literal can be cast, and the cast might not be immutable
+ CREATE TABLE moneyp (
+ 	a money
+ ) PARTITION BY LIST (a);
+ CREATE TABLE moneyp_10 PARTITION OF moneyp FOR VALUES IN (10);
+-CREATE TABLE moneyp_10 PARTITION OF moneyp FOR VALUES IN ('10');
++CREATE TABLE moneyp_11 PARTITION OF moneyp FOR VALUES IN ('11');
++CREATE TABLE moneyp_12 PARTITION OF moneyp FOR VALUES IN (to_char(12, '99')::int);
+ DROP TABLE moneyp;
+ 
+--- immutable cast should work, though
++-- cast is immutable
+ CREATE TABLE bigintp (
+ 	a bigint
+ ) PARTITION BY LIST (a);
+@@ -686,6 +692,28 @@ create table parted_collate_must_match2 partition of parted_collate_must_match
+   (b collate "POSIX") for values from ('m') to ('z');
+ drop table parted_collate_must_match;
+ 
++-- check that specifying incompatible collations for partition bound
++-- expressions fails promptly
++
++create table test_part_coll_posix (a text) partition by range (a collate "POSIX");
++-- fail
++create table test_part_coll partition of test_part_coll_posix for values from ('a' collate "C") to ('g');
++-- ok
++create table test_part_coll partition of test_part_coll_posix for values from ('a' collate "POSIX") to ('g');
++-- ok
++create table test_part_coll2 partition of test_part_coll_posix for values from ('g') to ('m');
++
++-- using a cast expression uses the target type's default collation
++
++-- fail
++create table test_part_coll_cast partition of test_part_coll_posix for values from (name 'm' collate "C") to ('s');
++-- ok
++create table test_part_coll_cast partition of test_part_coll_posix for values from (name 'm' collate "POSIX") to ('s');
++-- ok; partition collation silently overrides the default collation of type 'name'
++create table test_part_coll_cast2 partition of test_part_coll_posix for values from (name 's') to ('z');
++
++drop table test_part_coll_posix;
++
+ -- Partition bound in describe output
+ \d+ part_b
+ 
+@@ -776,3 +804,12 @@ create trigger trig_part_create before insert on tab_part_create
+ insert into tab_part_create values (1);
+ drop table tab_part_create;
+ drop function func_part_create();
++
++-- test using a volatile expression as partition bound
++create table volatile_partbound_test (partkey timestamp) partition by range (partkey);
++create table volatile_partbound_test1 partition of volatile_partbound_test for values from (minvalue) to (current_timestamp);
++create table volatile_partbound_test2 partition of volatile_partbound_test for values from (current_timestamp) to (maxvalue);
++-- this should go into the partition volatile_partbound_test2
++insert into volatile_partbound_test values (current_timestamp);
++select tableoid::regclass from volatile_partbound_test;
++drop table volatile_partbound_test;

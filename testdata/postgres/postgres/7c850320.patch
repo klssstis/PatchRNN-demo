@@ -1,0 +1,360 @@
+From 7c850320d8cfa5503ecec61c2559661b924f7595 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 14 May 2019 11:27:31 -0400
+Subject: [PATCH] Fix SQL-style substring() to have spec-compliant greediness
+ behavior.
+
+SQL's regular-expression substring() function is defined to have a
+pattern argument that's separated into three subpatterns by escape-
+double-quote markers; the function result is the part of the input
+matching the second subpattern.  The standard makes it clear that
+if there is ambiguity about how to match the input to the subpatterns,
+the first and third subpatterns should be taken to match the smallest
+possible amount of text (i.e., they're "non greedy", in the terms of
+our regex code).  We were not doing it that way: the first subpattern
+would eat the largest possible amount of text, causing the function
+result to be shorter than what the spec requires.
+
+Fix that by attaching explicit greediness quantifiers to the
+subpatterns.  (This depends on the regex fix in commit 8a29ed053;
+before that, this didn't reliably change the regex engine's behavior.)
+
+Also, by adding parentheses around each subpattern, we ensure that
+"|" (OR) in the subpatterns behave sanely.  Previously, "|" in the
+first or third subpatterns didn't work.
+
+This patch also makes the function throw error if you write more than
+two escape-double-quote markers, and do something sane if you write
+just one, and document that behavior.  Previously, an odd number of
+markers led to a confusing complaint about unbalanced parentheses,
+while extra pairs of markers were just ignored.  (Note that the spec
+requires exactly two markers, but we've historically allowed there
+to be none, and this patch preserves the old behavior for that case.)
+
+In passing, adjust some substring() test cases that didn't really
+prove what they said they were testing for: they used patterns
+that didn't match the data string, so that the output would be
+NULL whether or not the function was really strict.
+
+Although this is certainly a bug fix, changing the behavior in back
+branches seems undesirable: applications could perhaps be depending on
+the old behavior, since it's not obviously wrong unless you read the
+spec very closely.  Hence, no back-patch.
+
+Discussion: https://postgr.es/m/5bb27a41-350d-37bf-901e-9d26f5592dd0@charter.net
+---
+ doc/src/sgml/func.sgml                | 42 ++++++++++++---
+ src/backend/utils/adt/regexp.c        | 73 ++++++++++++++++++++++++---
+ src/test/regress/expected/strings.out | 59 ++++++++++++++++++++--
+ src/test/regress/sql/strings.sql      | 26 ++++++++--
+ 4 files changed, 174 insertions(+), 26 deletions(-)
+
+diff --git a/doc/src/sgml/func.sgml b/doc/src/sgml/func.sgml
+index da0f3059815c..bc2275c8fee5 100644
+--- a/doc/src/sgml/func.sgml
++++ b/doc/src/sgml/func.sgml
+@@ -4296,19 +4296,45 @@ cast(-44 as bit(12))           <lineannotation>111111010100</lineannotation>
+    </para>
+ 
+    <para>
+-    The <function>substring</function> function with three parameters,
+-    <function>substring(<replaceable>string</replaceable> from
+-    <replaceable>pattern</replaceable> for
+-    <replaceable>escape-character</replaceable>)</function>, provides
+-    extraction of a substring that matches an SQL
+-    regular expression pattern.  As with <literal>SIMILAR TO</literal>, the
++    The <function>substring</function> function with three parameters
++    provides extraction of a substring that matches an SQL
++    regular expression pattern.  The function can be written according
++    to SQL99 syntax:
++<synopsis>
++substring(<replaceable>string</replaceable> from <replaceable>pattern</replaceable> for <replaceable>escape-character</replaceable>)
++</synopsis>
++    or as a plain three-argument function:
++<synopsis>
++substring(<replaceable>string</replaceable>, <replaceable>pattern</replaceable>, <replaceable>escape-character</replaceable>)
++</synopsis>
++    As with <literal>SIMILAR TO</literal>, the
+     specified pattern must match the entire data string, or else the
+     function fails and returns null.  To indicate the part of the
+-    pattern that should be returned on success, the pattern must contain
++    pattern for which the matching data sub-string is of interest,
++    the pattern should contain
+     two occurrences of the escape character followed by a double quote
+     (<literal>"</literal>). <!-- " font-lock sanity -->
+     The text matching the portion of the pattern
+-    between these markers is returned.
++    between these separators is returned when the match is successful.
++   </para>
++
++   <para>
++    The escape-double-quote separators actually
++    divide <function>substring</function>'s pattern into three independent
++    regular expressions; for example, a vertical bar (<literal>|</literal>)
++    in any of the three sections affects only that section.  Also, the first
++    and third of these regular expressions are defined to match the smallest
++    possible amount of text, not the largest, when there is any ambiguity
++    about how much of the data string matches which pattern.  (In POSIX
++    parlance, the first and third regular expressions are forced to be
++    non-greedy.)
++   </para>
++
++   <para>
++    As an extension to the SQL standard, <productname>PostgreSQL</productname>
++    allows there to be just one escape-double-quote separator, in which case
++    the third regular expression is taken as empty; or no separators, in which
++    case the first and third regular expressions are taken as empty.
+    </para>
+ 
+    <para>
+diff --git a/src/backend/utils/adt/regexp.c b/src/backend/utils/adt/regexp.c
+index da13a875eb04..ab44846e0b36 100644
+--- a/src/backend/utils/adt/regexp.c
++++ b/src/backend/utils/adt/regexp.c
+@@ -708,20 +708,42 @@ similar_escape(PG_FUNCTION_ARGS)
+ 	 * We surround the transformed input string with
+ 	 *			^(?: ... )$
+ 	 * which requires some explanation.  We need "^" and "$" to force
+-	 * the pattern to match the entire input string as per SQL99 spec.
++	 * the pattern to match the entire input string as per the SQL spec.
+ 	 * The "(?:" and ")" are a non-capturing set of parens; we have to have
+ 	 * parens in case the string contains "|", else the "^" and "$" will
+ 	 * be bound into the first and last alternatives which is not what we
+ 	 * want, and the parens must be non capturing because we don't want them
+ 	 * to count when selecting output for SUBSTRING.
++	 *
++	 * When the pattern is divided into three parts by escape-double-quotes,
++	 * what we emit is
++	 *			^(?:part1){1,1}?(part2){1,1}(?:part3)$
++	 * which requires even more explanation.  The "{1,1}?" on part1 makes it
++	 * non-greedy so that it will match the smallest possible amount of text
++	 * not the largest, as required by SQL.  The plain parens around part2
++	 * are capturing parens so that that part is what controls the result of
++	 * SUBSTRING.  The "{1,1}" forces part2 to be greedy, so that it matches
++	 * the largest possible amount of text; hence part3 must match the
++	 * smallest amount of text, as required by SQL.  We don't need an explicit
++	 * greediness marker on part3.  Note that this also confines the effects
++	 * of any "|" characters to the respective part, which is what we want.
++	 *
++	 * The SQL spec says that SUBSTRING's pattern must contain exactly two
++	 * escape-double-quotes, but we only complain if there's more than two.
++	 * With none, we act as though part1 and part3 are empty; with one, we
++	 * act as though part3 is empty.  Both behaviors fall out of omitting
++	 * the relevant part separators in the above expansion.  If the result
++	 * of this function is used in a plain regexp match (SIMILAR TO), the
++	 * escape-double-quotes have no effect on the match behavior.
+ 	 *----------
+ 	 */
+ 
+ 	/*
+-	 * We need room for the prefix/postfix plus as many as 3 output bytes per
+-	 * input byte; since the input is at most 1GB this can't overflow
++	 * We need room for the prefix/postfix and part separators, plus as many
++	 * as 3 output bytes per input byte; since the input is at most 1GB this
++	 * can't overflow size_t.
+ 	 */
+-	result = (text *) palloc(VARHDRSZ + 6 + 3 * plen);
++	result = (text *) palloc(VARHDRSZ + 23 + 3 * (size_t) plen);
+ 	r = VARDATA(result);
+ 
+ 	*r++ = '^';
+@@ -760,7 +782,7 @@ similar_escape(PG_FUNCTION_ARGS)
+ 				}
+ 				else if (e && elen == mblen && memcmp(e, p, mblen) == 0)
+ 				{
+-					/* SQL99 escape character; do not send to output */
++					/* SQL escape character; do not send to output */
+ 					afterescape = true;
+ 				}
+ 				else
+@@ -784,10 +806,45 @@ similar_escape(PG_FUNCTION_ARGS)
+ 		/* fast path */
+ 		if (afterescape)
+ 		{
+-			if (pchar == '"' && !incharclass)	/* for SUBSTRING patterns */
+-				*r++ = ((nquotes++ % 2) == 0) ? '(' : ')';
++			if (pchar == '"' && !incharclass)	/* escape-double-quote? */
++			{
++				/* emit appropriate part separator, per notes above */
++				if (nquotes == 0)
++				{
++					*r++ = ')';
++					*r++ = '{';
++					*r++ = '1';
++					*r++ = ',';
++					*r++ = '1';
++					*r++ = '}';
++					*r++ = '?';
++					*r++ = '(';
++				}
++				else if (nquotes == 1)
++				{
++					*r++ = ')';
++					*r++ = '{';
++					*r++ = '1';
++					*r++ = ',';
++					*r++ = '1';
++					*r++ = '}';
++					*r++ = '(';
++					*r++ = '?';
++					*r++ = ':';
++				}
++				else
++					ereport(ERROR,
++							(errcode(ERRCODE_INVALID_USE_OF_ESCAPE_CHARACTER),
++							 errmsg("SQL regular expression may not contain more than two escape-double-quote separators")));
++				nquotes++;
++			}
+ 			else
+ 			{
++				/*
++				 * We allow any character at all to be escaped; notably, this
++				 * allows access to POSIX character-class escapes such as
++				 * "\d".  The SQL spec is considerably more restrictive.
++				 */
+ 				*r++ = '\\';
+ 				*r++ = pchar;
+ 			}
+@@ -795,7 +852,7 @@ similar_escape(PG_FUNCTION_ARGS)
+ 		}
+ 		else if (e && pchar == *e)
+ 		{
+-			/* SQL99 escape character; do not send to output */
++			/* SQL escape character; do not send to output */
+ 			afterescape = true;
+ 		}
+ 		else if (incharclass)
+diff --git a/src/test/regress/expected/strings.out b/src/test/regress/expected/strings.out
+index 7c7f8726fcca..24570bed163b 100644
+--- a/src/test/regress/expected/strings.out
++++ b/src/test/regress/expected/strings.out
+@@ -313,7 +313,7 @@ SELECT SUBSTRING('1234567890' FROM 4 FOR 3) = '456' AS "456";
+  t
+ (1 row)
+ 
+--- T581 regular expression substring (with SQL99's bizarre regexp syntax)
++-- T581 regular expression substring (with SQL's bizarre regexp syntax)
+ SELECT SUBSTRING('abcdefg' FROM 'a#"(b_d)#"%' FOR '#') AS "bcd";
+  bcd 
+ -----
+@@ -328,13 +328,13 @@ SELECT SUBSTRING('abcdefg' FROM '#"(b_d)#"%' FOR '#') IS NULL AS "True";
+ (1 row)
+ 
+ -- Null inputs should return NULL
+-SELECT SUBSTRING('abcdefg' FROM '(b|c)' FOR NULL) IS NULL AS "True";
++SELECT SUBSTRING('abcdefg' FROM '%' FOR NULL) IS NULL AS "True";
+  True 
+ ------
+  t
+ (1 row)
+ 
+-SELECT SUBSTRING(NULL FROM '(b|c)' FOR '#') IS NULL AS "True";
++SELECT SUBSTRING(NULL FROM '%' FOR '#') IS NULL AS "True";
+  True 
+ ------
+  t
+@@ -346,8 +346,57 @@ SELECT SUBSTRING('abcdefg' FROM NULL FOR '#') IS NULL AS "True";
+  t
+ (1 row)
+ 
+--- PostgreSQL extension to allow omitting the escape character;
+--- here the regexp is taken as Posix syntax
++-- The first and last parts should act non-greedy
++SELECT SUBSTRING('abcdefg' FROM 'a#"%#"g' FOR '#') AS "bcdef";
++ bcdef 
++-------
++ bcdef
++(1 row)
++
++SELECT SUBSTRING('abcdefg' FROM 'a*#"%#"g*' FOR '#') AS "abcdefg";
++ abcdefg 
++---------
++ abcdefg
++(1 row)
++
++-- Vertical bar in any part affects only that part
++SELECT SUBSTRING('abcdefg' FROM 'a|b#"%#"g' FOR '#') AS "bcdef";
++ bcdef 
++-------
++ bcdef
++(1 row)
++
++SELECT SUBSTRING('abcdefg' FROM 'a#"%#"x|g' FOR '#') AS "bcdef";
++ bcdef 
++-------
++ bcdef
++(1 row)
++
++SELECT SUBSTRING('abcdefg' FROM 'a#"%|ab#"g' FOR '#') AS "bcdef";
++ bcdef 
++-------
++ bcdef
++(1 row)
++
++-- Can't have more than two part separators
++SELECT SUBSTRING('abcdefg' FROM 'a*#"%#"g*#"x' FOR '#') AS "error";
++ERROR:  SQL regular expression may not contain more than two escape-double-quote separators
++CONTEXT:  SQL function "substring" statement 1
++-- Postgres extension: with 0 or 1 separator, assume parts 1 and 3 are empty
++SELECT SUBSTRING('abcdefg' FROM 'a#"%g' FOR '#') AS "bcdefg";
++ bcdefg 
++--------
++ bcdefg
++(1 row)
++
++SELECT SUBSTRING('abcdefg' FROM 'a%g' FOR '#') AS "abcdefg";
++ abcdefg 
++---------
++ abcdefg
++(1 row)
++
++-- substring() with just two arguments is not allowed by SQL spec;
++-- we accept it, but we interpret the pattern as a POSIX regexp not SQL
+ SELECT SUBSTRING('abcdefg' FROM 'c.e') AS "cde";
+  cde 
+ -----
+diff --git a/src/test/regress/sql/strings.sql b/src/test/regress/sql/strings.sql
+index 9cd2bc5d7e8d..5744c9f8007f 100644
+--- a/src/test/regress/sql/strings.sql
++++ b/src/test/regress/sql/strings.sql
+@@ -110,19 +110,35 @@ SELECT SUBSTRING('1234567890' FROM 3) = '34567890' AS "34567890";
+ 
+ SELECT SUBSTRING('1234567890' FROM 4 FOR 3) = '456' AS "456";
+ 
+--- T581 regular expression substring (with SQL99's bizarre regexp syntax)
++-- T581 regular expression substring (with SQL's bizarre regexp syntax)
+ SELECT SUBSTRING('abcdefg' FROM 'a#"(b_d)#"%' FOR '#') AS "bcd";
+ 
+ -- No match should return NULL
+ SELECT SUBSTRING('abcdefg' FROM '#"(b_d)#"%' FOR '#') IS NULL AS "True";
+ 
+ -- Null inputs should return NULL
+-SELECT SUBSTRING('abcdefg' FROM '(b|c)' FOR NULL) IS NULL AS "True";
+-SELECT SUBSTRING(NULL FROM '(b|c)' FOR '#') IS NULL AS "True";
++SELECT SUBSTRING('abcdefg' FROM '%' FOR NULL) IS NULL AS "True";
++SELECT SUBSTRING(NULL FROM '%' FOR '#') IS NULL AS "True";
+ SELECT SUBSTRING('abcdefg' FROM NULL FOR '#') IS NULL AS "True";
+ 
+--- PostgreSQL extension to allow omitting the escape character;
+--- here the regexp is taken as Posix syntax
++-- The first and last parts should act non-greedy
++SELECT SUBSTRING('abcdefg' FROM 'a#"%#"g' FOR '#') AS "bcdef";
++SELECT SUBSTRING('abcdefg' FROM 'a*#"%#"g*' FOR '#') AS "abcdefg";
++
++-- Vertical bar in any part affects only that part
++SELECT SUBSTRING('abcdefg' FROM 'a|b#"%#"g' FOR '#') AS "bcdef";
++SELECT SUBSTRING('abcdefg' FROM 'a#"%#"x|g' FOR '#') AS "bcdef";
++SELECT SUBSTRING('abcdefg' FROM 'a#"%|ab#"g' FOR '#') AS "bcdef";
++
++-- Can't have more than two part separators
++SELECT SUBSTRING('abcdefg' FROM 'a*#"%#"g*#"x' FOR '#') AS "error";
++
++-- Postgres extension: with 0 or 1 separator, assume parts 1 and 3 are empty
++SELECT SUBSTRING('abcdefg' FROM 'a#"%g' FOR '#') AS "bcdefg";
++SELECT SUBSTRING('abcdefg' FROM 'a%g' FOR '#') AS "abcdefg";
++
++-- substring() with just two arguments is not allowed by SQL spec;
++-- we accept it, but we interpret the pattern as a POSIX regexp not SQL
+ SELECT SUBSTRING('abcdefg' FROM 'c.e') AS "cde";
+ 
+ -- With a parenthesized subexpression, return only what matches the subexpr

@@ -1,0 +1,102 @@
+From 7a980dfc6c15add6ec3309932cf3061bb6745f65 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 5 Aug 2020 15:38:55 -0400
+Subject: [PATCH] Fix matching of sub-partitions when a partitioned plan is
+ stale.
+
+Since we no longer require AccessExclusiveLock to add a partition,
+the executor may see that a partitioned table has more partitions
+than the planner saw.  ExecCreatePartitionPruneState's code for
+matching up the partition lists in such cases was faulty, and would
+misbehave if the planner had successfully pruned any partitions from
+the query.  (Thus, trouble would occur only if a partition addition
+happens concurrently with a query that uses both static and dynamic
+partition pruning.)  This led to an Assert failure in debug builds,
+and probably to crashes or query misbehavior in production builds.
+
+To repair the bug, just explicitly skip zeroes in the plan's
+relid_map[] list.  I also made some cosmetic changes to make the code
+more readable (IMO anyway).  Also, convert the cross-checking Assert
+to a regular test-and-elog, since it's now apparent that this logic
+is more fragile than one would like.
+
+Currently, there's no way to repeatably exercise this code, except
+with manual use of a debugger to stop the backend between planning
+and execution.  Hence, no test case in this patch.  We oughta do
+something about that testability gap, but that's for another day.
+
+Amit Langote and Tom Lane, per report from Justin Pryzby.  Oversight
+in commit 898e5e329; backpatch to v12 where that appeared.
+
+Discussion: https://postgr.es/m/20200802181131.GA27754@telsasoft.com
+---
+ src/backend/executor/execPartition.c | 47 +++++++++++++++++++++-------
+ 1 file changed, 36 insertions(+), 11 deletions(-)
+
+diff --git a/src/backend/executor/execPartition.c b/src/backend/executor/execPartition.c
+index fb6ce4905681..79fcbd6b0665 100644
+--- a/src/backend/executor/execPartition.c
++++ b/src/backend/executor/execPartition.c
+@@ -1667,26 +1667,51 @@ ExecCreatePartitionPruneState(PlanState *planstate,
+ 				 * present in the one used to construct subplan_map and
+ 				 * subpart_map.  So we must construct new and longer arrays
+ 				 * where the partitions that were originally present map to
+-				 * the same place, and any added indexes map to -1, as if the
+-				 * new partitions had been pruned.
++				 * the same sub-structures, and any added partitions map to
++				 * -1, as if the new partitions had been pruned.
++				 *
++				 * Note: pinfo->relid_map[] may contain InvalidOid entries for
++				 * partitions pruned by the planner.  We cannot tell exactly
++				 * which of the partdesc entries these correspond to, but we
++				 * don't have to; just skip over them.  The non-pruned
++				 * relid_map entries, however, had better be a subset of the
++				 * partdesc entries and in the same order.
+ 				 */
+ 				pprune->subpart_map = palloc(sizeof(int) * partdesc->nparts);
+-				for (pp_idx = 0; pp_idx < partdesc->nparts; ++pp_idx)
++				for (pp_idx = 0; pp_idx < partdesc->nparts; pp_idx++)
+ 				{
+-					if (pinfo->relid_map[pd_idx] != partdesc->oids[pp_idx])
+-					{
+-						pprune->subplan_map[pp_idx] = -1;
+-						pprune->subpart_map[pp_idx] = -1;
+-					}
+-					else
++					/* Skip any InvalidOid relid_map entries */
++					while (pd_idx < pinfo->nparts &&
++						   !OidIsValid(pinfo->relid_map[pd_idx]))
++						pd_idx++;
++
++					if (pd_idx < pinfo->nparts &&
++						pinfo->relid_map[pd_idx] == partdesc->oids[pp_idx])
+ 					{
++						/* match... */
+ 						pprune->subplan_map[pp_idx] =
+ 							pinfo->subplan_map[pd_idx];
+ 						pprune->subpart_map[pp_idx] =
+-							pinfo->subpart_map[pd_idx++];
++							pinfo->subpart_map[pd_idx];
++						pd_idx++;
++					}
++					else
++					{
++						/* this partdesc entry is not in the plan */
++						pprune->subplan_map[pp_idx] = -1;
++						pprune->subpart_map[pp_idx] = -1;
+ 					}
+ 				}
+-				Assert(pd_idx == pinfo->nparts);
++
++				/*
++				 * It might seem that we need to skip any trailing InvalidOid
++				 * entries in pinfo->relid_map before checking that we scanned
++				 * all of the relid_map.  But we will have skipped them above,
++				 * because they must correspond to some partdesc->oids
++				 * entries; we just couldn't tell which.
++				 */
++				if (pd_idx != pinfo->nparts)
++					elog(ERROR, "could not match partition child tables to plan elements");
+ 			}
+ 
+ 			/* present_parts is also subject to later modification */

@@ -1,0 +1,126 @@
+From 7fbcee1b2d5f1012c67942126881bd492e95077e Mon Sep 17 00:00:00 2001
+From: Fujii Masao <fujii@postgresql.org>
+Date: Wed, 24 Mar 2021 10:36:56 +0900
+Subject: [PATCH] Log when GetNewOidWithIndex() fails to find unused OID many
+ times.
+
+GetNewOidWithIndex() generates a new OID one by one until it finds
+one not in the relation. If there are very long runs of consecutive
+existing OIDs, GetNewOidWithIndex() needs to iterate many times
+in the loop to find unused OID. Since TOAST table can have a large
+number of entries and there can be such long runs of OIDs, there is
+the case where it takes so many iterations to find new OID not in
+TOAST table. Furthermore if all (i.e., 2^32) OIDs are already used,
+GetNewOidWithIndex() enters something like busy loop and repeats
+the iterations until at least one OID is marked as unused.
+
+There are some reported troubles caused by a large number of
+iterations in GetNewOidWithIndex(). For example, when inserting
+a billion of records into the table, all the backends doing that
+insertion operation got hang with 100% CPU usage at some point.
+
+Previously there was no easy way to detect that GetNewOidWithIndex()
+failed to find unused OID many times. So, for example, gdb full
+backtrace of hanged backends needed to be taken, in order to
+investigate that trouble. This is inconvenient and may not be
+available in some production environments.
+
+To provide easy way for that, this commit makes GetNewOidWithIndex()
+log that it iterates more than GETNEWOID_LOG_THRESHOLD but have
+not yet found OID unused in the relation. Also this commit makes
+it repeat logging with exponentially increasing intervals until
+it iterates more than GETNEWOID_LOG_MAX_INTERVAL, and makes it
+finally repeat logging every GETNEWOID_LOG_MAX_INTERVAL unless
+an unused OID is found. Those macro variables are used not to
+fill up the server log with the similar messages.
+
+In the discusion at pgsql-hackers, there was another idea to report
+the lots of iterations in GetNewOidWithIndex() via wait event.
+But since GetNewOidWithIndex() traverses indexes to find unused
+OID and which will do I/O, acquire locks, etc, which will overwrite
+the wait event and reset it to nothing once done. So that idea
+doesn't work well, and we didn't adopt it.
+
+Author: Tomohiro Hiramitsu
+Reviewed-by: Tatsuhito Kasahara, Kyotaro Horiguchi, Tom Lane, Fujii Masao
+Discussion: https://postgr.es/m/16722-93043fb459a41073@postgresql.org
+---
+ src/backend/catalog/catalog.c | 49 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
+diff --git a/src/backend/catalog/catalog.c b/src/backend/catalog/catalog.c
+index e2ed80a5de94..245d53637265 100644
+--- a/src/backend/catalog/catalog.c
++++ b/src/backend/catalog/catalog.c
+@@ -47,6 +47,13 @@
+ #include "utils/snapmgr.h"
+ #include "utils/syscache.h"
+ 
++/*
++ * Parameters to determine when to emit a log message in
++ * GetNewOidWithIndex()
++ */
++#define GETNEWOID_LOG_THRESHOLD 1000000
++#define GETNEWOID_LOG_MAX_INTERVAL 128000000
++
+ /*
+  * IsSystemRelation
+  *		True iff the relation is either a system catalog or a toast table.
+@@ -318,6 +325,8 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
+ 	SysScanDesc scan;
+ 	ScanKeyData key;
+ 	bool		collides;
++	uint64		retries = 0;
++	uint64		retries_before_log = GETNEWOID_LOG_THRESHOLD;
+ 
+ 	/* Only system relations are supported */
+ 	Assert(IsSystemRelation(relation));
+@@ -353,8 +362,48 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
+ 		collides = HeapTupleIsValid(systable_getnext(scan));
+ 
+ 		systable_endscan(scan);
++
++		/*
++		 * Log that we iterate more than GETNEWOID_LOG_THRESHOLD but have not
++		 * yet found OID unused in the relation. Then repeat logging with
++		 * exponentially increasing intervals until we iterate more than
++		 * GETNEWOID_LOG_MAX_INTERVAL. Finally repeat logging every
++		 * GETNEWOID_LOG_MAX_INTERVAL unless an unused OID is found. This
++		 * logic is necessary not to fill up the server log with the similar
++		 * messages.
++		 */
++		if (retries >= retries_before_log)
++		{
++			ereport(LOG,
++					(errmsg("still finding an unused OID within relation \"%s\"",
++							RelationGetRelationName(relation)),
++					 errdetail("OID candidates were checked \"%llu\"  times, but no unused OID is yet found.",
++							   (unsigned long long) retries)));
++
++			/*
++			 * Double the number of retries to do before logging next until it
++			 * reaches GETNEWOID_LOG_MAX_INTERVAL.
++			 */
++			if (retries_before_log * 2 <= GETNEWOID_LOG_MAX_INTERVAL)
++				retries_before_log *= 2;
++			else
++				retries_before_log += GETNEWOID_LOG_MAX_INTERVAL;
++		}
++
++		retries++;
+ 	} while (collides);
+ 
++	/*
++	 * If at least one log message is emitted, also log the completion of OID
++	 * assignment.
++	 */
++	if (retries > GETNEWOID_LOG_THRESHOLD)
++	{
++		ereport(LOG,
++				(errmsg("new OID has been assigned in relation \"%s\" after \"%llu\" retries",
++						RelationGetRelationName(relation), (unsigned long long) retries)));
++	}
++
+ 	return newOid;
+ }
+ 

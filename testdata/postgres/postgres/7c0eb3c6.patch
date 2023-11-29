@@ -1,0 +1,229 @@
+From 7c0eb3c622eb0882f460805109f244679b340964 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 14 Jul 2022 09:04:23 -0400
+Subject: [PATCH] Tighten up parsing logic in gen_node_support.pl.
+
+Teach this script to handle function pointer fields honestly.
+Previously they were just silently ignored, but that's not likely to
+be a behavior we can accept indefinitely.  This mostly entails fixing
+it so that a field declaration spanning multiple lines can be parsed,
+because we have a bunch of such fields that're laid out that way.
+But that's a good improvement in its own right.
+
+With that change and a minor regex adjustment, the only struct it
+fails to parse in the node-defining headers is A_Const, because
+of the embedded union.  The path of least resistance is to move
+that union declaration outside the struct.
+
+Having done those things, we can make it error out if it finds
+any within-struct syntax it doesn't understand, which seems like
+a pretty important property for robustness.
+
+This commit doesn't change the output files at all; it's just in
+the way of future-proofing.
+
+Discussion: https://postgr.es/m/2593369.1657759779@sss.pgh.pa.us
+---
+ src/backend/nodes/gen_node_support.pl | 77 +++++++++++++++++++++++++--
+ src/include/nodes/parsenodes.h        | 28 +++++-----
+ src/include/nodes/pathnodes.h         |  5 +-
+ 3 files changed, 90 insertions(+), 20 deletions(-)
+
+diff --git a/src/backend/nodes/gen_node_support.pl b/src/backend/nodes/gen_node_support.pl
+index 96af17516aa7..975e456ee2df 100644
+--- a/src/backend/nodes/gen_node_support.pl
++++ b/src/backend/nodes/gen_node_support.pl
+@@ -213,15 +213,39 @@ sub elem
+ 	}
+ 	$file_content .= $raw_file_content;
+ 
+-	my $lineno = 0;
++	my $lineno   = 0;
++	my $prevline = '';
+ 	foreach my $line (split /\n/, $file_content)
+ 	{
++		# per-physical-line processing
+ 		$lineno++;
+ 		chomp $line;
+ 		$line =~ s/\s*$//;
+ 		next if $line eq '';
+ 		next if $line =~ /^#(define|ifdef|endif)/;
+ 
++		# within a struct, don't process until we have whole logical line
++		if ($in_struct && $subline > 0)
++		{
++			if ($line =~ /;$/)
++			{
++				# found the end, re-attach any previous line(s)
++				$line     = $prevline . $line;
++				$prevline = '';
++			}
++			elsif ($prevline eq ''
++				&& $line =~ /^\s*pg_node_attr\(([\w(), ]*)\)$/)
++			{
++				# special case: node-attributes line doesn't end with semi
++			}
++			else
++			{
++				# set it aside for a moment
++				$prevline .= $line . ' ';
++				next;
++			}
++		}
++
+ 		# we are analyzing a struct definition
+ 		if ($in_struct)
+ 		{
+@@ -394,7 +418,7 @@ sub elem
+ 			}
+ 			# normal struct field
+ 			elsif ($line =~
+-				/^\s*(.+)\s*\b(\w+)(\[\w+\])?\s*(?:pg_node_attr\(([\w(), ]*)\))?;/
++				/^\s*(.+)\s*\b(\w+)(\[[\w\s+]+\])?\s*(?:pg_node_attr\(([\w(), ]*)\))?;/
+ 			  )
+ 			{
+ 				if ($is_node_struct)
+@@ -441,13 +465,46 @@ sub elem
+ 					$my_field_attrs{$name} = \@attrs;
+ 				}
+ 			}
+-			else
++			# function pointer field
++			elsif ($line =~
++				/^\s*([\w\s*]+)\s*\(\*(\w+)\)\s*\((.*)\)\s*(?:pg_node_attr\(([\w(), ]*)\))?;/
++			  )
+ 			{
+ 				if ($is_node_struct)
+ 				{
+-					#warn "$infile:$lineno: could not parse \"$line\"\n";
++					my $type  = $1;
++					my $name  = $2;
++					my $args  = $3;
++					my $attrs = $4;
++
++					my @attrs;
++					if ($attrs)
++					{
++						@attrs = split /,\s*/, $attrs;
++						foreach my $attr (@attrs)
++						{
++							if (   $attr !~ /^copy_as\(\w+\)$/
++								&& $attr !~ /^read_as\(\w+\)$/
++								&& !elem $attr,
++								qw(equal_ignore read_write_ignore))
++							{
++								die
++								  "$infile:$lineno: unrecognized attribute \"$attr\"\n";
++							}
++						}
++					}
++
++					push @my_fields, $name;
++					$my_field_types{$name} = 'function pointer';
++					$my_field_attrs{$name} = \@attrs;
+ 				}
+ 			}
++			else
++			{
++				# We're not too picky about what's outside structs,
++				# but we'd better understand everything inside.
++				die "$infile:$lineno: could not parse \"$line\"\n";
++			}
+ 		}
+ 		# not in a struct
+ 		else
+@@ -709,6 +766,12 @@ sub elem
+ 				  unless $equal_ignore;
+ 			}
+ 		}
++		elsif ($t eq 'function pointer')
++		{
++			# we can copy and compare as a scalar
++			print $cff "\tCOPY_SCALAR_FIELD($f);\n"    unless $copy_ignore;
++			print $eff "\tCOMPARE_SCALAR_FIELD($f);\n" unless $equal_ignore;
++		}
+ 		# node type
+ 		elsif ($t =~ /(\w+)\*/ and elem $1, @node_types)
+ 		{
+@@ -980,6 +1043,12 @@ sub elem
+ 				  unless $no_read;
+ 			}
+ 		}
++		elsif ($t eq 'function pointer')
++		{
++			# We don't print these, and we can't read them either
++			die "cannot read function pointer in struct \"$n\" field \"$f\"\n"
++			  unless $no_read;
++		}
+ 		# Special treatments of several Path node fields
+ 		elsif ($t eq 'RelOptInfo*' && elem 'write_only_relids', @a)
+ 		{
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index b0c9c5f2ef67..98fe1abaa28a 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -303,26 +303,26 @@ typedef struct A_Expr
+ 
+ /*
+  * A_Const - a literal constant
++ *
++ * Value nodes are inline for performance.  You can treat 'val' as a node,
++ * as in IsA(&val, Integer).  'val' is not valid if isnull is true.
+  */
++union ValUnion
++{
++	Node		node;
++	Integer		ival;
++	Float		fval;
++	Boolean		boolval;
++	String		sval;
++	BitString	bsval;
++};
++
+ typedef struct A_Const
+ {
+ 	pg_node_attr(custom_copy_equal, custom_read_write, no_read)
+ 
+ 	NodeTag		type;
+-
+-	/*
+-	 * Value nodes are inline for performance.  You can treat 'val' as a node,
+-	 * as in IsA(&val, Integer).  'val' is not valid if isnull is true.
+-	 */
+-	union ValUnion
+-	{
+-		Node		node;
+-		Integer		ival;
+-		Float		fval;
+-		Boolean		boolval;
+-		String		sval;
+-		BitString	bsval;
+-	}			val;
++	union ValUnion val;
+ 	bool		isnull;			/* SQL NULL constant */
+ 	int			location;		/* token location, or -1 if unknown */
+ } A_Const;
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index 44ffc73f1559..69ba254372dd 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -1098,7 +1098,7 @@ struct IndexOptInfo
+ 
+ 	/*
+ 	 * Remaining fields are copied from the index AM's API struct
+-	 * (IndexAmRoutine)
++	 * (IndexAmRoutine).  We don't bother to dump them.
+ 	 */
+ 	bool		amcanorderbyop pg_node_attr(read_write_ignore);
+ 	bool		amoptionalkey pg_node_attr(read_write_ignore);
+@@ -1111,8 +1111,9 @@ struct IndexOptInfo
+ 	bool		amcanparallel pg_node_attr(read_write_ignore);
+ 	/* does AM have ammarkpos interface? */
+ 	bool		amcanmarkpos pg_node_attr(read_write_ignore);
++	/* AM's cost estimator */
+ 	/* Rather than include amapi.h here, we declare amcostestimate like this */
+-	void		(*amcostestimate) ();	/* AM's cost estimator */
++	void		(*amcostestimate) () pg_node_attr(read_write_ignore);
+ };
+ 
+ /*

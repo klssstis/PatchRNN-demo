@@ -1,0 +1,438 @@
+From 7cce159349ccdb39ade07f869f08e4929ef2fe0b Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Mon, 29 Jul 2019 09:58:49 +0900
+Subject: [PATCH] Fix handling of expressions and predicates in REINDEX
+ CONCURRENTLY
+
+When copying the definition of an index rebuilt concurrently for the new
+entry, the index information was taken directly from the old index using
+the relation cache.  In this case, predicates and expressions have
+some post-processing to prepare things for the planner, which loses some
+information including the collations added in any of them.
+
+This inconsistency can cause issues when attempting for example a table
+rewrite, and makes the new indexes rebuilt concurrently inconsistent
+with the old entries.
+
+In order to fix the problem, fetch expressions and predicates directly
+from the catalog of the old entry, and fill in IndexInfo for the new
+index with that.  This makes the process more consistent with
+DefineIndex(), and the code is refactored with the addition of a routine
+to create an IndexInfo node.
+
+Reported-by: Manuel Rigger
+Author: Michael Paquier
+Discussion: https://postgr.es/m/CA+u7OA5Hp0ra235F3czPom_FyAd-3+XwSJmX95r1+sRPOJc9VQ@mail.gmail.com
+Backpatch-through: 12
+---
+ src/backend/catalog/index.c                | 74 ++++++++++++++++++++--
+ src/backend/commands/indexcmds.c           | 46 ++++----------
+ src/backend/nodes/makefuncs.c              | 52 ++++++++++++++-
+ src/include/nodes/makefuncs.h              |  7 +-
+ src/test/regress/expected/create_index.out | 72 +++++++++++++++++++++
+ src/test/regress/sql/create_index.sql      | 28 ++++++++
+ 6 files changed, 237 insertions(+), 42 deletions(-)
+
+diff --git a/src/backend/catalog/index.c b/src/backend/catalog/index.c
+index 9234e93261c5..99ae159f98a2 100644
+--- a/src/backend/catalog/index.c
++++ b/src/backend/catalog/index.c
+@@ -1197,7 +1197,8 @@ Oid
+ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId, const char *newName)
+ {
+ 	Relation	indexRelation;
+-	IndexInfo  *indexInfo;
++	IndexInfo  *oldInfo,
++			   *newInfo;
+ 	Oid			newIndexId = InvalidOid;
+ 	HeapTuple	indexTuple,
+ 				classTuple;
+@@ -1208,11 +1209,22 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId, const char
+ 	int2vector *indcoloptions;
+ 	bool		isnull;
+ 	List	   *indexColNames = NIL;
++	List	   *indexExprs = NIL;
++	List	   *indexPreds = NIL;
+ 
+ 	indexRelation = index_open(oldIndexId, RowExclusiveLock);
+ 
+-	/* New index uses the same index information as old index */
+-	indexInfo = BuildIndexInfo(indexRelation);
++	/* The new index needs some information from the old index */
++	oldInfo = BuildIndexInfo(indexRelation);
++
++	/*
++	 * Concurrent build of an index with exclusion constraints is not
++	 * supported.
++	 */
++	if (oldInfo->ii_ExclusionOps != NULL)
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("concurrent index creation for exclusion constraints is not supported")));
+ 
+ 	/* Get the array of class and column options IDs from index info */
+ 	indexTuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(oldIndexId));
+@@ -1236,14 +1248,64 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId, const char
+ 								  Anum_pg_class_reloptions, &isnull);
+ 
+ 	/*
+-	 * Extract the list of column names to be used for the index creation.
++	 * Fetch the list of expressions and predicates directly from the
++	 * catalogs.  This cannot rely on the information from IndexInfo of the
++	 * old index as these have been flattened for the planner.
+ 	 */
+-	for (int i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
++	if (oldInfo->ii_Expressions != NIL)
++	{
++		Datum		exprDatum;
++		char	   *exprString;
++
++		exprDatum = SysCacheGetAttr(INDEXRELID, indexTuple,
++									Anum_pg_index_indexprs, &isnull);
++		Assert(!isnull);
++		exprString = TextDatumGetCString(exprDatum);
++		indexExprs = (List *) stringToNode(exprString);
++		pfree(exprString);
++	}
++	if (oldInfo->ii_Predicate != NIL)
++	{
++		Datum		predDatum;
++		char	   *predString;
++
++		predDatum = SysCacheGetAttr(INDEXRELID, indexTuple,
++									Anum_pg_index_indpred, &isnull);
++		Assert(!isnull);
++		predString = TextDatumGetCString(predDatum);
++		indexPreds = (List *) stringToNode(predString);
++
++		/* Also convert to implicit-AND format */
++		indexPreds = make_ands_implicit((Expr *) indexPreds);
++		pfree(predString);
++	}
++
++	/*
++	 * Build the index information for the new index.  Note that rebuild of
++	 * indexes with exclusion constraints is not supported, hence there is no
++	 * need to fill all the ii_Exclusion* fields.
++	 */
++	newInfo = makeIndexInfo(oldInfo->ii_NumIndexAttrs,
++							oldInfo->ii_NumIndexKeyAttrs,
++							oldInfo->ii_Am,
++							indexExprs,
++							indexPreds,
++							oldInfo->ii_Unique,
++							false,	/* not ready for inserts */
++							true);
++
++	/*
++	 * Extract the list of column names and the column numbers for the new
++	 * index information.  All this information will be used for the index
++	 * creation.
++	 */
++	for (int i = 0; i < oldInfo->ii_NumIndexAttrs; i++)
+ 	{
+ 		TupleDesc	indexTupDesc = RelationGetDescr(indexRelation);
+ 		Form_pg_attribute att = TupleDescAttr(indexTupDesc, i);
+ 
+ 		indexColNames = lappend(indexColNames, NameStr(att->attname));
++		newInfo->ii_IndexAttrNumbers[i] = oldInfo->ii_IndexAttrNumbers[i];
+ 	}
+ 
+ 	/*
+@@ -1259,7 +1321,7 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId, const char
+ 							  InvalidOid,	/* parentIndexRelid */
+ 							  InvalidOid,	/* parentConstraintId */
+ 							  InvalidOid,	/* relFileNode */
+-							  indexInfo,
++							  newInfo,
+ 							  indexColNames,
+ 							  indexRelation->rd_rel->relam,
+ 							  indexRelation->rd_rel->reltablespace,
+diff --git a/src/backend/commands/indexcmds.c b/src/backend/commands/indexcmds.c
+index fd299273c5a8..8dc7a3987066 100644
+--- a/src/backend/commands/indexcmds.c
++++ b/src/backend/commands/indexcmds.c
+@@ -202,18 +202,8 @@ CheckIndexCompatible(Oid oldId,
+ 	 * contains only key attributes, thus we're filling ii_NumIndexAttrs and
+ 	 * ii_NumIndexKeyAttrs with same value.
+ 	 */
+-	indexInfo = makeNode(IndexInfo);
+-	indexInfo->ii_NumIndexAttrs = numberOfAttributes;
+-	indexInfo->ii_NumIndexKeyAttrs = numberOfAttributes;
+-	indexInfo->ii_Expressions = NIL;
+-	indexInfo->ii_ExpressionsState = NIL;
+-	indexInfo->ii_PredicateState = NULL;
+-	indexInfo->ii_ExclusionOps = NULL;
+-	indexInfo->ii_ExclusionProcs = NULL;
+-	indexInfo->ii_ExclusionStrats = NULL;
+-	indexInfo->ii_Am = accessMethodId;
+-	indexInfo->ii_AmCache = NULL;
+-	indexInfo->ii_Context = CurrentMemoryContext;
++	indexInfo = makeIndexInfo(numberOfAttributes, numberOfAttributes,
++							  accessMethodId, NIL, NIL, false, false, false);
+ 	typeObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
+ 	collationObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
+ 	classObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
+@@ -780,27 +770,17 @@ DefineIndex(Oid relationId,
+ 
+ 	/*
+ 	 * Prepare arguments for index_create, primarily an IndexInfo structure.
+-	 * Note that ii_Predicate must be in implicit-AND format.
+-	 */
+-	indexInfo = makeNode(IndexInfo);
+-	indexInfo->ii_NumIndexAttrs = numberOfAttributes;
+-	indexInfo->ii_NumIndexKeyAttrs = numberOfKeyAttributes;
+-	indexInfo->ii_Expressions = NIL;	/* for now */
+-	indexInfo->ii_ExpressionsState = NIL;
+-	indexInfo->ii_Predicate = make_ands_implicit((Expr *) stmt->whereClause);
+-	indexInfo->ii_PredicateState = NULL;
+-	indexInfo->ii_ExclusionOps = NULL;
+-	indexInfo->ii_ExclusionProcs = NULL;
+-	indexInfo->ii_ExclusionStrats = NULL;
+-	indexInfo->ii_Unique = stmt->unique;
+-	/* In a concurrent build, mark it not-ready-for-inserts */
+-	indexInfo->ii_ReadyForInserts = !stmt->concurrent;
+-	indexInfo->ii_Concurrent = stmt->concurrent;
+-	indexInfo->ii_BrokenHotChain = false;
+-	indexInfo->ii_ParallelWorkers = 0;
+-	indexInfo->ii_Am = accessMethodId;
+-	indexInfo->ii_AmCache = NULL;
+-	indexInfo->ii_Context = CurrentMemoryContext;
++	 * Note that predicates must be in implicit-AND format.  In a concurrent
++	 * build, mark it not-ready-for-inserts.
++	 */
++	indexInfo = makeIndexInfo(numberOfAttributes,
++							  numberOfKeyAttributes,
++							  accessMethodId,
++							  NIL,	/* expressions, NIL for now */
++							  make_ands_implicit((Expr *) stmt->whereClause),
++							  stmt->unique,
++							  !stmt->concurrent,
++							  stmt->concurrent);
+ 
+ 	typeObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
+ 	collationObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
+diff --git a/src/backend/nodes/makefuncs.c b/src/backend/nodes/makefuncs.c
+index 7085ed2c4c84..5c11b5472e56 100644
+--- a/src/backend/nodes/makefuncs.c
++++ b/src/backend/nodes/makefuncs.c
+@@ -1,8 +1,8 @@
+ /*-------------------------------------------------------------------------
+  *
+  * makefuncs.c
+- *	  creator functions for primitive nodes. The functions here are for
+- *	  the most frequently created nodes.
++ *	  creator functions for various nodes. The functions here are for the
++ *	  most frequently created nodes.
+  *
+  * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+  * Portions Copyright (c) 1994, Regents of the University of California
+@@ -733,6 +733,54 @@ make_ands_implicit(Expr *clause)
+ 		return list_make1(clause);
+ }
+ 
++/*
++ * makeIndexInfo
++ *	  create an IndexInfo node
++ */
++IndexInfo *
++makeIndexInfo(int numattrs, int numkeyattrs, Oid amoid, List *expressions,
++			  List *predicates, bool unique, bool isready, bool concurrent)
++{
++	IndexInfo  *n = makeNode(IndexInfo);
++
++	n->ii_NumIndexAttrs = numattrs;
++	n->ii_NumIndexKeyAttrs = numkeyattrs;
++	Assert(n->ii_NumIndexKeyAttrs != 0);
++	Assert(n->ii_NumIndexKeyAttrs <= n->ii_NumIndexAttrs);
++	n->ii_Unique = unique;
++	n->ii_ReadyForInserts = isready;
++	n->ii_Concurrent = concurrent;
++
++	/* expressions */
++	n->ii_Expressions = expressions;
++	n->ii_ExpressionsState = NIL;
++
++	/* predicates  */
++	n->ii_Predicate = predicates;
++	n->ii_PredicateState = NULL;
++
++	/* exclusion constraints */
++	n->ii_ExclusionOps = NULL;
++	n->ii_ExclusionProcs = NULL;
++	n->ii_ExclusionStrats = NULL;
++
++	/* speculative inserts */
++	n->ii_UniqueOps = NULL;
++	n->ii_UniqueProcs = NULL;
++	n->ii_UniqueStrats = NULL;
++
++	/* initialize index-build state to default */
++	n->ii_BrokenHotChain = false;
++	n->ii_ParallelWorkers = 0;
++
++	/* set up for possible use by index AM */
++	n->ii_Am = amoid;
++	n->ii_AmCache = NULL;
++	n->ii_Context = CurrentMemoryContext;
++
++	return n;
++}
++
+ /*
+  * makeGroupingSet
+  *
+diff --git a/src/include/nodes/makefuncs.h b/src/include/nodes/makefuncs.h
+index ad7b41d4aa60..8032bb7aa2a2 100644
+--- a/src/include/nodes/makefuncs.h
++++ b/src/include/nodes/makefuncs.h
+@@ -1,7 +1,7 @@
+ /*-------------------------------------------------------------------------
+  *
+  * makefuncs.h
+- *	  prototypes for the creator functions (for primitive nodes)
++ *	  prototypes for the creator functions of various nodes
+  *
+  *
+  * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+@@ -14,6 +14,7 @@
+ #ifndef MAKEFUNC_H
+ #define MAKEFUNC_H
+ 
++#include "nodes/execnodes.h"
+ #include "nodes/parsenodes.h"
+ 
+ 
+@@ -92,6 +93,10 @@ extern Node *make_and_qual(Node *qual1, Node *qual2);
+ extern Expr *make_ands_explicit(List *andclauses);
+ extern List *make_ands_implicit(Expr *clause);
+ 
++extern IndexInfo *makeIndexInfo(int numattrs, int numkeyattrs, Oid amoid,
++								List *expressions, List *predicates,
++								bool unique, bool isready, bool concurrent);
++
+ extern DefElem *makeDefElem(char *name, Node *arg, int location);
+ extern DefElem *makeDefElemExtended(char *nameSpace, char *name, Node *arg,
+ 									DefElemAction defaction, int location);
+diff --git a/src/test/regress/expected/create_index.out b/src/test/regress/expected/create_index.out
+index 9305649c1131..c6d575a2f996 100644
+--- a/src/test/regress/expected/create_index.out
++++ b/src/test/regress/expected/create_index.out
+@@ -2170,6 +2170,78 @@ Indexes:
+     "concur_reindex_ind5" UNIQUE, btree (c1)
+ 
+ DROP TABLE concur_reindex_tab4;
++-- Check handling of indexes with expressions and predicates.  The
++-- definitions of the rebuilt indexes should match the original
++-- definitions.
++CREATE TABLE concur_exprs_tab (c1 int , c2 boolean);
++INSERT INTO concur_exprs_tab (c1, c2) VALUES (1369652450, FALSE),
++  (414515746, TRUE),
++  (897778963, FALSE);
++CREATE UNIQUE INDEX concur_exprs_index_expr
++  ON concur_exprs_tab ((c1::text COLLATE "C"));
++CREATE UNIQUE INDEX concur_exprs_index_pred ON concur_exprs_tab (c1)
++  WHERE (c1::text > 500000000::text COLLATE "C");
++CREATE UNIQUE INDEX concur_exprs_index_pred_2
++  ON concur_exprs_tab ((1 / c1))
++  WHERE ('-H') >= (c2::TEXT) COLLATE "C";
++SELECT pg_get_indexdef('concur_exprs_index_expr'::regclass);
++                                                pg_get_indexdef                                                
++---------------------------------------------------------------------------------------------------------------
++ CREATE UNIQUE INDEX concur_exprs_index_expr ON public.concur_exprs_tab USING btree (((c1)::text) COLLATE "C")
++(1 row)
++
++SELECT pg_get_indexdef('concur_exprs_index_pred'::regclass);
++                                                               pg_get_indexdef                                                                
++----------------------------------------------------------------------------------------------------------------------------------------------
++ CREATE UNIQUE INDEX concur_exprs_index_pred ON public.concur_exprs_tab USING btree (c1) WHERE ((c1)::text > ((500000000)::text COLLATE "C"))
++(1 row)
++
++SELECT pg_get_indexdef('concur_exprs_index_pred_2'::regclass);
++                                                                 pg_get_indexdef                                                                  
++--------------------------------------------------------------------------------------------------------------------------------------------------
++ CREATE UNIQUE INDEX concur_exprs_index_pred_2 ON public.concur_exprs_tab USING btree (((1 / c1))) WHERE ('-H'::text >= ((c2)::text COLLATE "C"))
++(1 row)
++
++REINDEX TABLE CONCURRENTLY concur_exprs_tab;
++SELECT pg_get_indexdef('concur_exprs_index_expr'::regclass);
++                                                pg_get_indexdef                                                
++---------------------------------------------------------------------------------------------------------------
++ CREATE UNIQUE INDEX concur_exprs_index_expr ON public.concur_exprs_tab USING btree (((c1)::text) COLLATE "C")
++(1 row)
++
++SELECT pg_get_indexdef('concur_exprs_index_pred'::regclass);
++                                                               pg_get_indexdef                                                                
++----------------------------------------------------------------------------------------------------------------------------------------------
++ CREATE UNIQUE INDEX concur_exprs_index_pred ON public.concur_exprs_tab USING btree (c1) WHERE ((c1)::text > ((500000000)::text COLLATE "C"))
++(1 row)
++
++SELECT pg_get_indexdef('concur_exprs_index_pred_2'::regclass);
++                                                                 pg_get_indexdef                                                                  
++--------------------------------------------------------------------------------------------------------------------------------------------------
++ CREATE UNIQUE INDEX concur_exprs_index_pred_2 ON public.concur_exprs_tab USING btree (((1 / c1))) WHERE ('-H'::text >= ((c2)::text COLLATE "C"))
++(1 row)
++
++-- ALTER TABLE recreates the indexes, which should keep their collations.
++ALTER TABLE concur_exprs_tab ALTER c2 TYPE TEXT;
++SELECT pg_get_indexdef('concur_exprs_index_expr'::regclass);
++                                                pg_get_indexdef                                                
++---------------------------------------------------------------------------------------------------------------
++ CREATE UNIQUE INDEX concur_exprs_index_expr ON public.concur_exprs_tab USING btree (((c1)::text) COLLATE "C")
++(1 row)
++
++SELECT pg_get_indexdef('concur_exprs_index_pred'::regclass);
++                                                               pg_get_indexdef                                                                
++----------------------------------------------------------------------------------------------------------------------------------------------
++ CREATE UNIQUE INDEX concur_exprs_index_pred ON public.concur_exprs_tab USING btree (c1) WHERE ((c1)::text > ((500000000)::text COLLATE "C"))
++(1 row)
++
++SELECT pg_get_indexdef('concur_exprs_index_pred_2'::regclass);
++                                                             pg_get_indexdef                                                              
++------------------------------------------------------------------------------------------------------------------------------------------
++ CREATE UNIQUE INDEX concur_exprs_index_pred_2 ON public.concur_exprs_tab USING btree (((1 / c1))) WHERE ('-H'::text >= (c2 COLLATE "C"))
++(1 row)
++
++DROP TABLE concur_exprs_tab;
+ --
+ -- REINDEX SCHEMA
+ --
+diff --git a/src/test/regress/sql/create_index.sql b/src/test/regress/sql/create_index.sql
+index cd46f071bdc2..f96bebf410de 100644
+--- a/src/test/regress/sql/create_index.sql
++++ b/src/test/regress/sql/create_index.sql
+@@ -872,6 +872,34 @@ REINDEX INDEX CONCURRENTLY concur_reindex_ind5;
+ \d concur_reindex_tab4
+ DROP TABLE concur_reindex_tab4;
+ 
++-- Check handling of indexes with expressions and predicates.  The
++-- definitions of the rebuilt indexes should match the original
++-- definitions.
++CREATE TABLE concur_exprs_tab (c1 int , c2 boolean);
++INSERT INTO concur_exprs_tab (c1, c2) VALUES (1369652450, FALSE),
++  (414515746, TRUE),
++  (897778963, FALSE);
++CREATE UNIQUE INDEX concur_exprs_index_expr
++  ON concur_exprs_tab ((c1::text COLLATE "C"));
++CREATE UNIQUE INDEX concur_exprs_index_pred ON concur_exprs_tab (c1)
++  WHERE (c1::text > 500000000::text COLLATE "C");
++CREATE UNIQUE INDEX concur_exprs_index_pred_2
++  ON concur_exprs_tab ((1 / c1))
++  WHERE ('-H') >= (c2::TEXT) COLLATE "C";
++SELECT pg_get_indexdef('concur_exprs_index_expr'::regclass);
++SELECT pg_get_indexdef('concur_exprs_index_pred'::regclass);
++SELECT pg_get_indexdef('concur_exprs_index_pred_2'::regclass);
++REINDEX TABLE CONCURRENTLY concur_exprs_tab;
++SELECT pg_get_indexdef('concur_exprs_index_expr'::regclass);
++SELECT pg_get_indexdef('concur_exprs_index_pred'::regclass);
++SELECT pg_get_indexdef('concur_exprs_index_pred_2'::regclass);
++-- ALTER TABLE recreates the indexes, which should keep their collations.
++ALTER TABLE concur_exprs_tab ALTER c2 TYPE TEXT;
++SELECT pg_get_indexdef('concur_exprs_index_expr'::regclass);
++SELECT pg_get_indexdef('concur_exprs_index_pred'::regclass);
++SELECT pg_get_indexdef('concur_exprs_index_pred_2'::regclass);
++DROP TABLE concur_exprs_tab;
++
+ --
+ -- REINDEX SCHEMA
+ --

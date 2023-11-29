@@ -1,0 +1,1323 @@
+From 7fc0e7de9fb8306e84d1c15211aba4308f694455 Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Tue, 12 Apr 2022 14:45:23 -0400
+Subject: [PATCH] Revert the addition of GetMaxBackends() and related stuff.
+
+This reverts commits 0147fc7, 4567596, aa64f23, and 5ecd018.
+There is no longer agreement that introducing this function
+was the right way to address the problem. The consensus now
+seems to favor trying to make a correct value for MaxBackends
+available to mdules executing their _PG_init() functions.
+
+Nathan Bossart
+
+Discussion: http://postgr.es/m/20220323045229.i23skfscdbvrsuxa@jrouhaud
+---
+ src/backend/access/nbtree/nbtutils.c        |  4 +-
+ src/backend/access/transam/multixact.c      | 31 +++-----
+ src/backend/access/transam/twophase.c       |  3 +-
+ src/backend/commands/async.c                | 12 ++-
+ src/backend/libpq/pqcomm.c                  |  3 +-
+ src/backend/postmaster/auxprocess.c         |  2 +-
+ src/backend/postmaster/postmaster.c         | 14 ++--
+ src/backend/storage/ipc/dsm.c               |  2 +-
+ src/backend/storage/ipc/procarray.c         | 25 ++----
+ src/backend/storage/ipc/procsignal.c        | 37 ++++-----
+ src/backend/storage/ipc/sinvaladt.c         |  4 +-
+ src/backend/storage/lmgr/deadlock.c         | 31 ++++----
+ src/backend/storage/lmgr/lock.c             | 23 +++---
+ src/backend/storage/lmgr/predicate.c        | 10 +--
+ src/backend/storage/lmgr/proc.c             | 17 ++--
+ src/backend/utils/activity/backend_status.c | 88 ++++++++++-----------
+ src/backend/utils/adt/lockfuncs.c           |  5 +-
+ src/backend/utils/init/postinit.c           | 55 +++----------
+ src/include/miscadmin.h                     |  3 +-
+ 19 files changed, 142 insertions(+), 227 deletions(-)
+
+diff --git a/src/backend/access/nbtree/nbtutils.c b/src/backend/access/nbtree/nbtutils.c
+index 96c72fc43243..fd1b53885cc5 100644
+--- a/src/backend/access/nbtree/nbtutils.c
++++ b/src/backend/access/nbtree/nbtutils.c
+@@ -2072,7 +2072,7 @@ BTreeShmemSize(void)
+ 	Size		size;
+ 
+ 	size = offsetof(BTVacInfo, vacuums);
+-	size = add_size(size, mul_size(GetMaxBackends(), sizeof(BTOneVacInfo)));
++	size = add_size(size, mul_size(MaxBackends, sizeof(BTOneVacInfo)));
+ 	return size;
+ }
+ 
+@@ -2101,7 +2101,7 @@ BTreeShmemInit(void)
+ 		btvacinfo->cycle_ctr = (BTCycleId) time(NULL);
+ 
+ 		btvacinfo->num_vacuums = 0;
+-		btvacinfo->max_vacuums = GetMaxBackends();
++		btvacinfo->max_vacuums = MaxBackends;
+ 	}
+ 	else
+ 		Assert(found);
+diff --git a/src/backend/access/transam/multixact.c b/src/backend/access/transam/multixact.c
+index 45907d1b449f..8f7d12950e59 100644
+--- a/src/backend/access/transam/multixact.c
++++ b/src/backend/access/transam/multixact.c
+@@ -282,11 +282,12 @@ typedef struct MultiXactStateData
+ } MultiXactStateData;
+ 
+ /*
+- * Pointers to the state data in shared memory
+- *
+- * The index of the last element of the OldestMemberMXactId and
+- * OldestVisibleMXactId arrays can be obtained with GetMaxOldestSlot().
++ * Last element of OldestMemberMXactId and OldestVisibleMXactId arrays.
++ * Valid elements are (1..MaxOldestSlot); element 0 is never used.
+  */
++#define MaxOldestSlot	(MaxBackends + max_prepared_xacts)
++
++/* Pointers to the state data in shared memory */
+ static MultiXactStateData *MultiXactState;
+ static MultiXactId *OldestMemberMXactId;
+ static MultiXactId *OldestVisibleMXactId;
+@@ -341,7 +342,6 @@ static void MultiXactIdSetOldestVisible(void);
+ static void RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset,
+ 							   int nmembers, MultiXactMember *members);
+ static MultiXactId GetNewMultiXactId(int nmembers, MultiXactOffset *offset);
+-static inline int GetMaxOldestSlot(void);
+ 
+ /* MultiXact cache management */
+ static int	mxactMemberComparator(const void *arg1, const void *arg2);
+@@ -662,17 +662,6 @@ MultiXactIdSetOldestMember(void)
+ 	}
+ }
+ 
+-/*
+- * Retrieve the index of the last element of the OldestMemberMXactId and
+- * OldestVisibleMXactId arrays.  Valid elements are (1..MaxOldestSlot); element
+- * 0 is never used.
+- */
+-static inline int
+-GetMaxOldestSlot(void)
+-{
+-	return GetMaxBackends() + max_prepared_xacts;
+-}
+-
+ /*
+  * MultiXactIdSetOldestVisible
+  *		Save the oldest MultiXactId this transaction considers possibly live.
+@@ -695,7 +684,6 @@ MultiXactIdSetOldestVisible(void)
+ 	if (!MultiXactIdIsValid(OldestVisibleMXactId[MyBackendId]))
+ 	{
+ 		MultiXactId oldestMXact;
+-		int			maxOldestSlot = GetMaxOldestSlot();
+ 		int			i;
+ 
+ 		LWLockAcquire(MultiXactGenLock, LW_EXCLUSIVE);
+@@ -709,7 +697,7 @@ MultiXactIdSetOldestVisible(void)
+ 		if (oldestMXact < FirstMultiXactId)
+ 			oldestMXact = FirstMultiXactId;
+ 
+-		for (i = 1; i <= maxOldestSlot; i++)
++		for (i = 1; i <= MaxOldestSlot; i++)
+ 		{
+ 			MultiXactId thisoldest = OldestMemberMXactId[i];
+ 
+@@ -1843,7 +1831,7 @@ MultiXactShmemSize(void)
+ 	/* We need 2*MaxOldestSlot + 1 perBackendXactIds[] entries */
+ #define SHARED_MULTIXACT_STATE_SIZE \
+ 	add_size(offsetof(MultiXactStateData, perBackendXactIds) + sizeof(MultiXactId), \
+-			 mul_size(sizeof(MultiXactId) * 2, GetMaxOldestSlot()))
++			 mul_size(sizeof(MultiXactId) * 2, MaxOldestSlot))
+ 
+ 	size = SHARED_MULTIXACT_STATE_SIZE;
+ 	size = add_size(size, SimpleLruShmemSize(NUM_MULTIXACTOFFSET_BUFFERS, 0));
+@@ -1894,7 +1882,7 @@ MultiXactShmemInit(void)
+ 	 * since we only use indexes 1..MaxOldestSlot in each array.
+ 	 */
+ 	OldestMemberMXactId = MultiXactState->perBackendXactIds;
+-	OldestVisibleMXactId = OldestMemberMXactId + GetMaxOldestSlot();
++	OldestVisibleMXactId = OldestMemberMXactId + MaxOldestSlot;
+ }
+ 
+ /*
+@@ -2519,7 +2507,6 @@ GetOldestMultiXactId(void)
+ {
+ 	MultiXactId oldestMXact;
+ 	MultiXactId nextMXact;
+-	int			maxOldestSlot = GetMaxOldestSlot();
+ 	int			i;
+ 
+ 	/*
+@@ -2538,7 +2525,7 @@ GetOldestMultiXactId(void)
+ 		nextMXact = FirstMultiXactId;
+ 
+ 	oldestMXact = nextMXact;
+-	for (i = 1; i <= maxOldestSlot; i++)
++	for (i = 1; i <= MaxOldestSlot; i++)
+ 	{
+ 		MultiXactId thisoldest;
+ 
+diff --git a/src/backend/access/transam/twophase.c b/src/backend/access/transam/twophase.c
+index 7632596008c9..dc0266693e39 100644
+--- a/src/backend/access/transam/twophase.c
++++ b/src/backend/access/transam/twophase.c
+@@ -264,7 +264,6 @@ TwoPhaseShmemInit(void)
+ 	{
+ 		GlobalTransaction gxacts;
+ 		int			i;
+-		int			max_backends = GetMaxBackends();
+ 
+ 		Assert(!found);
+ 		TwoPhaseState->freeGXacts = NULL;
+@@ -298,7 +297,7 @@ TwoPhaseShmemInit(void)
+ 			 * prepared transaction. Currently multixact.c uses that
+ 			 * technique.
+ 			 */
+-			gxacts[i].dummyBackendId = max_backends + 1 + i;
++			gxacts[i].dummyBackendId = MaxBackends + 1 + i;
+ 		}
+ 	}
+ 	else
+diff --git a/src/backend/commands/async.c b/src/backend/commands/async.c
+index 455d895a44a7..3e1b92df0307 100644
+--- a/src/backend/commands/async.c
++++ b/src/backend/commands/async.c
+@@ -518,7 +518,7 @@ AsyncShmemSize(void)
+ 	Size		size;
+ 
+ 	/* This had better match AsyncShmemInit */
+-	size = mul_size(GetMaxBackends() + 1, sizeof(QueueBackendStatus));
++	size = mul_size(MaxBackends + 1, sizeof(QueueBackendStatus));
+ 	size = add_size(size, offsetof(AsyncQueueControl, backend));
+ 
+ 	size = add_size(size, SimpleLruShmemSize(NUM_NOTIFY_BUFFERS, 0));
+@@ -534,7 +534,6 @@ AsyncShmemInit(void)
+ {
+ 	bool		found;
+ 	Size		size;
+-	int			max_backends = GetMaxBackends();
+ 
+ 	/*
+ 	 * Create or attach to the AsyncQueueControl structure.
+@@ -542,7 +541,7 @@ AsyncShmemInit(void)
+ 	 * The used entries in the backend[] array run from 1 to MaxBackends; the
+ 	 * zero'th entry is unused but must be allocated.
+ 	 */
+-	size = mul_size(max_backends + 1, sizeof(QueueBackendStatus));
++	size = mul_size(MaxBackends + 1, sizeof(QueueBackendStatus));
+ 	size = add_size(size, offsetof(AsyncQueueControl, backend));
+ 
+ 	asyncQueueControl = (AsyncQueueControl *)
+@@ -557,7 +556,7 @@ AsyncShmemInit(void)
+ 		QUEUE_FIRST_LISTENER = InvalidBackendId;
+ 		asyncQueueControl->lastQueueFillWarn = 0;
+ 		/* zero'th entry won't be used, but let's initialize it anyway */
+-		for (int i = 0; i <= max_backends; i++)
++		for (int i = 0; i <= MaxBackends; i++)
+ 		{
+ 			QUEUE_BACKEND_PID(i) = InvalidPid;
+ 			QUEUE_BACKEND_DBOID(i) = InvalidOid;
+@@ -1633,7 +1632,6 @@ SignalBackends(void)
+ 	int32	   *pids;
+ 	BackendId  *ids;
+ 	int			count;
+-	int			max_backends = GetMaxBackends();
+ 
+ 	/*
+ 	 * Identify backends that we need to signal.  We don't want to send
+@@ -1643,8 +1641,8 @@ SignalBackends(void)
+ 	 * XXX in principle these pallocs could fail, which would be bad. Maybe
+ 	 * preallocate the arrays?  They're not that large, though.
+ 	 */
+-	pids = (int32 *) palloc(max_backends * sizeof(int32));
+-	ids = (BackendId *) palloc(max_backends * sizeof(BackendId));
++	pids = (int32 *) palloc(MaxBackends * sizeof(int32));
++	ids = (BackendId *) palloc(MaxBackends * sizeof(BackendId));
+ 	count = 0;
+ 
+ 	LWLockAcquire(NotifyQueueLock, LW_EXCLUSIVE);
+diff --git a/src/backend/libpq/pqcomm.c b/src/backend/libpq/pqcomm.c
+index 7d3dc2a51f32..03cdc72b4063 100644
+--- a/src/backend/libpq/pqcomm.c
++++ b/src/backend/libpq/pqcomm.c
+@@ -334,7 +334,6 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
+ 	struct addrinfo hint;
+ 	int			listen_index = 0;
+ 	int			added = 0;
+-	int			max_backends = GetMaxBackends();
+ 
+ #ifdef HAVE_UNIX_SOCKETS
+ 	char		unixSocketPath[MAXPGPATH];
+@@ -557,7 +556,7 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
+ 		 * intended to provide a clamp on the request on platforms where an
+ 		 * overly large request provokes a kernel error (are there any?).
+ 		 */
+-		maxconn = max_backends * 2;
++		maxconn = MaxBackends * 2;
+ 		if (maxconn > PG_SOMAXCONN)
+ 			maxconn = PG_SOMAXCONN;
+ 
+diff --git a/src/backend/postmaster/auxprocess.c b/src/backend/postmaster/auxprocess.c
+index 0587e45920a9..39ac4490db1b 100644
+--- a/src/backend/postmaster/auxprocess.c
++++ b/src/backend/postmaster/auxprocess.c
+@@ -116,7 +116,7 @@ AuxiliaryProcessMain(AuxProcType auxtype)
+ 	 * This will need rethinking if we ever want more than one of a particular
+ 	 * auxiliary process type.
+ 	 */
+-	ProcSignalInit(GetMaxBackends() + MyAuxProcType + 1);
++	ProcSignalInit(MaxBackends + MyAuxProcType + 1);
+ 
+ 	/*
+ 	 * Auxiliary processes don't run transactions, but they may need a
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index 3535e9e47d2d..3dcaf8a4a5d3 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -1005,8 +1005,10 @@ PostmasterMain(int argc, char *argv[])
+ 	LocalProcessControlFile(false);
+ 
+ 	/*
+-	 * Register the apply launcher.  It's probably a good idea to call this
+-	 * before any modules had a chance to take the background worker slots.
++	 * Register the apply launcher.  Since it registers a background worker,
++	 * it needs to be called before InitializeMaxBackends(), and it's probably
++	 * a good idea to call it before any modules had chance to take the
++	 * background worker slots.
+ 	 */
+ 	ApplyLauncherRegister();
+ 
+@@ -1027,8 +1029,8 @@ PostmasterMain(int argc, char *argv[])
+ #endif
+ 
+ 	/*
+-	 * Now that loadable modules have had their chance to alter any GUCs,
+-	 * calculate MaxBackends.
++	 * Now that loadable modules have had their chance to register background
++	 * workers, calculate MaxBackends.
+ 	 */
+ 	InitializeMaxBackends();
+ 
+@@ -6142,7 +6144,7 @@ save_backend_variables(BackendParameters *param, Port *port,
+ 	param->query_id_enabled = query_id_enabled;
+ 	param->max_safe_fds = max_safe_fds;
+ 
+-	param->MaxBackends = GetMaxBackends();
++	param->MaxBackends = MaxBackends;
+ 
+ #ifdef WIN32
+ 	param->PostmasterHandle = PostmasterHandle;
+@@ -6375,7 +6377,7 @@ restore_backend_variables(BackendParameters *param, Port *port)
+ 	query_id_enabled = param->query_id_enabled;
+ 	max_safe_fds = param->max_safe_fds;
+ 
+-	SetMaxBackends(param->MaxBackends);
++	MaxBackends = param->MaxBackends;
+ 
+ #ifdef WIN32
+ 	PostmasterHandle = param->PostmasterHandle;
+diff --git a/src/backend/storage/ipc/dsm.c b/src/backend/storage/ipc/dsm.c
+index ce6f07d4c58d..9d86bbe87246 100644
+--- a/src/backend/storage/ipc/dsm.c
++++ b/src/backend/storage/ipc/dsm.c
+@@ -166,7 +166,7 @@ dsm_postmaster_startup(PGShmemHeader *shim)
+ 
+ 	/* Determine size for new control segment. */
+ 	maxitems = PG_DYNSHMEM_FIXED_SLOTS
+-		+ PG_DYNSHMEM_SLOTS_PER_BACKEND * GetMaxBackends();
++		+ PG_DYNSHMEM_SLOTS_PER_BACKEND * MaxBackends;
+ 	elog(DEBUG2, "dynamic shared memory system will support %u segments",
+ 		 maxitems);
+ 	segsize = dsm_control_bytes_needed(maxitems);
+diff --git a/src/backend/storage/ipc/procarray.c b/src/backend/storage/ipc/procarray.c
+index e184a3552c8e..cb39fdde3391 100644
+--- a/src/backend/storage/ipc/procarray.c
++++ b/src/backend/storage/ipc/procarray.c
+@@ -97,7 +97,7 @@ typedef struct ProcArrayStruct
+ 	/* oldest catalog xmin of any replication slot */
+ 	TransactionId replication_slot_catalog_xmin;
+ 
+-	/* indexes into allProcs[], has ProcArrayMaxProcs entries */
++	/* indexes into allProcs[], has PROCARRAY_MAXPROCS entries */
+ 	int			pgprocnos[FLEXIBLE_ARRAY_MEMBER];
+ } ProcArrayStruct;
+ 
+@@ -355,17 +355,6 @@ static void MaintainLatestCompletedXidRecovery(TransactionId latestXid);
+ static inline FullTransactionId FullXidRelativeTo(FullTransactionId rel,
+ 												  TransactionId xid);
+ static void GlobalVisUpdateApply(ComputeXidHorizonsResult *horizons);
+-static inline int GetProcArrayMaxProcs(void);
+-
+-
+-/*
+- * Retrieve the number of slots in the ProcArray structure.
+- */
+-static inline int
+-GetProcArrayMaxProcs(void)
+-{
+-	return GetMaxBackends() + max_prepared_xacts;
+-}
+ 
+ /*
+  * Report shared-memory space needed by CreateSharedProcArray.
+@@ -376,8 +365,10 @@ ProcArrayShmemSize(void)
+ 	Size		size;
+ 
+ 	/* Size of the ProcArray structure itself */
++#define PROCARRAY_MAXPROCS	(MaxBackends + max_prepared_xacts)
++
+ 	size = offsetof(ProcArrayStruct, pgprocnos);
+-	size = add_size(size, mul_size(sizeof(int), GetProcArrayMaxProcs()));
++	size = add_size(size, mul_size(sizeof(int), PROCARRAY_MAXPROCS));
+ 
+ 	/*
+ 	 * During Hot Standby processing we have a data structure called
+@@ -393,7 +384,7 @@ ProcArrayShmemSize(void)
+ 	 * shared memory is being set up.
+ 	 */
+ #define TOTAL_MAX_CACHED_SUBXIDS \
+-	((PGPROC_MAX_CACHED_SUBXIDS + 1) * GetProcArrayMaxProcs())
++	((PGPROC_MAX_CACHED_SUBXIDS + 1) * PROCARRAY_MAXPROCS)
+ 
+ 	if (EnableHotStandby)
+ 	{
+@@ -420,7 +411,7 @@ CreateSharedProcArray(void)
+ 		ShmemInitStruct("Proc Array",
+ 						add_size(offsetof(ProcArrayStruct, pgprocnos),
+ 								 mul_size(sizeof(int),
+-										  GetProcArrayMaxProcs())),
++										  PROCARRAY_MAXPROCS)),
+ 						&found);
+ 
+ 	if (!found)
+@@ -429,7 +420,7 @@ CreateSharedProcArray(void)
+ 		 * We're the first - initialize.
+ 		 */
+ 		procArray->numProcs = 0;
+-		procArray->maxProcs = GetProcArrayMaxProcs();
++		procArray->maxProcs = PROCARRAY_MAXPROCS;
+ 		procArray->maxKnownAssignedXids = TOTAL_MAX_CACHED_SUBXIDS;
+ 		procArray->numKnownAssignedXids = 0;
+ 		procArray->tailKnownAssignedXids = 0;
+@@ -4645,7 +4636,7 @@ KnownAssignedXidsCompress(bool force)
+ 		 */
+ 		int			nelements = head - tail;
+ 
+-		if (nelements < 4 * GetProcArrayMaxProcs() ||
++		if (nelements < 4 * PROCARRAY_MAXPROCS ||
+ 			nelements < 2 * pArray->numKnownAssignedXids)
+ 			return;
+ 	}
+diff --git a/src/backend/storage/ipc/procsignal.c b/src/backend/storage/ipc/procsignal.c
+index f41563a0a481..00d66902d8bf 100644
+--- a/src/backend/storage/ipc/procsignal.c
++++ b/src/backend/storage/ipc/procsignal.c
+@@ -81,6 +81,13 @@ typedef struct
+ 	ProcSignalSlot psh_slot[FLEXIBLE_ARRAY_MEMBER];
+ } ProcSignalHeader;
+ 
++/*
++ * We reserve a slot for each possible BackendId, plus one for each
++ * possible auxiliary process type.  (This scheme assumes there is not
++ * more than one of any auxiliary process type at a time.)
++ */
++#define NumProcSignalSlots	(MaxBackends + NUM_AUXPROCTYPES)
++
+ /* Check whether the relevant type bit is set in the flags. */
+ #define BARRIER_SHOULD_CHECK(flags, type) \
+ 	(((flags) & (((uint32) 1) << (uint32) (type))) != 0)
+@@ -95,20 +102,6 @@ static ProcSignalSlot *MyProcSignalSlot = NULL;
+ static bool CheckProcSignal(ProcSignalReason reason);
+ static void CleanupProcSignalState(int status, Datum arg);
+ static void ResetProcSignalBarrierBits(uint32 flags);
+-static inline int GetNumProcSignalSlots(void);
+-
+-/*
+- * GetNumProcSignalSlots
+- *
+- * We reserve a slot for each possible BackendId, plus one for each possible
+- * auxiliary process type.  (This scheme assume there is not more than one of
+- * any auxiliary process type at a time.)
+- */
+-static inline int
+-GetNumProcSignalSlots(void)
+-{
+-	return GetMaxBackends() + NUM_AUXPROCTYPES;
+-}
+ 
+ /*
+  * ProcSignalShmemSize
+@@ -119,7 +112,7 @@ ProcSignalShmemSize(void)
+ {
+ 	Size		size;
+ 
+-	size = mul_size(GetNumProcSignalSlots(), sizeof(ProcSignalSlot));
++	size = mul_size(NumProcSignalSlots, sizeof(ProcSignalSlot));
+ 	size = add_size(size, offsetof(ProcSignalHeader, psh_slot));
+ 	return size;
+ }
+@@ -133,7 +126,6 @@ ProcSignalShmemInit(void)
+ {
+ 	Size		size = ProcSignalShmemSize();
+ 	bool		found;
+-	int			numProcSignalSlots = GetNumProcSignalSlots();
+ 
+ 	ProcSignal = (ProcSignalHeader *)
+ 		ShmemInitStruct("ProcSignal", size, &found);
+@@ -145,7 +137,7 @@ ProcSignalShmemInit(void)
+ 
+ 		pg_atomic_init_u64(&ProcSignal->psh_barrierGeneration, 0);
+ 
+-		for (i = 0; i < numProcSignalSlots; ++i)
++		for (i = 0; i < NumProcSignalSlots; ++i)
+ 		{
+ 			ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
+ 
+@@ -171,7 +163,7 @@ ProcSignalInit(int pss_idx)
+ 	ProcSignalSlot *slot;
+ 	uint64		barrier_generation;
+ 
+-	Assert(pss_idx >= 1 && pss_idx <= GetNumProcSignalSlots());
++	Assert(pss_idx >= 1 && pss_idx <= NumProcSignalSlots);
+ 
+ 	slot = &ProcSignal->psh_slot[pss_idx - 1];
+ 
+@@ -300,7 +292,7 @@ SendProcSignal(pid_t pid, ProcSignalReason reason, BackendId backendId)
+ 		 */
+ 		int			i;
+ 
+-		for (i = GetNumProcSignalSlots() - 1; i >= 0; i--)
++		for (i = NumProcSignalSlots - 1; i >= 0; i--)
+ 		{
+ 			slot = &ProcSignal->psh_slot[i];
+ 
+@@ -341,7 +333,6 @@ EmitProcSignalBarrier(ProcSignalBarrierType type)
+ {
+ 	uint32		flagbit = 1 << (uint32) type;
+ 	uint64		generation;
+-	int			numProcSignalSlots = GetNumProcSignalSlots();
+ 
+ 	/*
+ 	 * Set all the flags.
+@@ -351,7 +342,7 @@ EmitProcSignalBarrier(ProcSignalBarrierType type)
+ 	 * anything that we do afterwards. (This is also true of the later call to
+ 	 * pg_atomic_add_fetch_u64.)
+ 	 */
+-	for (int i = 0; i < numProcSignalSlots; i++)
++	for (int i = 0; i < NumProcSignalSlots; i++)
+ 	{
+ 		volatile ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
+ 
+@@ -377,7 +368,7 @@ EmitProcSignalBarrier(ProcSignalBarrierType type)
+ 	 * backends that need to update state - but they won't actually need to
+ 	 * change any state.
+ 	 */
+-	for (int i = numProcSignalSlots - 1; i >= 0; i--)
++	for (int i = NumProcSignalSlots - 1; i >= 0; i--)
+ 	{
+ 		volatile ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
+ 		pid_t		pid = slot->pss_pid;
+@@ -402,7 +393,7 @@ WaitForProcSignalBarrier(uint64 generation)
+ {
+ 	Assert(generation <= pg_atomic_read_u64(&ProcSignal->psh_barrierGeneration));
+ 
+-	for (int i = GetNumProcSignalSlots() - 1; i >= 0; i--)
++	for (int i = NumProcSignalSlots - 1; i >= 0; i--)
+ 	{
+ 		ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
+ 		uint64		oldval;
+diff --git a/src/backend/storage/ipc/sinvaladt.c b/src/backend/storage/ipc/sinvaladt.c
+index 2dec668bbcd0..2861c03e04bd 100644
+--- a/src/backend/storage/ipc/sinvaladt.c
++++ b/src/backend/storage/ipc/sinvaladt.c
+@@ -213,7 +213,7 @@ SInvalShmemSize(void)
+ 	 * free slot. This is because the autovacuum launcher and worker processes,
+ 	 * which are included in MaxBackends, are not started in Hot Standby mode.
+ 	 */
+-	size = add_size(size, mul_size(sizeof(ProcState), GetMaxBackends()));
++	size = add_size(size, mul_size(sizeof(ProcState), MaxBackends));
+ 
+ 	return size;
+ }
+@@ -239,7 +239,7 @@ CreateSharedInvalidationState(void)
+ 	shmInvalBuffer->maxMsgNum = 0;
+ 	shmInvalBuffer->nextThreshold = CLEANUP_MIN;
+ 	shmInvalBuffer->lastBackend = 0;
+-	shmInvalBuffer->maxBackends = GetMaxBackends();
++	shmInvalBuffer->maxBackends = MaxBackends;
+ 	SpinLockInit(&shmInvalBuffer->msgnumLock);
+ 
+ 	/* The buffer[] array is initially all unused, so we need not fill it */
+diff --git a/src/backend/storage/lmgr/deadlock.c b/src/backend/storage/lmgr/deadlock.c
+index b5d539ba5d9b..cd9c0418eca7 100644
+--- a/src/backend/storage/lmgr/deadlock.c
++++ b/src/backend/storage/lmgr/deadlock.c
+@@ -143,7 +143,6 @@ void
+ InitDeadLockChecking(void)
+ {
+ 	MemoryContext oldcxt;
+-	int max_backends = GetMaxBackends();
+ 
+ 	/* Make sure allocations are permanent */
+ 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+@@ -152,16 +151,16 @@ InitDeadLockChecking(void)
+ 	 * FindLockCycle needs at most MaxBackends entries in visitedProcs[] and
+ 	 * deadlockDetails[].
+ 	 */
+-	visitedProcs = (PGPROC **) palloc(max_backends * sizeof(PGPROC *));
+-	deadlockDetails = (DEADLOCK_INFO *) palloc(max_backends * sizeof(DEADLOCK_INFO));
++	visitedProcs = (PGPROC **) palloc(MaxBackends * sizeof(PGPROC *));
++	deadlockDetails = (DEADLOCK_INFO *) palloc(MaxBackends * sizeof(DEADLOCK_INFO));
+ 
+ 	/*
+ 	 * TopoSort needs to consider at most MaxBackends wait-queue entries, and
+ 	 * it needn't run concurrently with FindLockCycle.
+ 	 */
+ 	topoProcs = visitedProcs;	/* re-use this space */
+-	beforeConstraints = (int *) palloc(max_backends * sizeof(int));
+-	afterConstraints = (int *) palloc(max_backends * sizeof(int));
++	beforeConstraints = (int *) palloc(MaxBackends * sizeof(int));
++	afterConstraints = (int *) palloc(MaxBackends * sizeof(int));
+ 
+ 	/*
+ 	 * We need to consider rearranging at most MaxBackends/2 wait queues
+@@ -170,8 +169,8 @@ InitDeadLockChecking(void)
+ 	 * MaxBackends total waiters.
+ 	 */
+ 	waitOrders = (WAIT_ORDER *)
+-		palloc((max_backends / 2) * sizeof(WAIT_ORDER));
+-	waitOrderProcs = (PGPROC **) palloc(max_backends * sizeof(PGPROC *));
++		palloc((MaxBackends / 2) * sizeof(WAIT_ORDER));
++	waitOrderProcs = (PGPROC **) palloc(MaxBackends * sizeof(PGPROC *));
+ 
+ 	/*
+ 	 * Allow at most MaxBackends distinct constraints in a configuration. (Is
+@@ -181,7 +180,7 @@ InitDeadLockChecking(void)
+ 	 * limits the maximum recursion depth of DeadLockCheckRecurse. Making it
+ 	 * really big might potentially allow a stack-overflow problem.
+ 	 */
+-	maxCurConstraints = max_backends;
++	maxCurConstraints = MaxBackends;
+ 	curConstraints = (EDGE *) palloc(maxCurConstraints * sizeof(EDGE));
+ 
+ 	/*
+@@ -192,7 +191,7 @@ InitDeadLockChecking(void)
+ 	 * last MaxBackends entries in possibleConstraints[] are reserved as
+ 	 * output workspace for FindLockCycle.
+ 	 */
+-	maxPossibleConstraints = max_backends * 4;
++	maxPossibleConstraints = MaxBackends * 4;
+ 	possibleConstraints =
+ 		(EDGE *) palloc(maxPossibleConstraints * sizeof(EDGE));
+ 
+@@ -328,7 +327,7 @@ DeadLockCheckRecurse(PGPROC *proc)
+ 	if (nCurConstraints >= maxCurConstraints)
+ 		return true;			/* out of room for active constraints? */
+ 	oldPossibleConstraints = nPossibleConstraints;
+-	if (nPossibleConstraints + nEdges + GetMaxBackends() <= maxPossibleConstraints)
++	if (nPossibleConstraints + nEdges + MaxBackends <= maxPossibleConstraints)
+ 	{
+ 		/* We can save the edge list in possibleConstraints[] */
+ 		nPossibleConstraints += nEdges;
+@@ -389,7 +388,7 @@ TestConfiguration(PGPROC *startProc)
+ 	/*
+ 	 * Make sure we have room for FindLockCycle's output.
+ 	 */
+-	if (nPossibleConstraints + GetMaxBackends() > maxPossibleConstraints)
++	if (nPossibleConstraints + MaxBackends > maxPossibleConstraints)
+ 		return -1;
+ 
+ 	/*
+@@ -487,7 +486,7 @@ FindLockCycleRecurse(PGPROC *checkProc,
+ 				 * record total length of cycle --- outer levels will now fill
+ 				 * deadlockDetails[]
+ 				 */
+-				Assert(depth <= GetMaxBackends());
++				Assert(depth <= MaxBackends);
+ 				nDeadlockDetails = depth;
+ 
+ 				return true;
+@@ -501,7 +500,7 @@ FindLockCycleRecurse(PGPROC *checkProc,
+ 		}
+ 	}
+ 	/* Mark proc as seen */
+-	Assert(nVisitedProcs < GetMaxBackends());
++	Assert(nVisitedProcs < MaxBackends);
+ 	visitedProcs[nVisitedProcs++] = checkProc;
+ 
+ 	/*
+@@ -699,7 +698,7 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
+ 					/*
+ 					 * Add this edge to the list of soft edges in the cycle
+ 					 */
+-					Assert(*nSoftEdges < GetMaxBackends());
++					Assert(*nSoftEdges < MaxBackends);
+ 					softEdges[*nSoftEdges].waiter = checkProcLeader;
+ 					softEdges[*nSoftEdges].blocker = leader;
+ 					softEdges[*nSoftEdges].lock = lock;
+@@ -772,7 +771,7 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
+ 					/*
+ 					 * Add this edge to the list of soft edges in the cycle
+ 					 */
+-					Assert(*nSoftEdges < GetMaxBackends());
++					Assert(*nSoftEdges < MaxBackends);
+ 					softEdges[*nSoftEdges].waiter = checkProcLeader;
+ 					softEdges[*nSoftEdges].blocker = leader;
+ 					softEdges[*nSoftEdges].lock = lock;
+@@ -835,7 +834,7 @@ ExpandConstraints(EDGE *constraints,
+ 		waitOrders[nWaitOrders].procs = waitOrderProcs + nWaitOrderProcs;
+ 		waitOrders[nWaitOrders].nProcs = lock->waitProcs.size;
+ 		nWaitOrderProcs += lock->waitProcs.size;
+-		Assert(nWaitOrderProcs <= GetMaxBackends());
++		Assert(nWaitOrderProcs <= MaxBackends);
+ 
+ 		/*
+ 		 * Do the topo sort.  TopoSort need not examine constraints after this
+diff --git a/src/backend/storage/lmgr/lock.c b/src/backend/storage/lmgr/lock.c
+index ee2e15c17e9c..5f5803f68149 100644
+--- a/src/backend/storage/lmgr/lock.c
++++ b/src/backend/storage/lmgr/lock.c
+@@ -55,7 +55,7 @@
+ int			max_locks_per_xact; /* set by guc.c */
+ 
+ #define NLOCKENTS() \
+-	mul_size(max_locks_per_xact, add_size(GetMaxBackends(), max_prepared_xacts))
++	mul_size(max_locks_per_xact, add_size(MaxBackends, max_prepared_xacts))
+ 
+ 
+ /*
+@@ -2924,7 +2924,6 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
+ 	LWLock	   *partitionLock;
+ 	int			count = 0;
+ 	int			fast_count = 0;
+-	int			max_backends = GetMaxBackends();
+ 
+ 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
+ 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
+@@ -2943,12 +2942,12 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
+ 			vxids = (VirtualTransactionId *)
+ 				MemoryContextAlloc(TopMemoryContext,
+ 								   sizeof(VirtualTransactionId) *
+-								   (max_backends + max_prepared_xacts + 1));
++								   (MaxBackends + max_prepared_xacts + 1));
+ 	}
+ 	else
+ 		vxids = (VirtualTransactionId *)
+ 			palloc0(sizeof(VirtualTransactionId) *
+-					(max_backends + max_prepared_xacts + 1));
++					(MaxBackends + max_prepared_xacts + 1));
+ 
+ 	/* Compute hash code and partition lock, and look up conflicting modes. */
+ 	hashcode = LockTagHashCode(locktag);
+@@ -3105,7 +3104,7 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
+ 
+ 	LWLockRelease(partitionLock);
+ 
+-	if (count > max_backends + max_prepared_xacts)	/* should never happen */
++	if (count > MaxBackends + max_prepared_xacts)	/* should never happen */
+ 		elog(PANIC, "too many conflicting locks found");
+ 
+ 	vxids[count].backendId = InvalidBackendId;
+@@ -3652,12 +3651,11 @@ GetLockStatusData(void)
+ 	int			els;
+ 	int			el;
+ 	int			i;
+-	int			max_backends = GetMaxBackends();
+ 
+ 	data = (LockData *) palloc(sizeof(LockData));
+ 
+ 	/* Guess how much space we'll need. */
+-	els = max_backends;
++	els = MaxBackends;
+ 	el = 0;
+ 	data->locks = (LockInstanceData *) palloc(sizeof(LockInstanceData) * els);
+ 
+@@ -3691,7 +3689,7 @@ GetLockStatusData(void)
+ 
+ 			if (el >= els)
+ 			{
+-				els += max_backends;
++				els += MaxBackends;
+ 				data->locks = (LockInstanceData *)
+ 					repalloc(data->locks, sizeof(LockInstanceData) * els);
+ 			}
+@@ -3723,7 +3721,7 @@ GetLockStatusData(void)
+ 
+ 			if (el >= els)
+ 			{
+-				els += max_backends;
++				els += MaxBackends;
+ 				data->locks = (LockInstanceData *)
+ 					repalloc(data->locks, sizeof(LockInstanceData) * els);
+ 			}
+@@ -3852,7 +3850,7 @@ GetBlockerStatusData(int blocked_pid)
+ 	 * for the procs[] array; the other two could need enlargement, though.)
+ 	 */
+ 	data->nprocs = data->nlocks = data->npids = 0;
+-	data->maxprocs = data->maxlocks = data->maxpids = GetMaxBackends();
++	data->maxprocs = data->maxlocks = data->maxpids = MaxBackends;
+ 	data->procs = (BlockedProcData *) palloc(sizeof(BlockedProcData) * data->maxprocs);
+ 	data->locks = (LockInstanceData *) palloc(sizeof(LockInstanceData) * data->maxlocks);
+ 	data->waiter_pids = (int *) palloc(sizeof(int) * data->maxpids);
+@@ -3927,7 +3925,6 @@ GetSingleProcBlockerStatusData(PGPROC *blocked_proc, BlockedProcsData *data)
+ 	PGPROC	   *proc;
+ 	int			queue_size;
+ 	int			i;
+-	int			max_backends = GetMaxBackends();
+ 
+ 	/* Nothing to do if this proc is not blocked */
+ 	if (theLock == NULL)
+@@ -3956,7 +3953,7 @@ GetSingleProcBlockerStatusData(PGPROC *blocked_proc, BlockedProcsData *data)
+ 
+ 		if (data->nlocks >= data->maxlocks)
+ 		{
+-			data->maxlocks += max_backends;
++			data->maxlocks += MaxBackends;
+ 			data->locks = (LockInstanceData *)
+ 				repalloc(data->locks, sizeof(LockInstanceData) * data->maxlocks);
+ 		}
+@@ -3985,7 +3982,7 @@ GetSingleProcBlockerStatusData(PGPROC *blocked_proc, BlockedProcsData *data)
+ 
+ 	if (queue_size > data->maxpids - data->npids)
+ 	{
+-		data->maxpids = Max(data->maxpids + max_backends,
++		data->maxpids = Max(data->maxpids + MaxBackends,
+ 							data->npids + queue_size);
+ 		data->waiter_pids = (int *) repalloc(data->waiter_pids,
+ 											 sizeof(int) * data->maxpids);
+diff --git a/src/backend/storage/lmgr/predicate.c b/src/backend/storage/lmgr/predicate.c
+index e337aad5b242..25e7e4e37bfd 100644
+--- a/src/backend/storage/lmgr/predicate.c
++++ b/src/backend/storage/lmgr/predicate.c
+@@ -257,7 +257,7 @@
+ 	(&MainLWLockArray[PREDICATELOCK_MANAGER_LWLOCK_OFFSET + (i)].lock)
+ 
+ #define NPREDICATELOCKTARGETENTS() \
+-	mul_size(max_predicate_locks_per_xact, add_size(GetMaxBackends(), max_prepared_xacts))
++	mul_size(max_predicate_locks_per_xact, add_size(MaxBackends, max_prepared_xacts))
+ 
+ #define SxactIsOnFinishedList(sxact) (!SHMQueueIsDetached(&((sxact)->finishedLink)))
+ 
+@@ -1222,7 +1222,7 @@ InitPredicateLocks(void)
+ 	 * Compute size for serializable transaction hashtable. Note these
+ 	 * calculations must agree with PredicateLockShmemSize!
+ 	 */
+-	max_table_size = (GetMaxBackends() + max_prepared_xacts);
++	max_table_size = (MaxBackends + max_prepared_xacts);
+ 
+ 	/*
+ 	 * Allocate a list to hold information on transactions participating in
+@@ -1375,7 +1375,7 @@ PredicateLockShmemSize(void)
+ 	size = add_size(size, size / 10);
+ 
+ 	/* transaction list */
+-	max_table_size = GetMaxBackends() + max_prepared_xacts;
++	max_table_size = MaxBackends + max_prepared_xacts;
+ 	max_table_size *= 10;
+ 	size = add_size(size, PredXactListDataSize);
+ 	size = add_size(size, mul_size((Size) max_table_size,
+@@ -1907,7 +1907,7 @@ GetSerializableTransactionSnapshotInt(Snapshot snapshot,
+ 	{
+ 		++(PredXact->WritableSxactCount);
+ 		Assert(PredXact->WritableSxactCount <=
+-			   (GetMaxBackends() + max_prepared_xacts));
++			   (MaxBackends + max_prepared_xacts));
+ 	}
+ 
+ 	MySerializableXact = sxact;
+@@ -5111,7 +5111,7 @@ predicatelock_twophase_recover(TransactionId xid, uint16 info,
+ 		{
+ 			++(PredXact->WritableSxactCount);
+ 			Assert(PredXact->WritableSxactCount <=
+-				   (GetMaxBackends() + max_prepared_xacts));
++				   (MaxBackends + max_prepared_xacts));
+ 		}
+ 
+ 		/*
+diff --git a/src/backend/storage/lmgr/proc.c b/src/backend/storage/lmgr/proc.c
+index 93d082c45eec..37aaab13381d 100644
+--- a/src/backend/storage/lmgr/proc.c
++++ b/src/backend/storage/lmgr/proc.c
+@@ -103,7 +103,7 @@ ProcGlobalShmemSize(void)
+ {
+ 	Size		size = 0;
+ 	Size		TotalProcs =
+-	add_size(GetMaxBackends(), add_size(NUM_AUXILIARY_PROCS, max_prepared_xacts));
++	add_size(MaxBackends, add_size(NUM_AUXILIARY_PROCS, max_prepared_xacts));
+ 
+ 	/* ProcGlobal */
+ 	size = add_size(size, sizeof(PROC_HDR));
+@@ -127,7 +127,7 @@ ProcGlobalSemas(void)
+ 	 * We need a sema per backend (including autovacuum), plus one for each
+ 	 * auxiliary process.
+ 	 */
+-	return GetMaxBackends() + NUM_AUXILIARY_PROCS;
++	return MaxBackends + NUM_AUXILIARY_PROCS;
+ }
+ 
+ /*
+@@ -162,8 +162,7 @@ InitProcGlobal(void)
+ 	int			i,
+ 				j;
+ 	bool		found;
+-	int			max_backends = GetMaxBackends();
+-	uint32		TotalProcs = max_backends + NUM_AUXILIARY_PROCS + max_prepared_xacts;
++	uint32		TotalProcs = MaxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts;
+ 
+ 	/* Create the ProcGlobal shared structure */
+ 	ProcGlobal = (PROC_HDR *)
+@@ -196,7 +195,7 @@ InitProcGlobal(void)
+ 	MemSet(procs, 0, TotalProcs * sizeof(PGPROC));
+ 	ProcGlobal->allProcs = procs;
+ 	/* XXX allProcCount isn't really all of them; it excludes prepared xacts */
+-	ProcGlobal->allProcCount = max_backends + NUM_AUXILIARY_PROCS;
++	ProcGlobal->allProcCount = MaxBackends + NUM_AUXILIARY_PROCS;
+ 
+ 	/*
+ 	 * Allocate arrays mirroring PGPROC fields in a dense manner. See
+@@ -222,7 +221,7 @@ InitProcGlobal(void)
+ 		 * dummy PGPROCs don't need these though - they're never associated
+ 		 * with a real process
+ 		 */
+-		if (i < max_backends + NUM_AUXILIARY_PROCS)
++		if (i < MaxBackends + NUM_AUXILIARY_PROCS)
+ 		{
+ 			procs[i].sem = PGSemaphoreCreate();
+ 			InitSharedLatch(&(procs[i].procLatch));
+@@ -259,7 +258,7 @@ InitProcGlobal(void)
+ 			ProcGlobal->bgworkerFreeProcs = &procs[i];
+ 			procs[i].procgloballist = &ProcGlobal->bgworkerFreeProcs;
+ 		}
+-		else if (i < max_backends)
++		else if (i < MaxBackends)
+ 		{
+ 			/* PGPROC for walsender, add to walsenderFreeProcs list */
+ 			procs[i].links.next = (SHM_QUEUE *) ProcGlobal->walsenderFreeProcs;
+@@ -287,8 +286,8 @@ InitProcGlobal(void)
+ 	 * Save pointers to the blocks of PGPROC structures reserved for auxiliary
+ 	 * processes and prepared transactions.
+ 	 */
+-	AuxiliaryProcs = &procs[max_backends];
+-	PreparedXactProcs = &procs[max_backends + NUM_AUXILIARY_PROCS];
++	AuxiliaryProcs = &procs[MaxBackends];
++	PreparedXactProcs = &procs[MaxBackends + NUM_AUXILIARY_PROCS];
+ 
+ 	/* Create ProcStructLock spinlock, too */
+ 	ProcStructLock = (slock_t *) ShmemAlloc(sizeof(slock_t));
+diff --git a/src/backend/utils/activity/backend_status.c b/src/backend/utils/activity/backend_status.c
+index 079321599d6a..c7ed1e6d7ac0 100644
+--- a/src/backend/utils/activity/backend_status.c
++++ b/src/backend/utils/activity/backend_status.c
+@@ -26,6 +26,18 @@
+ #include "utils/memutils.h"
+ 
+ 
++/* ----------
++ * Total number of backends including auxiliary
++ *
++ * We reserve a slot for each possible BackendId, plus one for each
++ * possible auxiliary process type.  (This scheme assumes there is not
++ * more than one of any auxiliary process type at a time.) MaxBackends
++ * includes autovacuum workers and background workers as well.
++ * ----------
++ */
++#define NumBackendStatSlots (MaxBackends + NUM_AUXPROCTYPES)
++
++
+ /* ----------
+  * GUC parameters
+  * ----------
+@@ -63,23 +75,8 @@ static MemoryContext backendStatusSnapContext;
+ static void pgstat_beshutdown_hook(int code, Datum arg);
+ static void pgstat_read_current_status(void);
+ static void pgstat_setup_backend_status_context(void);
+-static inline int GetNumBackendStatSlots(void);
+ 
+ 
+-/*
+- * Retrieve the total number of backends including auxiliary
+- *
+- * We reserve a slot for each possible BackendId, plus one for each possible
+- * auxiliary process type.  (This scheme assumes there is not more than one of
+- * any auxiliary process type at a time.)  MaxBackends includes autovacuum
+- * workers and background workers as well.
+- */
+-static inline int
+-GetNumBackendStatSlots(void)
+-{
+-	return GetMaxBackends() + NUM_AUXPROCTYPES;
+-}
+-
+ /*
+  * Report shared-memory space needed by CreateSharedBackendStatus.
+  */
+@@ -87,28 +84,27 @@ Size
+ BackendStatusShmemSize(void)
+ {
+ 	Size		size;
+-	int			numBackendStatSlots = GetNumBackendStatSlots();
+ 
+ 	/* BackendStatusArray: */
+-	size = mul_size(sizeof(PgBackendStatus), numBackendStatSlots);
++	size = mul_size(sizeof(PgBackendStatus), NumBackendStatSlots);
+ 	/* BackendAppnameBuffer: */
+ 	size = add_size(size,
+-					mul_size(NAMEDATALEN, numBackendStatSlots));
++					mul_size(NAMEDATALEN, NumBackendStatSlots));
+ 	/* BackendClientHostnameBuffer: */
+ 	size = add_size(size,
+-					mul_size(NAMEDATALEN, numBackendStatSlots));
++					mul_size(NAMEDATALEN, NumBackendStatSlots));
+ 	/* BackendActivityBuffer: */
+ 	size = add_size(size,
+-					mul_size(pgstat_track_activity_query_size, numBackendStatSlots));
++					mul_size(pgstat_track_activity_query_size, NumBackendStatSlots));
+ #ifdef USE_SSL
+ 	/* BackendSslStatusBuffer: */
+ 	size = add_size(size,
+-					mul_size(sizeof(PgBackendSSLStatus), numBackendStatSlots));
++					mul_size(sizeof(PgBackendSSLStatus), NumBackendStatSlots));
+ #endif
+ #ifdef ENABLE_GSS
+ 	/* BackendGssStatusBuffer: */
+ 	size = add_size(size,
+-					mul_size(sizeof(PgBackendGSSStatus), numBackendStatSlots));
++					mul_size(sizeof(PgBackendGSSStatus), NumBackendStatSlots));
+ #endif
+ 	return size;
+ }
+@@ -124,10 +120,9 @@ CreateSharedBackendStatus(void)
+ 	bool		found;
+ 	int			i;
+ 	char	   *buffer;
+-	int			numBackendStatSlots = GetNumBackendStatSlots();
+ 
+ 	/* Create or attach to the shared array */
+-	size = mul_size(sizeof(PgBackendStatus), numBackendStatSlots);
++	size = mul_size(sizeof(PgBackendStatus), NumBackendStatSlots);
+ 	BackendStatusArray = (PgBackendStatus *)
+ 		ShmemInitStruct("Backend Status Array", size, &found);
+ 
+@@ -140,7 +135,7 @@ CreateSharedBackendStatus(void)
+ 	}
+ 
+ 	/* Create or attach to the shared appname buffer */
+-	size = mul_size(NAMEDATALEN, numBackendStatSlots);
++	size = mul_size(NAMEDATALEN, NumBackendStatSlots);
+ 	BackendAppnameBuffer = (char *)
+ 		ShmemInitStruct("Backend Application Name Buffer", size, &found);
+ 
+@@ -150,7 +145,7 @@ CreateSharedBackendStatus(void)
+ 
+ 		/* Initialize st_appname pointers. */
+ 		buffer = BackendAppnameBuffer;
+-		for (i = 0; i < numBackendStatSlots; i++)
++		for (i = 0; i < NumBackendStatSlots; i++)
+ 		{
+ 			BackendStatusArray[i].st_appname = buffer;
+ 			buffer += NAMEDATALEN;
+@@ -158,7 +153,7 @@ CreateSharedBackendStatus(void)
+ 	}
+ 
+ 	/* Create or attach to the shared client hostname buffer */
+-	size = mul_size(NAMEDATALEN, numBackendStatSlots);
++	size = mul_size(NAMEDATALEN, NumBackendStatSlots);
+ 	BackendClientHostnameBuffer = (char *)
+ 		ShmemInitStruct("Backend Client Host Name Buffer", size, &found);
+ 
+@@ -168,7 +163,7 @@ CreateSharedBackendStatus(void)
+ 
+ 		/* Initialize st_clienthostname pointers. */
+ 		buffer = BackendClientHostnameBuffer;
+-		for (i = 0; i < numBackendStatSlots; i++)
++		for (i = 0; i < NumBackendStatSlots; i++)
+ 		{
+ 			BackendStatusArray[i].st_clienthostname = buffer;
+ 			buffer += NAMEDATALEN;
+@@ -177,7 +172,7 @@ CreateSharedBackendStatus(void)
+ 
+ 	/* Create or attach to the shared activity buffer */
+ 	BackendActivityBufferSize = mul_size(pgstat_track_activity_query_size,
+-										 numBackendStatSlots);
++										 NumBackendStatSlots);
+ 	BackendActivityBuffer = (char *)
+ 		ShmemInitStruct("Backend Activity Buffer",
+ 						BackendActivityBufferSize,
+@@ -189,7 +184,7 @@ CreateSharedBackendStatus(void)
+ 
+ 		/* Initialize st_activity pointers. */
+ 		buffer = BackendActivityBuffer;
+-		for (i = 0; i < numBackendStatSlots; i++)
++		for (i = 0; i < NumBackendStatSlots; i++)
+ 		{
+ 			BackendStatusArray[i].st_activity_raw = buffer;
+ 			buffer += pgstat_track_activity_query_size;
+@@ -198,7 +193,7 @@ CreateSharedBackendStatus(void)
+ 
+ #ifdef USE_SSL
+ 	/* Create or attach to the shared SSL status buffer */
+-	size = mul_size(sizeof(PgBackendSSLStatus), numBackendStatSlots);
++	size = mul_size(sizeof(PgBackendSSLStatus), NumBackendStatSlots);
+ 	BackendSslStatusBuffer = (PgBackendSSLStatus *)
+ 		ShmemInitStruct("Backend SSL Status Buffer", size, &found);
+ 
+@@ -210,7 +205,7 @@ CreateSharedBackendStatus(void)
+ 
+ 		/* Initialize st_sslstatus pointers. */
+ 		ptr = BackendSslStatusBuffer;
+-		for (i = 0; i < numBackendStatSlots; i++)
++		for (i = 0; i < NumBackendStatSlots; i++)
+ 		{
+ 			BackendStatusArray[i].st_sslstatus = ptr;
+ 			ptr++;
+@@ -220,7 +215,7 @@ CreateSharedBackendStatus(void)
+ 
+ #ifdef ENABLE_GSS
+ 	/* Create or attach to the shared GSSAPI status buffer */
+-	size = mul_size(sizeof(PgBackendGSSStatus), numBackendStatSlots);
++	size = mul_size(sizeof(PgBackendGSSStatus), NumBackendStatSlots);
+ 	BackendGssStatusBuffer = (PgBackendGSSStatus *)
+ 		ShmemInitStruct("Backend GSS Status Buffer", size, &found);
+ 
+@@ -232,7 +227,7 @@ CreateSharedBackendStatus(void)
+ 
+ 		/* Initialize st_gssstatus pointers. */
+ 		ptr = BackendGssStatusBuffer;
+-		for (i = 0; i < numBackendStatSlots; i++)
++		for (i = 0; i < NumBackendStatSlots; i++)
+ 		{
+ 			BackendStatusArray[i].st_gssstatus = ptr;
+ 			ptr++;
+@@ -256,7 +251,7 @@ pgstat_beinit(void)
+ 	/* Initialize MyBEEntry */
+ 	if (MyBackendId != InvalidBackendId)
+ 	{
+-		Assert(MyBackendId >= 1 && MyBackendId <= GetMaxBackends());
++		Assert(MyBackendId >= 1 && MyBackendId <= MaxBackends);
+ 		MyBEEntry = &BackendStatusArray[MyBackendId - 1];
+ 	}
+ 	else
+@@ -272,7 +267,7 @@ pgstat_beinit(void)
+ 		 * MaxBackends + AuxBackendType + 1 as the index of the slot for an
+ 		 * auxiliary process.
+ 		 */
+-		MyBEEntry = &BackendStatusArray[GetMaxBackends() + MyAuxProcType];
++		MyBEEntry = &BackendStatusArray[MaxBackends + MyAuxProcType];
+ 	}
+ 
+ 	/* Set up a process-exit hook to clean up */
+@@ -744,7 +739,6 @@ pgstat_read_current_status(void)
+ 	PgBackendGSSStatus *localgssstatus;
+ #endif
+ 	int			i;
+-	int			numBackendStatSlots = GetNumBackendStatSlots();
+ 
+ 	if (localBackendStatusTable)
+ 		return;					/* already done */
+@@ -761,32 +755,32 @@ pgstat_read_current_status(void)
+ 	 */
+ 	localtable = (LocalPgBackendStatus *)
+ 		MemoryContextAlloc(backendStatusSnapContext,
+-						   sizeof(LocalPgBackendStatus) * numBackendStatSlots);
++						   sizeof(LocalPgBackendStatus) * NumBackendStatSlots);
+ 	localappname = (char *)
+ 		MemoryContextAlloc(backendStatusSnapContext,
+-						   NAMEDATALEN * numBackendStatSlots);
++						   NAMEDATALEN * NumBackendStatSlots);
+ 	localclienthostname = (char *)
+ 		MemoryContextAlloc(backendStatusSnapContext,
+-						   NAMEDATALEN * numBackendStatSlots);
++						   NAMEDATALEN * NumBackendStatSlots);
+ 	localactivity = (char *)
+ 		MemoryContextAllocHuge(backendStatusSnapContext,
+-							   pgstat_track_activity_query_size * numBackendStatSlots);
++							   pgstat_track_activity_query_size * NumBackendStatSlots);
+ #ifdef USE_SSL
+ 	localsslstatus = (PgBackendSSLStatus *)
+ 		MemoryContextAlloc(backendStatusSnapContext,
+-						   sizeof(PgBackendSSLStatus) * numBackendStatSlots);
++						   sizeof(PgBackendSSLStatus) * NumBackendStatSlots);
+ #endif
+ #ifdef ENABLE_GSS
+ 	localgssstatus = (PgBackendGSSStatus *)
+ 		MemoryContextAlloc(backendStatusSnapContext,
+-						   sizeof(PgBackendGSSStatus) * numBackendStatSlots);
++						   sizeof(PgBackendGSSStatus) * NumBackendStatSlots);
+ #endif
+ 
+ 	localNumBackends = 0;
+ 
+ 	beentry = BackendStatusArray;
+ 	localentry = localtable;
+-	for (i = 1; i <= numBackendStatSlots; i++)
++	for (i = 1; i <= NumBackendStatSlots; i++)
+ 	{
+ 		/*
+ 		 * Follow the protocol of retrying if st_changecount changes while we
+@@ -899,10 +893,9 @@ pgstat_get_backend_current_activity(int pid, bool checkUser)
+ {
+ 	PgBackendStatus *beentry;
+ 	int			i;
+-	int			max_backends = GetMaxBackends();
+ 
+ 	beentry = BackendStatusArray;
+-	for (i = 1; i <= max_backends; i++)
++	for (i = 1; i <= MaxBackends; i++)
+ 	{
+ 		/*
+ 		 * Although we expect the target backend's entry to be stable, that
+@@ -978,7 +971,6 @@ pgstat_get_crashed_backend_activity(int pid, char *buffer, int buflen)
+ {
+ 	volatile PgBackendStatus *beentry;
+ 	int			i;
+-	int			max_backends = GetMaxBackends();
+ 
+ 	beentry = BackendStatusArray;
+ 
+@@ -989,7 +981,7 @@ pgstat_get_crashed_backend_activity(int pid, char *buffer, int buflen)
+ 	if (beentry == NULL || BackendActivityBuffer == NULL)
+ 		return NULL;
+ 
+-	for (i = 1; i <= max_backends; i++)
++	for (i = 1; i <= MaxBackends; i++)
+ 	{
+ 		if (beentry->st_procpid == pid)
+ 		{
+diff --git a/src/backend/utils/adt/lockfuncs.c b/src/backend/utils/adt/lockfuncs.c
+index 944cd6df03fa..023a004ac899 100644
+--- a/src/backend/utils/adt/lockfuncs.c
++++ b/src/backend/utils/adt/lockfuncs.c
+@@ -559,14 +559,13 @@ pg_safe_snapshot_blocking_pids(PG_FUNCTION_ARGS)
+ 	int		   *blockers;
+ 	int			num_blockers;
+ 	Datum	   *blocker_datums;
+-	int			max_backends = GetMaxBackends();
+ 
+ 	/* A buffer big enough for any possible blocker list without truncation */
+-	blockers = (int *) palloc(max_backends * sizeof(int));
++	blockers = (int *) palloc(MaxBackends * sizeof(int));
+ 
+ 	/* Collect a snapshot of processes waited for by GetSafeSnapshot */
+ 	num_blockers =
+-		GetSafeSnapshotBlockingPids(blocked_pid, blockers, max_backends);
++		GetSafeSnapshotBlockingPids(blocked_pid, blockers, MaxBackends);
+ 
+ 	/* Convert int array to Datum array */
+ 	if (num_blockers > 0)
+diff --git a/src/backend/utils/init/postinit.c b/src/backend/utils/init/postinit.c
+index a85c2e0260d2..9139fe895c0e 100644
+--- a/src/backend/utils/init/postinit.c
++++ b/src/backend/utils/init/postinit.c
+@@ -25,7 +25,6 @@
+ #include "access/session.h"
+ #include "access/sysattr.h"
+ #include "access/tableam.h"
+-#include "access/twophase.h"
+ #include "access/xact.h"
+ #include "access/xlog.h"
+ #include "access/xloginsert.h"
+@@ -68,9 +67,6 @@
+ #include "utils/syscache.h"
+ #include "utils/timeout.h"
+ 
+-static int MaxBackends = 0;
+-static int MaxBackendsInitialized = false;
+-
+ static HeapTuple GetDatabaseTuple(const char *dbname);
+ static HeapTuple GetDatabaseTupleByOid(Oid dboid);
+ static void PerformAuthentication(Port *port);
+@@ -542,8 +538,9 @@ pg_split_opts(char **argv, int *argcp, const char *optstr)
+ /*
+  * Initialize MaxBackends value from config options.
+  *
+- * This must be called after modules have had the chance to alter GUCs in
+- * shared_preload_libraries and before shared memory size is determined.
++ * This must be called after modules have had the chance to register background
++ * workers in shared_preload_libraries, and before shared memory size is
++ * determined.
+  *
+  * Note that in EXEC_BACKEND environment, the value is passed down from
+  * postmaster to subprocesses via BackendParameters in SubPostmasterMain; only
+@@ -553,49 +550,15 @@ pg_split_opts(char **argv, int *argcp, const char *optstr)
+ void
+ InitializeMaxBackends(void)
+ {
+-	/* the extra unit accounts for the autovacuum launcher */
+-	SetMaxBackends(MaxConnections + autovacuum_max_workers + 1 +
+-		max_worker_processes + max_wal_senders);
+-}
++	Assert(MaxBackends == 0);
+ 
+-/*
+- * Safely retrieve the value of MaxBackends.
+- *
+- * Previously, MaxBackends was externally visible, but it was often used before
+- * it was initialized (e.g., in preloaded libraries' _PG_init() functions).
+- * Unfortunately, we cannot initialize MaxBackends before processing
+- * shared_preload_libraries because the libraries sometimes alter GUCs that are
+- * used to calculate its value.  Instead, we provide this function for accessing
+- * MaxBackends, and we ERROR if someone calls it before it is initialized.
+- */
+-int
+-GetMaxBackends(void)
+-{
+-	if (unlikely(!MaxBackendsInitialized))
+-		elog(ERROR, "MaxBackends not yet initialized");
+-
+-	return MaxBackends;
+-}
+-
+-/*
+- * Set the value of MaxBackends.
+- *
+- * This should only be used by InitializeMaxBackends() and
+- * restore_backend_variables().  If MaxBackends is already initialized or the
+- * specified value is greater than the maximum, this will ERROR.
+- */
+-void
+-SetMaxBackends(int max_backends)
+-{
+-	if (MaxBackendsInitialized)
+-		elog(ERROR, "MaxBackends already initialized");
++	/* the extra unit accounts for the autovacuum launcher */
++	MaxBackends = MaxConnections + autovacuum_max_workers + 1 +
++		max_worker_processes + max_wal_senders;
+ 
+ 	/* internal error because the values were all checked previously */
+-	if (max_backends > MAX_BACKENDS)
++	if (MaxBackends > MAX_BACKENDS)
+ 		elog(ERROR, "too many backends configured");
+-
+-	MaxBackends = max_backends;
+-	MaxBackendsInitialized = true;
+ }
+ 
+ /*
+@@ -707,7 +670,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
+ 
+ 	SharedInvalBackendInit(false);
+ 
+-	if (MyBackendId > GetMaxBackends() || MyBackendId <= 0)
++	if (MyBackendId > MaxBackends || MyBackendId <= 0)
+ 		elog(FATAL, "bad backend ID: %d", MyBackendId);
+ 
+ 	/* Now that we have a BackendId, we can participate in ProcSignal */
+diff --git a/src/include/miscadmin.h b/src/include/miscadmin.h
+index e9ad52c3475f..53fd168d93c3 100644
+--- a/src/include/miscadmin.h
++++ b/src/include/miscadmin.h
+@@ -173,6 +173,7 @@ extern PGDLLIMPORT char *DataDir;
+ extern PGDLLIMPORT int data_directory_mode;
+ 
+ extern PGDLLIMPORT int NBuffers;
++extern PGDLLIMPORT int MaxBackends;
+ extern PGDLLIMPORT int MaxConnections;
+ extern PGDLLIMPORT int max_worker_processes;
+ extern PGDLLIMPORT int max_parallel_workers;
+@@ -456,8 +457,6 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
+ /* in utils/init/postinit.c */
+ extern void pg_split_opts(char **argv, int *argcp, const char *optstr);
+ extern void InitializeMaxBackends(void);
+-extern int	GetMaxBackends(void);
+-extern void SetMaxBackends(int max_backends);
+ extern void InitPostgres(const char *in_dbname, Oid dboid, const char *username,
+ 						 Oid useroid, char *out_dbname, bool override_allow_connections);
+ extern void BaseInit(void);

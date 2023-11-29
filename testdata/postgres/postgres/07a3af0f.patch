@@ -1,0 +1,166 @@
+From 07a3af0ff81d8ac6d2e787e13ca10de36313aa51 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 17 Sep 2018 13:16:32 -0400
+Subject: [PATCH] Fix parsetree representation of
+ XMLTABLE(XMLNAMESPACES(DEFAULT ...)).
+
+The original coding for XMLTABLE thought it could represent a default
+namespace by a T_String Value node with a null string pointer.  That's
+not okay, though; in particular outfuncs.c/readfuncs.c are not on board
+with such a representation, meaning you'll get a null pointer crash
+if you try to store a view or rule containing this construct.
+
+To fix, change the parsetree representation so that we have a NULL
+list element, instead of a bogus Value node.
+
+This isn't really a functional limitation since default XML namespaces
+aren't yet implemented in the executor; you'd just get "DEFAULT
+namespace is not supported" anyway.  But crashes are not nice, so
+back-patch to v10 where this syntax was added.  Ordinarily we'd consider
+a parsetree representation change to be un-backpatchable; but since
+existing releases would crash on the way to storing such constructs,
+there can't be any existing views/rules to be incompatible with.
+
+Per report from Andrey Lepikhov.
+
+Discussion: https://postgr.es/m/3690074f-abd2-56a9-144a-aa5545d7a291@postgrespro.ru
+---
+ src/backend/executor/nodeTableFuncscan.c |  6 +++++-
+ src/backend/parser/parse_clause.c        | 15 ++++++++-------
+ src/backend/utils/adt/ruleutils.c        |  6 +++---
+ src/include/nodes/execnodes.h            |  4 ++--
+ src/include/nodes/primnodes.h            |  7 +++++--
+ 5 files changed, 23 insertions(+), 15 deletions(-)
+
+diff --git a/src/backend/executor/nodeTableFuncscan.c b/src/backend/executor/nodeTableFuncscan.c
+index abbf0e4d445a..a9fd3fda6be6 100644
+--- a/src/backend/executor/nodeTableFuncscan.c
++++ b/src/backend/executor/nodeTableFuncscan.c
+@@ -364,8 +364,9 @@ tfuncInitialize(TableFuncScanState *tstate, ExprContext *econtext, Datum doc)
+ 	forboth(lc1, tstate->ns_uris, lc2, tstate->ns_names)
+ 	{
+ 		ExprState  *expr = (ExprState *) lfirst(lc1);
+-		char	   *ns_name = strVal(lfirst(lc2));
++		Value	   *ns_node = (Value *) lfirst(lc2);
+ 		char	   *ns_uri;
++		char	   *ns_name;
+ 
+ 		value = ExecEvalExpr((ExprState *) expr, econtext, &isnull);
+ 		if (isnull)
+@@ -374,6 +375,9 @@ tfuncInitialize(TableFuncScanState *tstate, ExprContext *econtext, Datum doc)
+ 					 errmsg("namespace URI must not be null")));
+ 		ns_uri = TextDatumGetCString(value);
+ 
++		/* DEFAULT is passed down to SetNamespace as NULL */
++		ns_name = ns_node ? strVal(ns_node) : NULL;
++
+ 		routine->SetNamespace(tstate, ns_name, ns_uri);
+ 	}
+ 
+diff --git a/src/backend/parser/parse_clause.c b/src/backend/parser/parse_clause.c
+index cfd4b91897f4..d6b93f55dfd5 100644
+--- a/src/backend/parser/parse_clause.c
++++ b/src/backend/parser/parse_clause.c
+@@ -779,7 +779,7 @@ transformRangeTableFunc(ParseState *pstate, RangeTableFunc *rtf)
+ 	/* undef ordinality column number */
+ 	tf->ordinalitycol = -1;
+ 
+-
++	/* Process column specs */
+ 	names = palloc(sizeof(char *) * list_length(rtf->columns));
+ 
+ 	colno = 0;
+@@ -900,15 +900,15 @@ transformRangeTableFunc(ParseState *pstate, RangeTableFunc *rtf)
+ 			{
+ 				foreach(lc2, ns_names)
+ 				{
+-					char	   *name = strVal(lfirst(lc2));
++					Value	   *ns_node = (Value *) lfirst(lc2);
+ 
+-					if (name == NULL)
++					if (ns_node == NULL)
+ 						continue;
+-					if (strcmp(name, r->name) == 0)
++					if (strcmp(strVal(ns_node), r->name) == 0)
+ 						ereport(ERROR,
+ 								(errcode(ERRCODE_SYNTAX_ERROR),
+ 								 errmsg("namespace name \"%s\" is not unique",
+-										name),
++										r->name),
+ 								 parser_errposition(pstate, r->location)));
+ 				}
+ 			}
+@@ -922,8 +922,9 @@ transformRangeTableFunc(ParseState *pstate, RangeTableFunc *rtf)
+ 				default_ns_seen = true;
+ 			}
+ 
+-			/* Note the string may be NULL */
+-			ns_names = lappend(ns_names, makeString(r->name));
++			/* We represent DEFAULT by a null pointer */
++			ns_names = lappend(ns_names,
++							   r->name ? makeString(r->name) : NULL);
+ 		}
+ 
+ 		tf->ns_uris = ns_uris;
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index 4c2408d65513..eecd64e4b572 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -9739,17 +9739,17 @@ get_tablefunc(TableFunc *tf, deparse_context *context, bool showimplicit)
+ 		forboth(lc1, tf->ns_uris, lc2, tf->ns_names)
+ 		{
+ 			Node	   *expr = (Node *) lfirst(lc1);
+-			char	   *name = strVal(lfirst(lc2));
++			Value	   *ns_node = (Value *) lfirst(lc2);
+ 
+ 			if (!first)
+ 				appendStringInfoString(buf, ", ");
+ 			else
+ 				first = false;
+ 
+-			if (name != NULL)
++			if (ns_node != NULL)
+ 			{
+ 				get_rule_expr(expr, context, showimplicit);
+-				appendStringInfo(buf, " AS %s", name);
++				appendStringInfo(buf, " AS %s", strVal(ns_node));
+ 			}
+ 			else
+ 			{
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index c830f141b168..687d7cd2f41a 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -1573,8 +1573,8 @@ typedef struct TableFuncScanState
+ 	ExprState  *rowexpr;		/* state for row-generating expression */
+ 	List	   *colexprs;		/* state for column-generating expression */
+ 	List	   *coldefexprs;	/* state for column default expressions */
+-	List	   *ns_names;		/* list of str nodes with namespace names */
+-	List	   *ns_uris;		/* list of states of namespace uri exprs */
++	List	   *ns_names;		/* same as TableFunc.ns_names */
++	List	   *ns_uris;		/* list of states of namespace URI exprs */
+ 	Bitmapset  *notnulls;		/* nullability flag for each output column */
+ 	void	   *opaque;			/* table builder private space */
+ 	const struct TableFuncRoutine *routine; /* table builder methods */
+diff --git a/src/include/nodes/primnodes.h b/src/include/nodes/primnodes.h
+index 1b4b0d75afa0..40f6eb03d241 100644
+--- a/src/include/nodes/primnodes.h
++++ b/src/include/nodes/primnodes.h
+@@ -75,12 +75,15 @@ typedef struct RangeVar
+ 
+ /*
+  * TableFunc - node for a table function, such as XMLTABLE.
++ *
++ * Entries in the ns_names list are either string Value nodes containing
++ * literal namespace names, or NULL pointers to represent DEFAULT.
+  */
+ typedef struct TableFunc
+ {
+ 	NodeTag		type;
+-	List	   *ns_uris;		/* list of namespace uri */
+-	List	   *ns_names;		/* list of namespace names */
++	List	   *ns_uris;		/* list of namespace URI expressions */
++	List	   *ns_names;		/* list of namespace names or NULL */
+ 	Node	   *docexpr;		/* input document expression */
+ 	Node	   *rowexpr;		/* row filter expression */
+ 	List	   *colnames;		/* column names (list of String) */

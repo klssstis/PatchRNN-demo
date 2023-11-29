@@ -1,0 +1,196 @@
+From 7b7ed046cb2ad9f6efac90380757d5977f0f563f Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 13 Apr 2022 13:35:02 -0400
+Subject: [PATCH] Prevent access to no-longer-pinned buffer in
+ heapam_tuple_lock().
+
+heap_fetch() used to have a "keep_buf" parameter that told it to return
+ownership of the buffer pin to the caller after finding that the
+requested tuple TID exists but is invisible to the specified snapshot.
+This was thoughtlessly removed in commit 5db6df0c0, which broke
+heapam_tuple_lock() (formerly EvalPlanQualFetch) because that function
+needs to do more accesses to the tuple even if it's invisible.  The net
+effect is that we would continue to touch the page for a microsecond or
+two after releasing pin on the buffer.  Usually no harm would result;
+but if a different session decided to defragment the page concurrently,
+we could see garbage data and mistakenly conclude that there's no newer
+tuple version to chain up to.  (It's hard to say whether this has
+happened in the field.  The bug was actually found thanks to a later
+change that allowed valgrind to detect accesses to non-pinned buffers.)
+
+The most reasonable way to fix this is to reintroduce keep_buf,
+although I made it behave slightly differently: buffer ownership
+is passed back only if there is a valid tuple at the requested TID.
+In HEAD, we can just add the parameter back to heap_fetch().
+To avoid an API break in the back branches, introduce an additional
+function heap_fetch_extended() in those branches.
+
+In HEAD there is an additional, less obvious API change: tuple->t_data
+will be set to NULL in all cases where buffer ownership is not returned,
+in particular when the tuple exists but fails the time qual (and
+!keep_buf).  This is to defend against any other callers attempting to
+access non-pinned buffers.  We concluded that making that change in back
+branches would be more likely to introduce problems than cure any.
+
+In passing, remove a comment about heap_fetch that was obsoleted by
+9a8ee1dc6.
+
+Per bug #17462 from Daniil Anisimov.  Back-patch to v12 where the bug
+was introduced.
+
+Discussion: https://postgr.es/m/17462-9c98a0f00df9bd36@postgresql.org
+---
+ src/backend/access/heap/heapam.c         | 30 ++++++++++++++++--------
+ src/backend/access/heap/heapam_handler.c | 16 ++++++-------
+ src/include/access/heapam.h              |  2 +-
+ 3 files changed, 28 insertions(+), 20 deletions(-)
+
+diff --git a/src/backend/access/heap/heapam.c b/src/backend/access/heap/heapam.c
+index 8d7655f4cfd4..742185102765 100644
+--- a/src/backend/access/heap/heapam.c
++++ b/src/backend/access/heap/heapam.c
+@@ -1530,10 +1530,14 @@ heap_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
+  * must unpin the buffer when done with the tuple.
+  *
+  * If the tuple is not found (ie, item number references a deleted slot),
+- * then tuple->t_data is set to NULL and false is returned.
++ * then tuple->t_data is set to NULL, *userbuf is set to InvalidBuffer,
++ * and false is returned.
+  *
+- * If the tuple is found but fails the time qual check, then false is returned
+- * but tuple->t_data is left pointing to the tuple.
++ * If the tuple is found but fails the time qual check, then the behavior
++ * depends on the keep_buf parameter.  If keep_buf is false, the results
++ * are the same as for the tuple-not-found case.  If keep_buf is true,
++ * then tuple->t_data and *userbuf are returned as for the success case,
++ * and again the caller must unpin the buffer; but false is returned.
+  *
+  * heap_fetch does not follow HOT chains: only the exact TID requested will
+  * be fetched.
+@@ -1551,7 +1555,8 @@ bool
+ heap_fetch(Relation relation,
+ 		   Snapshot snapshot,
+ 		   HeapTuple tuple,
+-		   Buffer *userbuf)
++		   Buffer *userbuf,
++		   bool keep_buf)
+ {
+ 	ItemPointer tid = &(tuple->t_self);
+ 	ItemId		lp;
+@@ -1634,9 +1639,15 @@ heap_fetch(Relation relation,
+ 		return true;
+ 	}
+ 
+-	/* Tuple failed time qual */
+-	ReleaseBuffer(buffer);
+-	*userbuf = InvalidBuffer;
++	/* Tuple failed time qual, but maybe caller wants to see it anyway. */
++	if (keep_buf)
++		*userbuf = buffer;
++	else
++	{
++		ReleaseBuffer(buffer);
++		*userbuf = InvalidBuffer;
++		tuple->t_data = NULL;
++	}
+ 
+ 	return false;
+ }
+@@ -1659,8 +1670,7 @@ heap_fetch(Relation relation,
+  * are vacuumable, false if not.
+  *
+  * Unlike heap_fetch, the caller must already have pin and (at least) share
+- * lock on the buffer; it is still pinned/locked at exit.  Also unlike
+- * heap_fetch, we do not report any pgstats count; caller may do so if wanted.
++ * lock on the buffer; it is still pinned/locked at exit.
+  */
+ bool
+ heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+@@ -5379,7 +5389,7 @@ heap_lock_updated_tuple_rec(Relation rel, ItemPointer tid, TransactionId xid,
+ 		block = ItemPointerGetBlockNumber(&tupid);
+ 		ItemPointerCopy(&tupid, &(mytup.t_self));
+ 
+-		if (!heap_fetch(rel, SnapshotAny, &mytup, &buf))
++		if (!heap_fetch(rel, SnapshotAny, &mytup, &buf, false))
+ 		{
+ 			/*
+ 			 * if we fail to find the updated version of the tuple, it's
+diff --git a/src/backend/access/heap/heapam_handler.c b/src/backend/access/heap/heapam_handler.c
+index 666b6205a7bd..444f027149ce 100644
+--- a/src/backend/access/heap/heapam_handler.c
++++ b/src/backend/access/heap/heapam_handler.c
+@@ -188,7 +188,7 @@ heapam_fetch_row_version(Relation relation,
+ 	Assert(TTS_IS_BUFFERTUPLE(slot));
+ 
+ 	bslot->base.tupdata.t_self = *tid;
+-	if (heap_fetch(relation, snapshot, &bslot->base.tupdata, &buffer))
++	if (heap_fetch(relation, snapshot, &bslot->base.tupdata, &buffer, false))
+ 	{
+ 		/* store in slot, transferring existing pin */
+ 		ExecStorePinnedBufferHeapTuple(&bslot->base.tupdata, slot, buffer);
+@@ -401,7 +401,7 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
+ 							 errmsg("tuple to be locked was already moved to another partition due to concurrent update")));
+ 
+ 				tuple->t_self = *tid;
+-				if (heap_fetch(relation, &SnapshotDirty, tuple, &buffer))
++				if (heap_fetch(relation, &SnapshotDirty, tuple, &buffer, true))
+ 				{
+ 					/*
+ 					 * If xmin isn't what we're expecting, the slot must have
+@@ -500,6 +500,7 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
+ 				 */
+ 				if (tuple->t_data == NULL)
+ 				{
++					Assert(!BufferIsValid(buffer));
+ 					return TM_Deleted;
+ 				}
+ 
+@@ -509,8 +510,7 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
+ 				if (!TransactionIdEquals(HeapTupleHeaderGetXmin(tuple->t_data),
+ 										 priorXmax))
+ 				{
+-					if (BufferIsValid(buffer))
+-						ReleaseBuffer(buffer);
++					ReleaseBuffer(buffer);
+ 					return TM_Deleted;
+ 				}
+ 
+@@ -526,13 +526,12 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
+ 				 *
+ 				 * As above, it should be safe to examine xmax and t_ctid
+ 				 * without the buffer content lock, because they can't be
+-				 * changing.
++				 * changing.  We'd better hold a buffer pin though.
+ 				 */
+ 				if (ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid))
+ 				{
+ 					/* deleted, so forget about it */
+-					if (BufferIsValid(buffer))
+-						ReleaseBuffer(buffer);
++					ReleaseBuffer(buffer);
+ 					return TM_Deleted;
+ 				}
+ 
+@@ -540,8 +539,7 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
+ 				*tid = tuple->t_data->t_ctid;
+ 				/* updated row should have xmin matching this xmax */
+ 				priorXmax = HeapTupleHeaderGetUpdateXid(tuple->t_data);
+-				if (BufferIsValid(buffer))
+-					ReleaseBuffer(buffer);
++				ReleaseBuffer(buffer);
+ 				/* loop back to fetch next in chain */
+ 			}
+ 		}
+diff --git a/src/include/access/heapam.h b/src/include/access/heapam.h
+index 4403f01e1306..5d7f7fd800ee 100644
+--- a/src/include/access/heapam.h
++++ b/src/include/access/heapam.h
+@@ -133,7 +133,7 @@ extern bool heap_getnextslot_tidrange(TableScanDesc sscan,
+ 									  ScanDirection direction,
+ 									  TupleTableSlot *slot);
+ extern bool heap_fetch(Relation relation, Snapshot snapshot,
+-					   HeapTuple tuple, Buffer *userbuf);
++					   HeapTuple tuple, Buffer *userbuf, bool keep_buf);
+ extern bool heap_hot_search_buffer(ItemPointer tid, Relation relation,
+ 								   Buffer buffer, Snapshot snapshot, HeapTuple heapTuple,
+ 								   bool *all_dead, bool first_call);
