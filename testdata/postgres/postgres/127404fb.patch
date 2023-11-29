@@ -1,0 +1,162 @@
+From 127404fbe28455d6e8183fa58f3b7aefeba8f909 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Mon, 12 Jul 2021 11:05:27 +0900
+Subject: [PATCH] pageinspect: Improve page_header() for pages of 32kB
+
+ld_upper, ld_lower, pd_special and the page size have been using
+smallint as return type, which could cause those fields to return
+negative values in certain cases for builds configures with a page size
+of 32kB.
+
+Bump pageinspect to 1.10.  page_header() is able to handle the correct
+return type of those fields at runtime when using an older version of
+the extension, with some tests are added to cover that.
+
+Author: Quan Zongliang
+Reviewed-by: Michael Paquier, Bharath Rupireddy
+Discussion: https://postgr.es/m/8b8ec36e-61fe-14f9-005d-07bc85aa4eed@yeah.net
+---
+ contrib/pageinspect/Makefile                  |  2 +-
+ .../pageinspect/expected/oldextversions.out   | 16 ++++++++++
+ .../pageinspect/pageinspect--1.9--1.10.sql    | 21 +++++++++++++
+ contrib/pageinspect/pageinspect.control       |  2 +-
+ contrib/pageinspect/rawpage.c                 | 31 ++++++++++++++++---
+ contrib/pageinspect/sql/oldextversions.sql    |  6 ++++
+ 6 files changed, 72 insertions(+), 6 deletions(-)
+ create mode 100644 contrib/pageinspect/pageinspect--1.9--1.10.sql
+
+diff --git a/contrib/pageinspect/Makefile b/contrib/pageinspect/Makefile
+index 2d330ddb2857..5c0736564abd 100644
+--- a/contrib/pageinspect/Makefile
++++ b/contrib/pageinspect/Makefile
+@@ -13,7 +13,7 @@ OBJS = \
+ 	rawpage.o
+ 
+ EXTENSION = pageinspect
+-DATA =  pageinspect--1.8--1.9.sql \
++DATA =  pageinspect--1.9--1.10.sql pageinspect--1.8--1.9.sql \
+ 	pageinspect--1.7--1.8.sql pageinspect--1.6--1.7.sql \
+ 	pageinspect--1.5.sql pageinspect--1.5--1.6.sql \
+ 	pageinspect--1.4--1.5.sql pageinspect--1.3--1.4.sql \
+diff --git a/contrib/pageinspect/expected/oldextversions.out b/contrib/pageinspect/expected/oldextversions.out
+index 04dc7f8640eb..f5c4b61bd793 100644
+--- a/contrib/pageinspect/expected/oldextversions.out
++++ b/contrib/pageinspect/expected/oldextversions.out
+@@ -36,5 +36,21 @@ SELECT * FROM bt_page_items('test1_a_idx', 1);
+           1 | (0,1) |      16 | f     | f    | 01 00 00 00 00 00 00 01 | f    | (0,1) | 
+ (1 row)
+ 
++-- page_header() uses int instead of smallint for lower, upper, special and
++-- pagesize in pageinspect >= 1.10.
++ALTER EXTENSION pageinspect UPDATE TO '1.9';
++\df page_header
++                                                                                                                  List of functions
++ Schema |    Name     | Result data type |                                                                                         Argument data types                                                                                         | Type 
++--------+-------------+------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------
++ public | page_header | record           | page bytea, OUT lsn pg_lsn, OUT checksum smallint, OUT flags smallint, OUT lower smallint, OUT upper smallint, OUT special smallint, OUT pagesize smallint, OUT version smallint, OUT prune_xid xid | func
++(1 row)
++
++SELECT pagesize, version FROM page_header(get_raw_page('test1', 0));
++ pagesize | version 
++----------+---------
++     8192 |       4
++(1 row)
++
+ DROP TABLE test1;
+ DROP EXTENSION pageinspect;
+diff --git a/contrib/pageinspect/pageinspect--1.9--1.10.sql b/contrib/pageinspect/pageinspect--1.9--1.10.sql
+new file mode 100644
+index 000000000000..8dd9a2750539
+--- /dev/null
++++ b/contrib/pageinspect/pageinspect--1.9--1.10.sql
+@@ -0,0 +1,21 @@
++/* contrib/pageinspect/pageinspect--1.9--1.10.sql */
++
++-- complain if script is sourced in psql, rather than via ALTER EXTENSION
++\echo Use "ALTER EXTENSION pageinspect UPDATE TO '1.10'" to load this file. \quit
++
++--
++-- page_header()
++--
++DROP FUNCTION page_header(IN page bytea);
++CREATE FUNCTION page_header(IN page bytea,
++    OUT lsn pg_lsn,
++    OUT checksum smallint,
++    OUT flags smallint,
++    OUT lower int,
++    OUT upper int,
++    OUT special int,
++    OUT pagesize int,
++    OUT version smallint,
++    OUT prune_xid xid)
++AS 'MODULE_PATHNAME', 'page_header'
++LANGUAGE C STRICT PARALLEL SAFE;
+diff --git a/contrib/pageinspect/pageinspect.control b/contrib/pageinspect/pageinspect.control
+index bd716769a174..7cdf37913dae 100644
+--- a/contrib/pageinspect/pageinspect.control
++++ b/contrib/pageinspect/pageinspect.control
+@@ -1,5 +1,5 @@
+ # pageinspect extension
+ comment = 'inspect the contents of database pages at a low level'
+-default_version = '1.9'
++default_version = '1.10'
+ module_pathname = '$libdir/pageinspect'
+ relocatable = true
+diff --git a/contrib/pageinspect/rawpage.c b/contrib/pageinspect/rawpage.c
+index e9fee73bc436..4bfa346c24a2 100644
+--- a/contrib/pageinspect/rawpage.c
++++ b/contrib/pageinspect/rawpage.c
+@@ -296,10 +296,33 @@ page_header(PG_FUNCTION_ARGS)
+ 		values[0] = LSNGetDatum(lsn);
+ 	values[1] = UInt16GetDatum(page->pd_checksum);
+ 	values[2] = UInt16GetDatum(page->pd_flags);
+-	values[3] = UInt16GetDatum(page->pd_lower);
+-	values[4] = UInt16GetDatum(page->pd_upper);
+-	values[5] = UInt16GetDatum(page->pd_special);
+-	values[6] = UInt16GetDatum(PageGetPageSize(page));
++
++	/* pageinspect >= 1.10 uses int4 instead of int2 for those fields */
++	switch (TupleDescAttr(tupdesc, 3)->atttypid)
++	{
++		case INT2OID:
++			Assert(TupleDescAttr(tupdesc, 4)->atttypid == INT2OID &&
++				   TupleDescAttr(tupdesc, 5)->atttypid == INT2OID &&
++				   TupleDescAttr(tupdesc, 6)->atttypid == INT2OID);
++			values[3] = UInt16GetDatum(page->pd_lower);
++			values[4] = UInt16GetDatum(page->pd_upper);
++			values[5] = UInt16GetDatum(page->pd_special);
++			values[6] = UInt16GetDatum(PageGetPageSize(page));
++			break;
++		case INT4OID:
++			Assert(TupleDescAttr(tupdesc, 4)->atttypid == INT4OID &&
++				   TupleDescAttr(tupdesc, 5)->atttypid == INT4OID &&
++				   TupleDescAttr(tupdesc, 6)->atttypid == INT4OID);
++			values[3] = Int32GetDatum(page->pd_lower);
++			values[4] = Int32GetDatum(page->pd_upper);
++			values[5] = Int32GetDatum(page->pd_special);
++			values[6] = Int32GetDatum(PageGetPageSize(page));
++			break;
++		default:
++			elog(ERROR, "incorrect output types");
++			break;
++	}
++
+ 	values[7] = UInt16GetDatum(PageGetPageLayoutVersion(page));
+ 	values[8] = TransactionIdGetDatum(page->pd_prune_xid);
+ 
+diff --git a/contrib/pageinspect/sql/oldextversions.sql b/contrib/pageinspect/sql/oldextversions.sql
+index 78e08f40e824..9f953492c23c 100644
+--- a/contrib/pageinspect/sql/oldextversions.sql
++++ b/contrib/pageinspect/sql/oldextversions.sql
+@@ -16,5 +16,11 @@ SELECT page_checksum(get_raw_page('test1', 0), 0) IS NOT NULL AS silly_checksum_
+ SELECT * FROM bt_page_stats('test1_a_idx', 1);
+ SELECT * FROM bt_page_items('test1_a_idx', 1);
+ 
++-- page_header() uses int instead of smallint for lower, upper, special and
++-- pagesize in pageinspect >= 1.10.
++ALTER EXTENSION pageinspect UPDATE TO '1.9';
++\df page_header
++SELECT pagesize, version FROM page_header(get_raw_page('test1', 0));
++
+ DROP TABLE test1;
+ DROP EXTENSION pageinspect;

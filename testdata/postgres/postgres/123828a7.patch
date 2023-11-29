@@ -1,0 +1,172 @@
+From 123828a7fa563025d0ceee10cf1b2a253cd05319 Mon Sep 17 00:00:00 2001
+From: Thomas Munro <tmunro@postgresql.org>
+Date: Fri, 14 Jan 2022 21:39:18 +1300
+Subject: [PATCH] Test replay of regression tests.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a new TAP test under src/test/recovery to run the standard
+regression tests while a streaming replica replays the WAL.  This
+provides a basic workout for WAL decoding and redo code, and compares
+the replicated result.
+
+Optionally, enable (expensive) wal_consistency_checking if listed in
+the env variable PG_TEST_EXTRA.
+
+Reviewed-by: 綱川 貴之 (Takayuki Tsunakawa) <tsunakawa.takay@fujitsu.com>
+Reviewed-by: Andres Freund <andres@anarazel.de>
+Reviewed-by: Andrew Dunstan <andrew@dunslane.net>
+Reviewed-by: Tom Lane <tgl@sss.pgh.pa.us>
+Reviewed-by: Anastasia Lubennikova <lubennikovaav@gmail.com>
+Reviewed-by: Michael Paquier <michael@paquier.xyz>
+Discussion: https://postgr.es/m/CA%2BhUKGKpRWQ9SxdxxDmTBCJoR0YnFpMBe7kyzY8SUQk%2BHeskxg%40mail.gmail.com
+---
+ doc/src/sgml/regress.sgml                 | 11 ++++
+ src/test/recovery/Makefile                |  6 +-
+ src/test/recovery/t/027_stream_regress.pl | 80 +++++++++++++++++++++++
+ src/tools/msvc/vcregress.pl               |  2 +
+ 4 files changed, 98 insertions(+), 1 deletion(-)
+ create mode 100644 src/test/recovery/t/027_stream_regress.pl
+
+diff --git a/doc/src/sgml/regress.sgml b/doc/src/sgml/regress.sgml
+index 724ef566e76d..eee2bff0374e 100644
+--- a/doc/src/sgml/regress.sgml
++++ b/doc/src/sgml/regress.sgml
+@@ -289,6 +289,17 @@ make check-world PG_TEST_EXTRA='kerberos ldap ssl'
+       </para>
+      </listitem>
+     </varlistentry>
++
++    <varlistentry>
++     <term><literal>wal_consistency_checking</literal></term>
++     <listitem>
++      <para>
++       Uses <literal>wal_consistency_checking=all</literal> while running
++       certain tests under <filename>src/test/recovery</filename>.  Not
++       enabled by default because it is resource intensive.
++      </para>
++     </listitem>
++    </varlistentry>
+    </variablelist>
+ 
+    Tests for features that are not supported by the current build
+diff --git a/src/test/recovery/Makefile b/src/test/recovery/Makefile
+index e3011c3e379b..ec5a1f14d15f 100644
+--- a/src/test/recovery/Makefile
++++ b/src/test/recovery/Makefile
+@@ -15,10 +15,14 @@ subdir = src/test/recovery
+ top_builddir = ../../..
+ include $(top_builddir)/src/Makefile.global
+ 
+-# required for 017_shm.pl
++# required for 017_shm.pl and 027_stream_regress.pl
+ REGRESS_SHLIB=$(abs_top_builddir)/src/test/regress/regress$(DLSUFFIX)
+ export REGRESS_SHLIB
+ 
++# required for 027_stream_regress.pl
++REGRESS_OUTPUTDIR=$(abs_top_builddir)/src/test/recovery
++export REGRESS_OUTPUTDIR
++
+ check:
+ 	$(prove_check)
+ 
+diff --git a/src/test/recovery/t/027_stream_regress.pl b/src/test/recovery/t/027_stream_regress.pl
+new file mode 100644
+index 000000000000..afd2d2242a16
+--- /dev/null
++++ b/src/test/recovery/t/027_stream_regress.pl
+@@ -0,0 +1,80 @@
++# Run the standard regression tests with streaming replication
++use strict;
++use warnings;
++use PostgreSQL::Test::Cluster;
++use PostgreSQL::Test::Utils;
++use Test::More tests => 4;
++use File::Basename;
++
++# Initialize primary node
++my $node_primary = PostgreSQL::Test::Cluster->new('primary');
++$node_primary->init(allows_streaming => 1);
++$node_primary->adjust_conf('postgresql.conf', 'max_connections', '25', 1);
++$node_primary->append_conf('postgresql.conf', 'max_prepared_transactions = 10');
++
++# WAL consistency checking is resource intensive so require opt-in with the
++# PG_TEST_EXTRA environment variable.
++if ($ENV{PG_TEST_EXTRA} &&
++	$ENV{PG_TEST_EXTRA} =~ m/\bwal_consistency_checking\b/) {
++	$node_primary->append_conf('postgresql.conf',
++		'wal_consistency_checking = all');
++}
++
++$node_primary->start;
++is( $node_primary->psql(
++        'postgres',
++        qq[SELECT pg_create_physical_replication_slot('standby_1');]),
++    0,
++    'physical slot created on primary');
++my $backup_name = 'my_backup';
++
++# Take backup
++$node_primary->backup($backup_name);
++
++# Create streaming standby linking to primary
++my $node_standby_1 = PostgreSQL::Test::Cluster->new('standby_1');
++$node_standby_1->init_from_backup($node_primary, $backup_name,
++	has_streaming => 1);
++$node_standby_1->append_conf('postgresql.conf',
++    "primary_slot_name = standby_1");
++$node_standby_1->start;
++
++my $dlpath = PostgreSQL::Test::Utils::perl2host(dirname($ENV{REGRESS_SHLIB}));
++my $outputdir = PostgreSQL::Test::Utils::perl2host($ENV{REGRESS_OUTPUTDIR});
++
++# Run the regression tests against the primary.
++my $extra_opts = $ENV{EXTRA_REGRESS_OPTS} || "";
++system_or_bail($ENV{PG_REGRESS} . " " .
++			   "--dlpath=\"$dlpath\" " .
++			   "--bindir= " .
++			   "--port=" . $node_primary->port . " " .
++			   "--schedule=../regress/parallel_schedule " .
++			   "--max-concurrent-tests=20 " .
++			   "--inputdir=../regress " .
++			   "--outputdir=\"$outputdir\" " .
++			   $extra_opts);
++
++# Clobber all sequences with their next value, so that we don't have
++# differences between nodes due to caching.
++$node_primary->psql('regression',
++	"select setval(seqrelid, nextval(seqrelid)) from pg_sequence");
++
++# Wait for standby to catch up
++$node_primary->wait_for_catchup($node_standby_1, 'replay',
++	$node_primary->lsn('insert'));
++
++# Perform a logical dump of primary and standby, and check that they match
++command_ok(
++	[ 'pg_dumpall', '-f', $outputdir . '/primary.dump', '--no-sync',
++	  '-p', $node_primary->port ],
++	'dump primary server');
++command_ok(
++	[ 'pg_dumpall', '-f', $outputdir . '/standby.dump', '--no-sync',
++	  '-p', $node_standby_1->port ],
++	'dump standby server');
++command_ok(
++	[ 'diff', $outputdir . '/primary.dump', $outputdir . '/standby.dump' ],
++	'compare primary and standby dumps');
++
++$node_standby_1->stop;
++$node_primary->stop;
+diff --git a/src/tools/msvc/vcregress.pl b/src/tools/msvc/vcregress.pl
+index 7c4115614e54..8ba823b712ce 100644
+--- a/src/tools/msvc/vcregress.pl
++++ b/src/tools/msvc/vcregress.pl
+@@ -536,6 +536,8 @@ sub recoverycheck
+ {
+ 	InstallTemp();
+ 
++	$ENV{REGRESS_OUTPUTDIR} = "$topdir/src/test/recovery";
++
+ 	my $mstat  = 0;
+ 	my $dir    = "$topdir/src/test/recovery";
+ 	my $status = tap_check($dir);

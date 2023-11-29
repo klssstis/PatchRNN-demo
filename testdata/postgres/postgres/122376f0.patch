@@ -1,0 +1,694 @@
+From 122376f028a0e31b91d6c6bad2a9a6e994708547 Mon Sep 17 00:00:00 2001
+From: Peter Geoghegan <pg@bowt.ie>
+Date: Thu, 30 Mar 2023 12:26:12 -0700
+Subject: [PATCH] Show record information in pg_get_wal_block_info.
+
+Expand the output parameters in pg_walinspect's pg_get_wal_block_info
+function to return additional information that was previously only
+available from pg_walinspect's pg_get_wal_records_info function.  Some
+of the details are attributed to individual block references, rather
+than aggregated into whole-record values, since the function returns one
+row per block reference per WAL record (unlike pg_get_wal_records_info,
+which always returns one row per WAL record).
+
+This structure is much easier to work with when writing queries that
+track how individual blocks changed over time, or when attributing costs
+to individual blocks (not WAL records) is useful.
+
+This is the second time that pg_get_wal_block_info has been enhanced in
+recent weeks.  Commit 9ecb134a expanded on the original version of the
+function added in commit c31cf1c0 (where it first appeared under the
+name pg_get_wal_fpi_info).  There still hasn't been a stable release
+since commit c31cf1c0, so no bump in the pg_walinspect extension
+version.
+
+Author: Bharath Rupireddy <bharath.rupireddyforpostgres@gmail.com>
+Author: Peter Geoghegan <pg@bowt.ie>
+Reviewed-By: Peter Geoghegan <pg@bowt.ie>
+Reviewed-By: Kyotaro HORIGUCHI <horikyota.ntt@gmail.com>
+Discussion: https://postgr.es/m/CALj2ACVRK5=Z+2ZVsjgTTSkfEnQzCuwny7iigpG7g1btk4Ws2A@mail.gmail.com
+---
+ .../pg_walinspect/expected/pg_walinspect.out  |   4 +-
+ .../pg_walinspect/pg_walinspect--1.0--1.1.sql |  23 +-
+ contrib/pg_walinspect/pg_walinspect.c         | 197 ++++++++++-------
+ contrib/pg_walinspect/sql/pg_walinspect.sql   |   4 +-
+ doc/src/sgml/pgwalinspect.sgml                | 205 ++++++++++++------
+ 5 files changed, 273 insertions(+), 160 deletions(-)
+
+diff --git a/contrib/pg_walinspect/expected/pg_walinspect.out b/contrib/pg_walinspect/expected/pg_walinspect.out
+index b9e2bb994cae..950f0e921754 100644
+--- a/contrib/pg_walinspect/expected/pg_walinspect.out
++++ b/contrib/pg_walinspect/expected/pg_walinspect.out
+@@ -121,7 +121,7 @@ UPDATE sample_tbl SET col1 = col1 + 1 WHERE col1 = 1;
+ SELECT pg_current_wal_lsn() AS wal_lsn4 \gset
+ -- Check if we get block data from WAL record.
+ SELECT COUNT(*) >= 1 AS ok FROM pg_get_wal_block_info(:'wal_lsn3', :'wal_lsn4')
+-  WHERE relfilenode = :'sample_tbl_oid' AND blockdata IS NOT NULL;
++  WHERE relfilenode = :'sample_tbl_oid' AND block_data IS NOT NULL;
+  ok 
+ ----
+  t
+@@ -134,7 +134,7 @@ UPDATE sample_tbl SET col1 = col1 + 1 WHERE col1 = 2;
+ SELECT pg_current_wal_lsn() AS wal_lsn6 \gset
+ -- Check if we get FPI from WAL record.
+ SELECT COUNT(*) >= 1 AS ok FROM pg_get_wal_block_info(:'wal_lsn5', :'wal_lsn6')
+-  WHERE relfilenode = :'sample_tbl_oid' AND fpi IS NOT NULL;
++  WHERE relfilenode = :'sample_tbl_oid' AND block_fpi_data IS NOT NULL;
+  ok 
+ ----
+  t
+diff --git a/contrib/pg_walinspect/pg_walinspect--1.0--1.1.sql b/contrib/pg_walinspect/pg_walinspect--1.0--1.1.sql
+index 586c3b446772..fdd75e8a7298 100644
+--- a/contrib/pg_walinspect/pg_walinspect--1.0--1.1.sql
++++ b/contrib/pg_walinspect/pg_walinspect--1.0--1.1.sql
+@@ -12,17 +12,26 @@ DROP FUNCTION pg_get_wal_stats_till_end_of_wal(pg_lsn, boolean);
+ --
+ CREATE FUNCTION pg_get_wal_block_info(IN start_lsn pg_lsn,
+ 	IN end_lsn pg_lsn,
+-	OUT lsn pg_lsn,
+-	OUT blockid int2,
++	OUT start_lsn pg_lsn,
++	OUT end_lsn pg_lsn,
++	OUT prev_lsn pg_lsn,
++	OUT block_id int2,
+ 	OUT reltablespace oid,
+ 	OUT reldatabase oid,
+ 	OUT relfilenode oid,
++	OUT relforknumber int2,
+ 	OUT relblocknumber int8,
+-	OUT forkname text,
+-	OUT blockdata bytea,
+-	OUT fpi bytea,
+-	OUT fpilen int4,
+-	OUT fpiinfo text[]
++	OUT xid xid,
++	OUT resource_manager text,
++	OUT record_type text,
++	OUT record_length int4,
++	OUT main_data_length int4,
++	OUT block_data_length int4,
++	OUT block_fpi_length int4,
++	OUT block_fpi_info text[],
++	OUT description text,
++	OUT block_data bytea,
++	OUT block_fpi_data bytea
+ )
+ RETURNS SETOF record
+ AS 'MODULE_PATHNAME', 'pg_get_wal_block_info'
+diff --git a/contrib/pg_walinspect/pg_walinspect.c b/contrib/pg_walinspect/pg_walinspect.c
+index 062e90dbce9b..1ff53c5abccc 100644
+--- a/contrib/pg_walinspect/pg_walinspect.c
++++ b/contrib/pg_walinspect/pg_walinspect.c
+@@ -176,13 +176,18 @@ ReadNextXLogRecord(XLogReaderState *xlogreader)
+ }
+ 
+ /*
+- * Get a single WAL record info.
++ * Output values that make up a row describing caller's WAL record.
++ *
++ * This function leaks memory.  Caller may need to use its own custom memory
++ * context.
++ *
++ * Keep this in sync with GetWALBlockInfo.
+  */
+ static void
+ GetWALRecordInfo(XLogReaderState *record, Datum *values,
+ 				 bool *nulls, uint32 ncols)
+ {
+-	const char *id;
++	const char *record_type;
+ 	RmgrData	desc;
+ 	uint32		fpi_len = 0;
+ 	StringInfoData rec_desc;
+@@ -190,10 +195,10 @@ GetWALRecordInfo(XLogReaderState *record, Datum *values,
+ 	int			i = 0;
+ 
+ 	desc = GetRmgr(XLogRecGetRmid(record));
+-	id = desc.rm_identify(XLogRecGetInfo(record));
++	record_type = desc.rm_identify(XLogRecGetInfo(record));
+ 
+-	if (id == NULL)
+-		id = psprintf("UNKNOWN (%x)", XLogRecGetInfo(record) & ~XLR_INFO_MASK);
++	if (record_type == NULL)
++		record_type = psprintf("UNKNOWN (%x)", XLogRecGetInfo(record) & ~XLR_INFO_MASK);
+ 
+ 	initStringInfo(&rec_desc);
+ 	desc.rm_desc(&rec_desc, record);
+@@ -209,7 +214,7 @@ GetWALRecordInfo(XLogReaderState *record, Datum *values,
+ 	values[i++] = LSNGetDatum(XLogRecGetPrev(record));
+ 	values[i++] = TransactionIdGetDatum(XLogRecGetXid(record));
+ 	values[i++] = CStringGetTextDatum(desc.rm_name);
+-	values[i++] = CStringGetTextDatum(id);
++	values[i++] = CStringGetTextDatum(record_type);
+ 	values[i++] = UInt32GetDatum(XLogRecGetTotalLen(record));
+ 	values[i++] = UInt32GetDatum(XLogRecGetDataLen(record));
+ 	values[i++] = UInt32GetDatum(fpi_len);
+@@ -229,24 +234,48 @@ GetWALRecordInfo(XLogReaderState *record, Datum *values,
+ 
+ 
+ /*
+- * Store a set of block information from a single record (FPI and block
+- * information).
++ * Output one or more rows in rsinfo tuple store, each describing a single
++ * block reference from caller's WAL record. (Should only be called with
++ * records that have block references.)
++ *
++ * This function leaks memory.  Caller may need to use its own custom memory
++ * context.
++ *
++ * Keep this in sync with GetWALRecordInfo.
+  */
+ static void
+ GetWALBlockInfo(FunctionCallInfo fcinfo, XLogReaderState *record)
+ {
+-#define PG_GET_WAL_BLOCK_INFO_COLS 11
++#define PG_GET_WAL_BLOCK_INFO_COLS 20
+ 	int			block_id;
+ 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
++	RmgrData	desc;
++	const char	*record_type;
++	StringInfoData	rec_desc;
++
++	Assert(XLogRecHasAnyBlockRefs(record));
++
++	desc = GetRmgr(XLogRecGetRmid(record));
++	record_type = desc.rm_identify(XLogRecGetInfo(record));
++
++	if (record_type == NULL)
++		record_type = psprintf("UNKNOWN (%x)",
++							   XLogRecGetInfo(record) & ~XLR_INFO_MASK);
++
++	initStringInfo(&rec_desc);
++	desc.rm_desc(&rec_desc, record);
+ 
+ 	for (block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++)
+ 	{
+ 		DecodedBkpBlock *blk;
+ 		BlockNumber blkno;
+ 		RelFileLocator rnode;
+-		ForkNumber	fork;
++		ForkNumber	forknum;
+ 		Datum		values[PG_GET_WAL_BLOCK_INFO_COLS] = {0};
+ 		bool		nulls[PG_GET_WAL_BLOCK_INFO_COLS] = {0};
++		uint32		block_data_len = 0,
++					block_fpi_len = 0;
++		ArrayType  *block_fpi_info = NULL;
+ 		int			i = 0;
+ 
+ 		if (!XLogRecHasBlockRef(record, block_id))
+@@ -255,99 +284,117 @@ GetWALBlockInfo(FunctionCallInfo fcinfo, XLogReaderState *record)
+ 		blk = XLogRecGetBlock(record, block_id);
+ 
+ 		(void) XLogRecGetBlockTagExtended(record, block_id,
+-										  &rnode, &fork, &blkno, NULL);
++										  &rnode, &forknum, &blkno, NULL);
+ 
++		/* Save block_data_len */
++		if (blk->has_data)
++			block_data_len = blk->data_len;
++
++		if (blk->has_image)
++		{
++			/* Block reference has an FPI, so prepare relevant output */
++			int			bitcnt;
++			int			cnt = 0;
++			Datum	   *flags;
++
++			/* Save block_fpi_len */
++			block_fpi_len = blk->bimg_len;
++
++			/* Construct and save block_fpi_info */
++			bitcnt = pg_popcount((const char *) &blk->bimg_info,
++								 sizeof(uint8));
++			flags = (Datum *) palloc0(sizeof(Datum) * bitcnt);
++			if ((blk->bimg_info & BKPIMAGE_HAS_HOLE) != 0)
++				flags[cnt++] = CStringGetTextDatum("HAS_HOLE");
++			if (blk->apply_image)
++				flags[cnt++] = CStringGetTextDatum("APPLY");
++			if ((blk->bimg_info & BKPIMAGE_COMPRESS_PGLZ) != 0)
++				flags[cnt++] = CStringGetTextDatum("COMPRESS_PGLZ");
++			if ((blk->bimg_info & BKPIMAGE_COMPRESS_LZ4) != 0)
++				flags[cnt++] = CStringGetTextDatum("COMPRESS_LZ4");
++			if ((blk->bimg_info & BKPIMAGE_COMPRESS_ZSTD) != 0)
++				flags[cnt++] = CStringGetTextDatum("COMPRESS_ZSTD");
++
++			Assert(cnt <= bitcnt);
++			block_fpi_info = construct_array_builtin(flags, cnt, TEXTOID);
++		}
++
++		/* start_lsn, end_lsn, prev_lsn, and blockid outputs */
+ 		values[i++] = LSNGetDatum(record->ReadRecPtr);
++		values[i++] = LSNGetDatum(record->EndRecPtr);
++		values[i++] = LSNGetDatum(XLogRecGetPrev(record));
+ 		values[i++] = Int16GetDatum(block_id);
++
++		/* relfile and block related outputs */
+ 		values[i++] = ObjectIdGetDatum(blk->rlocator.spcOid);
+ 		values[i++] = ObjectIdGetDatum(blk->rlocator.dbOid);
+ 		values[i++] = ObjectIdGetDatum(blk->rlocator.relNumber);
++		values[i++] = Int16GetDatum(forknum);
+ 		values[i++] = Int64GetDatum((int64) blkno);
+ 
+-		if (fork >= 0 && fork <= MAX_FORKNUM)
+-			values[i++] = CStringGetTextDatum(forkNames[fork]);
++		/* xid, resource_manager, and record_type outputs */
++		values[i++] = TransactionIdGetDatum(XLogRecGetXid(record));
++		values[i++] = CStringGetTextDatum(desc.rm_name);
++		values[i++] = CStringGetTextDatum(record_type);
++
++		/*
++		 * record_length, main_data_length, block_data_len, and
++		 * block_fpi_length outputs
++		 */
++		values[i++] = UInt32GetDatum(XLogRecGetTotalLen(record));
++		values[i++] = UInt32GetDatum(XLogRecGetDataLen(record));
++		values[i++] = UInt32GetDatum(block_data_len);
++		values[i++] = UInt32GetDatum(block_fpi_len);
++
++		/* block_fpi_info (text array) output */
++		if (block_fpi_info)
++			values[i++] = PointerGetDatum(block_fpi_info);
+ 		else
+-			ereport(ERROR,
+-					(errcode(ERRCODE_INTERNAL_ERROR),
+-					 errmsg_internal("invalid fork number: %u", fork)));
++			nulls[i++] = true;
+ 
+-		/* Block data */
++		/* description output (describes WAL record) */
++		if (rec_desc.len > 0)
++			values[i++] = CStringGetTextDatum(rec_desc.data);
++		else
++			nulls[i++] = true;
++
++		/* block_data output */
+ 		if (blk->has_data)
+ 		{
+-			bytea	   *raw_data;
++			bytea	   *block_data;
+ 
+-			/* Initialize bytea buffer to copy the data to */
+-			raw_data = (bytea *) palloc(blk->data_len + VARHDRSZ);
+-			SET_VARSIZE(raw_data, blk->data_len + VARHDRSZ);
+-
+-			/* Copy the data */
+-			memcpy(VARDATA(raw_data), blk->data, blk->data_len);
+-			values[i++] = PointerGetDatum(raw_data);
++			block_data = (bytea *) palloc(block_data_len + VARHDRSZ);
++			SET_VARSIZE(block_data, block_data_len + VARHDRSZ);
++			memcpy(VARDATA(block_data), blk->data, block_data_len);
++			values[i++] = PointerGetDatum(block_data);
+ 		}
+ 		else
+-		{
+-			/* No data, so set this field to NULL */
+ 			nulls[i++] = true;
+-		}
+ 
++		/* block_fpi_data output */
+ 		if (blk->has_image)
+ 		{
+ 			PGAlignedBlock buf;
+ 			Page		page;
+-			bytea	   *raw_page;
+-			int			bitcnt;
+-			int			cnt = 0;
+-			Datum	   *flags;
+-			ArrayType  *a;
++			bytea	   *block_fpi_data;
+ 
+ 			page = (Page) buf.data;
+-
+-			/* Full page image exists, so let's save it */
+ 			if (!RestoreBlockImage(record, block_id, page))
+ 				ereport(ERROR,
+ 						(errcode(ERRCODE_INTERNAL_ERROR),
+ 						 errmsg_internal("%s", record->errormsg_buf)));
+ 
+-			/* Initialize bytea buffer to copy the FPI to */
+-			raw_page = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+-			SET_VARSIZE(raw_page, BLCKSZ + VARHDRSZ);
+-
+-			/* Take a verbatim copy of the FPI */
+-			memcpy(VARDATA(raw_page), page, BLCKSZ);
+-
+-			values[i++] = PointerGetDatum(raw_page);
+-			values[i++] = UInt32GetDatum(blk->bimg_len);
+-
+-			/* FPI flags */
+-			bitcnt = pg_popcount((const char *) &blk->bimg_info,
+-								 sizeof(uint8));
+-			/* Build set of raw flags */
+-			flags = (Datum *) palloc0(sizeof(Datum) * bitcnt);
+-
+-			if ((blk->bimg_info & BKPIMAGE_HAS_HOLE) != 0)
+-				flags[cnt++] = CStringGetTextDatum("HAS_HOLE");
+-			if (blk->apply_image)
+-				flags[cnt++] = CStringGetTextDatum("APPLY");
+-			if ((blk->bimg_info & BKPIMAGE_COMPRESS_PGLZ) != 0)
+-				flags[cnt++] = CStringGetTextDatum("COMPRESS_PGLZ");
+-			if ((blk->bimg_info & BKPIMAGE_COMPRESS_LZ4) != 0)
+-				flags[cnt++] = CStringGetTextDatum("COMPRESS_LZ4");
+-			if ((blk->bimg_info & BKPIMAGE_COMPRESS_ZSTD) != 0)
+-				flags[cnt++] = CStringGetTextDatum("COMPRESS_ZSTD");
+-
+-			Assert(cnt <= bitcnt);
+-			a = construct_array_builtin(flags, cnt, TEXTOID);
+-			values[i++] = PointerGetDatum(a);
++			block_fpi_data = (bytea *) palloc(BLCKSZ + VARHDRSZ);
++			SET_VARSIZE(block_fpi_data, BLCKSZ + VARHDRSZ);
++			memcpy(VARDATA(block_fpi_data), page, BLCKSZ);
++			values[i++] = PointerGetDatum(block_fpi_data);
+ 		}
+ 		else
+-		{
+-			/* No full page image, so store NULLs for all its fields */
+-			memset(&nulls[i], true, 3 * sizeof(bool));
+-			i += 3;
+-		}
++			nulls[i++] = true;
+ 
+ 		Assert(i == PG_GET_WAL_BLOCK_INFO_COLS);
+ 
++		/* Store a tuple for this block reference */
+ 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+ 							 values, nulls);
+ 	}
+@@ -356,11 +403,7 @@ GetWALBlockInfo(FunctionCallInfo fcinfo, XLogReaderState *record)
+ }
+ 
+ /*
+- * Get information about all the blocks saved in WAL records between start
+- * and end LSNs. This produces information about the full page images with
+- * their relation information, and the data saved in each block associated
+- * to a record. Decompression is applied to the full page images, if
+- * necessary.
++ * Get WAL record info, unnested by block reference
+  */
+ Datum
+ pg_get_wal_block_info(PG_FUNCTION_ARGS)
+@@ -484,7 +527,7 @@ ValidateInputLSNs(XLogRecPtr start_lsn, XLogRecPtr *end_lsn)
+ }
+ 
+ /*
+- * Get info and data of all WAL records between start LSN and end LSN.
++ * Get info of all WAL records between start LSN and end LSN.
+  */
+ static void
+ GetWALRecordsInfo(FunctionCallInfo fcinfo, XLogRecPtr start_lsn,
+@@ -536,7 +579,7 @@ GetWALRecordsInfo(FunctionCallInfo fcinfo, XLogRecPtr start_lsn,
+ }
+ 
+ /*
+- * Get info and data of all WAL records between start LSN and end LSN.
++ * Get info of all WAL records between start LSN and end LSN.
+  */
+ Datum
+ pg_get_wal_records_info(PG_FUNCTION_ARGS)
+diff --git a/contrib/pg_walinspect/sql/pg_walinspect.sql b/contrib/pg_walinspect/sql/pg_walinspect.sql
+index 2f0a909c183a..0541e5fbf1f8 100644
+--- a/contrib/pg_walinspect/sql/pg_walinspect.sql
++++ b/contrib/pg_walinspect/sql/pg_walinspect.sql
+@@ -78,7 +78,7 @@ UPDATE sample_tbl SET col1 = col1 + 1 WHERE col1 = 1;
+ SELECT pg_current_wal_lsn() AS wal_lsn4 \gset
+ -- Check if we get block data from WAL record.
+ SELECT COUNT(*) >= 1 AS ok FROM pg_get_wal_block_info(:'wal_lsn3', :'wal_lsn4')
+-  WHERE relfilenode = :'sample_tbl_oid' AND blockdata IS NOT NULL;
++  WHERE relfilenode = :'sample_tbl_oid' AND block_data IS NOT NULL;
+ 
+ -- Force full-page image on the next update.
+ SELECT pg_current_wal_lsn() AS wal_lsn5 \gset
+@@ -87,7 +87,7 @@ UPDATE sample_tbl SET col1 = col1 + 1 WHERE col1 = 2;
+ SELECT pg_current_wal_lsn() AS wal_lsn6 \gset
+ -- Check if we get FPI from WAL record.
+ SELECT COUNT(*) >= 1 AS ok FROM pg_get_wal_block_info(:'wal_lsn5', :'wal_lsn6')
+-  WHERE relfilenode = :'sample_tbl_oid' AND fpi IS NOT NULL;
++  WHERE relfilenode = :'sample_tbl_oid' AND block_fpi_data IS NOT NULL;
+ 
+ -- ===================================================================
+ -- Tests for permissions
+diff --git a/doc/src/sgml/pgwalinspect.sgml b/doc/src/sgml/pgwalinspect.sgml
+index 9a0241a8d67c..300ffac3744d 100644
+--- a/doc/src/sgml/pgwalinspect.sgml
++++ b/doc/src/sgml/pgwalinspect.sgml
+@@ -18,29 +18,38 @@
+ 
+  <para>
+   All the functions of this module will provide the WAL information using the
+-  current server's timeline ID.
+- </para>
+-
+- <para>
+-  All the functions of this module will try to find the first valid WAL record
+-  that is at or after the given <replaceable>in_lsn</replaceable> or
+-  <replaceable>start_lsn</replaceable> and will emit error if no such record
+-  is available. Similarly, the <replaceable>end_lsn</replaceable> must be
+-  available, and if it falls in the middle of a record, the entire record must
+-  be available.
++  server's current timeline ID.
+  </para>
+ 
+  <note>
+   <para>
+-   Some functions, such as <function><link
+-   linkend="pg-logical-emit-message">pg_logical_emit_message</link></function>,
+-   return the LSN <emphasis>after</emphasis> the record just
+-   inserted. Therefore, if you pass that LSN as
+-   <replaceable>in_lsn</replaceable> or <replaceable>start_lsn</replaceable>
+-   to one of these functions, it will return the <emphasis>next</emphasis>
+-   record.
++   The <filename>pg_walinspect</filename> functions are often called
++   using an LSN argument that specifies the location at which a known
++   WAL record of interest <emphasis>begins</emphasis>.  However, some
++   functions, such as
++   <function><link linkend="pg-logical-emit-message">pg_logical_emit_message</link></function>,
++   return the LSN <emphasis>after</emphasis> the record that was just
++   inserted.
+   </para>
+  </note>
++ <tip>
++  <para>
++   All of the <filename>pg_walinspect</filename> functions that show
++   information about records that fall within a certain LSN range are
++   permissive about accepting <replaceable>end_lsn</replaceable>
++   arguments that are after the server's current LSN.  Using an
++   <replaceable>end_lsn</replaceable> <quote>from the future</quote>
++   will not raise an error.
++  </para>
++  <para>
++   It may be convenient to provide the value
++   <literal>FFFFFFFF/FFFFFFFF</literal> (the maximum valid
++   <type>pg_lsn</type> value) as an <replaceable>end_lsn</replaceable>
++   argument.  This is equivalent to providing an
++   <replaceable>end_lsn</replaceable> argument matching the server's
++   current LSN.
++  </para>
++ </tip>
+  <para>
+   By default, use of these functions is restricted to superusers and members of
+   the <literal>pg_read_server_files</literal> role. Access may be granted by
+@@ -58,11 +67,9 @@
+ 
+     <listitem>
+      <para>
+-      Gets WAL record information of a given LSN. If the given LSN isn't
+-      at the start of a WAL record, it gives the information of the next
+-      available valid WAL record; or an error if no such record is found.
+-      For example, usage of the function is as
+-      follows:
++      Gets WAL record information about a record that is located at or
++      after the <replaceable>in_lsn</replaceable> argument.  For
++      example:
+ <screen>
+ postgres=# SELECT * FROM pg_get_wal_record_info('0/1E826E98');
+ -[ RECORD 1 ]----+----------------------------------------------------
+@@ -79,6 +86,12 @@ description      | snapshotConflictHorizon 33748 nredirected 0 ndead 2
+ block_ref        | blkref #0: rel 1663/5/60221 fork main blk 2
+ </screen>
+      </para>
++     <para>
++      If <replaceable>in_lsn</replaceable> isn't at the start of a WAL
++      record, information about the next valid WAL record is shown
++      instead.  If there is no next valid WAL record, the function
++      raises an error.
++     </para>
+     </listitem>
+    </varlistentry>
+ 
+@@ -94,11 +107,7 @@ block_ref        | blkref #0: rel 1663/5/60221 fork main blk 2
+      <para>
+       Gets information of all the valid WAL records between
+       <replaceable>start_lsn</replaceable> and <replaceable>end_lsn</replaceable>.
+-      Returns one row per WAL record. If a future
+-      <replaceable>end_lsn</replaceable> (i.e. ahead of the current LSN of
+-      the server) is specified, it returns information until the end of WAL.
+-      The function raises an error if <replaceable>start_lsn</replaceable>
+-      is not available. For example, usage of the function is as follows:
++      Returns one row per WAL record.  For example:
+ <screen>
+ postgres=# SELECT * FROM pg_get_wal_records_info('0/1E913618', '0/1E913740') LIMIT 1;
+ -[ RECORD 1 ]----+--------------------------------------------------------------
+@@ -115,6 +124,99 @@ description      | nextXid 33775 latestCompletedXid 33774 oldestRunningXid 33775
+ block_ref        |
+ </screen>
+      </para>
++     <para>
++      The function raises an error if
++      <replaceable>start_lsn</replaceable> is not available.
++     </para>
++    </listitem>
++   </varlistentry>
++
++   <varlistentry>
++    <term>
++     <function>pg_get_wal_block_info(start_lsn pg_lsn, end_lsn pg_lsn) returns setof record</function>
++    </term>
++
++    <listitem>
++     <para>
++      Gets information about each block reference from all the valid
++      WAL records between <replaceable>start_lsn</replaceable> and
++      <replaceable>end_lsn</replaceable> with one or more block
++      references.  Returns one row per block reference per WAL record.
++      For example:
++<screen>
++postgres=# SELECT * FROM pg_get_wal_block_info('0/10E9D80', '0/10E9DC0') LIMIT 1;
++-[ RECORD 1 ]-----+-----------------------------------
++start_lsn         | 0/10E9D80
++end_lsn           | 0/10E9DC0
++prev_lsn          | 0/10E9860
++block_id          | 0
++reltablespace     | 1663
++reldatabase       | 1
++relfilenode       | 2690
++relforknumber     | 0
++relblocknumber    | 5
++xid               | 117
++resource_manager  | Btree
++record_type       | INSERT_LEAF
++record_length     | 64
++main_data_length  | 2
++block_data_length | 16
++block_fpi_length  | 0
++block_fpi_info    |
++description       | off 14
++block_data        | \x00005400020010001407000000000000
++block_fpi_data    |
++</screen>
++     </para>
++     <para>
++      This example involves a WAL record that only contains one block
++      reference, but many WAL records contain several block
++      references.  Rows output by
++      <function>pg_get_wal_block_info</function> are guaranteed to
++      have a unique combination of
++      <replaceable>start_lsn</replaceable> and
++      <replaceable>block_id</replaceable> values.
++     </para>
++     <para>
++      Much of the information shown here matches the output that
++      <function>pg_get_wal_records_info</function> would show, given
++      the same arguments.  However,
++      <function>pg_get_wal_block_info</function> unnests the
++      information from each WAL record into an expanded form by
++      outputting one row per block reference, so certain details are
++      tracked at the block reference level rather than at the
++      whole-record level.  This structure is useful with queries that
++      track how individual blocks changed over time.  Note that
++      records with no block references (e.g.,
++      <literal>COMMIT</literal> WAL records) will have no rows
++      returned, so <function>pg_get_wal_block_info</function> may
++      actually return <emphasis>fewer</emphasis> rows than
++      <function>pg_get_wal_records_info</function>.
++     </para>
++     <para>
++      The <structfield>reltablespace</structfield>,
++      <structfield>reldatabase</structfield>, and
++      <structfield>relfilenode</structfield> parameters reference
++      <link linkend="catalog-pg-tablespace"><structname>pg_tablespace</structname></link>.<structfield>oid</structfield>,
++      <link linkend="catalog-pg-database"><structname>pg_database</structname></link>.<structfield>oid</structfield>, and
++      <link linkend="catalog-pg-class"><structname>pg_class</structname></link>.<structfield>relfilenode</structfield>
++      respectively.  The <structfield>relforknumber</structfield>
++      field is the fork number within the relation for the block
++      reference; see <filename>common/relpath.h</filename> for
++      details.
++     </para>
++     <tip>
++      <para>
++       The <function>pg_filenode_relation</function> function (see
++       <xref linkend="functions-admin-dblocation"/>) can help you to
++       determine which block/relation was modified by each WAL record
++       during original execution
++      </para>
++     </tip>
++     <para>
++      The function raises an error if
++      <replaceable>start_lsn</replaceable> is not available.
++     </para>
+     </listitem>
+    </varlistentry>
+ 
+@@ -133,11 +235,8 @@ block_ref        |
+       <replaceable>end_lsn</replaceable>. By default, it returns one row per
+       <replaceable>resource_manager</replaceable> type. When
+       <replaceable>per_record</replaceable> is set to <literal>true</literal>,
+-      it returns one row per <replaceable>record_type</replaceable>. If a
+-      future <replaceable>end_lsn</replaceable> (i.e. ahead of the current
+-      LSN of the server) is specified, it returns statistics until the end
+-      of WAL. An error is raised if <replaceable>start_lsn</replaceable> is
+-      not available. For example, usage of the function is as follows:
++      it returns one row per <replaceable>record_type</replaceable>.
++      For example:
+ <screen>
+ postgres=# SELECT * FROM pg_get_wal_stats('0/1E847D00', '0/1E84F500')
+              WHERE count > 0 LIMIT 1 AND
+@@ -154,47 +253,9 @@ combined_size                | 875
+ combined_size_percentage     | 2.8634072910530795
+ </screen>
+      </para>
+-    </listitem>
+-   </varlistentry>
+-
+-   <varlistentry>
+-    <term>
+-     <function>pg_get_wal_block_info(start_lsn pg_lsn, end_lsn pg_lsn) returns setof record</function>
+-    </term>
+-
+-    <listitem>
+      <para>
+-      Gets a copy of the block information stored in WAL records. This includes
+-      copies of the block data (<literal>NULL</literal> if none) and full page
+-      images as <type>bytea</type> values (after
+-      applying decompression when necessary, or <literal>NULL</literal> if none)
+-      and their information associated with all the valid WAL records between
+-      <replaceable>start_lsn</replaceable> and
+-      <replaceable>end_lsn</replaceable>. Returns one row per block registered
+-      in a WAL record. If a future <replaceable>end_lsn</replaceable> (i.e.
+-      ahead of the current LSN of the server) is specified, it returns
+-      statistics until the end of WAL. An error is raised if
+-      <replaceable>start_lsn</replaceable> is not available. For example,
+-      usage of the function is as follows:
+-<screen>
+-postgres=# SELECT lsn, blockid, reltablespace, reldatabase, relfilenode,
+-                  relblocknumber, forkname,
+-                  substring(blockdata for 24) as block_trimmed,
+-                  substring(fpi for 24) as fpi_trimmed, fpilen, fpiinfo
+-             FROM pg_get_wal_block_info('0/1871080', '0/1871440');
+--[ RECORD 1 ]--+---------------------------------------------------
+-lsn            | 0/18712F8
+-blockid        | 0
+-reltablespace  | 1663
+-reldatabase    | 16384
+-relfilenode    | 16392
+-relblocknumber | 0
+-forkname       | main
+-block_trimmed  | \x02800128180164000000
+-fpi_trimmed    | \x0000000050108701000000002c00601f00200420e0020000
+-fpilen         | 204
+-fpiinfo        | {HAS_HOLE,APPLY}
+-</screen>
++      The function raises an error if
++      <replaceable>start_lsn</replaceable> is not available.
+      </para>
+     </listitem>
+    </varlistentry>

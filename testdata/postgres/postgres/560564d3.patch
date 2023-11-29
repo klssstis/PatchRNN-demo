@@ -1,0 +1,163 @@
+From 560564d3addcb6c54e13c1ca8bd11afafbb7ba11 Mon Sep 17 00:00:00 2001
+From: Peter Eisentraut <peter@eisentraut.org>
+Date: Wed, 4 Nov 2020 07:47:06 +0100
+Subject: [PATCH] Enable hash partitioning of text arrays
+
+hash_array_extended() needs to pass PG_GET_COLLATION() to the hash
+function of the element type.  Otherwise, the hash function of a
+collation-aware data type such as text will error out, since the
+introduction of nondeterministic collation made hash functions require
+a collation, too.
+
+The consequence of this is that before this change, hash partitioning
+using an array over text in the partition key would not work.
+
+Reviewed-by: Heikki Linnakangas <hlinnaka@iki.fi>
+Reviewed-by: Tom Lane <tgl@sss.pgh.pa.us>
+Reviewed-by: Michael Paquier <michael@paquier.xyz>
+Discussion: https://www.postgresql.org/message-id/flat/32c1fdae-95c6-5dc6-058a-a90330a3b621%40enterprisedb.com
+---
+ src/backend/utils/adt/arrayfuncs.c            |  2 +-
+ .../regress/expected/collate.icu.utf8.out     | 50 +++++++++++++++++++
+ src/test/regress/sql/collate.icu.utf8.sql     | 26 ++++++++++
+ 3 files changed, 77 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/utils/adt/arrayfuncs.c b/src/backend/utils/adt/arrayfuncs.c
+index 392445ea0329..a7ea7656c75d 100644
+--- a/src/backend/utils/adt/arrayfuncs.c
++++ b/src/backend/utils/adt/arrayfuncs.c
+@@ -4071,7 +4071,7 @@ hash_array_extended(PG_FUNCTION_ARGS)
+ 	typalign = typentry->typalign;
+ 
+ 	InitFunctionCallInfoData(*locfcinfo, &typentry->hash_extended_proc_finfo, 2,
+-							 InvalidOid, NULL, NULL);
++							 PG_GET_COLLATION(), NULL, NULL);
+ 
+ 	/* Loop over source data */
+ 	nitems = ArrayGetNItems(ndims, dims);
+diff --git a/src/test/regress/expected/collate.icu.utf8.out b/src/test/regress/expected/collate.icu.utf8.out
+index 16b4d9e2cdc6..bc3752e92369 100644
+--- a/src/test/regress/expected/collate.icu.utf8.out
++++ b/src/test/regress/expected/collate.icu.utf8.out
+@@ -1212,6 +1212,30 @@ SELECT * FROM test6 WHERE b = 'äbc' COLLATE ctest_nondet;
+  2 | äbc
+ (2 rows)
+ 
++-- same with arrays
++CREATE TABLE test6a (a int, b text[]);
++INSERT INTO test6a VALUES (1, ARRAY[U&'\00E4bc']);
++INSERT INTO test6a VALUES (2, ARRAY[U&'\0061\0308bc']);
++SELECT * FROM test6a;
++ a |   b   
++---+-------
++ 1 | {äbc}
++ 2 | {äbc}
++(2 rows)
++
++SELECT * FROM test6a WHERE b = ARRAY['äbc'] COLLATE ctest_det;
++ a |   b   
++---+-------
++ 1 | {äbc}
++(1 row)
++
++SELECT * FROM test6a WHERE b = ARRAY['äbc'] COLLATE ctest_nondet;
++ a |   b   
++---+-------
++ 1 | {äbc}
++ 2 | {äbc}
++(2 rows)
++
+ CREATE COLLATION case_sensitive (provider = icu, locale = '');
+ CREATE COLLATION case_insensitive (provider = icu, locale = '@colStrength=secondary', deterministic = false);
+ SELECT 'abc' <= 'ABC' COLLATE case_sensitive, 'abc' >= 'ABC' COLLATE case_sensitive;
+@@ -1839,6 +1863,19 @@ SELECT (SELECT count(*) FROM test22_0) = (SELECT count(*) FROM test22_1);
+  t
+ (1 row)
+ 
++-- same with arrays
++CREATE TABLE test22a (a int, b text[] COLLATE case_sensitive) PARTITION BY HASH (b);
++CREATE TABLE test22a_0 PARTITION OF test22a FOR VALUES WITH (MODULUS 2, REMAINDER 0);
++CREATE TABLE test22a_1 PARTITION OF test22a FOR VALUES WITH (MODULUS 2, REMAINDER 1);
++INSERT INTO test22a VALUES (1, ARRAY['def']);
++INSERT INTO test22a VALUES (2, ARRAY['DEF']);
++-- they end up in different partitions
++SELECT (SELECT count(*) FROM test22a_0) = (SELECT count(*) FROM test22a_1);
++ ?column? 
++----------
++ t
++(1 row)
++
+ CREATE TABLE test23 (a int, b text COLLATE case_insensitive) PARTITION BY HASH (b);
+ CREATE TABLE test23_0 PARTITION OF test23 FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+ CREATE TABLE test23_1 PARTITION OF test23 FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+@@ -1851,6 +1888,19 @@ SELECT (SELECT count(*) FROM test23_0) <> (SELECT count(*) FROM test23_1);
+  t
+ (1 row)
+ 
++-- same with arrays
++CREATE TABLE test23a (a int, b text[] COLLATE case_insensitive) PARTITION BY HASH (b);
++CREATE TABLE test23a_0 PARTITION OF test23a FOR VALUES WITH (MODULUS 2, REMAINDER 0);
++CREATE TABLE test23a_1 PARTITION OF test23a FOR VALUES WITH (MODULUS 2, REMAINDER 1);
++INSERT INTO test23a VALUES (1, ARRAY['def']);
++INSERT INTO test23a VALUES (2, ARRAY['DEF']);
++-- they end up in the same partition (but it's platform-dependent which one)
++SELECT (SELECT count(*) FROM test23a_0) <> (SELECT count(*) FROM test23a_1);
++ ?column? 
++----------
++ t
++(1 row)
++
+ CREATE TABLE test30 (a int, b char(3) COLLATE case_insensitive) PARTITION BY LIST (b);
+ CREATE TABLE test30_1 PARTITION OF test30 FOR VALUES IN ('abc');
+ INSERT INTO test30 VALUES (1, 'abc');
+diff --git a/src/test/regress/sql/collate.icu.utf8.sql b/src/test/regress/sql/collate.icu.utf8.sql
+index 4714c044d531..0de2ed8d8565 100644
+--- a/src/test/regress/sql/collate.icu.utf8.sql
++++ b/src/test/regress/sql/collate.icu.utf8.sql
+@@ -478,6 +478,14 @@ SELECT * FROM test6;
+ SELECT * FROM test6 WHERE b = 'äbc' COLLATE ctest_det;
+ SELECT * FROM test6 WHERE b = 'äbc' COLLATE ctest_nondet;
+ 
++-- same with arrays
++CREATE TABLE test6a (a int, b text[]);
++INSERT INTO test6a VALUES (1, ARRAY[U&'\00E4bc']);
++INSERT INTO test6a VALUES (2, ARRAY[U&'\0061\0308bc']);
++SELECT * FROM test6a;
++SELECT * FROM test6a WHERE b = ARRAY['äbc'] COLLATE ctest_det;
++SELECT * FROM test6a WHERE b = ARRAY['äbc'] COLLATE ctest_nondet;
++
+ CREATE COLLATION case_sensitive (provider = icu, locale = '');
+ CREATE COLLATION case_insensitive (provider = icu, locale = '@colStrength=secondary', deterministic = false);
+ 
+@@ -680,6 +688,15 @@ INSERT INTO test22 VALUES (2, 'DEF');
+ -- they end up in different partitions
+ SELECT (SELECT count(*) FROM test22_0) = (SELECT count(*) FROM test22_1);
+ 
++-- same with arrays
++CREATE TABLE test22a (a int, b text[] COLLATE case_sensitive) PARTITION BY HASH (b);
++CREATE TABLE test22a_0 PARTITION OF test22a FOR VALUES WITH (MODULUS 2, REMAINDER 0);
++CREATE TABLE test22a_1 PARTITION OF test22a FOR VALUES WITH (MODULUS 2, REMAINDER 1);
++INSERT INTO test22a VALUES (1, ARRAY['def']);
++INSERT INTO test22a VALUES (2, ARRAY['DEF']);
++-- they end up in different partitions
++SELECT (SELECT count(*) FROM test22a_0) = (SELECT count(*) FROM test22a_1);
++
+ CREATE TABLE test23 (a int, b text COLLATE case_insensitive) PARTITION BY HASH (b);
+ CREATE TABLE test23_0 PARTITION OF test23 FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+ CREATE TABLE test23_1 PARTITION OF test23 FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+@@ -688,6 +705,15 @@ INSERT INTO test23 VALUES (2, 'DEF');
+ -- they end up in the same partition (but it's platform-dependent which one)
+ SELECT (SELECT count(*) FROM test23_0) <> (SELECT count(*) FROM test23_1);
+ 
++-- same with arrays
++CREATE TABLE test23a (a int, b text[] COLLATE case_insensitive) PARTITION BY HASH (b);
++CREATE TABLE test23a_0 PARTITION OF test23a FOR VALUES WITH (MODULUS 2, REMAINDER 0);
++CREATE TABLE test23a_1 PARTITION OF test23a FOR VALUES WITH (MODULUS 2, REMAINDER 1);
++INSERT INTO test23a VALUES (1, ARRAY['def']);
++INSERT INTO test23a VALUES (2, ARRAY['DEF']);
++-- they end up in the same partition (but it's platform-dependent which one)
++SELECT (SELECT count(*) FROM test23a_0) <> (SELECT count(*) FROM test23a_1);
++
+ CREATE TABLE test30 (a int, b char(3) COLLATE case_insensitive) PARTITION BY LIST (b);
+ CREATE TABLE test30_1 PARTITION OF test30 FOR VALUES IN ('abc');
+ INSERT INTO test30 VALUES (1, 'abc');

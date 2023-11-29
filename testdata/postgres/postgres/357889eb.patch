@@ -1,0 +1,1362 @@
+From 357889eb17bb9c9336c4f324ceb1651da616fe57 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Tue, 7 Apr 2020 16:22:13 -0400
+Subject: [PATCH] Support FETCH FIRST WITH TIES
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+WITH TIES is an option to the FETCH FIRST N ROWS clause (the SQL
+standard's spelling of LIMIT), where you additionally get rows that
+compare equal to the last of those N rows by the columns in the
+mandatory ORDER BY clause.
+
+There was a proposal by Andrew Gierth to implement this functionality in
+a more powerful way that would yield more features, but the other patch
+had not been finished at this time, so we decided to use this one for
+now in the spirit of incremental development.
+
+Author: Surafel Temesgen <surafel3000@gmail.com>
+Reviewed-by: Álvaro Herrera <alvherre@alvh.no-ip.org>
+Reviewed-by: Tomas Vondra <tomas.vondra@2ndquadrant.com>
+Discussion: https://postgr.es/m/CALAY4q9ky7rD_A4vf=FVQvCGngm3LOes-ky0J6euMrg=_Se+ag@mail.gmail.com
+Discussion: https://postgr.es/m/87o8wvz253.fsf@news-spur.riddles.org.uk
+---
+ doc/src/sgml/ref/select.sgml            |  15 ++-
+ src/backend/catalog/sql_features.txt    |   2 +-
+ src/backend/executor/nodeLimit.c        | 160 ++++++++++++++++++++---
+ src/backend/nodes/copyfuncs.c           |   7 +
+ src/backend/nodes/equalfuncs.c          |   2 +
+ src/backend/nodes/outfuncs.c            |   7 +
+ src/backend/nodes/readfuncs.c           |   6 +
+ src/backend/optimizer/plan/createplan.c |  45 ++++++-
+ src/backend/optimizer/plan/planner.c    |   1 +
+ src/backend/optimizer/util/pathnode.c   |   2 +
+ src/backend/parser/analyze.c            |  21 ++-
+ src/backend/parser/gram.y               | 117 +++++++++++++----
+ src/backend/parser/parse_clause.c       |  15 ++-
+ src/backend/utils/adt/ruleutils.c       |  27 +++-
+ src/include/catalog/catversion.h        |   2 +-
+ src/include/nodes/execnodes.h           |   5 +
+ src/include/nodes/nodes.h               |  13 ++
+ src/include/nodes/parsenodes.h          |   2 +
+ src/include/nodes/pathnodes.h           |   1 +
+ src/include/nodes/plannodes.h           |   5 +
+ src/include/optimizer/pathnode.h        |   1 +
+ src/include/optimizer/planmain.h        |   5 +-
+ src/include/parser/parse_clause.h       |   3 +-
+ src/test/regress/expected/limit.out     | 167 ++++++++++++++++++++++++
+ src/test/regress/sql/limit.sql          |  48 +++++++
+ 25 files changed, 610 insertions(+), 69 deletions(-)
+
+diff --git a/doc/src/sgml/ref/select.sgml b/doc/src/sgml/ref/select.sgml
+index 691e4028030d..2b11c38087ff 100644
+--- a/doc/src/sgml/ref/select.sgml
++++ b/doc/src/sgml/ref/select.sgml
+@@ -44,7 +44,7 @@ SELECT [ ALL | DISTINCT [ ON ( <replaceable class="parameter">expression</replac
+     [ ORDER BY <replaceable class="parameter">expression</replaceable> [ ASC | DESC | USING <replaceable class="parameter">operator</replaceable> ] [ NULLS { FIRST | LAST } ] [, ...] ]
+     [ LIMIT { <replaceable class="parameter">count</replaceable> | ALL } ]
+     [ OFFSET <replaceable class="parameter">start</replaceable> [ ROW | ROWS ] ]
+-    [ FETCH { FIRST | NEXT } [ <replaceable class="parameter">count</replaceable> ] { ROW | ROWS } ONLY ]
++    [ FETCH { FIRST | NEXT } [ <replaceable class="parameter">count</replaceable> ] { ROW | ROWS } { ONLY | WITH TIES } ]
+     [ FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE } [ OF <replaceable class="parameter">table_name</replaceable> [, ...] ] [ NOWAIT | SKIP LOCKED ] [...] ]
+ 
+ <phrase>where <replaceable class="parameter">from_item</replaceable> can be one of:</phrase>
+@@ -1438,7 +1438,7 @@ OFFSET <replaceable class="parameter">start</replaceable>
+     which <productname>PostgreSQL</productname> also supports.  It is:
+ <synopsis>
+ OFFSET <replaceable class="parameter">start</replaceable> { ROW | ROWS }
+-FETCH { FIRST | NEXT } [ <replaceable class="parameter">count</replaceable> ] { ROW | ROWS } ONLY
++FETCH { FIRST | NEXT } [ <replaceable class="parameter">count</replaceable> ] { ROW | ROWS } { ONLY | WITH TIES }
+ </synopsis>
+     In this syntax, the <replaceable class="parameter">start</replaceable>
+     or <replaceable class="parameter">count</replaceable> value is required by
+@@ -1448,10 +1448,13 @@ FETCH { FIRST | NEXT } [ <replaceable class="parameter">count</replaceable> ] {
+     ambiguity.
+     If <replaceable class="parameter">count</replaceable> is
+     omitted in a <literal>FETCH</literal> clause, it defaults to 1.
+-    <literal>ROW</literal>
+-    and <literal>ROWS</literal> as well as <literal>FIRST</literal>
+-    and <literal>NEXT</literal> are noise words that don't influence
+-    the effects of these clauses.
++    The <literal>WITH TIES</literal> option is used to return any additional
++    rows that tie for the last place in the result set according to
++    <literal>ORDER BY</literal> clause; <literal>ORDER BY</literal>
++    is mandatory in this case.
++    <literal>ROW</literal> and <literal>ROWS</literal> as well as
++    <literal>FIRST</literal> and <literal>NEXT</literal> are noise
++    words that don't influence the effects of these clauses.
+     According to the standard, the <literal>OFFSET</literal> clause must come
+     before the <literal>FETCH</literal> clause if both are present; but
+     <productname>PostgreSQL</productname> is laxer and allows either order.
+diff --git a/src/backend/catalog/sql_features.txt b/src/backend/catalog/sql_features.txt
+index 3a40b027d410..b6e58e84939c 100644
+--- a/src/backend/catalog/sql_features.txt
++++ b/src/backend/catalog/sql_features.txt
+@@ -345,7 +345,7 @@ F863	Nested <result offset clause> in <query expression>			YES
+ F864	Top-level <result offset clause> in views			YES	
+ F865	<offset row count> in <result offset clause>			YES	
+ F866	FETCH FIRST clause: PERCENT option			NO	
+-F867	FETCH FIRST clause: WITH TIES option			NO	
++F867	FETCH FIRST clause: WITH TIES option			YES	
+ R010	Row pattern recognition: FROM clause			NO	
+ R020	Row pattern recognition: WINDOW clause			NO	
+ R030	Row pattern recognition: full aggregate support			NO	
+diff --git a/src/backend/executor/nodeLimit.c b/src/backend/executor/nodeLimit.c
+index d792e97cfabc..12cfc5177bb5 100644
+--- a/src/backend/executor/nodeLimit.c
++++ b/src/backend/executor/nodeLimit.c
+@@ -41,6 +41,7 @@ static TupleTableSlot *			/* return: a tuple or NULL */
+ ExecLimit(PlanState *pstate)
+ {
+ 	LimitState *node = castNode(LimitState, pstate);
++	ExprContext *econtext = node->ps.ps_ExprContext;
+ 	ScanDirection direction;
+ 	TupleTableSlot *slot;
+ 	PlanState  *outerPlan;
+@@ -102,6 +103,16 @@ ExecLimit(PlanState *pstate)
+ 					node->lstate = LIMIT_EMPTY;
+ 					return NULL;
+ 				}
++
++				/*
++				 * Tuple at limit is needed for comparation in subsequent
++				 * execution to detect ties.
++				 */
++				if (node->limitOption == LIMIT_OPTION_WITH_TIES &&
++					node->position - node->offset == node->count - 1)
++				{
++					ExecCopySlot(node->last_slot, slot);
++				}
+ 				node->subSlot = slot;
+ 				if (++node->position > node->offset)
+ 					break;
+@@ -125,10 +136,13 @@ ExecLimit(PlanState *pstate)
+ 			if (ScanDirectionIsForward(direction))
+ 			{
+ 				/*
+-				 * Forwards scan, so check for stepping off end of window. If
+-				 * we are at the end of the window, return NULL without
+-				 * advancing the subplan or the position variable; but change
+-				 * the state machine state to record having done so.
++				 * Forwards scan, so check for stepping off end of window.  At
++				 * the end of the window, the behavior depends on whether WITH
++				 * TIES was specified: in that case, we need to change the
++				 * state machine to LIMIT_WINDOWTIES.  If not (nothing was
++				 * specified, or ONLY was) return NULL without advancing the
++				 * subplan or the position variable but change the state
++				 * machine to record having done so
+ 				 *
+ 				 * Once at the end, ideally, we can shut down parallel
+ 				 * resources but that would destroy the parallel context which
+@@ -139,12 +153,72 @@ ExecLimit(PlanState *pstate)
+ 				if (!node->noCount &&
+ 					node->position - node->offset >= node->count)
+ 				{
+-					node->lstate = LIMIT_WINDOWEND;
++					if (node->limitOption == LIMIT_OPTION_COUNT)
++					{
++						node->lstate = LIMIT_WINDOWEND;
++						return NULL;
++					}
++					else
++					{
++						node->lstate = LIMIT_WINDOWEND_TIES;
++						/* fall-through */
++					}
++				}
++				else
++				{
++					/*
++					 * Get next tuple from subplan, if any.
++					 */
++					slot = ExecProcNode(outerPlan);
++					if (TupIsNull(slot))
++					{
++						node->lstate = LIMIT_SUBPLANEOF;
++						return NULL;
++					}
++
++					/*
++					 * Tuple at limit is needed for comparation in subsequent
++					 * execution to detect ties.
++					 */
++					if (node->limitOption == LIMIT_OPTION_WITH_TIES &&
++						node->position - node->offset == node->count - 1)
++					{
++						ExecCopySlot(node->last_slot, slot);
++					}
++					node->subSlot = slot;
++					node->position++;
++					break;
++				}
++			}
++			else
++			{
++				/*
++				 * Backwards scan, so check for stepping off start of window.
++				 * As above, change only state-machine status if so.
++				 */
++				if (node->position <= node->offset + 1)
++				{
++					node->lstate = LIMIT_WINDOWSTART;
+ 					return NULL;
+ 				}
+ 
+ 				/*
+-				 * Get next tuple from subplan, if any.
++				 * Get previous tuple from subplan; there should be one!
++				 */
++				slot = ExecProcNode(outerPlan);
++				if (TupIsNull(slot))
++					elog(ERROR, "LIMIT subplan failed to run backwards");
++				node->subSlot = slot;
++				node->position--;
++				break;
++			}
++
++		case LIMIT_WINDOWEND_TIES:
++			if (ScanDirectionIsForward(direction))
++			{
++				/*
++				 * Advance the subplan until we find the first row with
++				 * different ORDER BY pathkeys.
+ 				 */
+ 				slot = ExecProcNode(outerPlan);
+ 				if (TupIsNull(slot))
+@@ -152,14 +226,29 @@ ExecLimit(PlanState *pstate)
+ 					node->lstate = LIMIT_SUBPLANEOF;
+ 					return NULL;
+ 				}
+-				node->subSlot = slot;
+-				node->position++;
++
++				/*
++				 * Test if the new tuple and the last tuple match. If so we
++				 * return the tuple.
++				 */
++				econtext->ecxt_innertuple = slot;
++				econtext->ecxt_outertuple = node->last_slot;
++				if (ExecQualAndReset(node->eqfunction, econtext))
++				{
++					node->subSlot = slot;
++					node->position++;
++				}
++				else
++				{
++					node->lstate = LIMIT_WINDOWEND;
++					return NULL;
++				}
+ 			}
+ 			else
+ 			{
+ 				/*
+ 				 * Backwards scan, so check for stepping off start of window.
+-				 * As above, change only state-machine status if so.
++				 * Change only state-machine status if so.
+ 				 */
+ 				if (node->position <= node->offset + 1)
+ 				{
+@@ -168,13 +257,15 @@ ExecLimit(PlanState *pstate)
+ 				}
+ 
+ 				/*
+-				 * Get previous tuple from subplan; there should be one!
++				 * Get previous tuple from subplan; there should be one! And
++				 * change state-machine status.
+ 				 */
+ 				slot = ExecProcNode(outerPlan);
+ 				if (TupIsNull(slot))
+ 					elog(ERROR, "LIMIT subplan failed to run backwards");
+ 				node->subSlot = slot;
+ 				node->position--;
++				node->lstate = LIMIT_INWINDOW;
+ 			}
+ 			break;
+ 
+@@ -199,12 +290,28 @@ ExecLimit(PlanState *pstate)
+ 				return NULL;
+ 
+ 			/*
+-			 * Backing up from window end: simply re-return the last tuple
+-			 * fetched from the subplan.
++			 * We already past one position to detect ties so re-fetch
++			 * previous tuple; there should be one!  Note previous tuple must
++			 * be in window.
+ 			 */
+-			slot = node->subSlot;
+-			node->lstate = LIMIT_INWINDOW;
+-			/* position does not change 'cause we didn't advance it before */
++			if (node->limitOption == LIMIT_OPTION_WITH_TIES)
++			{
++				slot = ExecProcNode(outerPlan);
++				if (TupIsNull(slot))
++					elog(ERROR, "LIMIT subplan failed to run backwards");
++				node->subSlot = slot;
++				node->lstate = LIMIT_INWINDOW;
++			}
++			else
++			{
++				/*
++				 * Backing up from window end: simply re-return the last tuple
++				 * fetched from the subplan.
++				 */
++				slot = node->subSlot;
++				node->lstate = LIMIT_INWINDOW;
++				/* position does not change 'cause we didn't advance it before */
++			}
+ 			break;
+ 
+ 		case LIMIT_WINDOWSTART:
+@@ -319,7 +426,7 @@ recompute_limits(LimitState *node)
+ static int64
+ compute_tuples_needed(LimitState *node)
+ {
+-	if (node->noCount)
++	if ((node->noCount) || (node->limitOption == LIMIT_OPTION_WITH_TIES))
+ 		return -1;
+ 	/* Note: if this overflows, we'll return a negative value, which is OK */
+ 	return node->count + node->offset;
+@@ -372,6 +479,7 @@ ExecInitLimit(Limit *node, EState *estate, int eflags)
+ 										   (PlanState *) limitstate);
+ 	limitstate->limitCount = ExecInitExpr((Expr *) node->limitCount,
+ 										  (PlanState *) limitstate);
++	limitstate->limitOption = node->limitOption;
+ 
+ 	/*
+ 	 * Initialize result type.
+@@ -388,6 +496,26 @@ ExecInitLimit(Limit *node, EState *estate, int eflags)
+ 	 */
+ 	limitstate->ps.ps_ProjInfo = NULL;
+ 
++	/*
++	 * Initialize the equality evaluation, to detect ties.
++	 */
++	if (node->limitOption == LIMIT_OPTION_WITH_TIES)
++	{
++		TupleDesc	desc;
++		const TupleTableSlotOps *ops;
++
++		desc = ExecGetResultType(outerPlanState(limitstate));
++		ops = ExecGetResultSlotOps(outerPlanState(limitstate), NULL);
++
++		limitstate->last_slot = ExecInitExtraTupleSlot(estate, desc, ops);
++		limitstate->eqfunction = execTuplesMatchPrepare(desc,
++														node->uniqNumCols,
++														node->uniqColIdx,
++														node->uniqOperators,
++														node->uniqCollations,
++														&limitstate->ps);
++	}
++
+ 	return limitstate;
+ }
+ 
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index f9d86859ee7a..1525c0de7258 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -1185,6 +1185,11 @@ _copyLimit(const Limit *from)
+ 	 */
+ 	COPY_NODE_FIELD(limitOffset);
+ 	COPY_NODE_FIELD(limitCount);
++	COPY_SCALAR_FIELD(limitOption);
++	COPY_SCALAR_FIELD(uniqNumCols);
++	COPY_POINTER_FIELD(uniqColIdx, from->uniqNumCols * sizeof(AttrNumber));
++	COPY_POINTER_FIELD(uniqOperators, from->uniqNumCols * sizeof(Oid));
++	COPY_POINTER_FIELD(uniqCollations, from->uniqNumCols * sizeof(Oid));
+ 
+ 	return newnode;
+ }
+@@ -3079,6 +3084,7 @@ _copyQuery(const Query *from)
+ 	COPY_NODE_FIELD(sortClause);
+ 	COPY_NODE_FIELD(limitOffset);
+ 	COPY_NODE_FIELD(limitCount);
++	COPY_SCALAR_FIELD(limitOption);
+ 	COPY_NODE_FIELD(rowMarks);
+ 	COPY_NODE_FIELD(setOperations);
+ 	COPY_NODE_FIELD(constraintDeps);
+@@ -3163,6 +3169,7 @@ _copySelectStmt(const SelectStmt *from)
+ 	COPY_NODE_FIELD(sortClause);
+ 	COPY_NODE_FIELD(limitOffset);
+ 	COPY_NODE_FIELD(limitCount);
++	COPY_SCALAR_FIELD(limitOption);
+ 	COPY_NODE_FIELD(lockingClause);
+ 	COPY_NODE_FIELD(withClause);
+ 	COPY_SCALAR_FIELD(op);
+diff --git a/src/backend/nodes/equalfuncs.c b/src/backend/nodes/equalfuncs.c
+index e8e781834a5c..4f34189ab5cb 100644
+--- a/src/backend/nodes/equalfuncs.c
++++ b/src/backend/nodes/equalfuncs.c
+@@ -981,6 +981,7 @@ _equalQuery(const Query *a, const Query *b)
+ 	COMPARE_NODE_FIELD(sortClause);
+ 	COMPARE_NODE_FIELD(limitOffset);
+ 	COMPARE_NODE_FIELD(limitCount);
++	COMPARE_SCALAR_FIELD(limitOption);
+ 	COMPARE_NODE_FIELD(rowMarks);
+ 	COMPARE_NODE_FIELD(setOperations);
+ 	COMPARE_NODE_FIELD(constraintDeps);
+@@ -1055,6 +1056,7 @@ _equalSelectStmt(const SelectStmt *a, const SelectStmt *b)
+ 	COMPARE_NODE_FIELD(sortClause);
+ 	COMPARE_NODE_FIELD(limitOffset);
+ 	COMPARE_NODE_FIELD(limitCount);
++	COMPARE_SCALAR_FIELD(limitOption);
+ 	COMPARE_NODE_FIELD(lockingClause);
+ 	COMPARE_NODE_FIELD(withClause);
+ 	COMPARE_SCALAR_FIELD(op);
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index 35ed8c0d5385..5b826509ebed 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -931,6 +931,11 @@ _outLimit(StringInfo str, const Limit *node)
+ 
+ 	WRITE_NODE_FIELD(limitOffset);
+ 	WRITE_NODE_FIELD(limitCount);
++	WRITE_ENUM_FIELD(limitOption, LimitOption);
++	WRITE_INT_FIELD(uniqNumCols);
++	WRITE_ATTRNUMBER_ARRAY(uniqColIdx, node->uniqNumCols);
++	WRITE_OID_ARRAY(uniqOperators, node->uniqNumCols);
++	WRITE_OID_ARRAY(uniqCollations, node->uniqNumCols);
+ }
+ 
+ static void
+@@ -2741,6 +2746,7 @@ _outSelectStmt(StringInfo str, const SelectStmt *node)
+ 	WRITE_NODE_FIELD(sortClause);
+ 	WRITE_NODE_FIELD(limitOffset);
+ 	WRITE_NODE_FIELD(limitCount);
++	WRITE_ENUM_FIELD(limitOption, LimitOption);
+ 	WRITE_NODE_FIELD(lockingClause);
+ 	WRITE_NODE_FIELD(withClause);
+ 	WRITE_ENUM_FIELD(op, SetOperation);
+@@ -2952,6 +2958,7 @@ _outQuery(StringInfo str, const Query *node)
+ 	WRITE_NODE_FIELD(sortClause);
+ 	WRITE_NODE_FIELD(limitOffset);
+ 	WRITE_NODE_FIELD(limitCount);
++	WRITE_ENUM_FIELD(limitOption, LimitOption);
+ 	WRITE_NODE_FIELD(rowMarks);
+ 	WRITE_NODE_FIELD(setOperations);
+ 	WRITE_NODE_FIELD(constraintDeps);
+diff --git a/src/backend/nodes/readfuncs.c b/src/backend/nodes/readfuncs.c
+index 2a2f39bf0474..644e0f5fc734 100644
+--- a/src/backend/nodes/readfuncs.c
++++ b/src/backend/nodes/readfuncs.c
+@@ -278,6 +278,7 @@ _readQuery(void)
+ 	READ_NODE_FIELD(sortClause);
+ 	READ_NODE_FIELD(limitOffset);
+ 	READ_NODE_FIELD(limitCount);
++	READ_ENUM_FIELD(limitOption, LimitOption);
+ 	READ_NODE_FIELD(rowMarks);
+ 	READ_NODE_FIELD(setOperations);
+ 	READ_NODE_FIELD(constraintDeps);
+@@ -2398,6 +2399,11 @@ _readLimit(void)
+ 
+ 	READ_NODE_FIELD(limitOffset);
+ 	READ_NODE_FIELD(limitCount);
++	READ_ENUM_FIELD(limitOption, LimitOption);
++	READ_INT_FIELD(uniqNumCols);
++	READ_ATTRNUMBER_ARRAY(uniqColIdx, local_node->uniqNumCols);
++	READ_OID_ARRAY(uniqOperators, local_node->uniqNumCols);
++	READ_OID_ARRAY(uniqCollations, local_node->uniqNumCols);
+ 
+ 	READ_DONE();
+ }
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index 6d26bfbeb5f2..9941dfe65e46 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -2378,7 +2378,9 @@ create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
+ 
+ 		plan = (Plan *) make_limit(plan,
+ 								   subparse->limitOffset,
+-								   subparse->limitCount);
++								   subparse->limitCount,
++								   subparse->limitOption,
++								   0, NULL, NULL, NULL);
+ 
+ 		/* Must apply correct cost/width data to Limit node */
+ 		plan->startup_cost = mminfo->path->startup_cost;
+@@ -2688,13 +2690,43 @@ create_limit_plan(PlannerInfo *root, LimitPath *best_path, int flags)
+ {
+ 	Limit	   *plan;
+ 	Plan	   *subplan;
++	int			numUniqkeys = 0;
++	AttrNumber *uniqColIdx = NULL;
++	Oid		   *uniqOperators = NULL;
++	Oid		   *uniqCollations = NULL;
+ 
+ 	/* Limit doesn't project, so tlist requirements pass through */
+ 	subplan = create_plan_recurse(root, best_path->subpath, flags);
+ 
++	/* Extract information necessary for comparing rows for WITH TIES. */
++	if (best_path->limitOption == LIMIT_OPTION_WITH_TIES)
++	{
++		Query	   *parse = root->parse;
++		ListCell   *l;
++
++		numUniqkeys = list_length(parse->sortClause);
++		uniqColIdx = (AttrNumber *) palloc(numUniqkeys * sizeof(AttrNumber));
++		uniqOperators = (Oid *) palloc(numUniqkeys * sizeof(Oid));
++		uniqCollations = (Oid *) palloc(numUniqkeys * sizeof(Oid));
++
++		numUniqkeys = 0;
++		foreach(l, parse->sortClause)
++		{
++			SortGroupClause *sortcl = (SortGroupClause *) lfirst(l);
++			TargetEntry *tle = get_sortgroupclause_tle(sortcl, parse->targetList);
++
++			uniqColIdx[numUniqkeys] = tle->resno;
++			uniqOperators[numUniqkeys] = sortcl->eqop;
++			uniqCollations[numUniqkeys] = exprCollation((Node *) tle->expr);
++			numUniqkeys++;
++		}
++	}
++
+ 	plan = make_limit(subplan,
+ 					  best_path->limitOffset,
+-					  best_path->limitCount);
++					  best_path->limitCount,
++					  best_path->limitOption,
++					  numUniqkeys, uniqColIdx, uniqOperators, uniqCollations);
+ 
+ 	copy_generic_path_info(&plan->plan, (Path *) best_path);
+ 
+@@ -6672,7 +6704,9 @@ make_lockrows(Plan *lefttree, List *rowMarks, int epqParam)
+  *	  Build a Limit plan node
+  */
+ Limit *
+-make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount)
++make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount,
++		   LimitOption limitOption, int uniqNumCols, AttrNumber *uniqColIdx,
++		   Oid *uniqOperators, Oid *uniqCollations)
+ {
+ 	Limit	   *node = makeNode(Limit);
+ 	Plan	   *plan = &node->plan;
+@@ -6684,6 +6718,11 @@ make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount)
+ 
+ 	node->limitOffset = limitOffset;
+ 	node->limitCount = limitCount;
++	node->limitOption = limitOption;
++	node->uniqNumCols = uniqNumCols;
++	node->uniqColIdx = uniqColIdx;
++	node->uniqOperators = uniqOperators;
++	node->uniqCollations = uniqCollations;
+ 
+ 	return node;
+ }
+diff --git a/src/backend/optimizer/plan/planner.c b/src/backend/optimizer/plan/planner.c
+index a09f5e3866f3..b31c52404a4c 100644
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -2319,6 +2319,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
+ 			path = (Path *) create_limit_path(root, final_rel, path,
+ 											  parse->limitOffset,
+ 											  parse->limitCount,
++											  parse->limitOption,
+ 											  offset_est, count_est);
+ 		}
+ 
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index 4538ed88e090..e991385059fa 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -3602,6 +3602,7 @@ LimitPath *
+ create_limit_path(PlannerInfo *root, RelOptInfo *rel,
+ 				  Path *subpath,
+ 				  Node *limitOffset, Node *limitCount,
++				  LimitOption limitOption,
+ 				  int64 offset_est, int64 count_est)
+ {
+ 	LimitPath  *pathnode = makeNode(LimitPath);
+@@ -3623,6 +3624,7 @@ create_limit_path(PlannerInfo *root, RelOptInfo *rel,
+ 	pathnode->subpath = subpath;
+ 	pathnode->limitOffset = limitOffset;
+ 	pathnode->limitCount = limitCount;
++	pathnode->limitOption = limitOption;
+ 
+ 	/*
+ 	 * Adjust the output rows count and costs according to the offset/limit.
+diff --git a/src/backend/parser/analyze.c b/src/backend/parser/analyze.c
+index 6676412842be..eee9c33637b6 100644
+--- a/src/backend/parser/analyze.c
++++ b/src/backend/parser/analyze.c
+@@ -1281,9 +1281,12 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
+ 
+ 	/* transform LIMIT */
+ 	qry->limitOffset = transformLimitClause(pstate, stmt->limitOffset,
+-											EXPR_KIND_OFFSET, "OFFSET");
++											EXPR_KIND_OFFSET, "OFFSET",
++											stmt->limitOption);
+ 	qry->limitCount = transformLimitClause(pstate, stmt->limitCount,
+-										   EXPR_KIND_LIMIT, "LIMIT");
++										   EXPR_KIND_LIMIT, "LIMIT",
++										   stmt->limitOption);
++	qry->limitOption = stmt->limitOption;
+ 
+ 	/* transform window clauses after we have seen all window functions */
+ 	qry->windowClause = transformWindowDefinitions(pstate,
+@@ -1524,9 +1527,12 @@ transformValuesClause(ParseState *pstate, SelectStmt *stmt)
+ 										  false /* allow SQL92 rules */ );
+ 
+ 	qry->limitOffset = transformLimitClause(pstate, stmt->limitOffset,
+-											EXPR_KIND_OFFSET, "OFFSET");
++											EXPR_KIND_OFFSET, "OFFSET",
++											stmt->limitOption);
+ 	qry->limitCount = transformLimitClause(pstate, stmt->limitCount,
+-										   EXPR_KIND_LIMIT, "LIMIT");
++										   EXPR_KIND_LIMIT, "LIMIT",
++										   stmt->limitOption);
++	qry->limitOption = stmt->limitOption;
+ 
+ 	if (stmt->lockingClause)
+ 		ereport(ERROR,
+@@ -1775,9 +1781,12 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
+ 									exprLocation(list_nth(qry->targetList, tllen)))));
+ 
+ 	qry->limitOffset = transformLimitClause(pstate, limitOffset,
+-											EXPR_KIND_OFFSET, "OFFSET");
++											EXPR_KIND_OFFSET, "OFFSET",
++											stmt->limitOption);
+ 	qry->limitCount = transformLimitClause(pstate, limitCount,
+-										   EXPR_KIND_LIMIT, "LIMIT");
++										   EXPR_KIND_LIMIT, "LIMIT",
++										   stmt->limitOption);
++	qry->limitOption = stmt->limitOption;
+ 
+ 	qry->rtable = pstate->p_rtable;
+ 	qry->jointree = makeFromExpr(pstate->p_joinlist, NULL);
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 3449c26bd118..1219ac8c2649 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -127,6 +127,14 @@ typedef struct ImportQual
+ 	List	   *table_names;
+ } ImportQual;
+ 
++/* Private struct for the result of opt_select_limit production */
++typedef struct SelectLimit
++{
++	Node *limitOffset;
++	Node *limitCount;
++	LimitOption limitOption;
++} SelectLimit;
++
+ /* ConstraintAttributeSpec yields an integer bitmask of these flags: */
+ #define CAS_NOT_DEFERRABLE			0x01
+ #define CAS_DEFERRABLE				0x02
+@@ -164,7 +172,7 @@ static List *makeOrderedSetArgs(List *directargs, List *orderedargs,
+ 								core_yyscan_t yyscanner);
+ static void insertSelectOptions(SelectStmt *stmt,
+ 								List *sortClause, List *lockingClause,
+-								Node *limitOffset, Node *limitCount,
++								SelectLimit *limitClause,
+ 								WithClause *withClause,
+ 								core_yyscan_t yyscanner);
+ static Node *makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg);
+@@ -242,6 +250,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	PartitionSpec		*partspec;
+ 	PartitionBoundSpec	*partboundspec;
+ 	RoleSpec			*rolespec;
++	struct SelectLimit	*selectlimit;
+ }
+ 
+ %type <node>	stmt schema_stmt
+@@ -374,6 +383,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ %type <ival>	import_qualification_type
+ %type <importqual> import_qualification
+ %type <node>	vacuum_relation
++%type <selectlimit> opt_select_limit select_limit limit_clause
+ 
+ %type <list>	stmtblock stmtmulti
+ 				OptTableElementList TableElementList OptInherit definition
+@@ -394,8 +404,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 				target_list opt_target_list insert_column_list set_target_list
+ 				set_clause_list set_clause
+ 				def_list operator_def_list indirection opt_indirection
+-				reloption_list group_clause TriggerFuncArgs select_limit
+-				opt_select_limit opclass_item_list opclass_drop_list
++				reloption_list group_clause TriggerFuncArgs opclass_item_list opclass_drop_list
+ 				opclass_purpose opt_opfamily transaction_mode_list_or_empty
+ 				OptTableFuncElementList TableFuncElementList opt_type_modifiers
+ 				prep_type_clause
+@@ -458,7 +467,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 				comment_type_any_name comment_type_name
+ 				security_label_type_any_name security_label_type_name
+ 
+-%type <node>	fetch_args limit_clause select_limit_value
++%type <node>	fetch_args select_limit_value
+ 				offset_clause select_offset_value
+ 				select_fetch_first_value I_or_F_const
+ %type <ival>	row_or_rows first_or_next
+@@ -11378,14 +11387,14 @@ select_no_parens:
+ 			| select_clause sort_clause
+ 				{
+ 					insertSelectOptions((SelectStmt *) $1, $2, NIL,
+-										NULL, NULL, NULL,
++										NULL, NULL,
+ 										yyscanner);
+ 					$$ = $1;
+ 				}
+ 			| select_clause opt_sort_clause for_locking_clause opt_select_limit
+ 				{
+ 					insertSelectOptions((SelectStmt *) $1, $2, $3,
+-										list_nth($4, 0), list_nth($4, 1),
++										$4,
+ 										NULL,
+ 										yyscanner);
+ 					$$ = $1;
+@@ -11393,7 +11402,7 @@ select_no_parens:
+ 			| select_clause opt_sort_clause select_limit opt_for_locking_clause
+ 				{
+ 					insertSelectOptions((SelectStmt *) $1, $2, $4,
+-										list_nth($3, 0), list_nth($3, 1),
++										$3,
+ 										NULL,
+ 										yyscanner);
+ 					$$ = $1;
+@@ -11401,7 +11410,7 @@ select_no_parens:
+ 			| with_clause select_clause
+ 				{
+ 					insertSelectOptions((SelectStmt *) $2, NULL, NIL,
+-										NULL, NULL,
++										NULL,
+ 										$1,
+ 										yyscanner);
+ 					$$ = $2;
+@@ -11409,7 +11418,7 @@ select_no_parens:
+ 			| with_clause select_clause sort_clause
+ 				{
+ 					insertSelectOptions((SelectStmt *) $2, $3, NIL,
+-										NULL, NULL,
++										NULL,
+ 										$1,
+ 										yyscanner);
+ 					$$ = $2;
+@@ -11417,7 +11426,7 @@ select_no_parens:
+ 			| with_clause select_clause opt_sort_clause for_locking_clause opt_select_limit
+ 				{
+ 					insertSelectOptions((SelectStmt *) $2, $3, $4,
+-										list_nth($5, 0), list_nth($5, 1),
++										$5,
+ 										$1,
+ 										yyscanner);
+ 					$$ = $2;
+@@ -11425,7 +11434,7 @@ select_no_parens:
+ 			| with_clause select_clause opt_sort_clause select_limit opt_for_locking_clause
+ 				{
+ 					insertSelectOptions((SelectStmt *) $2, $3, $5,
+-										list_nth($4, 0), list_nth($4, 1),
++										$4,
+ 										$1,
+ 										yyscanner);
+ 					$$ = $2;
+@@ -11719,20 +11728,44 @@ sortby:		a_expr USING qual_all_Op opt_nulls_order
+ 
+ 
+ select_limit:
+-			limit_clause offset_clause			{ $$ = list_make2($2, $1); }
+-			| offset_clause limit_clause		{ $$ = list_make2($1, $2); }
+-			| limit_clause						{ $$ = list_make2(NULL, $1); }
+-			| offset_clause						{ $$ = list_make2($1, NULL); }
++			limit_clause offset_clause
++				{
++					$$ = $1;
++					($$)->limitOffset = $2;
++				}
++			| offset_clause limit_clause
++				{
++					$$ = $2;
++					($$)->limitOffset = $1;
++				}
++			| limit_clause
++				{
++					$$ = $1;
++				}
++			| offset_clause
++				{
++					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
++					n->limitOffset = $1;
++					n->limitCount = NULL;
++					n->limitOption = LIMIT_OPTION_COUNT;
++					$$ = n;
++				}
+ 		;
+ 
+ opt_select_limit:
+ 			select_limit						{ $$ = $1; }
+-			| /* EMPTY */						{ $$ = list_make2(NULL,NULL); }
++			| /* EMPTY */						{ $$ = NULL; }
+ 		;
+ 
+ limit_clause:
+ 			LIMIT select_limit_value
+-				{ $$ = $2; }
++				{
++					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
++					n->limitOffset = NULL;
++					n->limitCount = $2;
++					n->limitOption = LIMIT_OPTION_COUNT;
++					$$ = n;
++				}
+ 			| LIMIT select_limit_value ',' select_offset_value
+ 				{
+ 					/* Disabled because it was too confusing, bjm 2002-02-18 */
+@@ -11750,9 +11783,29 @@ limit_clause:
+ 			 * we can see the ONLY token in the lookahead slot.
+ 			 */
+ 			| FETCH first_or_next select_fetch_first_value row_or_rows ONLY
+-				{ $$ = $3; }
++				{
++					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
++					n->limitOffset = NULL;
++					n->limitCount = $3;
++					n->limitOption = LIMIT_OPTION_COUNT;
++					$$ = n;
++				}
++			| FETCH first_or_next select_fetch_first_value row_or_rows WITH TIES
++				{
++					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
++					n->limitOffset = NULL;
++					n->limitCount = $3;
++					n->limitOption = LIMIT_OPTION_WITH_TIES;
++					$$ = n;
++				}
+ 			| FETCH first_or_next row_or_rows ONLY
+-				{ $$ = makeIntConst(1, -1); }
++				{
++					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
++					n->limitOffset = NULL;
++					n->limitCount = makeIntConst(1, -1);
++					n->limitOption = LIMIT_OPTION_COUNT;
++					$$ = n;
++				}
+ 		;
+ 
+ offset_clause:
+@@ -16047,7 +16100,7 @@ makeOrderedSetArgs(List *directargs, List *orderedargs,
+ static void
+ insertSelectOptions(SelectStmt *stmt,
+ 					List *sortClause, List *lockingClause,
+-					Node *limitOffset, Node *limitCount,
++					SelectLimit *limitClause,
+ 					WithClause *withClause,
+ 					core_yyscan_t yyscanner)
+ {
+@@ -16068,23 +16121,35 @@ insertSelectOptions(SelectStmt *stmt,
+ 	}
+ 	/* We can handle multiple locking clauses, though */
+ 	stmt->lockingClause = list_concat(stmt->lockingClause, lockingClause);
+-	if (limitOffset)
++	if (limitClause && limitClause->limitOffset)
+ 	{
+ 		if (stmt->limitOffset)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_SYNTAX_ERROR),
+ 					 errmsg("multiple OFFSET clauses not allowed"),
+-					 parser_errposition(exprLocation(limitOffset))));
+-		stmt->limitOffset = limitOffset;
++					 parser_errposition(exprLocation(limitClause->limitOffset))));
++		stmt->limitOffset = limitClause->limitOffset;
+ 	}
+-	if (limitCount)
++	if (limitClause && limitClause->limitCount)
+ 	{
+ 		if (stmt->limitCount)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_SYNTAX_ERROR),
+ 					 errmsg("multiple LIMIT clauses not allowed"),
+-					 parser_errposition(exprLocation(limitCount))));
+-		stmt->limitCount = limitCount;
++					 parser_errposition(exprLocation(limitClause->limitCount))));
++		stmt->limitCount = limitClause->limitCount;
++	}
++	if (limitClause && limitClause->limitOption != LIMIT_OPTION_DEFAULT)
++	{
++		if (stmt->limitOption)
++			ereport(ERROR,
++					(errcode(ERRCODE_SYNTAX_ERROR),
++					 errmsg("multiple limit options not allowed")));
++		if (!stmt->sortClause && limitClause->limitOption == LIMIT_OPTION_WITH_TIES)
++			ereport(ERROR,
++					(errcode(ERRCODE_SYNTAX_ERROR),
++					 errmsg("WITH TIES options can not be specified without ORDER BY clause")));
++		stmt->limitOption = limitClause->limitOption;
+ 	}
+ 	if (withClause)
+ 	{
+diff --git a/src/backend/parser/parse_clause.c b/src/backend/parser/parse_clause.c
+index 36a3efff876d..6fff13479e47 100644
+--- a/src/backend/parser/parse_clause.c
++++ b/src/backend/parser/parse_clause.c
+@@ -1745,7 +1745,8 @@ transformWhereClause(ParseState *pstate, Node *clause,
+  */
+ Node *
+ transformLimitClause(ParseState *pstate, Node *clause,
+-					 ParseExprKind exprKind, const char *constructName)
++					 ParseExprKind exprKind, const char *constructName,
++					 LimitOption limitOption)
+ {
+ 	Node	   *qual;
+ 
+@@ -1759,6 +1760,18 @@ transformLimitClause(ParseState *pstate, Node *clause,
+ 	/* LIMIT can't refer to any variables of the current query */
+ 	checkExprIsVarFree(pstate, qual, constructName);
+ 
++	/*
++	 * Don't allow NULLs in FETCH FIRST .. WITH TIES.  This test is ugly and
++	 * extremely simplistic, in that you can pass a NULL anyway by hiding it
++	 * inside an expression -- but this protects ruleutils against emitting an
++	 * unadorned NULL that's not accepted back by the grammar.
++	 */
++	if (exprKind == EXPR_KIND_LIMIT && limitOption == LIMIT_OPTION_WITH_TIES &&
++		IsA(clause, A_Const) && ((A_Const *) clause)->val.type == T_Null)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE),
++				 errmsg("row count cannot be NULL in FETCH FIRST ... WITH TIES clause")));
++
+ 	return qual;
+ }
+ 
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index f6cf7e72a1e8..695d8c322845 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -5243,7 +5243,10 @@ get_select_query_def(Query *query, deparse_context *context,
+ 						 force_colno, context);
+ 	}
+ 
+-	/* Add the LIMIT clause if given */
++	/*
++	 * Add the LIMIT/OFFSET clauses if given. If non-default options, use the
++	 * standard spelling of LIMIT.
++	 */
+ 	if (query->limitOffset != NULL)
+ 	{
+ 		appendContextKeyword(context, " OFFSET ",
+@@ -5252,13 +5255,23 @@ get_select_query_def(Query *query, deparse_context *context,
+ 	}
+ 	if (query->limitCount != NULL)
+ 	{
+-		appendContextKeyword(context, " LIMIT ",
+-							 -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+-		if (IsA(query->limitCount, Const) &&
+-			((Const *) query->limitCount)->constisnull)
+-			appendStringInfoString(buf, "ALL");
+-		else
++		if (query->limitOption == LIMIT_OPTION_WITH_TIES)
++		{
++			appendContextKeyword(context, " FETCH FIRST ",
++								 -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+ 			get_rule_expr(query->limitCount, context, false);
++			appendStringInfo(buf, " ROWS WITH TIES");
++		}
++		else
++		{
++			appendContextKeyword(context, " LIMIT ",
++								 -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
++			if (IsA(query->limitCount, Const) &&
++				((Const *) query->limitCount)->constisnull)
++				appendStringInfoString(buf, "ALL");
++			else
++				get_rule_expr(query->limitCount, context, false);
++		}
+ 	}
+ 
+ 	/* Add FOR [KEY] UPDATE/SHARE clauses if present */
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index b077c0f0f592..7830c02021a0 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202004071
++#define CATALOG_VERSION_NO	202004072
+ 
+ #endif
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index fb490b404ce5..4c009b1a7c54 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -2449,6 +2449,7 @@ typedef enum
+ 	LIMIT_RESCAN,				/* rescan after recomputing parameters */
+ 	LIMIT_EMPTY,				/* there are no returnable rows */
+ 	LIMIT_INWINDOW,				/* have returned a row in the window */
++	LIMIT_WINDOWEND_TIES,		/* have returned a tied row */
+ 	LIMIT_SUBPLANEOF,			/* at EOF of subplan (within window) */
+ 	LIMIT_WINDOWEND,			/* stepped off end of window */
+ 	LIMIT_WINDOWSTART			/* stepped off beginning of window */
+@@ -2459,12 +2460,16 @@ typedef struct LimitState
+ 	PlanState	ps;				/* its first field is NodeTag */
+ 	ExprState  *limitOffset;	/* OFFSET parameter, or NULL if none */
+ 	ExprState  *limitCount;		/* COUNT parameter, or NULL if none */
++	LimitOption limitOption;	/* limit specification type */
+ 	int64		offset;			/* current OFFSET value */
+ 	int64		count;			/* current COUNT, if any */
+ 	bool		noCount;		/* if true, ignore count */
+ 	LimitStateCond lstate;		/* state machine status, as above */
+ 	int64		position;		/* 1-based index of last tuple returned */
+ 	TupleTableSlot *subSlot;	/* tuple last obtained from subplan */
++	ExprState  *eqfunction;		/* tuple equality qual in case of WITH TIES
++								 * option */
++	TupleTableSlot *last_slot;	/* slot for evaluation of ties */
+ } LimitState;
+ 
+ #endif							/* EXECNODES_H */
+diff --git a/src/include/nodes/nodes.h b/src/include/nodes/nodes.h
+index 50b1ba51863d..381d84b4e4f8 100644
+--- a/src/include/nodes/nodes.h
++++ b/src/include/nodes/nodes.h
+@@ -826,4 +826,17 @@ typedef enum OnConflictAction
+ 	ONCONFLICT_UPDATE			/* ON CONFLICT ... DO UPDATE */
+ } OnConflictAction;
+ 
++/*
++ * LimitOption -
++ *	LIMIT option of query
++ *
++ * This is needed in both parsenodes.h and plannodes.h, so put it here...
++ */
++typedef enum LimitOption
++{
++	LIMIT_OPTION_COUNT,			/* FETCH FIRST... ONLY */
++	LIMIT_OPTION_WITH_TIES,		/* FETCH FIRST... WITH TIES */
++	LIMIT_OPTION_DEFAULT,		/* No limit present */
++} LimitOption;
++
+ #endif							/* NODES_H */
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index cd6f1be64359..518abe42c109 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -159,6 +159,7 @@ typedef struct Query
+ 
+ 	Node	   *limitOffset;	/* # of result tuples to skip (int8 expr) */
+ 	Node	   *limitCount;		/* # of result tuples to return (int8 expr) */
++	LimitOption limitOption;	/* limit type */
+ 
+ 	List	   *rowMarks;		/* a list of RowMarkClause's */
+ 
+@@ -1617,6 +1618,7 @@ typedef struct SelectStmt
+ 	List	   *sortClause;		/* sort clause (a list of SortBy's) */
+ 	Node	   *limitOffset;	/* # of result tuples to skip */
+ 	Node	   *limitCount;		/* # of result tuples to return */
++	LimitOption limitOption;	/* limit type */
+ 	List	   *lockingClause;	/* FOR UPDATE (list of LockingClause's) */
+ 	WithClause *withClause;		/* WITH clause */
+ 
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index a6d206b25a38..d76f88001b28 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -1824,6 +1824,7 @@ typedef struct LimitPath
+ 	Path	   *subpath;		/* path representing input source */
+ 	Node	   *limitOffset;	/* OFFSET parameter, or NULL if none */
+ 	Node	   *limitCount;		/* COUNT parameter, or NULL if none */
++	LimitOption limitOption;	/* FETCH FIRST with ties or exact number */
+ } LimitPath;
+ 
+ 
+diff --git a/src/include/nodes/plannodes.h b/src/include/nodes/plannodes.h
+index be8ef54a1e4a..55f363f70c5c 100644
+--- a/src/include/nodes/plannodes.h
++++ b/src/include/nodes/plannodes.h
+@@ -982,6 +982,11 @@ typedef struct Limit
+ 	Plan		plan;
+ 	Node	   *limitOffset;	/* OFFSET parameter, or NULL if none */
+ 	Node	   *limitCount;		/* COUNT parameter, or NULL if none */
++	LimitOption limitOption;	/* limit type */
++	int			uniqNumCols;	/* number of columns to check for similarity  */
++	AttrNumber *uniqColIdx;		/* their indexes in the target list */
++	Oid		   *uniqOperators;	/* equality operators to compare with */
++	Oid		   *uniqCollations; /* collations for equality comparisons */
+ } Limit;
+ 
+ 
+diff --git a/src/include/optimizer/pathnode.h b/src/include/optimizer/pathnode.h
+index bcd08af753ea..715a24ad29a7 100644
+--- a/src/include/optimizer/pathnode.h
++++ b/src/include/optimizer/pathnode.h
+@@ -268,6 +268,7 @@ extern ModifyTablePath *create_modifytable_path(PlannerInfo *root,
+ extern LimitPath *create_limit_path(PlannerInfo *root, RelOptInfo *rel,
+ 									Path *subpath,
+ 									Node *limitOffset, Node *limitCount,
++									LimitOption limitOption,
+ 									int64 offset_est, int64 count_est);
+ extern void adjust_limit_rows_costs(double *rows,
+ 									Cost *startup_cost, Cost *total_cost,
+diff --git a/src/include/optimizer/planmain.h b/src/include/optimizer/planmain.h
+index 47812010015e..f3cefe67b8d3 100644
+--- a/src/include/optimizer/planmain.h
++++ b/src/include/optimizer/planmain.h
+@@ -56,7 +56,10 @@ extern Agg *make_agg(List *tlist, List *qual,
+ 					 int numGroupCols, AttrNumber *grpColIdx, Oid *grpOperators, Oid *grpCollations,
+ 					 List *groupingSets, List *chain, double dNumGroups,
+ 					 Size transitionSpace, Plan *lefttree);
+-extern Limit *make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount);
++extern Limit *make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount,
++						 LimitOption limitOption, int uniqNumCols,
++						 AttrNumber *uniqColIdx, Oid *uniqOperators,
++						 Oid *uniqCollations);
+ 
+ /*
+  * prototypes for plan/initsplan.c
+diff --git a/src/include/parser/parse_clause.h b/src/include/parser/parse_clause.h
+index d65ea3c3be26..75a4fcfa598b 100644
+--- a/src/include/parser/parse_clause.h
++++ b/src/include/parser/parse_clause.h
+@@ -23,7 +23,8 @@ extern int	setTargetTable(ParseState *pstate, RangeVar *relation,
+ extern Node *transformWhereClause(ParseState *pstate, Node *clause,
+ 								  ParseExprKind exprKind, const char *constructName);
+ extern Node *transformLimitClause(ParseState *pstate, Node *clause,
+-								  ParseExprKind exprKind, const char *constructName);
++								  ParseExprKind exprKind, const char *constructName,
++								  LimitOption limitOption);
+ extern List *transformGroupClause(ParseState *pstate, List *grouplist,
+ 								  List **groupingSets,
+ 								  List **targetlist, List *sortClause,
+diff --git a/src/test/regress/expected/limit.out b/src/test/regress/expected/limit.out
+index c18f547cbd31..a4e175855c39 100644
+--- a/src/test/regress/expected/limit.out
++++ b/src/test/regress/expected/limit.out
+@@ -286,6 +286,58 @@ fetch all in c4;
+ ----+----
+ (0 rows)
+ 
++declare c5 cursor for select * from int8_tbl order by q1 fetch first 2 rows with ties;
++fetch all in c5;
++ q1  |        q2        
++-----+------------------
++ 123 |              456
++ 123 | 4567890123456789
++(2 rows)
++
++fetch 1 in c5;
++ q1 | q2 
++----+----
++(0 rows)
++
++fetch backward 1 in c5;
++ q1  |        q2        
++-----+------------------
++ 123 | 4567890123456789
++(1 row)
++
++fetch backward 1 in c5;
++ q1  | q2  
++-----+-----
++ 123 | 456
++(1 row)
++
++fetch all in c5;
++ q1  |        q2        
++-----+------------------
++ 123 | 4567890123456789
++(1 row)
++
++fetch backward all in c5;
++ q1  |        q2        
++-----+------------------
++ 123 | 4567890123456789
++ 123 |              456
++(2 rows)
++
++fetch all in c5;
++ q1  |        q2        
++-----+------------------
++ 123 |              456
++ 123 | 4567890123456789
++(2 rows)
++
++fetch backward all in c5;
++ q1  |        q2        
++-----+------------------
++ 123 | 4567890123456789
++ 123 |              456
++(2 rows)
++
+ rollback;
+ -- Stress test for variable LIMIT in conjunction with bounded-heap sorting
+ SELECT
+@@ -503,3 +555,118 @@ select sum(tenthous) as s1, sum(tenthous) + random()*0 as s2
+  45020 | 45020
+ (3 rows)
+ 
++--
++-- FETCH FIRST
++-- Check the WITH TIES clause
++--
++SELECT  thousand
++		FROM onek WHERE thousand < 5
++		ORDER BY thousand FETCH FIRST 2 ROW WITH TIES;
++ thousand 
++----------
++        0
++        0
++        0
++        0
++        0
++        0
++        0
++        0
++        0
++        0
++(10 rows)
++
++SELECT  thousand
++		FROM onek WHERE thousand < 5
++		ORDER BY thousand FETCH FIRST 1 ROW WITH TIES;
++ thousand 
++----------
++        0
++        0
++        0
++        0
++        0
++        0
++        0
++        0
++        0
++        0
++(10 rows)
++
++SELECT  thousand
++		FROM onek WHERE thousand < 5
++		ORDER BY thousand FETCH FIRST 2 ROW ONLY;
++ thousand 
++----------
++        0
++        0
++(2 rows)
++
++-- should fail
++SELECT ''::text AS two, unique1, unique2, stringu1
++		FROM onek WHERE unique1 > 50
++		FETCH FIRST 2 ROW WITH TIES;
++ERROR:  WITH TIES options can not be specified without ORDER BY clause
++-- test ruleutils
++CREATE VIEW limit_thousand_v_1 AS SELECT thousand FROM onek WHERE thousand < 995
++		ORDER BY thousand FETCH FIRST 5 ROWS WITH TIES OFFSET 10;
++\d+ limit_thousand_v_1
++                      View "public.limit_thousand_v_1"
++  Column  |  Type   | Collation | Nullable | Default | Storage | Description 
++----------+---------+-----------+----------+---------+---------+-------------
++ thousand | integer |           |          |         | plain   | 
++View definition:
++ SELECT onek.thousand
++   FROM onek
++  WHERE onek.thousand < 995
++  ORDER BY onek.thousand
++ OFFSET 10
++ FETCH FIRST 5 ROWS WITH TIES;
++
++CREATE VIEW limit_thousand_v_2 AS SELECT thousand FROM onek WHERE thousand < 995
++		ORDER BY thousand OFFSET 10 FETCH FIRST 5 ROWS ONLY;
++\d+ limit_thousand_v_2
++                      View "public.limit_thousand_v_2"
++  Column  |  Type   | Collation | Nullable | Default | Storage | Description 
++----------+---------+-----------+----------+---------+---------+-------------
++ thousand | integer |           |          |         | plain   | 
++View definition:
++ SELECT onek.thousand
++   FROM onek
++  WHERE onek.thousand < 995
++  ORDER BY onek.thousand
++ OFFSET 10
++ LIMIT 5;
++
++CREATE VIEW limit_thousand_v_3 AS SELECT thousand FROM onek WHERE thousand < 995
++		ORDER BY thousand FETCH FIRST NULL ROWS WITH TIES;		-- fails
++ERROR:  row count cannot be NULL in FETCH FIRST ... WITH TIES clause
++CREATE VIEW limit_thousand_v_3 AS SELECT thousand FROM onek WHERE thousand < 995
++		ORDER BY thousand FETCH FIRST (NULL+1) ROWS WITH TIES;
++\d+ limit_thousand_v_3
++                      View "public.limit_thousand_v_3"
++  Column  |  Type   | Collation | Nullable | Default | Storage | Description 
++----------+---------+-----------+----------+---------+---------+-------------
++ thousand | integer |           |          |         | plain   | 
++View definition:
++ SELECT onek.thousand
++   FROM onek
++  WHERE onek.thousand < 995
++  ORDER BY onek.thousand
++ FETCH FIRST (NULL::integer + 1) ROWS WITH TIES;
++
++CREATE VIEW limit_thousand_v_4 AS SELECT thousand FROM onek WHERE thousand < 995
++		ORDER BY thousand FETCH FIRST NULL ROWS ONLY;
++\d+ limit_thousand_v_4
++                      View "public.limit_thousand_v_4"
++  Column  |  Type   | Collation | Nullable | Default | Storage | Description 
++----------+---------+-----------+----------+---------+---------+-------------
++ thousand | integer |           |          |         | plain   | 
++View definition:
++ SELECT onek.thousand
++   FROM onek
++  WHERE onek.thousand < 995
++  ORDER BY onek.thousand
++ LIMIT ALL;
++
++-- leave these views
+diff --git a/src/test/regress/sql/limit.sql b/src/test/regress/sql/limit.sql
+index 2a313d80ca82..afce5019b266 100644
+--- a/src/test/regress/sql/limit.sql
++++ b/src/test/regress/sql/limit.sql
+@@ -71,6 +71,16 @@ fetch backward all in c4;
+ fetch backward 1 in c4;
+ fetch all in c4;
+ 
++declare c5 cursor for select * from int8_tbl order by q1 fetch first 2 rows with ties;
++fetch all in c5;
++fetch 1 in c5;
++fetch backward 1 in c5;
++fetch backward 1 in c5;
++fetch all in c5;
++fetch backward all in c5;
++fetch all in c5;
++fetch backward all in c5;
++
+ rollback;
+ 
+ -- Stress test for variable LIMIT in conjunction with bounded-heap sorting
+@@ -141,3 +151,41 @@ select sum(tenthous) as s1, sum(tenthous) + random()*0 as s2
+ 
+ select sum(tenthous) as s1, sum(tenthous) + random()*0 as s2
+   from tenk1 group by thousand order by thousand limit 3;
++
++--
++-- FETCH FIRST
++-- Check the WITH TIES clause
++--
++
++SELECT  thousand
++		FROM onek WHERE thousand < 5
++		ORDER BY thousand FETCH FIRST 2 ROW WITH TIES;
++
++SELECT  thousand
++		FROM onek WHERE thousand < 5
++		ORDER BY thousand FETCH FIRST 1 ROW WITH TIES;
++
++SELECT  thousand
++		FROM onek WHERE thousand < 5
++		ORDER BY thousand FETCH FIRST 2 ROW ONLY;
++-- should fail
++SELECT ''::text AS two, unique1, unique2, stringu1
++		FROM onek WHERE unique1 > 50
++		FETCH FIRST 2 ROW WITH TIES;
++
++-- test ruleutils
++CREATE VIEW limit_thousand_v_1 AS SELECT thousand FROM onek WHERE thousand < 995
++		ORDER BY thousand FETCH FIRST 5 ROWS WITH TIES OFFSET 10;
++\d+ limit_thousand_v_1
++CREATE VIEW limit_thousand_v_2 AS SELECT thousand FROM onek WHERE thousand < 995
++		ORDER BY thousand OFFSET 10 FETCH FIRST 5 ROWS ONLY;
++\d+ limit_thousand_v_2
++CREATE VIEW limit_thousand_v_3 AS SELECT thousand FROM onek WHERE thousand < 995
++		ORDER BY thousand FETCH FIRST NULL ROWS WITH TIES;		-- fails
++CREATE VIEW limit_thousand_v_3 AS SELECT thousand FROM onek WHERE thousand < 995
++		ORDER BY thousand FETCH FIRST (NULL+1) ROWS WITH TIES;
++\d+ limit_thousand_v_3
++CREATE VIEW limit_thousand_v_4 AS SELECT thousand FROM onek WHERE thousand < 995
++		ORDER BY thousand FETCH FIRST NULL ROWS ONLY;
++\d+ limit_thousand_v_4
++-- leave these views

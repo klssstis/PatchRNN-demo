@@ -1,0 +1,136 @@
+From 215824f9188a2b19f870e6a707c5a81e1ac3f1fc Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sun, 26 Jan 2020 14:31:08 -0500
+Subject: [PATCH] In postgres_fdw, don't try to ship MULTIEXPR updates to
+ remote server.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In a statement like "UPDATE remote_tab SET (x,y) = (SELECT ...)",
+we'd conclude that the statement could be directly executed remotely,
+because the sub-SELECT is in a resjunk tlist item that's not examined
+for shippability.  Currently that ends up crashing if the sub-SELECT
+contains any remote Vars.  Prevent the crash by deeming MULTIEXEC
+Params to be unshippable.
+
+This is a bit of a brute-force solution, since if the sub-SELECT
+*doesn't* contain any remote Vars, the current execution technology
+would work; but that's not a terribly common use-case for this syntax,
+I think.  In any case, we generally don't try to ship sub-SELECTs, so
+it won't surprise anybody that this doesn't end up as a remote direct
+update.  I'd be inclined to see if that general limitation can be fixed
+before worrying about this case further.
+
+Per report from Lukáš Sobotka.
+
+Back-patch to 9.6.  9.5 had MULTIEXPR, but we didn't try to perform
+remote direct updates then, so the case didn't arise anyway.
+
+Discussion: https://postgr.es/m/CAJif3k+iA_ekBB5Zw2hDBaE1wtiQa4LH4_JUXrrMGwTrH0J01Q@mail.gmail.com
+---
+ contrib/postgres_fdw/deparse.c                | 16 ++++++++++
+ .../postgres_fdw/expected/postgres_fdw.out    | 31 +++++++++++++++++++
+ contrib/postgres_fdw/sql/postgres_fdw.sql     | 20 ++++++++++++
+ 3 files changed, 67 insertions(+)
+
+diff --git a/contrib/postgres_fdw/deparse.c b/contrib/postgres_fdw/deparse.c
+index a3639e960428..ad37a7422133 100644
+--- a/contrib/postgres_fdw/deparse.c
++++ b/contrib/postgres_fdw/deparse.c
+@@ -390,6 +390,22 @@ foreign_expr_walker(Node *node,
+ 			{
+ 				Param	   *p = (Param *) node;
+ 
++				/*
++				 * If it's a MULTIEXPR Param, punt.  We can't tell from here
++				 * whether the referenced sublink/subplan contains any remote
++				 * Vars; if it does, handling that is too complicated to
++				 * consider supporting at present.  Fortunately, MULTIEXPR
++				 * Params are not reduced to plain PARAM_EXEC until the end of
++				 * planning, so we can easily detect this case.  (Normal
++				 * PARAM_EXEC Params are safe to ship because their values
++				 * come from somewhere else in the plan tree; but a MULTIEXPR
++				 * references a sub-select elsewhere in the same targetlist,
++				 * so we'd be on the hook to evaluate it somehow if we wanted
++				 * to handle such cases as direct foreign updates.)
++				 */
++				if (p->paramkind == PARAM_MULTIEXPR)
++					return false;
++
+ 				/*
+ 				 * Collation rule is same as for Consts and non-foreign Vars.
+ 				 */
+diff --git a/contrib/postgres_fdw/expected/postgres_fdw.out b/contrib/postgres_fdw/expected/postgres_fdw.out
+index 84fd3ad2e0c0..ebe7bfde2351 100644
+--- a/contrib/postgres_fdw/expected/postgres_fdw.out
++++ b/contrib/postgres_fdw/expected/postgres_fdw.out
+@@ -5449,6 +5449,37 @@ DELETE FROM ft2
+ (10 rows)
+ 
+ DELETE FROM ft2 WHERE ft2.c1 > 1200;
++-- Test UPDATE with a MULTIEXPR sub-select
++-- (maybe someday this'll be remotely executable, but not today)
++EXPLAIN (verbose, costs off)
++UPDATE ft2 AS target SET (c2, c7) = (
++    SELECT c2 * 10, c7
++        FROM ft2 AS src
++        WHERE target.c1 = src.c1
++) WHERE c1 > 1100;
++                                                                    QUERY PLAN                                                                     
++---------------------------------------------------------------------------------------------------------------------------------------------------
++ Update on public.ft2 target
++   Remote SQL: UPDATE "S 1"."T 1" SET c2 = $2, c7 = $3 WHERE ctid = $1
++   ->  Foreign Scan on public.ft2 target
++         Output: target.c1, $1, NULL::integer, target.c3, target.c4, target.c5, target.c6, $2, target.c8, (SubPlan 1 (returns $1,$2)), target.ctid
++         Remote SQL: SELECT "C 1", c3, c4, c5, c6, c8, ctid FROM "S 1"."T 1" WHERE (("C 1" > 1100)) FOR UPDATE
++         SubPlan 1 (returns $1,$2)
++           ->  Foreign Scan on public.ft2 src
++                 Output: (src.c2 * 10), src.c7
++                 Remote SQL: SELECT c2, c7 FROM "S 1"."T 1" WHERE (($1::integer = "C 1"))
++(9 rows)
++
++UPDATE ft2 AS target SET (c2, c7) = (
++    SELECT c2 * 10, c7
++        FROM ft2 AS src
++        WHERE target.c1 = src.c1
++) WHERE c1 > 1100;
++UPDATE ft2 AS target SET (c2) = (
++    SELECT c2 / 10
++        FROM ft2 AS src
++        WHERE target.c1 = src.c1
++) WHERE c1 > 1100;
+ -- Test UPDATE/DELETE with WHERE or JOIN/ON conditions containing
+ -- user-defined operators/functions
+ ALTER SERVER loopback OPTIONS (DROP extensions);
+diff --git a/contrib/postgres_fdw/sql/postgres_fdw.sql b/contrib/postgres_fdw/sql/postgres_fdw.sql
+index acd7275c7294..83971665e351 100644
+--- a/contrib/postgres_fdw/sql/postgres_fdw.sql
++++ b/contrib/postgres_fdw/sql/postgres_fdw.sql
+@@ -1191,6 +1191,26 @@ DELETE FROM ft2
+   RETURNING 100;
+ DELETE FROM ft2 WHERE ft2.c1 > 1200;
+ 
++-- Test UPDATE with a MULTIEXPR sub-select
++-- (maybe someday this'll be remotely executable, but not today)
++EXPLAIN (verbose, costs off)
++UPDATE ft2 AS target SET (c2, c7) = (
++    SELECT c2 * 10, c7
++        FROM ft2 AS src
++        WHERE target.c1 = src.c1
++) WHERE c1 > 1100;
++UPDATE ft2 AS target SET (c2, c7) = (
++    SELECT c2 * 10, c7
++        FROM ft2 AS src
++        WHERE target.c1 = src.c1
++) WHERE c1 > 1100;
++
++UPDATE ft2 AS target SET (c2) = (
++    SELECT c2 / 10
++        FROM ft2 AS src
++        WHERE target.c1 = src.c1
++) WHERE c1 > 1100;
++
+ -- Test UPDATE/DELETE with WHERE or JOIN/ON conditions containing
+ -- user-defined operators/functions
+ ALTER SERVER loopback OPTIONS (DROP extensions);

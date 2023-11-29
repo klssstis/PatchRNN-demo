@@ -1,0 +1,355 @@
+From 511540dadf1166d80b864f63979178f324844060 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 10 Apr 2017 10:26:54 -0400
+Subject: [PATCH] Move isolationtester's is-blocked query into C code for
+ speed.
+
+Commit 4deb41381 modified isolationtester's query to see whether a
+session is blocked to also check for waits occurring in GetSafeSnapshot.
+However, it did that in a way that enormously increased the query's
+runtime under CLOBBER_CACHE_ALWAYS, causing the buildfarm members
+that use that to run about four times slower than before, and in some
+cases fail entirely.  To fix, push the entire logic into a dedicated
+backend function.  This should actually reduce the CLOBBER_CACHE_ALWAYS
+runtime from what it was previously, though I've not checked that.
+
+In passing, expose a SQL function to check for safe-snapshot blockage,
+comparable to pg_blocking_pids.  This is more or less free given the
+infrastructure built to solve the other problem, so we might as well.
+
+Thomas Munro
+
+Discussion: https://postgr.es/m/20170407165749.pstcakbc637opkax@alap3.anarazel.de
+---
+ doc/src/sgml/func.sgml                    |  27 ++++-
+ src/backend/storage/lmgr/predicate.c      |  50 +++++++++
+ src/backend/utils/adt/lockfuncs.c         | 119 ++++++++++++++++++++++
+ src/include/catalog/catversion.h          |   2 +-
+ src/include/catalog/pg_proc.h             |   6 +-
+ src/include/storage/predicate_internals.h |   2 +
+ src/test/isolation/.gitignore             |   1 +
+ src/test/isolation/isolationtester.c      |  12 +--
+ 8 files changed, 206 insertions(+), 13 deletions(-)
+
+diff --git a/doc/src/sgml/func.sgml b/doc/src/sgml/func.sgml
+index cb0a36a170f7..6d7c7b8e0d03 100644
+--- a/doc/src/sgml/func.sgml
++++ b/doc/src/sgml/func.sgml
+@@ -15747,7 +15747,7 @@ SELECT * FROM pg_ls_dir('.') WITH ORDINALITY AS t(ls,n);
+       <row>
+        <entry><literal><function>pg_blocking_pids(<type>int</type>)</function></literal></entry>
+        <entry><type>int[]</type></entry>
+-       <entry>Process ID(s) that are blocking specified server process ID</entry>
++       <entry>Process ID(s) that are blocking specified server process ID from acquiring a lock</entry>
+       </row>
+ 
+       <row>
+@@ -15793,6 +15793,12 @@ SELECT * FROM pg_ls_dir('.') WITH ORDINALITY AS t(ls,n);
+        <entry>server start time</entry>
+       </row>
+ 
++      <row>
++       <entry><literal><function>pg_safe_snapshot_blocking_pids(<type>int</type>)</function></literal></entry>
++       <entry><type>int[]</type></entry>
++       <entry>Process ID(s) that are blocking specified server process ID from acquiring a safe snapshot</entry>
++      </row>
++
+       <row>
+        <entry><literal><function>pg_trigger_depth()</function></literal></entry>
+        <entry><type>int</type></entry>
+@@ -16067,6 +16073,25 @@ SET search_path TO <replaceable>schema</> <optional>, <replaceable>schema</>, ..
+     server started.
+    </para>
+ 
++   <indexterm>
++    <primary>pg_safe_snapshot_blocking_pids</primary>
++   </indexterm>
++
++   <para>
++    <function>pg_safe_snapshot_blocking_pids</function> returns an array of
++    the process IDs of the sessions that are blocking the server process with
++    the specified process ID from acquiring a safe snapshot, or an empty array
++    if there is no such server process or it is not blocked.  A session
++    running a <literal>SERIALIZABLE</literal> transaction blocks
++    a <literal>SERIALIZABLE READ ONLY DEFERRABLE</literal> transaction from
++    acquiring a snapshot until the latter determines that it is safe to avoid
++    taking any predicate locks.  See <xref linkend="xact-serializable"> for
++    more information about serializable and deferrable transactions.  Frequent
++    calls to this function could have some impact on database performance,
++    because it needs access to the predicate lock manager's shared
++    state for a short time.
++   </para>
++   
+    <indexterm>
+     <primary>version</primary>
+    </indexterm>
+diff --git a/src/backend/storage/lmgr/predicate.c b/src/backend/storage/lmgr/predicate.c
+index 10bac71e94b4..a3f0b8aba5c4 100644
+--- a/src/backend/storage/lmgr/predicate.c
++++ b/src/backend/storage/lmgr/predicate.c
+@@ -1555,6 +1555,56 @@ GetSafeSnapshot(Snapshot origSnapshot)
+ 	return snapshot;
+ }
+ 
++/*
++ * GetSafeSnapshotBlockingPids
++ *		If the specified process is currently blocked in GetSafeSnapshot,
++ *		write the process IDs of all processes that it is blocked by
++ *		into the caller-supplied buffer output[].  The list is truncated at
++ *		output_size, and the number of PIDs written into the buffer is
++ *		returned.  Returns zero if the given PID is not currently blocked
++ *		in GetSafeSnapshot.
++ */
++int
++GetSafeSnapshotBlockingPids(int blocked_pid, int *output, int output_size)
++{
++	int			num_written = 0;
++	SERIALIZABLEXACT *sxact;
++
++	LWLockAcquire(SerializableXactHashLock, LW_SHARED);
++
++	/* Find blocked_pid's SERIALIZABLEXACT by linear search. */
++	for (sxact = FirstPredXact(); sxact != NULL; sxact = NextPredXact(sxact))
++	{
++		if (sxact->pid == blocked_pid)
++			break;
++	}
++
++	/* Did we find it, and is it currently waiting in GetSafeSnapshot? */
++	if (sxact != NULL && SxactIsDeferrableWaiting(sxact))
++	{
++		RWConflict	possibleUnsafeConflict;
++
++		/* Traverse the list of possible unsafe conflicts collecting PIDs. */
++		possibleUnsafeConflict = (RWConflict)
++			SHMQueueNext(&sxact->possibleUnsafeConflicts,
++						 &sxact->possibleUnsafeConflicts,
++						 offsetof(RWConflictData, inLink));
++
++		while (possibleUnsafeConflict != NULL && num_written < output_size)
++		{
++			output[num_written++] = possibleUnsafeConflict->sxactOut->pid;
++			possibleUnsafeConflict = (RWConflict)
++				SHMQueueNext(&sxact->possibleUnsafeConflicts,
++							 &possibleUnsafeConflict->inLink,
++							 offsetof(RWConflictData, inLink));
++		}
++	}
++
++	LWLockRelease(SerializableXactHashLock);
++
++	return num_written;
++}
++
+ /*
+  * Acquire a snapshot that can be used for the current transaction.
+  *
+diff --git a/src/backend/utils/adt/lockfuncs.c b/src/backend/utils/adt/lockfuncs.c
+index 63f956e6708e..ef4824f79cc1 100644
+--- a/src/backend/utils/adt/lockfuncs.c
++++ b/src/backend/utils/adt/lockfuncs.c
+@@ -517,6 +517,125 @@ pg_blocking_pids(PG_FUNCTION_ARGS)
+ }
+ 
+ 
++/*
++ * pg_safe_snapshot_blocking_pids - produce an array of the PIDs blocking
++ * given PID from getting a safe snapshot
++ *
++ * XXX this does not consider parallel-query cases; not clear how big a
++ * problem that is in practice
++ */
++Datum
++pg_safe_snapshot_blocking_pids(PG_FUNCTION_ARGS)
++{
++	int			blocked_pid = PG_GETARG_INT32(0);
++	int		   *blockers;
++	int			num_blockers;
++	Datum	   *blocker_datums;
++
++	/* A buffer big enough for any possible blocker list without truncation */
++	blockers = (int *) palloc(MaxBackends * sizeof(int));
++
++	/* Collect a snapshot of processes waited for by GetSafeSnapshot */
++	num_blockers =
++		GetSafeSnapshotBlockingPids(blocked_pid, blockers, MaxBackends);
++
++	/* Convert int array to Datum array */
++	if (num_blockers > 0)
++	{
++		int			i;
++
++		blocker_datums = (Datum *) palloc(num_blockers * sizeof(Datum));
++		for (i = 0; i < num_blockers; ++i)
++			blocker_datums[i] = Int32GetDatum(blockers[i]);
++	}
++	else
++		blocker_datums = NULL;
++
++	/* Construct array, using hardwired knowledge about int4 type */
++	PG_RETURN_ARRAYTYPE_P(construct_array(blocker_datums, num_blockers,
++										  INT4OID,
++										  sizeof(int32), true, 'i'));
++}
++
++
++/*
++ * pg_isolation_test_session_is_blocked - support function for isolationtester
++ *
++ * Check if specified PID is blocked by any of the PIDs listed in the second
++ * argument.  Currently, this looks for blocking caused by waiting for
++ * heavyweight locks or safe snapshots.  We ignore blockage caused by PIDs
++ * not directly under the isolationtester's control, eg autovacuum.
++ *
++ * This is an undocumented function intended for use by the isolation tester,
++ * and may change in future releases as required for testing purposes.
++ */
++Datum
++pg_isolation_test_session_is_blocked(PG_FUNCTION_ARGS)
++{
++	int			blocked_pid = PG_GETARG_INT32(0);
++	ArrayType  *interesting_pids_a = PG_GETARG_ARRAYTYPE_P(1);
++	ArrayType  *blocking_pids_a;
++	int32	   *interesting_pids;
++	int32	   *blocking_pids;
++	int			num_interesting_pids;
++	int			num_blocking_pids;
++	int			dummy;
++	int			i,
++				j;
++
++	/* Validate the passed-in array */
++	Assert(ARR_ELEMTYPE(interesting_pids_a) == INT4OID);
++	if (array_contains_nulls(interesting_pids_a))
++		elog(ERROR, "array must not contain nulls");
++	interesting_pids = (int32 *) ARR_DATA_PTR(interesting_pids_a);
++	num_interesting_pids = ArrayGetNItems(ARR_NDIM(interesting_pids_a),
++										  ARR_DIMS(interesting_pids_a));
++
++	/*
++	 * Get the PIDs of all sessions blocking the given session's attempt to
++	 * acquire heavyweight locks.
++	 */
++	blocking_pids_a =
++		DatumGetArrayTypeP(DirectFunctionCall1(pg_blocking_pids, blocked_pid));
++
++	Assert(ARR_ELEMTYPE(blocking_pids_a) == INT4OID);
++	Assert(!array_contains_nulls(blocking_pids_a));
++	blocking_pids = (int32 *) ARR_DATA_PTR(blocking_pids_a);
++	num_blocking_pids = ArrayGetNItems(ARR_NDIM(blocking_pids_a),
++									   ARR_DIMS(blocking_pids_a));
++
++	/*
++	 * Check if any of these are in the list of interesting PIDs, that being
++	 * the sessions that the isolation tester is running.  We don't use
++	 * "arrayoverlaps" here, because it would lead to cache lookups and one of
++	 * our goals is to run quickly under CLOBBER_CACHE_ALWAYS.  We expect
++	 * blocking_pids to be usually empty and otherwise a very small number in
++	 * isolation tester cases, so make that the outer loop of a naive search
++	 * for a match.
++	 */
++	for (i = 0; i < num_blocking_pids; i++)
++		for (j = 0; j < num_interesting_pids; j++)
++		{
++			if (blocking_pids[i] == interesting_pids[j])
++				PG_RETURN_BOOL(true);
++		}
++
++	/*
++	 * Check if blocked_pid is waiting for a safe snapshot.  We could in
++	 * theory check the resulting array of blocker PIDs against the
++	 * interesting PIDs whitelist, but since there is no danger of autovacuum
++	 * blocking GetSafeSnapshot there seems to be no point in expending cycles
++	 * on allocating a buffer and searching for overlap; so it's presently
++	 * sufficient for the isolation tester's purposes to use a single element
++	 * buffer and check if the number of safe snapshot blockers is non-zero.
++	 */
++	if (GetSafeSnapshotBlockingPids(blocked_pid, &dummy, 1) > 0)
++		PG_RETURN_BOOL(true);
++
++	PG_RETURN_BOOL(false);
++}
++
++
+ /*
+  * Functions for manipulating advisory locks
+  *
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 0f118dfffbb5..43e09ec17987 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	201704062
++#define CATALOG_VERSION_NO	201704101
+ 
+ #endif
+diff --git a/src/include/catalog/pg_proc.h b/src/include/catalog/pg_proc.h
+index 643838bb054c..82562add43a3 100644
+--- a/src/include/catalog/pg_proc.h
++++ b/src/include/catalog/pg_proc.h
+@@ -3139,7 +3139,11 @@ DESCR("show pg_hba.conf rules");
+ DATA(insert OID = 1371 (  pg_lock_status   PGNSP PGUID 12 1 1000 0 0 f f f f t t v s 0 0 2249 "" "{25,26,26,23,21,25,28,26,26,21,25,23,25,16,16}" "{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}" "{locktype,database,relation,page,tuple,virtualxid,transactionid,classid,objid,objsubid,virtualtransaction,pid,mode,granted,fastpath}" _null_ _null_ pg_lock_status _null_ _null_ _null_ ));
+ DESCR("view system lock information");
+ DATA(insert OID = 2561 (  pg_blocking_pids PGNSP PGUID 12 1 0 0 0 f f f f t f v s 1 0 1007 "23" _null_ _null_ _null_ _null_ _null_ pg_blocking_pids _null_ _null_ _null_ ));
+-DESCR("get array of PIDs of sessions blocking specified backend PID");
++DESCR("get array of PIDs of sessions blocking specified backend PID from acquiring a heavyweight lock");
++DATA(insert OID = 3376 (  pg_safe_snapshot_blocking_pids PGNSP PGUID 12 1 0 0 0 f f f f t f v s 1 0 1007 "23" _null_ _null_ _null_ _null_ _null_ pg_safe_snapshot_blocking_pids _null_ _null_ _null_ ));
++DESCR("get array of PIDs of sessions blocking specified backend PID from acquiring a safe snapshot");
++DATA(insert OID = 3378 (  pg_isolation_test_session_is_blocked PGNSP PGUID 12 1 0 0 0 f f f f t f v s 2 0 16 "23 1007" _null_ _null_ _null_ _null_ _null_ pg_isolation_test_session_is_blocked _null_ _null_ _null_ ));
++DESCR("isolationtester support function");
+ DATA(insert OID = 1065 (  pg_prepared_xact PGNSP PGUID 12 1 1000 0 0 f f f f t t v s 0 0 2249 "" "{28,25,1184,26,26}" "{o,o,o,o,o}" "{transaction,gid,prepared,ownerid,dbid}" _null_ _null_ pg_prepared_xact _null_ _null_ _null_ ));
+ DESCR("view two-phase transactions");
+ DATA(insert OID = 3819 (  pg_get_multixact_members PGNSP PGUID 12 1 1000 0 0 f f f f t t v s 1 0 2249 "28" "{28,28,25}" "{i,o,o}" "{multixid,xid,mode}" _null_ _null_ pg_get_multixact_members _null_ _null_ _null_ ));
+diff --git a/src/include/storage/predicate_internals.h b/src/include/storage/predicate_internals.h
+index 408d94cc7a58..3cb0ab9bb0d3 100644
+--- a/src/include/storage/predicate_internals.h
++++ b/src/include/storage/predicate_internals.h
+@@ -474,5 +474,7 @@ typedef struct TwoPhasePredicateRecord
+  * locking internals.
+  */
+ extern PredicateLockData *GetPredicateLockStatusData(void);
++extern int GetSafeSnapshotBlockingPids(int blocked_pid,
++							int *output, int output_size);
+ 
+ #endif   /* PREDICATE_INTERNALS_H */
+diff --git a/src/test/isolation/.gitignore b/src/test/isolation/.gitignore
+index 44bcf95854c0..870dac4d281b 100644
+--- a/src/test/isolation/.gitignore
++++ b/src/test/isolation/.gitignore
+@@ -7,5 +7,6 @@
+ /specscanner.c
+ 
+ # Generated subdirectories
++/results/
+ /output_iso/
+ /tmp_check_iso/
+diff --git a/src/test/isolation/isolationtester.c b/src/test/isolation/isolationtester.c
+index 4d18710bdfdd..3af5a706ce90 100644
+--- a/src/test/isolation/isolationtester.c
++++ b/src/test/isolation/isolationtester.c
+@@ -224,20 +224,12 @@ main(int argc, char **argv)
+ 	 */
+ 	initPQExpBuffer(&wait_query);
+ 	appendPQExpBufferStr(&wait_query,
+-						 "SELECT pg_catalog.pg_blocking_pids($1) && '{");
++			"SELECT pg_catalog.pg_isolation_test_session_is_blocked($1, '{");
+ 	/* The spec syntax requires at least one session; assume that here. */
+ 	appendPQExpBufferStr(&wait_query, backend_pids[1]);
+ 	for (i = 2; i < nconns; i++)
+ 		appendPQExpBuffer(&wait_query, ",%s", backend_pids[i]);
+-	appendPQExpBufferStr(&wait_query, "}'::integer[]");
+-
+-	/* Also detect certain wait events. */
+-	appendPQExpBufferStr(&wait_query,
+-						 " OR EXISTS ("
+-						 "  SELECT * "
+-						 "  FROM pg_catalog.pg_stat_activity "
+-						 "  WHERE pid = $1 "
+-						 "  AND wait_event IN ('SafeSnapshot'))");
++	appendPQExpBufferStr(&wait_query, "}')");
+ 
+ 	res = PQprepare(conns[0], PREP_WAITING, wait_query.data, 0, NULL);
+ 	if (PQresultStatus(res) != PGRES_COMMAND_OK)

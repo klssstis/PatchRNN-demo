@@ -1,0 +1,125 @@
+From 638300fef541fb9393caa1ee8821a639816301d1 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 25 Feb 2022 17:40:21 -0500
+Subject: [PATCH] Disallow execution of SPI functions during plperl function
+ compilation.
+
+Perl can be convinced to execute user-defined code during compilation
+of a plperl function (or at least a plperlu function).  That's not
+such a big problem as long as the activity is confined within the
+Perl interpreter, and it's not clear we could do anything about that
+anyway.  However, if such code tries to use plperl's SPI functions,
+we have a bigger problem.  In the first place, those functions are
+likely to crash because current_call_data->prodesc isn't set up yet.
+In the second place, because it isn't set up, we lack critical info
+such as whether the function is supposed to be read-only.  And in
+the third place, this path allows code execution during function
+validation, which is strongly discouraged because of the potential
+for security exploits.  Hence, reject execution of the SPI functions
+until compilation is finished.
+
+While here, add check_spi_usage_allowed() calls to various functions
+that hadn't gotten the memo about checking that.  I think that perhaps
+plperl_sv_to_literal may have been intentionally omitted on the grounds
+that it was safe at the time; but if so, the addition of transforms
+functionality changed that.  The others are more recently added and
+seem to be flat-out oversights.
+
+Per report from Mark Murawski.  Back-patch to all supported branches.
+
+Discussion: https://postgr.es/m/9acdf918-7fff-4f40-f750-2ffa84f083d2@intellasoft.net
+---
+ src/pl/plperl/plperl.c | 33 +++++++++++++++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/src/pl/plperl/plperl.c b/src/pl/plperl/plperl.c
+index 81d9c46e00ca..81bb480bc20f 100644
+--- a/src/pl/plperl/plperl.c
++++ b/src/pl/plperl/plperl.c
+@@ -264,6 +264,7 @@ static plperl_proc_desc *compile_plperl_function(Oid fn_oid,
+ 
+ static SV  *plperl_hash_from_tuple(HeapTuple tuple, TupleDesc tupdesc, bool include_generated);
+ static SV  *plperl_hash_from_datum(Datum attr);
++static void check_spi_usage_allowed(void);
+ static SV  *plperl_ref_from_pg_array(Datum arg, Oid typid);
+ static SV  *split_array(plperl_array_info *info, int first, int last, int nest);
+ static SV  *make_array_ref(plperl_array_info *info, int first, int last);
+@@ -1429,13 +1430,15 @@ plperl_sv_to_datum(SV *sv, Oid typid, int32 typmod,
+ char *
+ plperl_sv_to_literal(SV *sv, char *fqtypename)
+ {
+-	Datum		str = CStringGetDatum(fqtypename);
+-	Oid			typid = DirectFunctionCall1(regtypein, str);
++	Oid			typid;
+ 	Oid			typoutput;
+ 	Datum		datum;
+ 	bool		typisvarlena,
+ 				isnull;
+ 
++	check_spi_usage_allowed();
++
++	typid = DirectFunctionCall1(regtypein, CStringGetDatum(fqtypename));
+ 	if (!OidIsValid(typid))
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_UNDEFINED_OBJECT),
+@@ -3097,6 +3100,21 @@ check_spi_usage_allowed(void)
+ 		/* simple croak as we don't want to involve PostgreSQL code */
+ 		croak("SPI functions can not be used in END blocks");
+ 	}
++
++	/*
++	 * Disallow SPI usage if we're not executing a fully-compiled plperl
++	 * function.  It might seem impossible to get here in that case, but there
++	 * are cases where Perl will try to execute code during compilation.  If
++	 * we proceed we are likely to crash trying to dereference the prodesc
++	 * pointer.  Working around that might be possible, but it seems unwise
++	 * because it'd allow code execution to happen while validating a
++	 * function, which is undesirable.
++	 */
++	if (current_call_data == NULL || current_call_data->prodesc == NULL)
++	{
++		/* simple croak as we don't want to involve PostgreSQL code */
++		croak("SPI functions can not be used during function compilation");
++	}
+ }
+ 
+ 
+@@ -3217,6 +3235,8 @@ plperl_return_next(SV *sv)
+ {
+ 	MemoryContext oldcontext = CurrentMemoryContext;
+ 
++	check_spi_usage_allowed();
++
+ 	PG_TRY();
+ 	{
+ 		plperl_return_next_internal(sv);
+@@ -3961,6 +3981,8 @@ plperl_spi_commit(void)
+ {
+ 	MemoryContext oldcontext = CurrentMemoryContext;
+ 
++	check_spi_usage_allowed();
++
+ 	PG_TRY();
+ 	{
+ 		SPI_commit();
+@@ -3986,6 +4008,8 @@ plperl_spi_rollback(void)
+ {
+ 	MemoryContext oldcontext = CurrentMemoryContext;
+ 
++	check_spi_usage_allowed();
++
+ 	PG_TRY();
+ 	{
+ 		SPI_rollback();
+@@ -4023,6 +4047,11 @@ plperl_util_elog(int level, SV *msg)
+ 	MemoryContext oldcontext = CurrentMemoryContext;
+ 	char	   *volatile cmsg = NULL;
+ 
++	/*
++	 * We intentionally omit check_spi_usage_allowed() here, as this seems
++	 * safe to allow even in the contexts that that function rejects.
++	 */
++
+ 	PG_TRY();
+ 	{
+ 		cmsg = sv2cstr(msg);

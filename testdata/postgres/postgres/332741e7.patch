@@ -1,0 +1,830 @@
+From 332741e73980401895e027eb697bb472860036fb Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 14 Dec 2022 16:10:20 -0500
+Subject: [PATCH] Convert the geometric input functions to report errors
+ softly.
+
+Convert box_in, circle_in, line_in, lseg_in, path_in, point_in,
+and poly_in to the new style.
+
+line_in still throws hard errors for overflows/underflows that can occur
+when the input is specified as two points rather than in the canonical
+"Ax + By + C = 0" style.  I'm not too concerned about that: it won't be
+reached in normal dump/restore cases, and it's fairly debatable that
+such conversion should ever have been made part of a type input function
+in the first place.  But in any case, I don't want to extend the soft
+error conventions into float.h without more discussion than this patch
+has had.
+
+Amul Sul, minor mods by me
+
+Discussion: https://postgr.es/m/CAAJ_b97KeDWUdpTKGOaFYPv0OicjOu6EW+QYWj-Ywrgj_aEy1g@mail.gmail.com
+---
+ src/backend/utils/adt/geo_ops.c        | 184 +++++++++++++++----------
+ src/test/regress/expected/box.out      |  25 ++++
+ src/test/regress/expected/geometry.out |  25 ++++
+ src/test/regress/expected/line.out     |  61 ++++++++
+ src/test/regress/expected/lseg.out     |  13 ++
+ src/test/regress/expected/path.out     |  25 ++++
+ src/test/regress/expected/point.out    |  13 ++
+ src/test/regress/expected/polygon.out  |  25 ++++
+ src/test/regress/sql/box.sql           |   6 +
+ src/test/regress/sql/geometry.sql      |   6 +
+ src/test/regress/sql/line.sql          |  12 ++
+ src/test/regress/sql/lseg.sql          |   4 +
+ src/test/regress/sql/path.sql          |   6 +
+ src/test/regress/sql/point.sql         |   4 +
+ src/test/regress/sql/polygon.sql       |   6 +
+ 15 files changed, 344 insertions(+), 71 deletions(-)
+
+diff --git a/src/backend/utils/adt/geo_ops.c b/src/backend/utils/adt/geo_ops.c
+index 721ce6634f85..86da02590638 100644
+--- a/src/backend/utils/adt/geo_ops.c
++++ b/src/backend/utils/adt/geo_ops.c
+@@ -31,6 +31,7 @@
+ 
+ #include "libpq/pqformat.h"
+ #include "miscadmin.h"
++#include "nodes/miscnodes.h"
+ #include "utils/float.h"
+ #include "utils/fmgrprotos.h"
+ #include "utils/geo_decls.h"
+@@ -130,16 +131,19 @@ static bool plist_same(int npts, Point *p1, Point *p2);
+ static float8 dist_ppoly_internal(Point *pt, POLYGON *poly);
+ 
+ /* Routines for encoding and decoding */
+-static float8 single_decode(char *num, char **endptr_p,
+-							const char *type_name, const char *orig_string);
++static bool single_decode(char *num, float8 *x, char **endptr_p,
++						  const char *type_name, const char *orig_string,
++						  Node *escontext);
+ static void single_encode(float8 x, StringInfo str);
+-static void pair_decode(char *str, float8 *x, float8 *y, char **endptr_p,
+-						const char *type_name, const char *orig_string);
++static bool pair_decode(char *str, float8 *x, float8 *y, char **endptr_p,
++						const char *type_name, const char *orig_string,
++						Node *escontext);
+ static void pair_encode(float8 x, float8 y, StringInfo str);
+ static int	pair_count(char *s, char delim);
+-static void path_decode(char *str, bool opentype, int npts, Point *p,
++static bool path_decode(char *str, bool opentype, int npts, Point *p,
+ 						bool *isopen, char **endptr_p,
+-						const char *type_name, const char *orig_string);
++						const char *type_name, const char *orig_string,
++						Node *escontext);
+ static char *path_encode(enum path_delim path_delim, int npts, Point *pt);
+ 
+ 
+@@ -185,11 +189,13 @@ static char *path_encode(enum path_delim path_delim, int npts, Point *pt);
+  *	and restore that order for text output - tgl 97/01/16
+  */
+ 
+-static float8
+-single_decode(char *num, char **endptr_p,
+-			  const char *type_name, const char *orig_string)
++static bool
++single_decode(char *num, float8 *x, char **endptr_p,
++			  const char *type_name, const char *orig_string,
++			  Node *escontext)
+ {
+-	return float8in_internal(num, endptr_p, type_name, orig_string, NULL);
++	*x = float8in_internal(num, endptr_p, type_name, orig_string, escontext);
++	return (!SOFT_ERROR_OCCURRED(escontext));
+ }								/* single_decode() */
+ 
+ static void
+@@ -201,9 +207,10 @@ single_encode(float8 x, StringInfo str)
+ 	pfree(xstr);
+ }								/* single_encode() */
+ 
+-static void
++static bool
+ pair_decode(char *str, float8 *x, float8 *y, char **endptr_p,
+-			const char *type_name, const char *orig_string)
++			const char *type_name, const char *orig_string,
++			Node *escontext)
+ {
+ 	bool		has_delim;
+ 
+@@ -212,23 +219,19 @@ pair_decode(char *str, float8 *x, float8 *y, char **endptr_p,
+ 	if ((has_delim = (*str == LDELIM)))
+ 		str++;
+ 
+-	*x = float8in_internal(str, &str, type_name, orig_string, NULL);
++	if (!single_decode(str, x, &str, type_name, orig_string, escontext))
++		return false;
+ 
+ 	if (*str++ != DELIM)
+-		ereport(ERROR,
+-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+-				 errmsg("invalid input syntax for type %s: \"%s\"",
+-						type_name, orig_string)));
++		goto fail;
+ 
+-	*y = float8in_internal(str, &str, type_name, orig_string, NULL);
++	if (!single_decode(str, y, &str, type_name, orig_string, escontext))
++		return false;
+ 
+ 	if (has_delim)
+ 	{
+ 		if (*str++ != RDELIM)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+-					 errmsg("invalid input syntax for type %s: \"%s\"",
+-							type_name, orig_string)));
++			goto fail;
+ 		while (isspace((unsigned char) *str))
+ 			str++;
+ 	}
+@@ -237,10 +240,14 @@ pair_decode(char *str, float8 *x, float8 *y, char **endptr_p,
+ 	if (endptr_p)
+ 		*endptr_p = str;
+ 	else if (*str != '\0')
+-		ereport(ERROR,
+-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+-				 errmsg("invalid input syntax for type %s: \"%s\"",
+-						type_name, orig_string)));
++		goto fail;
++	return true;
++
++fail:
++	ereturn(escontext, false,
++			(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
++			 errmsg("invalid input syntax for type %s: \"%s\"",
++					type_name, orig_string)));
+ }
+ 
+ static void
+@@ -254,10 +261,11 @@ pair_encode(float8 x, float8 y, StringInfo str)
+ 	pfree(ystr);
+ }
+ 
+-static void
++static bool
+ path_decode(char *str, bool opentype, int npts, Point *p,
+ 			bool *isopen, char **endptr_p,
+-			const char *type_name, const char *orig_string)
++			const char *type_name, const char *orig_string,
++			Node *escontext)
+ {
+ 	int			depth = 0;
+ 	char	   *cp;
+@@ -269,10 +277,7 @@ path_decode(char *str, bool opentype, int npts, Point *p,
+ 	{
+ 		/* no open delimiter allowed? */
+ 		if (!opentype)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+-					 errmsg("invalid input syntax for type %s: \"%s\"",
+-							type_name, orig_string)));
++			goto fail;
+ 		depth++;
+ 		str++;
+ 	}
+@@ -295,7 +300,9 @@ path_decode(char *str, bool opentype, int npts, Point *p,
+ 
+ 	for (i = 0; i < npts; i++)
+ 	{
+-		pair_decode(str, &(p->x), &(p->y), &str, type_name, orig_string);
++		if (!pair_decode(str, &(p->x), &(p->y), &str, type_name, orig_string,
++						 escontext))
++			return false;
+ 		if (*str == DELIM)
+ 			str++;
+ 		p++;
+@@ -311,20 +318,21 @@ path_decode(char *str, bool opentype, int npts, Point *p,
+ 				str++;
+ 		}
+ 		else
+-			ereport(ERROR,
+-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+-					 errmsg("invalid input syntax for type %s: \"%s\"",
+-							type_name, orig_string)));
++			goto fail;
+ 	}
+ 
+ 	/* report stopping point if wanted, else complain if not end of string */
+ 	if (endptr_p)
+ 		*endptr_p = str;
+ 	else if (*str != '\0')
+-		ereport(ERROR,
+-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+-				 errmsg("invalid input syntax for type %s: \"%s\"",
+-						type_name, orig_string)));
++		goto fail;
++	return true;
++
++fail:
++	ereturn(escontext, false,
++			(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
++			 errmsg("invalid input syntax for type %s: \"%s\"",
++					type_name, orig_string)));
+ }								/* path_decode() */
+ 
+ static char *
+@@ -413,12 +421,15 @@ Datum
+ box_in(PG_FUNCTION_ARGS)
+ {
+ 	char	   *str = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	BOX		   *box = (BOX *) palloc(sizeof(BOX));
+ 	bool		isopen;
+ 	float8		x,
+ 				y;
+ 
+-	path_decode(str, false, 2, &(box->high), &isopen, NULL, "box", str);
++	if (!path_decode(str, false, 2, &(box->high), &isopen, NULL, "box", str,
++					 escontext))
++		PG_RETURN_NULL();
+ 
+ 	/* reorder corners if necessary... */
+ 	if (float8_lt(box->high.x, box->low.x))
+@@ -935,29 +946,39 @@ box_diagonal(PG_FUNCTION_ARGS)
+  ***********************************************************************/
+ 
+ static bool
+-line_decode(char *s, const char *str, LINE *line)
++line_decode(char *s, const char *str, LINE *line, Node *escontext)
+ {
+ 	/* s was already advanced over leading '{' */
+-	line->A = single_decode(s, &s, "line", str);
++	if (!single_decode(s, &line->A, &s, "line", str, escontext))
++		return false;
+ 	if (*s++ != DELIM)
++		goto fail;
++	if (!single_decode(s, &line->B, &s, "line", str, escontext))
+ 		return false;
+-	line->B = single_decode(s, &s, "line", str);
+ 	if (*s++ != DELIM)
++		goto fail;
++	if (!single_decode(s, &line->C, &s, "line", str, escontext))
+ 		return false;
+-	line->C = single_decode(s, &s, "line", str);
+ 	if (*s++ != RDELIM_L)
+-		return false;
++		goto fail;
+ 	while (isspace((unsigned char) *s))
+ 		s++;
+ 	if (*s != '\0')
+-		return false;
++		goto fail;
+ 	return true;
++
++fail:
++	ereturn(escontext, false,
++			(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
++			 errmsg("invalid input syntax for type %s: \"%s\"",
++					"line", str)));
+ }
+ 
+ Datum
+ line_in(PG_FUNCTION_ARGS)
+ {
+ 	char	   *str = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	LINE	   *line = (LINE *) palloc(sizeof(LINE));
+ 	LSEG		lseg;
+ 	bool		isopen;
+@@ -968,23 +989,28 @@ line_in(PG_FUNCTION_ARGS)
+ 		s++;
+ 	if (*s == LDELIM_L)
+ 	{
+-		if (!line_decode(s + 1, str, line))
+-			ereport(ERROR,
+-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+-					 errmsg("invalid input syntax for type %s: \"%s\"",
+-							"line", str)));
++		if (!line_decode(s + 1, str, line, escontext))
++			PG_RETURN_NULL();
+ 		if (FPzero(line->A) && FPzero(line->B))
+-			ereport(ERROR,
++			ereturn(escontext, (Datum) 0,
+ 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 					 errmsg("invalid line specification: A and B cannot both be zero")));
+ 	}
+ 	else
+ 	{
+-		path_decode(s, true, 2, &lseg.p[0], &isopen, NULL, "line", str);
++		if (!path_decode(s, true, 2, &lseg.p[0], &isopen, NULL, "line", str,
++						 escontext))
++			PG_RETURN_NULL();
+ 		if (point_eq_point(&lseg.p[0], &lseg.p[1]))
+-			ereport(ERROR,
++			ereturn(escontext, (Datum) 0,
+ 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 					 errmsg("invalid line specification: must be two distinct points")));
++
++		/*
++		 * XXX lseg_sl() and line_construct() can throw overflow/underflow
++		 * errors.  Eventually we should allow those to be soft, but the
++		 * notational pain seems to outweigh the value for now.
++		 */
+ 		line_construct(line, &lseg.p[0], lseg_sl(&lseg));
+ 	}
+ 
+@@ -1375,6 +1401,7 @@ Datum
+ path_in(PG_FUNCTION_ARGS)
+ {
+ 	char	   *str = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	PATH	   *path;
+ 	bool		isopen;
+ 	char	   *s;
+@@ -1384,7 +1411,7 @@ path_in(PG_FUNCTION_ARGS)
+ 	int			depth = 0;
+ 
+ 	if ((npts = pair_count(str, ',')) <= 0)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 				 errmsg("invalid input syntax for type %s: \"%s\"",
+ 						"path", str)));
+@@ -1405,7 +1432,7 @@ path_in(PG_FUNCTION_ARGS)
+ 
+ 	/* Check for integer overflow */
+ 	if (base_size / npts != sizeof(path->p[0]) || size <= base_size)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+ 				 errmsg("too many points requested")));
+ 
+@@ -1414,12 +1441,14 @@ path_in(PG_FUNCTION_ARGS)
+ 	SET_VARSIZE(path, size);
+ 	path->npts = npts;
+ 
+-	path_decode(s, true, npts, &(path->p[0]), &isopen, &s, "path", str);
++	if (!path_decode(s, true, npts, &(path->p[0]), &isopen, &s, "path", str,
++					 escontext))
++		PG_RETURN_NULL();
+ 
+ 	if (depth >= 1)
+ 	{
+ 		if (*s++ != RDELIM)
+-			ereport(ERROR,
++			ereturn(escontext, (Datum) 0,
+ 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 					 errmsg("invalid input syntax for type %s: \"%s\"",
+ 							"path", str)));
+@@ -1427,7 +1456,7 @@ path_in(PG_FUNCTION_ARGS)
+ 			s++;
+ 	}
+ 	if (*s != '\0')
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 				 errmsg("invalid input syntax for type %s: \"%s\"",
+ 						"path", str)));
+@@ -1803,7 +1832,8 @@ point_in(PG_FUNCTION_ARGS)
+ 	char	   *str = PG_GETARG_CSTRING(0);
+ 	Point	   *point = (Point *) palloc(sizeof(Point));
+ 
+-	pair_decode(str, &point->x, &point->y, NULL, "point", str);
++	/* Ignore failure from pair_decode, since our return value won't matter */
++	pair_decode(str, &point->x, &point->y, NULL, "point", str, fcinfo->context);
+ 	PG_RETURN_POINT_P(point);
+ }
+ 
+@@ -2034,10 +2064,14 @@ Datum
+ lseg_in(PG_FUNCTION_ARGS)
+ {
+ 	char	   *str = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	LSEG	   *lseg = (LSEG *) palloc(sizeof(LSEG));
+ 	bool		isopen;
+ 
+-	path_decode(str, true, 2, &lseg->p[0], &isopen, NULL, "lseg", str);
++	if (!path_decode(str, true, 2, &lseg->p[0], &isopen, NULL, "lseg", str,
++					 escontext))
++		PG_RETURN_NULL();
++
+ 	PG_RETURN_LSEG_P(lseg);
+ }
+ 
+@@ -3380,6 +3414,7 @@ Datum
+ poly_in(PG_FUNCTION_ARGS)
+ {
+ 	char	   *str = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	POLYGON    *poly;
+ 	int			npts;
+ 	int			size;
+@@ -3387,7 +3422,7 @@ poly_in(PG_FUNCTION_ARGS)
+ 	bool		isopen;
+ 
+ 	if ((npts = pair_count(str, ',')) <= 0)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 				 errmsg("invalid input syntax for type %s: \"%s\"",
+ 						"polygon", str)));
+@@ -3397,7 +3432,7 @@ poly_in(PG_FUNCTION_ARGS)
+ 
+ 	/* Check for integer overflow */
+ 	if (base_size / npts != sizeof(poly->p[0]) || size <= base_size)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+ 				 errmsg("too many points requested")));
+ 
+@@ -3406,7 +3441,9 @@ poly_in(PG_FUNCTION_ARGS)
+ 	SET_VARSIZE(poly, size);
+ 	poly->npts = npts;
+ 
+-	path_decode(str, false, npts, &(poly->p[0]), &isopen, NULL, "polygon", str);
++	if (!path_decode(str, false, npts, &(poly->p[0]), &isopen, NULL, "polygon",
++					 str, escontext))
++		PG_RETURN_NULL();
+ 
+ 	make_bound_box(poly);
+ 
+@@ -4573,6 +4610,7 @@ Datum
+ circle_in(PG_FUNCTION_ARGS)
+ {
+ 	char	   *str = PG_GETARG_CSTRING(0);
++	Node	   *escontext = fcinfo->context;
+ 	CIRCLE	   *circle = (CIRCLE *) palloc(sizeof(CIRCLE));
+ 	char	   *s,
+ 			   *cp;
+@@ -4594,15 +4632,19 @@ circle_in(PG_FUNCTION_ARGS)
+ 	}
+ 
+ 	/* pair_decode will consume parens around the pair, if any */
+-	pair_decode(s, &circle->center.x, &circle->center.y, &s, "circle", str);
++	if (!pair_decode(s, &circle->center.x, &circle->center.y, &s, "circle", str,
++					 escontext))
++		PG_RETURN_NULL();
+ 
+ 	if (*s == DELIM)
+ 		s++;
+ 
+-	circle->radius = single_decode(s, &s, "circle", str);
++	if (!single_decode(s, &circle->radius, &s, "circle", str, escontext))
++		PG_RETURN_NULL();
++
+ 	/* We have to accept NaN. */
+ 	if (circle->radius < 0.0)
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 				 errmsg("invalid input syntax for type %s: \"%s\"",
+ 						"circle", str)));
+@@ -4617,14 +4659,14 @@ circle_in(PG_FUNCTION_ARGS)
+ 				s++;
+ 		}
+ 		else
+-			ereport(ERROR,
++			ereturn(escontext, (Datum) 0,
+ 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 					 errmsg("invalid input syntax for type %s: \"%s\"",
+ 							"circle", str)));
+ 	}
+ 
+ 	if (*s != '\0')
+-		ereport(ERROR,
++		ereturn(escontext, (Datum) 0,
+ 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ 				 errmsg("invalid input syntax for type %s: \"%s\"",
+ 						"circle", str)));
+diff --git a/src/test/regress/expected/box.out b/src/test/regress/expected/box.out
+index 6bf4d0bdc6d4..0d70194def56 100644
+--- a/src/test/regress/expected/box.out
++++ b/src/test/regress/expected/box.out
+@@ -639,3 +639,28 @@ WHERE seq.id IS NULL OR idx.id IS NULL;
+ RESET enable_seqscan;
+ RESET enable_indexscan;
+ RESET enable_bitmapscan;
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('200', 'box');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('200', 'box');
++          pg_input_error_message          
++------------------------------------------
++ invalid input syntax for type box: "200"
++(1 row)
++
++SELECT pg_input_is_valid('((200,300),(500, xyz))', 'box');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('((200,300),(500, xyz))', 'box');
++                   pg_input_error_message                    
++-------------------------------------------------------------
++ invalid input syntax for type box: "((200,300),(500, xyz))"
++(1 row)
++
+diff --git a/src/test/regress/expected/geometry.out b/src/test/regress/expected/geometry.out
+index b50103b2165e..291cacdf4fb3 100644
+--- a/src/test/regress/expected/geometry.out
++++ b/src/test/regress/expected/geometry.out
+@@ -5295,3 +5295,28 @@ SELECT * FROM polygon_tbl WHERE f1 @> '((1,1),(2,2),(2,1))'::polygon
+  ((2,0),(2,4),(0,0))
+ (1 row)
+ 
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('(1', 'circle');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('1,', 'circle');
++           pg_input_error_message           
++--------------------------------------------
++ invalid input syntax for type circle: "1,"
++(1 row)
++
++SELECT pg_input_is_valid('(1,2),-1', 'circle');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('(1,2),-1', 'circle');
++              pg_input_error_message              
++--------------------------------------------------
++ invalid input syntax for type circle: "(1,2),-1"
++(1 row)
++
+diff --git a/src/test/regress/expected/line.out b/src/test/regress/expected/line.out
+index fe106589c6a4..6baea8fdbdf4 100644
+--- a/src/test/regress/expected/line.out
++++ b/src/test/regress/expected/line.out
+@@ -85,3 +85,64 @@ select '{nan, 1, nan}'::line = '{nan, 1, nan}'::line as true,
+  t    | f
+ (1 row)
+ 
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('{1, 1}', 'line');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('{1, 1}', 'line');
++            pg_input_error_message            
++----------------------------------------------
++ invalid input syntax for type line: "{1, 1}"
++(1 row)
++
++SELECT pg_input_is_valid('{0, 0, 0}', 'line');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('{0, 0, 0}', 'line');
++                 pg_input_error_message                  
++---------------------------------------------------------
++ invalid line specification: A and B cannot both be zero
++(1 row)
++
++SELECT pg_input_is_valid('{1, 1, a}', 'line');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('{1, 1, a}', 'line');
++             pg_input_error_message              
++-------------------------------------------------
++ invalid input syntax for type line: "{1, 1, a}"
++(1 row)
++
++SELECT pg_input_is_valid('{1, 1, 1e400}', 'line');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('{1, 1, 1e400}', 'line');
++              pg_input_error_message               
++---------------------------------------------------
++ "1e400" is out of range for type double precision
++(1 row)
++
++SELECT pg_input_is_valid('(1, 1), (1, 1e400)', 'line');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('(1, 1), (1, 1e400)', 'line');
++              pg_input_error_message               
++---------------------------------------------------
++ "1e400" is out of range for type double precision
++(1 row)
++
+diff --git a/src/test/regress/expected/lseg.out b/src/test/regress/expected/lseg.out
+index 7e878b55779e..afb323fe04cd 100644
+--- a/src/test/regress/expected/lseg.out
++++ b/src/test/regress/expected/lseg.out
+@@ -42,3 +42,16 @@ select * from LSEG_TBL;
+  [(NaN,1),(NaN,90)]
+ (8 rows)
+ 
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('[(1,2),(3)]', 'lseg');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('[(1,2),(3)]', 'lseg');
++              pg_input_error_message               
++---------------------------------------------------
++ invalid input syntax for type lseg: "[(1,2),(3)]"
++(1 row)
++
+diff --git a/src/test/regress/expected/path.out b/src/test/regress/expected/path.out
+index 7ef68d0cd561..529a5e6fc296 100644
+--- a/src/test/regress/expected/path.out
++++ b/src/test/regress/expected/path.out
+@@ -80,3 +80,28 @@ SELECT popen(f1) AS open_path FROM PATH_TBL;
+  [(11,12),(13,14)]
+ (9 rows)
+ 
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('[(1,2),(3)]', 'path');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('[(1,2),(3)]', 'path');
++              pg_input_error_message               
++---------------------------------------------------
++ invalid input syntax for type path: "[(1,2),(3)]"
++(1 row)
++
++SELECT pg_input_is_valid('[(1,2,6),(3,4,6)]', 'path');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('[(1,2,6),(3,4,6)]', 'path');
++                 pg_input_error_message                  
++---------------------------------------------------------
++ invalid input syntax for type path: "[(1,2,6),(3,4,6)]"
++(1 row)
++
+diff --git a/src/test/regress/expected/point.out b/src/test/regress/expected/point.out
+index 3bde8ac7d095..a716ceb881b2 100644
+--- a/src/test/regress/expected/point.out
++++ b/src/test/regress/expected/point.out
+@@ -463,3 +463,16 @@ SELECT COUNT(*) FROM point_gist_tbl WHERE f1 ~= '(0.0000018,0.0000018)'::point;
+ RESET enable_seqscan;
+ RESET enable_indexscan;
+ RESET enable_bitmapscan;
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('1,y', 'point');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('1,y', 'point');
++           pg_input_error_message           
++--------------------------------------------
++ invalid input syntax for type point: "1,y"
++(1 row)
++
+diff --git a/src/test/regress/expected/polygon.out b/src/test/regress/expected/polygon.out
+index 38e433b2ec84..c7d565ad5384 100644
+--- a/src/test/regress/expected/polygon.out
++++ b/src/test/regress/expected/polygon.out
+@@ -306,3 +306,28 @@ WHERE seq.id IS NULL OR idx.id IS NULL;
+ RESET enable_seqscan;
+ RESET enable_indexscan;
+ RESET enable_bitmapscan;
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('(2.0,0.8,0.1)', 'polygon');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('(2.0,0.8,0.1)', 'polygon');
++                 pg_input_error_message                 
++--------------------------------------------------------
++ invalid input syntax for type polygon: "(2.0,0.8,0.1)"
++(1 row)
++
++SELECT pg_input_is_valid('(2.0,xyz)', 'polygon');
++ pg_input_is_valid 
++-------------------
++ f
++(1 row)
++
++SELECT pg_input_error_message('(2.0,xyz)', 'polygon');
++               pg_input_error_message               
++----------------------------------------------------
++ invalid input syntax for type polygon: "(2.0,xyz)"
++(1 row)
++
+diff --git a/src/test/regress/sql/box.sql b/src/test/regress/sql/box.sql
+index ceae58fc02fc..02e100391b47 100644
+--- a/src/test/regress/sql/box.sql
++++ b/src/test/regress/sql/box.sql
+@@ -281,3 +281,9 @@ WHERE seq.id IS NULL OR idx.id IS NULL;
+ RESET enable_seqscan;
+ RESET enable_indexscan;
+ RESET enable_bitmapscan;
++
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('200', 'box');
++SELECT pg_input_error_message('200', 'box');
++SELECT pg_input_is_valid('((200,300),(500, xyz))', 'box');
++SELECT pg_input_error_message('((200,300),(500, xyz))', 'box');
+diff --git a/src/test/regress/sql/geometry.sql b/src/test/regress/sql/geometry.sql
+index 8928d04aa3f5..309234b76c1e 100644
+--- a/src/test/regress/sql/geometry.sql
++++ b/src/test/regress/sql/geometry.sql
+@@ -523,3 +523,9 @@ SELECT * FROM polygon_tbl WHERE f1 @> '((1,1),(2,2),(2,1))'::polygon
+     ORDER BY (poly_center(f1))[0];
+ SELECT * FROM polygon_tbl WHERE f1 @> '((1,1),(2,2),(2,1))'::polygon
+     ORDER BY (poly_center(f1))[0];
++
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('(1', 'circle');
++SELECT pg_input_error_message('1,', 'circle');
++SELECT pg_input_is_valid('(1,2),-1', 'circle');
++SELECT pg_input_error_message('(1,2),-1', 'circle');
+diff --git a/src/test/regress/sql/line.sql b/src/test/regress/sql/line.sql
+index f589ffecc846..f706a41184da 100644
+--- a/src/test/regress/sql/line.sql
++++ b/src/test/regress/sql/line.sql
+@@ -40,3 +40,15 @@ select * from LINE_TBL;
+ 
+ select '{nan, 1, nan}'::line = '{nan, 1, nan}'::line as true,
+ 	   '{nan, 1, nan}'::line = '{nan, 2, nan}'::line as false;
++
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('{1, 1}', 'line');
++SELECT pg_input_error_message('{1, 1}', 'line');
++SELECT pg_input_is_valid('{0, 0, 0}', 'line');
++SELECT pg_input_error_message('{0, 0, 0}', 'line');
++SELECT pg_input_is_valid('{1, 1, a}', 'line');
++SELECT pg_input_error_message('{1, 1, a}', 'line');
++SELECT pg_input_is_valid('{1, 1, 1e400}', 'line');
++SELECT pg_input_error_message('{1, 1, 1e400}', 'line');
++SELECT pg_input_is_valid('(1, 1), (1, 1e400)', 'line');
++SELECT pg_input_error_message('(1, 1), (1, 1e400)', 'line');
+diff --git a/src/test/regress/sql/lseg.sql b/src/test/regress/sql/lseg.sql
+index f266ca3e09e5..0fece162e016 100644
+--- a/src/test/regress/sql/lseg.sql
++++ b/src/test/regress/sql/lseg.sql
+@@ -22,3 +22,7 @@ INSERT INTO LSEG_TBL VALUES ('[(,2),(3,4)]');
+ INSERT INTO LSEG_TBL VALUES ('[(1,2),(3,4)');
+ 
+ select * from LSEG_TBL;
++
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('[(1,2),(3)]', 'lseg');
++SELECT pg_input_error_message('[(1,2),(3)]', 'lseg');
+diff --git a/src/test/regress/sql/path.sql b/src/test/regress/sql/path.sql
+index 89f1aa9a3290..42c90afe53b4 100644
+--- a/src/test/regress/sql/path.sql
++++ b/src/test/regress/sql/path.sql
+@@ -42,3 +42,9 @@ SELECT f1 AS closed_path FROM PATH_TBL WHERE isclosed(f1);
+ SELECT pclose(f1) AS closed_path FROM PATH_TBL;
+ 
+ SELECT popen(f1) AS open_path FROM PATH_TBL;
++
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('[(1,2),(3)]', 'path');
++SELECT pg_input_error_message('[(1,2),(3)]', 'path');
++SELECT pg_input_is_valid('[(1,2,6),(3,4,6)]', 'path');
++SELECT pg_input_error_message('[(1,2,6),(3,4,6)]', 'path');
+diff --git a/src/test/regress/sql/point.sql b/src/test/regress/sql/point.sql
+index 435ff4b9b696..7bd1ebe2b511 100644
+--- a/src/test/regress/sql/point.sql
++++ b/src/test/regress/sql/point.sql
+@@ -96,3 +96,7 @@ SELECT COUNT(*) FROM point_gist_tbl WHERE f1 ~= '(0.0000018,0.0000018)'::point;
+ RESET enable_seqscan;
+ RESET enable_indexscan;
+ RESET enable_bitmapscan;
++
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('1,y', 'point');
++SELECT pg_input_error_message('1,y', 'point');
+diff --git a/src/test/regress/sql/polygon.sql b/src/test/regress/sql/polygon.sql
+index f53b2cb63094..da644e34e309 100644
+--- a/src/test/regress/sql/polygon.sql
++++ b/src/test/regress/sql/polygon.sql
+@@ -140,3 +140,9 @@ WHERE seq.id IS NULL OR idx.id IS NULL;
+ RESET enable_seqscan;
+ RESET enable_indexscan;
+ RESET enable_bitmapscan;
++
++-- test non-error-throwing API for some core types
++SELECT pg_input_is_valid('(2.0,0.8,0.1)', 'polygon');
++SELECT pg_input_error_message('(2.0,0.8,0.1)', 'polygon');
++SELECT pg_input_is_valid('(2.0,xyz)', 'polygon');
++SELECT pg_input_error_message('(2.0,xyz)', 'polygon');

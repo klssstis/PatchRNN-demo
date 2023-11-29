@@ -1,0 +1,359 @@
+From 411137a429210e432f923264a8e313a9872910ca Mon Sep 17 00:00:00 2001
+From: David Rowley <drowley@postgresql.org>
+Date: Wed, 24 Nov 2021 23:29:14 +1300
+Subject: [PATCH] Flush Memoize cache when non-key parameters change, take 2
+
+It's possible that a subplan below a Memoize node contains a parameter
+from above the Memoize node.  If this parameter changes then cache entries
+may become out-dated due to the new parameter value.
+
+Previously Memoize was mistakenly not aware of this.  We fix this here by
+flushing the cache whenever a parameter that's not part of the cache
+key changes.
+
+Bug: #17213
+Reported by: Elvis Pranskevichus
+Author: David Rowley
+Discussion: https://postgr.es/m/17213-988ed34b225a2862@postgresql.org
+Backpatch-through: 14, where Memoize was added
+---
+ src/backend/executor/nodeMemoize.c      | 38 ++++++++++++++++++++++++
+ src/backend/nodes/bitmapset.c           |  2 ++
+ src/backend/nodes/copyfuncs.c           |  1 +
+ src/backend/nodes/outfuncs.c            |  1 +
+ src/backend/nodes/readfuncs.c           |  1 +
+ src/backend/optimizer/plan/createplan.c | 10 +++++--
+ src/backend/optimizer/util/clauses.c    | 31 ++++++++++++++++++++
+ src/include/nodes/execnodes.h           |  2 ++
+ src/include/nodes/plannodes.h           |  1 +
+ src/include/optimizer/clauses.h         |  2 ++
+ src/test/regress/expected/memoize.out   | 39 +++++++++++++++++++++++++
+ src/test/regress/sql/memoize.sql        | 20 +++++++++++++
+ 12 files changed, 145 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/executor/nodeMemoize.c b/src/backend/executor/nodeMemoize.c
+index 683502dd90e1..31e39722239d 100644
+--- a/src/backend/executor/nodeMemoize.c
++++ b/src/backend/executor/nodeMemoize.c
+@@ -367,6 +367,37 @@ remove_cache_entry(MemoizeState *mstate, MemoizeEntry *entry)
+ 	pfree(key);
+ }
+ 
++/*
++ * cache_purge_all
++ *		Remove all items from the cache
++ */
++static void
++cache_purge_all(MemoizeState *mstate)
++{
++	uint64		evictions = mstate->hashtable->members;
++	PlanState *pstate = (PlanState *) mstate;
++
++	/*
++	 * Likely the most efficient way to remove all items is to just reset the
++	 * memory context for the cache and then rebuild a fresh hash table.  This
++	 * saves having to remove each item one by one and pfree each cached tuple
++	 */
++	MemoryContextReset(mstate->tableContext);
++
++	/* Make the hash table the same size as the original size */
++	build_hash_table(mstate, ((Memoize *) pstate->plan)->est_entries);
++
++	/* reset the LRU list */
++	dlist_init(&mstate->lru_list);
++	mstate->last_tuple = NULL;
++	mstate->entry = NULL;
++
++	mstate->mem_used = 0;
++
++	/* XXX should we add something new to track these purges? */
++	mstate->stats.cache_evictions += evictions; /* Update Stats */
++}
++
+ /*
+  * cache_reduce_memory
+  *		Evict older and less recently used items from the cache in order to
+@@ -979,6 +1010,7 @@ ExecInitMemoize(Memoize *node, EState *estate, int eflags)
+ 	 * getting the first tuple.  This allows us to mark it as so.
+ 	 */
+ 	mstate->singlerow = node->singlerow;
++	mstate->keyparamids = node->keyparamids;
+ 
+ 	/*
+ 	 * Record if the cache keys should be compared bit by bit, or logically
+@@ -1082,6 +1114,12 @@ ExecReScanMemoize(MemoizeState *node)
+ 	if (outerPlan->chgParam == NULL)
+ 		ExecReScan(outerPlan);
+ 
++	/*
++	 * Purge the entire cache if a parameter changed that is not part of the
++	 * cache key.
++	 */
++	if (bms_nonempty_difference(outerPlan->chgParam, node->keyparamids))
++		cache_purge_all(node);
+ }
+ 
+ /*
+diff --git a/src/backend/nodes/bitmapset.c b/src/backend/nodes/bitmapset.c
+index 649478b0d4d3..bff70cfb1ab1 100644
+--- a/src/backend/nodes/bitmapset.c
++++ b/src/backend/nodes/bitmapset.c
+@@ -540,6 +540,8 @@ bms_overlap_list(const Bitmapset *a, const List *b)
+ 
+ /*
+  * bms_nonempty_difference - do sets have a nonempty difference?
++ *
++ * i.e., are any members set in 'a' that are not also set in 'b'.
+  */
+ bool
+ bms_nonempty_difference(const Bitmapset *a, const Bitmapset *b)
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index 7d55fd69ab34..297b6ee715f0 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -973,6 +973,7 @@ _copyMemoize(const Memoize *from)
+ 	COPY_SCALAR_FIELD(singlerow);
+ 	COPY_SCALAR_FIELD(binary_mode);
+ 	COPY_SCALAR_FIELD(est_entries);
++	COPY_BITMAPSET_FIELD(keyparamids);
+ 
+ 	return newnode;
+ }
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index be374a0d706c..3600c9fa3648 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -868,6 +868,7 @@ _outMemoize(StringInfo str, const Memoize *node)
+ 	WRITE_BOOL_FIELD(singlerow);
+ 	WRITE_BOOL_FIELD(binary_mode);
+ 	WRITE_UINT_FIELD(est_entries);
++	WRITE_BITMAPSET_FIELD(keyparamids);
+ }
+ 
+ static void
+diff --git a/src/backend/nodes/readfuncs.c b/src/backend/nodes/readfuncs.c
+index a82c53ec0d2f..dcec3b728f2d 100644
+--- a/src/backend/nodes/readfuncs.c
++++ b/src/backend/nodes/readfuncs.c
+@@ -2232,6 +2232,7 @@ _readMemoize(void)
+ 	READ_BOOL_FIELD(singlerow);
+ 	READ_BOOL_FIELD(binary_mode);
+ 	READ_UINT_FIELD(est_entries);
++	READ_BITMAPSET_FIELD(keyparamids);
+ 
+ 	READ_DONE();
+ }
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index 866f19f64c1e..f12660a2606f 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -280,7 +280,7 @@ static Material *make_material(Plan *lefttree);
+ static Memoize *make_memoize(Plan *lefttree, Oid *hashoperators,
+ 							 Oid *collations, List *param_exprs,
+ 							 bool singlerow, bool binary_mode,
+-							 uint32 est_entries);
++							 uint32 est_entries, Bitmapset *keyparamids);
+ static WindowAgg *make_windowagg(List *tlist, Index winref,
+ 								 int partNumCols, AttrNumber *partColIdx, Oid *partOperators, Oid *partCollations,
+ 								 int ordNumCols, AttrNumber *ordColIdx, Oid *ordOperators, Oid *ordCollations,
+@@ -1586,6 +1586,7 @@ static Memoize *
+ create_memoize_plan(PlannerInfo *root, MemoizePath *best_path, int flags)
+ {
+ 	Memoize    *plan;
++	Bitmapset  *keyparamids;
+ 	Plan	   *subplan;
+ 	Oid		   *operators;
+ 	Oid		   *collations;
+@@ -1617,9 +1618,11 @@ create_memoize_plan(PlannerInfo *root, MemoizePath *best_path, int flags)
+ 		i++;
+ 	}
+ 
++	keyparamids = pull_paramids((Expr *) param_exprs);
++
+ 	plan = make_memoize(subplan, operators, collations, param_exprs,
+ 						best_path->singlerow, best_path->binary_mode,
+-						best_path->est_entries);
++						best_path->est_entries, keyparamids);
+ 
+ 	copy_generic_path_info(&plan->plan, (Path *) best_path);
+ 
+@@ -6420,7 +6423,7 @@ materialize_finished_plan(Plan *subplan)
+ static Memoize *
+ make_memoize(Plan *lefttree, Oid *hashoperators, Oid *collations,
+ 			 List *param_exprs, bool singlerow, bool binary_mode,
+-			 uint32 est_entries)
++			 uint32 est_entries, Bitmapset *keyparamids)
+ {
+ 	Memoize    *node = makeNode(Memoize);
+ 	Plan	   *plan = &node->plan;
+@@ -6437,6 +6440,7 @@ make_memoize(Plan *lefttree, Oid *hashoperators, Oid *collations,
+ 	node->singlerow = singlerow;
+ 	node->binary_mode = binary_mode;
+ 	node->est_entries = est_entries;
++	node->keyparamids = keyparamids;
+ 
+ 	return node;
+ }
+diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
+index 109f93d109dd..873e43bfe64b 100644
+--- a/src/backend/optimizer/util/clauses.c
++++ b/src/backend/optimizer/util/clauses.c
+@@ -152,6 +152,7 @@ static Query *substitute_actual_srf_parameters(Query *expr,
+ 											   int nargs, List *args);
+ static Node *substitute_actual_srf_parameters_mutator(Node *node,
+ 													  substitute_actual_srf_parameters_context *context);
++static bool pull_paramids_walker(Node *node, Bitmapset **context);
+ 
+ 
+ /*****************************************************************************
+@@ -5214,3 +5215,33 @@ substitute_actual_srf_parameters_mutator(Node *node,
+ 								   substitute_actual_srf_parameters_mutator,
+ 								   (void *) context);
+ }
++
++/*
++ * pull_paramids
++ *		Returns a Bitmapset containing the paramids of all Params in 'expr'.
++ */
++Bitmapset *
++pull_paramids(Expr *expr)
++{
++	Bitmapset  *result = NULL;
++
++	(void) pull_paramids_walker((Node *) expr, &result);
++
++	return result;
++}
++
++static bool
++pull_paramids_walker(Node *node, Bitmapset **context)
++{
++	if (node == NULL)
++		return false;
++	if (IsA(node, Param))
++	{
++		Param	   *param = (Param *)node;
++
++		*context = bms_add_member(*context, param->paramid);
++		return false;
++	}
++	return expression_tree_walker(node, pull_paramids_walker,
++								  (void *) context);
++}
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index d96ace32e43b..ddc352933264 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -2113,6 +2113,8 @@ typedef struct MemoizeState
+ 								 * by bit, false when using hash equality ops */
+ 	MemoizeInstrumentation stats;	/* execution statistics */
+ 	SharedMemoizeInfo *shared_info; /* statistics for parallel workers */
++	Bitmapset	   *keyparamids; /* Param->paramids of expressions belonging to
++								  * param_exprs */
+ } MemoizeState;
+ 
+ /* ----------------
+diff --git a/src/include/nodes/plannodes.h b/src/include/nodes/plannodes.h
+index f1328be3549b..be3c30704ad1 100644
+--- a/src/include/nodes/plannodes.h
++++ b/src/include/nodes/plannodes.h
+@@ -804,6 +804,7 @@ typedef struct Memoize
+ 	uint32		est_entries;	/* The maximum number of entries that the
+ 								 * planner expects will fit in the cache, or 0
+ 								 * if unknown */
++	Bitmapset   *keyparamids;	/* paramids from param_exprs */
+ } Memoize;
+ 
+ /* ----------------
+diff --git a/src/include/optimizer/clauses.h b/src/include/optimizer/clauses.h
+index 0673887a852c..bc3f3e60d432 100644
+--- a/src/include/optimizer/clauses.h
++++ b/src/include/optimizer/clauses.h
+@@ -53,4 +53,6 @@ extern void CommuteOpExpr(OpExpr *clause);
+ extern Query *inline_set_returning_function(PlannerInfo *root,
+ 											RangeTblEntry *rte);
+ 
++extern Bitmapset *pull_paramids(Expr *expr);
++
+ #endif							/* CLAUSES_H */
+diff --git a/src/test/regress/expected/memoize.out b/src/test/regress/expected/memoize.out
+index 0ed5d8474af0..4ca0bd1f1e1e 100644
+--- a/src/test/regress/expected/memoize.out
++++ b/src/test/regress/expected/memoize.out
+@@ -196,6 +196,45 @@ SELECT * FROM strtest s1 INNER JOIN strtest s2 ON s1.t >= s2.t;', false);
+ (8 rows)
+ 
+ DROP TABLE strtest;
++-- Exercise Memoize code that flushes the cache when a parameter changes which
++-- is not part of the cache key.
++-- Ensure we get a Memoize plan
++EXPLAIN (COSTS OFF)
++SELECT unique1 FROM tenk1 t0
++WHERE unique1 < 3
++  AND EXISTS (
++	SELECT 1 FROM tenk1 t1
++	INNER JOIN tenk1 t2 ON t1.unique1 = t2.hundred
++	WHERE t0.ten = t1.twenty AND t0.two <> t2.four OFFSET 0);
++                           QUERY PLAN                           
++----------------------------------------------------------------
++ Index Scan using tenk1_unique1 on tenk1 t0
++   Index Cond: (unique1 < 3)
++   Filter: (SubPlan 1)
++   SubPlan 1
++     ->  Nested Loop
++           ->  Index Scan using tenk1_hundred on tenk1 t2
++                 Filter: (t0.two <> four)
++           ->  Memoize
++                 Cache Key: t2.hundred
++                 Cache Mode: logical
++                 ->  Index Scan using tenk1_unique1 on tenk1 t1
++                       Index Cond: (unique1 = t2.hundred)
++                       Filter: (t0.ten = twenty)
++(13 rows)
++
++-- Ensure the above query returns the correct result
++SELECT unique1 FROM tenk1 t0
++WHERE unique1 < 3
++  AND EXISTS (
++	SELECT 1 FROM tenk1 t1
++	INNER JOIN tenk1 t2 ON t1.unique1 = t2.hundred
++	WHERE t0.ten = t1.twenty AND t0.two <> t2.four OFFSET 0);
++ unique1 
++---------
++       2
++(1 row)
++
+ RESET enable_seqscan;
+ RESET enable_mergejoin;
+ RESET work_mem;
+diff --git a/src/test/regress/sql/memoize.sql b/src/test/regress/sql/memoize.sql
+index 3c7360adf9c8..c6ed5a2aa661 100644
+--- a/src/test/regress/sql/memoize.sql
++++ b/src/test/regress/sql/memoize.sql
+@@ -103,6 +103,26 @@ SELECT * FROM strtest s1 INNER JOIN strtest s2 ON s1.t >= s2.t;', false);
+ 
+ DROP TABLE strtest;
+ 
++-- Exercise Memoize code that flushes the cache when a parameter changes which
++-- is not part of the cache key.
++
++-- Ensure we get a Memoize plan
++EXPLAIN (COSTS OFF)
++SELECT unique1 FROM tenk1 t0
++WHERE unique1 < 3
++  AND EXISTS (
++	SELECT 1 FROM tenk1 t1
++	INNER JOIN tenk1 t2 ON t1.unique1 = t2.hundred
++	WHERE t0.ten = t1.twenty AND t0.two <> t2.four OFFSET 0);
++
++-- Ensure the above query returns the correct result
++SELECT unique1 FROM tenk1 t0
++WHERE unique1 < 3
++  AND EXISTS (
++	SELECT 1 FROM tenk1 t1
++	INNER JOIN tenk1 t2 ON t1.unique1 = t2.hundred
++	WHERE t0.ten = t1.twenty AND t0.two <> t2.four OFFSET 0);
++
+ RESET enable_seqscan;
+ RESET enable_mergejoin;
+ RESET work_mem;

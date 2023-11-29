@@ -1,0 +1,1617 @@
+From 606948b058dc16bce494270eea577011a602810e Mon Sep 17 00:00:00 2001
+From: Andrew Dunstan <andrew@dunslane.net>
+Date: Thu, 3 Mar 2022 13:15:13 -0500
+Subject: [PATCH] SQL JSON functions
+
+This Patch introduces three SQL standard JSON functions:
+
+JSON() (incorrectly mentioned in my commit message for f4fb45d15c)
+JSON_SCALAR()
+JSON_SERIALIZE()
+
+JSON() produces json values from text, bytea, json or jsonb values, and
+has facilitites for handling duplicate keys.
+JSON_SCALAR() produces a json value from any scalar sql value, including
+json and jsonb.
+JSON_SERIALIZE() produces text or bytea from input which containis or
+represents json or jsonb;
+
+For the most part these functions don't add any significant new
+capabilities, but they will be of use to users wanting standard
+compliant JSON handling.
+
+Nikita Glukhov
+
+Reviewers have included (in no particular order) Andres Freund, Alexander
+Korotkov, Pavel Stehule, Andrew Alsup, Erik Rijkers, Zihong Yu,
+Himanshu Upadhyaya, Daniel Gustafsson, Justin Pryzby.
+
+Discussion: https://postgr.es/m/cd0bb935-0158-78a7-08b5-904886deac4b@postgrespro.ru
+---
+ doc/src/sgml/keywords/sql2016-02-reserved.txt |   3 +
+ src/backend/executor/execExpr.c               |  45 +++
+ src/backend/executor/execExprInterp.c         |  42 ++-
+ src/backend/nodes/copyfuncs.c                 |  53 ++++
+ src/backend/nodes/equalfuncs.c                |  38 +++
+ src/backend/nodes/nodeFuncs.c                 |  14 +
+ src/backend/parser/gram.y                     |  56 +++-
+ src/backend/parser/parse_expr.c               | 152 +++++++++-
+ src/backend/parser/parse_target.c             |   9 +
+ src/backend/utils/adt/format_type.c           |   4 +
+ src/backend/utils/adt/json.c                  |  51 ++--
+ src/backend/utils/adt/jsonb.c                 |  64 ++---
+ src/backend/utils/adt/ruleutils.c             |  13 +-
+ src/include/executor/execExpr.h               |   5 +
+ src/include/nodes/nodes.h                     |   3 +
+ src/include/nodes/parsenodes.h                |  35 +++
+ src/include/nodes/primnodes.h                 |   5 +-
+ src/include/parser/kwlist.h                   |   4 +-
+ src/include/utils/json.h                      |  21 +-
+ src/include/utils/jsonb.h                     |  21 ++
+ src/test/regress/expected/sqljson.out         | 267 ++++++++++++++++++
+ src/test/regress/sql/sqljson.sql              |  57 ++++
+ 22 files changed, 880 insertions(+), 82 deletions(-)
+
+diff --git a/doc/src/sgml/keywords/sql2016-02-reserved.txt b/doc/src/sgml/keywords/sql2016-02-reserved.txt
+index ae1101238811..7ba420839809 100644
+--- a/doc/src/sgml/keywords/sql2016-02-reserved.txt
++++ b/doc/src/sgml/keywords/sql2016-02-reserved.txt
+@@ -156,12 +156,15 @@ INTERVAL
+ INTO
+ IS
+ JOIN
++JSON
+ JSON_ARRAY
+ JSON_ARRAYAGG
+ JSON_EXISTS
+ JSON_OBJECT
+ JSON_OBJECTAGG
+ JSON_QUERY
++JSON_SCALAR
++JSON_SERIALIZE
+ JSON_TABLE
+ JSON_TABLE_PRIMITIVE
+ JSON_VALUE
+diff --git a/src/backend/executor/execExpr.c b/src/backend/executor/execExpr.c
+index 1c364a7f4c59..d4d3850ec7c8 100644
+--- a/src/backend/executor/execExpr.c
++++ b/src/backend/executor/execExpr.c
+@@ -47,6 +47,8 @@
+ #include "utils/array.h"
+ #include "utils/builtins.h"
+ #include "utils/datum.h"
++#include "utils/json.h"
++#include "utils/jsonb.h"
+ #include "utils/jsonpath.h"
+ #include "utils/lsyscache.h"
+ #include "utils/typcache.h"
+@@ -2460,6 +2462,12 @@ ExecInitExprRec(Expr *node, ExprState *state,
+ 				{
+ 					ExecInitExprRec(ctor->func, state, resv, resnull);
+ 				}
++				else if ((ctor->type == JSCTOR_JSON_PARSE && !ctor->unique) ||
++						 ctor->type == JSCTOR_JSON_SERIALIZE)
++				{
++					/* Use the value of the first argument as a result */
++					ExecInitExprRec(linitial(args), state, resv, resnull);
++				}
+ 				else
+ 				{
+ 					scratch.opcode = EEOP_JSON_CONSTRUCTOR;
+@@ -2492,6 +2500,43 @@ ExecInitExprRec(Expr *node, ExprState *state,
+ 						argno++;
+ 					}
+ 
++					/* prepare type cache for datum_to_json[b]() */
++					if (ctor->type == JSCTOR_JSON_SCALAR)
++					{
++						bool		is_jsonb =
++							ctor->returning->format->format_type == JS_FORMAT_JSONB;
++
++						scratch.d.json_constructor.arg_type_cache =
++							palloc(sizeof(*scratch.d.json_constructor.arg_type_cache) * nargs);
++
++						for (int i = 0; i < nargs; i++)
++						{
++							int			category;
++							Oid			outfuncid;
++							Oid			typid = scratch.d.json_constructor.arg_types[i];
++
++							if (is_jsonb)
++							{
++								JsonbTypeCategory jbcat;
++
++								jsonb_categorize_type(typid, &jbcat, &outfuncid);
++
++								category = (int) jbcat;
++							}
++							else
++							{
++								JsonTypeCategory jscat;
++
++								json_categorize_type(typid, &jscat, &outfuncid);
++
++								category = (int) jscat;
++							}
++
++							scratch.d.json_constructor.arg_type_cache[i].outfuncid = outfuncid;
++							scratch.d.json_constructor.arg_type_cache[i].category = category;
++						}
++					}
++
+ 					ExprEvalPushStep(state, &scratch);
+ 				}
+ 
+diff --git a/src/backend/executor/execExprInterp.c b/src/backend/executor/execExprInterp.c
+index 1215f707e284..7d4253d970da 100644
+--- a/src/backend/executor/execExprInterp.c
++++ b/src/backend/executor/execExprInterp.c
+@@ -3982,7 +3982,7 @@ ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
+ 		 * JSON text validation.
+ 		 */
+ 		if (res && (pred->unique_keys || exprtype == TEXTOID))
+-			res = json_validate(json, pred->unique_keys);
++			res = json_validate(json, pred->unique_keys, false);
+ 	}
+ 	else if (exprtype == JSONBOID)
+ 	{
+@@ -4527,6 +4527,46 @@ ExecEvalJsonConstructor(ExprState *state, ExprEvalStep *op,
+ 										 op->d.json_constructor.arg_types,
+ 										 op->d.json_constructor.constructor->absent_on_null,
+ 										 op->d.json_constructor.constructor->unique);
++	else if (ctor->type == JSCTOR_JSON_SCALAR)
++	{
++		if (op->d.json_constructor.arg_nulls[0])
++		{
++			res = (Datum) 0;
++			isnull = true;
++		}
++		else
++		{
++			Datum		value = op->d.json_constructor.arg_values[0];
++			int			category = op->d.json_constructor.arg_type_cache[0].category;
++			Oid			outfuncid = op->d.json_constructor.arg_type_cache[0].outfuncid;
++
++			if (is_jsonb)
++				res = to_jsonb_worker(value, category, outfuncid);
++			else
++				res = to_json_worker(value, category, outfuncid);
++		}
++	}
++	else if (ctor->type == JSCTOR_JSON_PARSE)
++	{
++		if (op->d.json_constructor.arg_nulls[0])
++		{
++			res = (Datum) 0;
++			isnull = true;
++		}
++		else
++		{
++			Datum		value = op->d.json_constructor.arg_values[0];
++			text	   *js = DatumGetTextP(value);
++
++			if (is_jsonb)
++				res = jsonb_from_text(js, true);
++			else
++			{
++				(void) json_validate(js, true, true);
++				res = value;
++			}
++		}
++	}
+ 	else
+ 	{
+ 		res = (Datum) 0;
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index c42d2ed814c6..56505557bff9 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -2345,6 +2345,50 @@ _copyJsonValueExpr(const JsonValueExpr *from)
+ 	return newnode;
+ }
+ 
++/*
++ * _copyJsonParseExpr
++ */
++static JsonParseExpr *
++_copyJsonParseExpr(const JsonParseExpr *from)
++{
++	JsonParseExpr  *newnode = makeNode(JsonParseExpr);
++
++	COPY_NODE_FIELD(expr);
++	COPY_SCALAR_FIELD(unique_keys);
++	COPY_LOCATION_FIELD(location);
++
++	return newnode;
++}
++
++/*
++ * _copyJsonScalarExpr
++ */
++static JsonScalarExpr *
++_copyJsonScalarExpr(const JsonScalarExpr *from)
++{
++	JsonScalarExpr *newnode = makeNode(JsonScalarExpr);
++
++	COPY_NODE_FIELD(expr);
++	COPY_LOCATION_FIELD(location);
++
++	return newnode;
++}
++
++/*
++ * _copyJsonSerializeExpr
++ */
++static JsonSerializeExpr *
++_copyJsonSerializeExpr(const JsonSerializeExpr *from)
++{
++	JsonSerializeExpr *newnode = makeNode(JsonSerializeExpr);
++
++	COPY_NODE_FIELD(expr);
++	COPY_NODE_FIELD(output);
++	COPY_LOCATION_FIELD(location);
++
++	return newnode;
++}
++
+ /*
+  * _copyJsonConstructorExpr
+  */
+@@ -5744,6 +5788,15 @@ copyObjectImpl(const void *from)
+ 		case T_JsonValueExpr:
+ 			retval = _copyJsonValueExpr(from);
+ 			break;
++		case T_JsonParseExpr:
++			retval = _copyJsonParseExpr(from);
++			break;
++		case T_JsonScalarExpr:
++			retval = _copyJsonScalarExpr(from);
++			break;
++		case T_JsonSerializeExpr:
++			retval = _copyJsonSerializeExpr(from);
++			break;
+ 		case T_JsonKeyValue:
+ 			retval = _copyJsonKeyValue(from);
+ 			break;
+diff --git a/src/backend/nodes/equalfuncs.c b/src/backend/nodes/equalfuncs.c
+index f6dd61370c02..9ea3c5abf239 100644
+--- a/src/backend/nodes/equalfuncs.c
++++ b/src/backend/nodes/equalfuncs.c
+@@ -871,6 +871,35 @@ _equalJsonValueExpr(const JsonValueExpr *a, const JsonValueExpr *b)
+ 	return true;
+ }
+ 
++static bool
++_equalJsonParseExpr(const JsonParseExpr *a, const JsonParseExpr *b)
++{
++	COMPARE_NODE_FIELD(expr);
++	COMPARE_SCALAR_FIELD(unique_keys);
++	COMPARE_LOCATION_FIELD(location);
++
++	return true;
++}
++
++static bool
++_equalJsonScalarExpr(const JsonScalarExpr *a, const JsonScalarExpr *b)
++{
++	COMPARE_NODE_FIELD(expr);
++	COMPARE_LOCATION_FIELD(location);
++
++	return true;
++}
++
++static bool
++_equalJsonSerializeExpr(const JsonSerializeExpr *a, const JsonSerializeExpr *b)
++{
++	COMPARE_NODE_FIELD(expr);
++	COMPARE_NODE_FIELD(output);
++	COMPARE_LOCATION_FIELD(location);
++
++	return true;
++}
++
+ static bool
+ _equalJsonConstructorExpr(const JsonConstructorExpr *a, const JsonConstructorExpr *b)
+ {
+@@ -3661,6 +3690,15 @@ equal(const void *a, const void *b)
+ 		case T_JsonValueExpr:
+ 			retval = _equalJsonValueExpr(a, b);
+ 			break;
++		case T_JsonParseExpr:
++			retval = _equalJsonParseExpr(a, b);
++			break;
++		case T_JsonScalarExpr:
++			retval = _equalJsonScalarExpr(a, b);
++			break;
++		case T_JsonSerializeExpr:
++			retval = _equalJsonSerializeExpr(a, b);
++			break;
+ 		case T_JsonConstructorExpr:
+ 			retval = _equalJsonConstructorExpr(a, b);
+ 			break;
+diff --git a/src/backend/nodes/nodeFuncs.c b/src/backend/nodes/nodeFuncs.c
+index c0a83471e157..4789ba691130 100644
+--- a/src/backend/nodes/nodeFuncs.c
++++ b/src/backend/nodes/nodeFuncs.c
+@@ -4363,6 +4363,20 @@ raw_expression_tree_walker(Node *node,
+ 					return true;
+ 			}
+ 			break;
++		case T_JsonParseExpr:
++			return walker(((JsonParseExpr *) node)->expr, context);
++		case T_JsonScalarExpr:
++			return walker(((JsonScalarExpr *) node)->expr, context);
++		case T_JsonSerializeExpr:
++			{
++				JsonSerializeExpr *jse = (JsonSerializeExpr *) node;
++
++				if (walker(jse->expr, context))
++					return true;
++				if (walker(jse->output, context))
++					return true;
++			}
++			break;
+ 		case T_JsonConstructorExpr:
+ 			{
+ 				JsonConstructorExpr *ctor = (JsonConstructorExpr *) node;
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 8ad8512e4c75..eefcf901879a 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -568,7 +568,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ %type <list>	copy_options
+ 
+ %type <typnam>	Typename SimpleTypename ConstTypename
+-				GenericType Numeric opt_float
++				GenericType Numeric opt_float JsonType
+ 				Character ConstCharacter
+ 				CharacterWithLength CharacterWithoutLength
+ 				ConstDatetime ConstInterval
+@@ -656,6 +656,9 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 					json_value_func_expr
+ 					json_query_expr
+ 					json_exists_predicate
++					json_parse_expr
++					json_scalar_expr
++					json_serialize_expr
+ 					json_api_common_syntax
+ 					json_context_item
+ 					json_argument
+@@ -776,7 +779,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION
+ 
+ 	JOIN JSON JSON_ARRAY JSON_ARRAYAGG JSON_EXISTS JSON_OBJECT JSON_OBJECTAGG
+-	JSON_QUERY JSON_VALUE
++	JSON_QUERY JSON_SCALAR JSON_SERIALIZE JSON_VALUE
+ 
+ 	KEY KEYS KEEP
+ 
+@@ -13345,6 +13348,7 @@ SimpleTypename:
+ 					$$->typmods = list_make2(makeIntConst(INTERVAL_FULL_RANGE, -1),
+ 											 makeIntConst($3, @3));
+ 				}
++			| JsonType								{ $$ = $1; }
+ 		;
+ 
+ /* We have a separate ConstTypename to allow defaulting fixed-length
+@@ -13363,6 +13367,7 @@ ConstTypename:
+ 			| ConstBit								{ $$ = $1; }
+ 			| ConstCharacter						{ $$ = $1; }
+ 			| ConstDatetime							{ $$ = $1; }
++			| JsonType								{ $$ = $1; }
+ 		;
+ 
+ /*
+@@ -13731,6 +13736,13 @@ interval_second:
+ 				}
+ 		;
+ 
++JsonType:
++			JSON
++				{
++					$$ = SystemTypeName("json");
++					$$->location = @1;
++				}
++		;
+ 
+ /*****************************************************************************
+  *
+@@ -15596,8 +15608,42 @@ json_func_expr:
+ 			| json_value_func_expr
+ 			| json_query_expr
+ 			| json_exists_predicate
++			| json_parse_expr
++			| json_scalar_expr
++			| json_serialize_expr
++		;
++
++json_parse_expr:
++			JSON '(' json_value_expr json_key_uniqueness_constraint_opt ')'
++				{
++					JsonParseExpr *n = makeNode(JsonParseExpr);
++					n->expr = (JsonValueExpr *) $3;
++					n->unique_keys = $4;
++					n->location = @1;
++					$$ = (Node *) n;
++				}
++		;
++
++json_scalar_expr:
++			JSON_SCALAR '(' a_expr ')'
++				{
++					JsonScalarExpr *n = makeNode(JsonScalarExpr);
++					n->expr = (Expr *) $3;
++					n->location = @1;
++					$$ = (Node *) n;
++				}
+ 		;
+ 
++json_serialize_expr:
++			JSON_SERIALIZE '(' json_value_expr json_output_clause_opt ')'
++				{
++					JsonSerializeExpr *n = makeNode(JsonSerializeExpr);
++					n->expr = (JsonValueExpr *) $3;
++					n->output = (JsonOutput *) $4;
++					n->location = @1;
++					$$ = (Node *) n;
++				}
++		;
+ 
+ json_value_func_expr:
+ 			JSON_VALUE '('
+@@ -16654,7 +16700,6 @@ unreserved_keyword:
+ 			| INSTEAD
+ 			| INVOKER
+ 			| ISOLATION
+-			| JSON
+ 			| KEEP
+ 			| KEY
+ 			| KEYS
+@@ -16872,12 +16917,15 @@ col_name_keyword:
+ 			| INT_P
+ 			| INTEGER
+ 			| INTERVAL
++			| JSON
+ 			| JSON_ARRAY
+ 			| JSON_ARRAYAGG
+ 			| JSON_EXISTS
+ 			| JSON_OBJECT
+ 			| JSON_OBJECTAGG
+ 			| JSON_QUERY
++			| JSON_SCALAR
++			| JSON_SERIALIZE
+ 			| JSON_VALUE
+ 			| LEAST
+ 			| NATIONAL
+@@ -17243,6 +17291,8 @@ bare_label_keyword:
+ 			| JSON_OBJECT
+ 			| JSON_OBJECTAGG
+ 			| JSON_QUERY
++			| JSON_SCALAR
++			| JSON_SERIALIZE
+ 			| JSON_VALUE
+ 			| KEEP
+ 			| KEY
+diff --git a/src/backend/parser/parse_expr.c b/src/backend/parser/parse_expr.c
+index ee316a919796..e14000725016 100644
+--- a/src/backend/parser/parse_expr.c
++++ b/src/backend/parser/parse_expr.c
+@@ -88,6 +88,10 @@ static Node *transformJsonArrayAgg(ParseState *pstate, JsonArrayAgg *agg);
+ static Node *transformJsonIsPredicate(ParseState *pstate, JsonIsPredicate *p);
+ static Node *transformJsonFuncExpr(ParseState *pstate, JsonFuncExpr *p);
+ static Node *transformJsonValueExpr(ParseState *pstate, JsonValueExpr *jve);
++static Node *transformJsonParseExpr(ParseState *pstate, JsonParseExpr *expr);
++static Node *transformJsonScalarExpr(ParseState *pstate, JsonScalarExpr *expr);
++static Node *transformJsonSerializeExpr(ParseState *pstate,
++										JsonSerializeExpr *expr);
+ static Node *make_row_comparison_op(ParseState *pstate, List *opname,
+ 									List *largs, List *rargs, int location);
+ static Node *make_row_distinct_op(ParseState *pstate, List *opname,
+@@ -347,6 +351,18 @@ transformExprRecurse(ParseState *pstate, Node *expr)
+ 			result = transformJsonValueExpr(pstate, (JsonValueExpr *) expr);
+ 			break;
+ 
++		case T_JsonParseExpr:
++			result = transformJsonParseExpr(pstate, (JsonParseExpr *) expr);
++			break;
++
++		case T_JsonScalarExpr:
++			result = transformJsonScalarExpr(pstate, (JsonScalarExpr *) expr);
++			break;
++
++		case T_JsonSerializeExpr:
++			result = transformJsonSerializeExpr(pstate, (JsonSerializeExpr *) expr);
++			break;
++
+ 		default:
+ 			/* should not reach here */
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+@@ -3229,7 +3245,8 @@ makeCaseTestExpr(Node *expr)
+  */
+ static Node *
+ transformJsonValueExprExt(ParseState *pstate, JsonValueExpr *ve,
+-						  JsonFormatType default_format, bool isarg)
++						  JsonFormatType default_format, bool isarg,
++						  Oid targettype)
+ {
+ 	Node	   *expr = transformExprRecurse(pstate, (Node *) ve->raw_expr);
+ 	Node	   *rawexpr;
+@@ -3303,17 +3320,17 @@ transformJsonValueExprExt(ParseState *pstate, JsonValueExpr *ve,
+ 	else
+ 		format = default_format;
+ 
+-	if (format == JS_FORMAT_DEFAULT)
++	if (format == JS_FORMAT_DEFAULT &&
++		(!OidIsValid(targettype) || exprtype == targettype))
+ 		expr = rawexpr;
+ 	else
+ 	{
+-		Oid			targettype = format == JS_FORMAT_JSONB ? JSONBOID : JSONOID;
+ 		Node	   *orig = makeCaseTestExpr(expr);
+ 		Node	   *coerced;
++		bool		cast_is_needed = OidIsValid(targettype);
+ 
+-		expr = orig;
+-
+-		if (!isarg && exprtype != BYTEAOID && typcategory != TYPCATEGORY_STRING)
++		if (!isarg && !cast_is_needed &&
++			exprtype != BYTEAOID && typcategory != TYPCATEGORY_STRING)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_DATATYPE_MISMATCH),
+ 					 errmsg(ve->format->format_type == JS_FORMAT_DEFAULT ?
+@@ -3322,6 +3339,8 @@ transformJsonValueExprExt(ParseState *pstate, JsonValueExpr *ve,
+ 					 parser_errposition(pstate, ve->format->location >= 0 ?
+ 										ve->format->location : location)));
+ 
++		expr = orig;
++
+ 		/* Convert encoded JSON text from bytea. */
+ 		if (format == JS_FORMAT_JSON && exprtype == BYTEAOID)
+ 		{
+@@ -3329,6 +3348,9 @@ transformJsonValueExprExt(ParseState *pstate, JsonValueExpr *ve,
+ 			exprtype = TEXTOID;
+ 		}
+ 
++		if (!OidIsValid(targettype))
++			targettype = format == JS_FORMAT_JSONB ? JSONBOID : JSONOID;
++
+ 		/* Try to coerce to the target type. */
+ 		coerced = coerce_to_target_type(pstate, expr, exprtype,
+ 										targettype, -1,
+@@ -3339,11 +3361,21 @@ transformJsonValueExprExt(ParseState *pstate, JsonValueExpr *ve,
+ 		if (!coerced)
+ 		{
+ 			/* If coercion failed, use to_json()/to_jsonb() functions. */
+-			Oid			fnoid = targettype == JSONOID ? F_TO_JSON : F_TO_JSONB;
+-			FuncExpr   *fexpr = makeFuncExpr(fnoid, targettype,
+-											 list_make1(expr),
+-											 InvalidOid, InvalidOid,
+-											 COERCE_EXPLICIT_CALL);
++			FuncExpr   *fexpr;
++			Oid			fnoid;
++
++			if (cast_is_needed)		/* only CAST is allowed */
++				ereport(ERROR,
++						(errcode(ERRCODE_CANNOT_COERCE),
++						 errmsg("cannot cast type %s to %s",
++								format_type_be(exprtype),
++								format_type_be(targettype)),
++								parser_errposition(pstate, location)));
++
++			fnoid = targettype == JSONOID ? F_TO_JSON : F_TO_JSONB;
++			fexpr = makeFuncExpr(fnoid, targettype, list_make1(expr),
++								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
++
+ 			fexpr->location = location;
+ 
+ 			coerced = (Node *) fexpr;
+@@ -3370,7 +3402,8 @@ transformJsonValueExprExt(ParseState *pstate, JsonValueExpr *ve,
+ static Node *
+ transformJsonValueExpr(ParseState *pstate, JsonValueExpr *jve)
+ {
+-	return transformJsonValueExprExt(pstate, jve, JS_FORMAT_JSON, false);
++	return transformJsonValueExprExt(pstate, jve, JS_FORMAT_JSON, false,
++									 InvalidOid);
+ }
+ 
+ /*
+@@ -3379,7 +3412,8 @@ transformJsonValueExpr(ParseState *pstate, JsonValueExpr *jve)
+ static Node *
+ transformJsonValueExprDefault(ParseState *pstate, JsonValueExpr *jve)
+ {
+-	return transformJsonValueExprExt(pstate, jve, JS_FORMAT_DEFAULT, false);
++	return transformJsonValueExprExt(pstate, jve, JS_FORMAT_DEFAULT, false,
++									 InvalidOid);
+ }
+ 
+ /*
+@@ -4022,7 +4056,7 @@ transformJsonPassingArgs(ParseState *pstate, JsonFormatType format, List *args,
+ 	{
+ 		JsonArgument *arg = castNode(JsonArgument, lfirst(lc));
+ 		Node	   *expr = transformJsonValueExprExt(pstate, arg->val,
+-													 format, true);
++													 format, true, InvalidOid);
+ 
+ 		assign_expr_collations(pstate, expr);
+ 
+@@ -4415,3 +4449,93 @@ transformJsonFuncExpr(ParseState *pstate, JsonFuncExpr *func)
+ 
+ 	return (Node *) jsexpr;
+ }
++
++/*
++ * Transform a JSON() expression.
++ */
++static Node *
++transformJsonParseExpr(ParseState *pstate, JsonParseExpr *jsexpr)
++{
++	JsonReturning *returning = makeNode(JsonReturning);
++	Node	   *arg;
++
++	returning->format = makeJsonFormat(JS_FORMAT_JSON, JS_ENC_DEFAULT, -1);
++	returning->typid = JSONOID;
++	returning->typmod = -1;
++
++	if (jsexpr->unique_keys)
++	{
++		/*
++		 * Coerce string argument to text and then to json[b] in the executor
++		 * node with key uniqueness check.
++		 */
++		JsonValueExpr *jve = jsexpr->expr;
++		Oid			arg_type;
++
++		arg = transformJsonParseArg(pstate, (Node *) jve->raw_expr, jve->format,
++									&arg_type);
++
++		if (arg_type != TEXTOID)
++			ereport(ERROR,
++					(errcode(ERRCODE_DATATYPE_MISMATCH),
++					 errmsg("cannot use non-string types with WITH UNIQUE KEYS clause"),
++					 parser_errposition(pstate, jsexpr->location)));
++	}
++	else
++	{
++		/*
++		 * Coerce argument to target type using CAST for compatibilty with PG
++		 * function-like CASTs.
++		 */
++		arg = transformJsonValueExprExt(pstate, jsexpr->expr, JS_FORMAT_JSON,
++										false, returning->typid);
++	}
++
++	return makeJsonConstructorExpr(pstate, JSCTOR_JSON_PARSE, list_make1(arg), NULL,
++							returning, jsexpr->unique_keys, false,
++							jsexpr->location);
++}
++
++/*
++ * Transform a JSON_SCALAR() expression.
++ */
++static Node *
++transformJsonScalarExpr(ParseState *pstate, JsonScalarExpr *jsexpr)
++{
++	JsonReturning *returning = makeNode(JsonReturning);
++	Node	   *arg = transformExprRecurse(pstate, (Node *) jsexpr->expr);
++
++	returning->format = makeJsonFormat(JS_FORMAT_JSON, JS_ENC_DEFAULT, -1);
++	returning->typid = JSONOID;
++	returning->typmod = -1;
++
++	if (exprType(arg) == UNKNOWNOID)
++		arg = coerce_to_specific_type(pstate, arg, TEXTOID, "JSON_SCALAR");
++
++	return makeJsonConstructorExpr(pstate, JSCTOR_JSON_SCALAR, list_make1(arg), NULL,
++							returning, false, false, jsexpr->location);
++}
++
++/*
++ * Transform a JSON_SERIALIZE() expression.
++ */
++static Node *
++transformJsonSerializeExpr(ParseState *pstate, JsonSerializeExpr *expr)
++{
++	Node	   *arg = transformJsonValueExpr(pstate, expr->expr);
++	JsonReturning *returning;
++
++	if (expr->output)
++		returning = transformJsonOutput(pstate, expr->output, true);
++	else
++	{
++		/* RETURNING TEXT FORMAT JSON is by default */
++		returning = makeNode(JsonReturning);
++		returning->format = makeJsonFormat(JS_FORMAT_JSON, JS_ENC_DEFAULT, -1);
++		returning->typid = TEXTOID;
++		returning->typmod = -1;
++	}
++
++	return makeJsonConstructorExpr(pstate, JSCTOR_JSON_SERIALIZE, list_make1(arg),
++							NULL, returning, false, false, expr->location);
++}
+diff --git a/src/backend/parser/parse_target.c b/src/backend/parser/parse_target.c
+index 62d5d7d4395f..31c576cfec5e 100644
+--- a/src/backend/parser/parse_target.c
++++ b/src/backend/parser/parse_target.c
+@@ -1958,6 +1958,15 @@ FigureColnameInternal(Node *node, char **name)
+ 		case T_XmlSerialize:
+ 			*name = "xmlserialize";
+ 			return 2;
++		case T_JsonParseExpr:
++			*name = "json";
++			return 2;
++		case T_JsonScalarExpr:
++			*name = "json_scalar";
++			return 2;
++		case T_JsonSerializeExpr:
++			*name = "json_serialize";
++			return 2;
+ 		case T_JsonObjectConstructor:
+ 			*name = "json_object";
+ 			return 2;
+diff --git a/src/backend/utils/adt/format_type.c b/src/backend/utils/adt/format_type.c
+index 2918fdbfb650..060fd7e183b2 100644
+--- a/src/backend/utils/adt/format_type.c
++++ b/src/backend/utils/adt/format_type.c
+@@ -294,6 +294,10 @@ format_type_extended(Oid type_oid, int32 typemod, bits16 flags)
+ 			else
+ 				buf = pstrdup("character varying");
+ 			break;
++
++		case JSONOID:
++			buf = pstrdup("json");
++			break;
+ 	}
+ 
+ 	if (buf == NULL)
+diff --git a/src/backend/utils/adt/json.c b/src/backend/utils/adt/json.c
+index 5edcb8bb60e1..492796eb8384 100644
+--- a/src/backend/utils/adt/json.c
++++ b/src/backend/utils/adt/json.c
+@@ -30,21 +30,6 @@
+ #include "utils/lsyscache.h"
+ #include "utils/typcache.h"
+ 
+-typedef enum					/* type categories for datum_to_json */
+-{
+-	JSONTYPE_NULL,				/* null, so we didn't bother to identify */
+-	JSONTYPE_BOOL,				/* boolean (built-in types only) */
+-	JSONTYPE_NUMERIC,			/* numeric (ditto) */
+-	JSONTYPE_DATE,				/* we use special formatting for datetimes */
+-	JSONTYPE_TIMESTAMP,
+-	JSONTYPE_TIMESTAMPTZ,
+-	JSONTYPE_JSON,				/* JSON itself (and JSONB) */
+-	JSONTYPE_ARRAY,				/* array */
+-	JSONTYPE_COMPOSITE,			/* composite */
+-	JSONTYPE_CAST,				/* something with an explicit cast to JSON */
+-	JSONTYPE_OTHER				/* all else */
+-} JsonTypeCategory;
+-
+ /* Common context for key uniqueness check */
+ typedef struct HTAB *JsonUniqueCheckState;	/* hash table for key names */
+ 
+@@ -99,9 +84,6 @@ static void array_dim_to_json(StringInfo result, int dim, int ndims, int *dims,
+ 							  bool use_line_feeds);
+ static void array_to_json_internal(Datum array, StringInfo result,
+ 								   bool use_line_feeds);
+-static void json_categorize_type(Oid typoid,
+-								 JsonTypeCategory *tcategory,
+-								 Oid *outfuncoid);
+ static void datum_to_json(Datum val, bool is_null, StringInfo result,
+ 						  JsonTypeCategory tcategory, Oid outfuncoid,
+ 						  bool key_scalar);
+@@ -180,7 +162,7 @@ json_recv(PG_FUNCTION_ARGS)
+  * output function OID.  If the returned category is JSONTYPE_CAST, we
+  * return the OID of the type->JSON cast function instead.
+  */
+-static void
++void
+ json_categorize_type(Oid typoid,
+ 					 JsonTypeCategory *tcategory,
+ 					 Oid *outfuncoid)
+@@ -762,6 +744,16 @@ row_to_json_pretty(PG_FUNCTION_ARGS)
+ 	PG_RETURN_TEXT_P(cstring_to_text_with_len(result->data, result->len));
+ }
+ 
++Datum
++to_json_worker(Datum val, JsonTypeCategory tcategory, Oid outfuncoid)
++{
++	StringInfo	result = makeStringInfo();
++
++	datum_to_json(val, false, result, tcategory, outfuncoid, false);
++
++	return PointerGetDatum(cstring_to_text_with_len(result->data, result->len));
++}
++
+ bool
+ to_json_is_immutable(Oid typoid)
+ {
+@@ -802,7 +794,6 @@ to_json(PG_FUNCTION_ARGS)
+ {
+ 	Datum		val = PG_GETARG_DATUM(0);
+ 	Oid			val_type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+-	StringInfo	result;
+ 	JsonTypeCategory tcategory;
+ 	Oid			outfuncoid;
+ 
+@@ -814,11 +805,7 @@ to_json(PG_FUNCTION_ARGS)
+ 	json_categorize_type(val_type,
+ 						 &tcategory, &outfuncoid);
+ 
+-	result = makeStringInfo();
+-
+-	datum_to_json(val, false, result, tcategory, outfuncoid, false);
+-
+-	PG_RETURN_TEXT_P(cstring_to_text_with_len(result->data, result->len));
++	PG_RETURN_DATUM(to_json_worker(val, tcategory, outfuncoid));
+ }
+ 
+ /*
+@@ -1712,7 +1699,7 @@ json_unique_object_field_start(void *_state, char *field, bool isnull)
+ 
+ /* Validate JSON text and additionally check key uniqueness */
+ bool
+-json_validate(text *json, bool check_unique_keys)
++json_validate(text *json, bool check_unique_keys, bool throw_error)
+ {
+ 	JsonLexContext *lex = makeJsonLexContext(json, check_unique_keys);
+ 	JsonSemAction uniqueSemAction = {0};
+@@ -1736,10 +1723,22 @@ json_validate(text *json, bool check_unique_keys)
+ 	result = pg_parse_json(lex, check_unique_keys ? &uniqueSemAction : &nullSemAction);
+ 
+ 	if (result != JSON_SUCCESS)
++	{
++		if (throw_error)
++			json_ereport_error(result, lex);
++
+ 		return false;	/* invalid json */
++	}
+ 
+ 	if (check_unique_keys && !state.unique)
++	{
++		if (throw_error)
++			ereport(ERROR,
++					(errcode(ERRCODE_DUPLICATE_JSON_OBJECT_KEY_VALUE),
++					 errmsg("duplicate JSON object key value")));
++
+ 		return false;	/* not unique keys */
++	}
+ 
+ 	return true;	/* ok */
+ }
+diff --git a/src/backend/utils/adt/jsonb.c b/src/backend/utils/adt/jsonb.c
+index d383cbdfedb6..2043f2e74afa 100644
+--- a/src/backend/utils/adt/jsonb.c
++++ b/src/backend/utils/adt/jsonb.c
+@@ -34,25 +34,9 @@ typedef struct JsonbInState
+ {
+ 	JsonbParseState *parseState;
+ 	JsonbValue *res;
++	bool		unique_keys;
+ } JsonbInState;
+ 
+-/* unlike with json categories, we need to treat json and jsonb differently */
+-typedef enum					/* type categories for datum_to_jsonb */
+-{
+-	JSONBTYPE_NULL,				/* null, so we didn't bother to identify */
+-	JSONBTYPE_BOOL,				/* boolean (built-in types only) */
+-	JSONBTYPE_NUMERIC,			/* numeric (ditto) */
+-	JSONBTYPE_DATE,				/* we use special formatting for datetimes */
+-	JSONBTYPE_TIMESTAMP,		/* we use special formatting for timestamp */
+-	JSONBTYPE_TIMESTAMPTZ,		/* ... and timestamptz */
+-	JSONBTYPE_JSON,				/* JSON */
+-	JSONBTYPE_JSONB,			/* JSONB */
+-	JSONBTYPE_ARRAY,			/* array */
+-	JSONBTYPE_COMPOSITE,		/* composite */
+-	JSONBTYPE_JSONCAST,			/* something with an explicit cast to JSON */
+-	JSONBTYPE_OTHER				/* all else */
+-} JsonbTypeCategory;
+-
+ typedef struct JsonbAggState
+ {
+ 	JsonbInState *res;
+@@ -62,7 +46,7 @@ typedef struct JsonbAggState
+ 	Oid			val_output_func;
+ } JsonbAggState;
+ 
+-static inline Datum jsonb_from_cstring(char *json, int len);
++static inline Datum jsonb_from_cstring(char *json, int len, bool unique_keys);
+ static size_t checkStringLen(size_t len);
+ static void jsonb_in_object_start(void *pstate);
+ static void jsonb_in_object_end(void *pstate);
+@@ -71,17 +55,11 @@ static void jsonb_in_array_end(void *pstate);
+ static void jsonb_in_object_field_start(void *pstate, char *fname, bool isnull);
+ static void jsonb_put_escaped_value(StringInfo out, JsonbValue *scalarVal);
+ static void jsonb_in_scalar(void *pstate, char *token, JsonTokenType tokentype);
+-static void jsonb_categorize_type(Oid typoid,
+-								  JsonbTypeCategory *tcategory,
+-								  Oid *outfuncoid);
+ static void composite_to_jsonb(Datum composite, JsonbInState *result);
+ static void array_dim_to_jsonb(JsonbInState *result, int dim, int ndims, int *dims,
+ 							   Datum *vals, bool *nulls, int *valcount,
+ 							   JsonbTypeCategory tcategory, Oid outfuncoid);
+ static void array_to_jsonb_internal(Datum array, JsonbInState *result);
+-static void jsonb_categorize_type(Oid typoid,
+-								  JsonbTypeCategory *tcategory,
+-								  Oid *outfuncoid);
+ static void datum_to_jsonb(Datum val, bool is_null, JsonbInState *result,
+ 						   JsonbTypeCategory tcategory, Oid outfuncoid,
+ 						   bool key_scalar);
+@@ -99,7 +77,7 @@ jsonb_in(PG_FUNCTION_ARGS)
+ {
+ 	char	   *json = PG_GETARG_CSTRING(0);
+ 
+-	return jsonb_from_cstring(json, strlen(json));
++	return jsonb_from_cstring(json, strlen(json), false);
+ }
+ 
+ /*
+@@ -123,7 +101,7 @@ jsonb_recv(PG_FUNCTION_ARGS)
+ 	else
+ 		elog(ERROR, "unsupported jsonb version number %d", version);
+ 
+-	return jsonb_from_cstring(str, nbytes);
++	return jsonb_from_cstring(str, nbytes, false);
+ }
+ 
+ /*
+@@ -164,6 +142,14 @@ jsonb_send(PG_FUNCTION_ARGS)
+ 	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
+ }
+ 
++Datum
++jsonb_from_text(text *js, bool unique_keys)
++{
++	return jsonb_from_cstring(VARDATA_ANY(js),
++							  VARSIZE_ANY_EXHDR(js),
++							  unique_keys);
++}
++
+ /*
+  * Get the type name of a jsonb container.
+  */
+@@ -254,7 +240,7 @@ jsonb_typeof(PG_FUNCTION_ARGS)
+  * Uses the json parser (with hooks) to construct a jsonb.
+  */
+ static inline Datum
+-jsonb_from_cstring(char *json, int len)
++jsonb_from_cstring(char *json, int len, bool unique_keys)
+ {
+ 	JsonLexContext *lex;
+ 	JsonbInState state;
+@@ -264,6 +250,8 @@ jsonb_from_cstring(char *json, int len)
+ 	memset(&sem, 0, sizeof(sem));
+ 	lex = makeJsonLexContextCstringLen(json, len, GetDatabaseEncoding(), true);
+ 
++	state.unique_keys = unique_keys;
++
+ 	sem.semstate = (void *) &state;
+ 
+ 	sem.object_start = jsonb_in_object_start;
+@@ -298,6 +286,7 @@ jsonb_in_object_start(void *pstate)
+ 	JsonbInState *_state = (JsonbInState *) pstate;
+ 
+ 	_state->res = pushJsonbValue(&_state->parseState, WJB_BEGIN_OBJECT, NULL);
++	_state->parseState->unique_keys = _state->unique_keys;
+ }
+ 
+ static void
+@@ -620,7 +609,7 @@ add_indent(StringInfo out, bool indent, int level)
+  * output function OID.  If the returned category is JSONBTYPE_JSONCAST,
+  * we return the OID of the relevant cast function instead.
+  */
+-static void
++void
+ jsonb_categorize_type(Oid typoid,
+ 					  JsonbTypeCategory *tcategory,
+ 					  Oid *outfuncoid)
+@@ -1127,6 +1116,18 @@ add_jsonb(Datum val, bool is_null, JsonbInState *result,
+ 	datum_to_jsonb(val, is_null, result, tcategory, outfuncoid, key_scalar);
+ }
+ 
++Datum
++to_jsonb_worker(Datum val, JsonbTypeCategory tcategory, Oid outfuncoid)
++{
++	JsonbInState result;
++
++	memset(&result, 0, sizeof(JsonbInState));
++
++	datum_to_jsonb(val, false, &result, tcategory, outfuncoid, false);
++
++	return JsonbPGetDatum(JsonbValueToJsonb(result.res));
++}
++
+ bool
+ to_jsonb_is_immutable(Oid typoid)
+ {
+@@ -1168,7 +1169,6 @@ to_jsonb(PG_FUNCTION_ARGS)
+ {
+ 	Datum		val = PG_GETARG_DATUM(0);
+ 	Oid			val_type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+-	JsonbInState result;
+ 	JsonbTypeCategory tcategory;
+ 	Oid			outfuncoid;
+ 
+@@ -1180,11 +1180,7 @@ to_jsonb(PG_FUNCTION_ARGS)
+ 	jsonb_categorize_type(val_type,
+ 						  &tcategory, &outfuncoid);
+ 
+-	memset(&result, 0, sizeof(JsonbInState));
+-
+-	datum_to_jsonb(val, false, &result, tcategory, outfuncoid, false);
+-
+-	PG_RETURN_POINTER(JsonbValueToJsonb(result.res));
++	PG_RETURN_DATUM(to_jsonb_worker(val, tcategory, outfuncoid));
+ }
+ 
+ Datum
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index c2484fbceaec..010d5a7a751c 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -10092,7 +10092,9 @@ get_json_constructor_options(JsonConstructorExpr *ctor, StringInfo buf)
+ 	if (ctor->unique)
+ 		appendStringInfoString(buf, " WITH UNIQUE KEYS");
+ 
+-	get_json_returning(ctor->returning, buf, true);
++	if (ctor->type != JSCTOR_JSON_PARSE &&
++		ctor->type != JSCTOR_JSON_SCALAR)
++		get_json_returning(ctor->returning, buf, true);
+ }
+ 
+ static void
+@@ -10106,6 +10108,15 @@ get_json_constructor(JsonConstructorExpr *ctor, deparse_context *context,
+ 
+ 	switch (ctor->type)
+ 	{
++		case JSCTOR_JSON_PARSE:
++			funcname = "JSON";
++			break;
++		case JSCTOR_JSON_SCALAR:
++			funcname = "JSON_SCALAR";
++			break;
++		case JSCTOR_JSON_SERIALIZE:
++			funcname = "JSON_SERIALIZE";
++			break;
+ 		case JSCTOR_JSON_OBJECT:
+ 			funcname = "JSON_OBJECT";
+ 			break;
+diff --git a/src/include/executor/execExpr.h b/src/include/executor/execExpr.h
+index 240d07982abc..9ce8df17e5db 100644
+--- a/src/include/executor/execExpr.h
++++ b/src/include/executor/execExpr.h
+@@ -680,6 +680,11 @@ typedef struct ExprEvalStep
+ 			Datum	   *arg_values;
+ 			bool	   *arg_nulls;
+ 			Oid		   *arg_types;
++			struct
++			{
++				int			category;
++				Oid			outfuncid;
++			}		   *arg_type_cache;		/* cache for datum_to_json[b]() */
+ 			int			nargs;
+ 		}			json_constructor;
+ 
+diff --git a/src/include/nodes/nodes.h b/src/include/nodes/nodes.h
+index d48147abeef8..a56b85fe7432 100644
+--- a/src/include/nodes/nodes.h
++++ b/src/include/nodes/nodes.h
+@@ -205,6 +205,9 @@ typedef enum NodeTag
+ 	T_JsonFormat,
+ 	T_JsonReturning,
+ 	T_JsonValueExpr,
++	T_JsonParseExpr,
++	T_JsonScalarExpr,
++	T_JsonSerializeExpr,
+ 	T_JsonConstructorExpr,
+ 	T_JsonExpr,
+ 	T_JsonCoercion,
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index 0ff4ba088466..c24fc26da174 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -1676,6 +1676,41 @@ typedef struct JsonKeyValue
+ 	JsonValueExpr *value;		/* JSON value expression */
+ } JsonKeyValue;
+ 
++/*
++ * JsonParseExpr -
++ *		untransformed representation of JSON()
++ */
++typedef struct JsonParseExpr
++{
++	NodeTag		type;
++	JsonValueExpr *expr;		/* string expression */
++	bool		unique_keys;	/* WITH UNIQUE KEYS? */
++	int			location;		/* token location, or -1 if unknown */
++} JsonParseExpr;
++
++/*
++ * JsonScalarExpr -
++ *		untransformed representation of JSON_SCALAR()
++ */
++typedef struct JsonScalarExpr
++{
++	NodeTag		type;
++	Expr	   *expr;			/* scalar expression */
++	int			location;		/* token location, or -1 if unknown */
++} JsonScalarExpr;
++
++/*
++ * JsonSerializeExpr -
++ *		untransformed representation of JSON_SERIALIZE() function
++ */
++typedef struct JsonSerializeExpr
++{
++	NodeTag		type;
++	JsonValueExpr *expr;		/* json value expression */
++	JsonOutput *output;			/* RETURNING clause, if specified  */
++	int			location;		/* token location, or -1 if unknown */
++} JsonSerializeExpr;
++
+ /*
+  * JsonObjectConstructor -
+  *		untransformed representation of JSON_OBJECT() constructor
+diff --git a/src/include/nodes/primnodes.h b/src/include/nodes/primnodes.h
+index 7ebe868af91f..439a16aa62e9 100644
+--- a/src/include/nodes/primnodes.h
++++ b/src/include/nodes/primnodes.h
+@@ -1339,7 +1339,10 @@ typedef enum JsonConstructorType
+ 	JSCTOR_JSON_OBJECT = 1,
+ 	JSCTOR_JSON_ARRAY = 2,
+ 	JSCTOR_JSON_OBJECTAGG = 3,
+-	JSCTOR_JSON_ARRAYAGG = 4
++	JSCTOR_JSON_ARRAYAGG = 4,
++	JSCTOR_JSON_SCALAR = 5,
++	JSCTOR_JSON_SERIALIZE = 6,
++	JSCTOR_JSON_PARSE = 7
+ } JsonConstructorType;
+ 
+ /*
+diff --git a/src/include/parser/kwlist.h b/src/include/parser/kwlist.h
+index 5f3834ddf3ee..a73032b319dc 100644
+--- a/src/include/parser/kwlist.h
++++ b/src/include/parser/kwlist.h
+@@ -232,13 +232,15 @@ PG_KEYWORD("is", IS, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("isnull", ISNULL, TYPE_FUNC_NAME_KEYWORD, AS_LABEL)
+ PG_KEYWORD("isolation", ISOLATION, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("join", JOIN, TYPE_FUNC_NAME_KEYWORD, BARE_LABEL)
+-PG_KEYWORD("json", JSON, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("json", JSON, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json_array", JSON_ARRAY, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json_arrayagg", JSON_ARRAYAGG, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json_exists", JSON_EXISTS, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json_object", JSON_OBJECT, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json_objectagg", JSON_OBJECTAGG, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json_query", JSON_QUERY, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("json_scalar", JSON_SCALAR, COL_NAME_KEYWORD, BARE_LABEL)
++PG_KEYWORD("json_serialize", JSON_SERIALIZE, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("json_value", JSON_VALUE, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("keep", KEEP, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("key", KEY, UNRESERVED_KEYWORD, BARE_LABEL)
+diff --git a/src/include/utils/json.h b/src/include/utils/json.h
+index bfe5b215912e..da4a9257b36f 100644
+--- a/src/include/utils/json.h
++++ b/src/include/utils/json.h
+@@ -16,16 +16,35 @@
+ 
+ #include "lib/stringinfo.h"
+ 
++typedef enum					/* type categories for datum_to_json */
++{
++	JSONTYPE_NULL,				/* null, so we didn't bother to identify */
++	JSONTYPE_BOOL,				/* boolean (built-in types only) */
++	JSONTYPE_NUMERIC,			/* numeric (ditto) */
++	JSONTYPE_DATE,				/* we use special formatting for datetimes */
++	JSONTYPE_TIMESTAMP,
++	JSONTYPE_TIMESTAMPTZ,
++	JSONTYPE_JSON,				/* JSON itself (and JSONB) */
++	JSONTYPE_ARRAY,				/* array */
++	JSONTYPE_COMPOSITE,			/* composite */
++	JSONTYPE_CAST,				/* something with an explicit cast to JSON */
++	JSONTYPE_OTHER				/* all else */
++} JsonTypeCategory;
++
+ /* functions in json.c */
+ extern void escape_json(StringInfo buf, const char *str);
+ extern char *JsonEncodeDateTime(char *buf, Datum value, Oid typid,
+ 								const int *tzp);
+ extern bool to_json_is_immutable(Oid typoid);
++extern void json_categorize_type(Oid typoid, JsonTypeCategory *tcategory,
++								 Oid *outfuncoid);
++extern Datum to_json_worker(Datum val, JsonTypeCategory tcategory,
++							Oid outfuncoid);
+ extern Datum json_build_object_worker(int nargs, Datum *args, bool *nulls,
+ 									  Oid *types, bool absent_on_null,
+ 									  bool unique_keys);
+ extern Datum json_build_array_worker(int nargs, Datum *args, bool *nulls,
+ 									 Oid *types, bool absent_on_null);
+-extern bool json_validate(text *json, bool check_unique_keys);
++extern bool json_validate(text *json, bool check_unique_keys, bool throw_error);
+ 
+ #endif							/* JSON_H */
+diff --git a/src/include/utils/jsonb.h b/src/include/utils/jsonb.h
+index 3fdff445cf6f..bae466b52340 100644
+--- a/src/include/utils/jsonb.h
++++ b/src/include/utils/jsonb.h
+@@ -376,6 +376,22 @@ typedef struct JsonbIterator
+ 	struct JsonbIterator *parent;
+ } JsonbIterator;
+ 
++/* unlike with json categories, we need to treat json and jsonb differently */
++typedef enum					/* type categories for datum_to_jsonb */
++{
++	JSONBTYPE_NULL,				/* null, so we didn't bother to identify */
++	JSONBTYPE_BOOL,				/* boolean (built-in types only) */
++	JSONBTYPE_NUMERIC,			/* numeric (ditto) */
++	JSONBTYPE_DATE,				/* we use special formatting for datetimes */
++	JSONBTYPE_TIMESTAMP,		/* we use special formatting for timestamp */
++	JSONBTYPE_TIMESTAMPTZ,		/* ... and timestamptz */
++	JSONBTYPE_JSON,				/* JSON */
++	JSONBTYPE_JSONB,			/* JSONB */
++	JSONBTYPE_ARRAY,			/* array */
++	JSONBTYPE_COMPOSITE,		/* composite */
++	JSONBTYPE_JSONCAST,			/* something with an explicit cast to JSON */
++	JSONBTYPE_OTHER				/* all else */
++} JsonbTypeCategory;
+ 
+ /* Support functions */
+ extern uint32 getJsonbOffset(const JsonbContainer *jc, int index);
+@@ -403,6 +419,7 @@ extern void JsonbHashScalarValueExtended(const JsonbValue *scalarVal,
+ 										 uint64 *hash, uint64 seed);
+ 
+ /* jsonb.c support functions */
++extern Datum jsonb_from_text(text *js, bool unique_keys);
+ extern char *JsonbToCString(StringInfo out, JsonbContainer *in,
+ 							int estimated_len);
+ extern char *JsonbToCStringIndent(StringInfo out, JsonbContainer *in,
+@@ -418,6 +435,10 @@ extern Datum jsonb_set_element(Jsonb *jb, Datum *path, int path_len,
+ extern Datum jsonb_get_element(Jsonb *jb, Datum *path, int npath,
+ 							   bool *isnull, bool as_text);
+ extern bool to_jsonb_is_immutable(Oid typoid);
++extern void jsonb_categorize_type(Oid typoid, JsonbTypeCategory *tcategory,
++								  Oid *outfuncoid);
++extern Datum to_jsonb_worker(Datum val, JsonbTypeCategory tcategory,
++							 Oid outfuncoid);
+ extern Datum jsonb_build_object_worker(int nargs, Datum *args, bool *nulls,
+ 									   Oid *types, bool absent_on_null,
+ 									   bool unique_keys);
+diff --git a/src/test/regress/expected/sqljson.out b/src/test/regress/expected/sqljson.out
+index 27dca7815a72..11f5eb2d2cee 100644
+--- a/src/test/regress/expected/sqljson.out
++++ b/src/test/regress/expected/sqljson.out
+@@ -1,3 +1,270 @@
++-- JSON()
++SELECT JSON();
++ERROR:  syntax error at or near ")"
++LINE 1: SELECT JSON();
++                    ^
++SELECT JSON(NULL);
++ json 
++------
++ 
++(1 row)
++
++SELECT JSON('{ "a" : 1 } ');
++     json     
++--------------
++ { "a" : 1 } 
++(1 row)
++
++SELECT JSON('{ "a" : 1 } ' FORMAT JSON);
++     json     
++--------------
++ { "a" : 1 } 
++(1 row)
++
++SELECT JSON('{ "a" : 1 } ' FORMAT JSON ENCODING UTF8);
++ERROR:  JSON ENCODING clause is only allowed for bytea input type
++LINE 1: SELECT JSON('{ "a" : 1 } ' FORMAT JSON ENCODING UTF8);
++                                   ^
++SELECT JSON('{ "a" : 1 } '::bytea FORMAT JSON ENCODING UTF8);
++     json     
++--------------
++ { "a" : 1 } 
++(1 row)
++
++SELECT pg_typeof(JSON('{ "a" : 1 } '));
++ pg_typeof 
++-----------
++ json
++(1 row)
++
++SELECT JSON('   1   '::json);
++  json   
++---------
++    1   
++(1 row)
++
++SELECT JSON('   1   '::jsonb);
++ json 
++------
++ 1
++(1 row)
++
++SELECT JSON('   1   '::json WITH UNIQUE KEYS);
++ERROR:  cannot use non-string types with WITH UNIQUE KEYS clause
++LINE 1: SELECT JSON('   1   '::json WITH UNIQUE KEYS);
++               ^
++SELECT JSON(123);
++ERROR:  cannot cast type integer to json
++LINE 1: SELECT JSON(123);
++                    ^
++SELECT JSON('{"a": 1, "a": 2}');
++       json       
++------------------
++ {"a": 1, "a": 2}
++(1 row)
++
++SELECT JSON('{"a": 1, "a": 2}' WITH UNIQUE KEYS);
++ERROR:  duplicate JSON object key value
++SELECT JSON('{"a": 1, "a": 2}' WITHOUT UNIQUE KEYS);
++       json       
++------------------
++ {"a": 1, "a": 2}
++(1 row)
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123');
++         QUERY PLAN          
++-----------------------------
++ Result
++   Output: JSON('123'::json)
++(2 rows)
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123' FORMAT JSON);
++         QUERY PLAN          
++-----------------------------
++ Result
++   Output: JSON('123'::json)
++(2 rows)
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123'::bytea FORMAT JSON);
++                  QUERY PLAN                   
++-----------------------------------------------
++ Result
++   Output: JSON('\x313233'::bytea FORMAT JSON)
++(2 rows)
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123'::bytea FORMAT JSON ENCODING UTF8);
++                         QUERY PLAN                          
++-------------------------------------------------------------
++ Result
++   Output: JSON('\x313233'::bytea FORMAT JSON ENCODING UTF8)
++(2 rows)
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123' WITH UNIQUE KEYS);
++                  QUERY PLAN                  
++----------------------------------------------
++ Result
++   Output: JSON('123'::text WITH UNIQUE KEYS)
++(2 rows)
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123' WITHOUT UNIQUE KEYS);
++         QUERY PLAN          
++-----------------------------
++ Result
++   Output: JSON('123'::json)
++(2 rows)
++
++-- JSON_SCALAR()
++SELECT JSON_SCALAR();
++ERROR:  syntax error at or near ")"
++LINE 1: SELECT JSON_SCALAR();
++                           ^
++SELECT JSON_SCALAR(NULL);
++ json_scalar 
++-------------
++ 
++(1 row)
++
++SELECT JSON_SCALAR(NULL::int);
++ json_scalar 
++-------------
++ 
++(1 row)
++
++SELECT JSON_SCALAR(123);
++ json_scalar 
++-------------
++ 123
++(1 row)
++
++SELECT JSON_SCALAR(123.45);
++ json_scalar 
++-------------
++ 123.45
++(1 row)
++
++SELECT JSON_SCALAR(123.45::numeric);
++ json_scalar 
++-------------
++ 123.45
++(1 row)
++
++SELECT JSON_SCALAR(true);
++ json_scalar 
++-------------
++ true
++(1 row)
++
++SELECT JSON_SCALAR(false);
++ json_scalar 
++-------------
++ false
++(1 row)
++
++SELECT JSON_SCALAR(' 123.45');
++ json_scalar 
++-------------
++ " 123.45"
++(1 row)
++
++SELECT JSON_SCALAR('2020-06-07'::date);
++ json_scalar  
++--------------
++ "2020-06-07"
++(1 row)
++
++SELECT JSON_SCALAR('2020-06-07 01:02:03'::timestamp);
++      json_scalar      
++-----------------------
++ "2020-06-07T01:02:03"
++(1 row)
++
++SELECT JSON_SCALAR('{}'::json);
++ json_scalar 
++-------------
++ {}
++(1 row)
++
++SELECT JSON_SCALAR('{}'::jsonb);
++ json_scalar 
++-------------
++ {}
++(1 row)
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON_SCALAR(123);
++         QUERY PLAN         
++----------------------------
++ Result
++   Output: JSON_SCALAR(123)
++(2 rows)
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON_SCALAR('123');
++             QUERY PLAN             
++------------------------------------
++ Result
++   Output: JSON_SCALAR('123'::text)
++(2 rows)
++
++-- JSON_SERIALIZE()
++SELECT JSON_SERIALIZE();
++ERROR:  syntax error at or near ")"
++LINE 1: SELECT JSON_SERIALIZE();
++                              ^
++SELECT JSON_SERIALIZE(NULL);
++ json_serialize 
++----------------
++ 
++(1 row)
++
++SELECT JSON_SERIALIZE(JSON('{ "a" : 1 } '));
++ json_serialize 
++----------------
++ { "a" : 1 } 
++(1 row)
++
++SELECT JSON_SERIALIZE('{ "a" : 1 } ');
++ json_serialize 
++----------------
++ { "a" : 1 } 
++(1 row)
++
++SELECT JSON_SERIALIZE('1');
++ json_serialize 
++----------------
++ 1
++(1 row)
++
++SELECT JSON_SERIALIZE('1' FORMAT JSON);
++ json_serialize 
++----------------
++ 1
++(1 row)
++
++SELECT JSON_SERIALIZE('{ "a" : 1 } ' RETURNING bytea);
++       json_serialize       
++----------------------------
++ \x7b20226122203a2031207d20
++(1 row)
++
++SELECT pg_typeof(JSON_SERIALIZE(NULL));
++ pg_typeof 
++-----------
++ text
++(1 row)
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON_SERIALIZE('{}');
++                     QUERY PLAN                      
++-----------------------------------------------------
++ Result
++   Output: JSON_SERIALIZE('{}'::json RETURNING text)
++(2 rows)
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON_SERIALIZE('{}' RETURNING bytea);
++                      QUERY PLAN                      
++------------------------------------------------------
++ Result
++   Output: JSON_SERIALIZE('{}'::json RETURNING bytea)
++(2 rows)
++
+ -- JSON_OBJECT()
+ SELECT JSON_OBJECT();
+  json_object 
+diff --git a/src/test/regress/sql/sqljson.sql b/src/test/regress/sql/sqljson.sql
+index 4f3c06dcb3db..98bd93c11042 100644
+--- a/src/test/regress/sql/sqljson.sql
++++ b/src/test/regress/sql/sqljson.sql
+@@ -1,3 +1,60 @@
++-- JSON()
++SELECT JSON();
++SELECT JSON(NULL);
++SELECT JSON('{ "a" : 1 } ');
++SELECT JSON('{ "a" : 1 } ' FORMAT JSON);
++SELECT JSON('{ "a" : 1 } ' FORMAT JSON ENCODING UTF8);
++SELECT JSON('{ "a" : 1 } '::bytea FORMAT JSON ENCODING UTF8);
++SELECT pg_typeof(JSON('{ "a" : 1 } '));
++
++SELECT JSON('   1   '::json);
++SELECT JSON('   1   '::jsonb);
++SELECT JSON('   1   '::json WITH UNIQUE KEYS);
++SELECT JSON(123);
++
++SELECT JSON('{"a": 1, "a": 2}');
++SELECT JSON('{"a": 1, "a": 2}' WITH UNIQUE KEYS);
++SELECT JSON('{"a": 1, "a": 2}' WITHOUT UNIQUE KEYS);
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123');
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123' FORMAT JSON);
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123'::bytea FORMAT JSON);
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123'::bytea FORMAT JSON ENCODING UTF8);
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123' WITH UNIQUE KEYS);
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON('123' WITHOUT UNIQUE KEYS);
++
++
++-- JSON_SCALAR()
++SELECT JSON_SCALAR();
++SELECT JSON_SCALAR(NULL);
++SELECT JSON_SCALAR(NULL::int);
++SELECT JSON_SCALAR(123);
++SELECT JSON_SCALAR(123.45);
++SELECT JSON_SCALAR(123.45::numeric);
++SELECT JSON_SCALAR(true);
++SELECT JSON_SCALAR(false);
++SELECT JSON_SCALAR(' 123.45');
++SELECT JSON_SCALAR('2020-06-07'::date);
++SELECT JSON_SCALAR('2020-06-07 01:02:03'::timestamp);
++SELECT JSON_SCALAR('{}'::json);
++SELECT JSON_SCALAR('{}'::jsonb);
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON_SCALAR(123);
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON_SCALAR('123');
++
++-- JSON_SERIALIZE()
++SELECT JSON_SERIALIZE();
++SELECT JSON_SERIALIZE(NULL);
++SELECT JSON_SERIALIZE(JSON('{ "a" : 1 } '));
++SELECT JSON_SERIALIZE('{ "a" : 1 } ');
++SELECT JSON_SERIALIZE('1');
++SELECT JSON_SERIALIZE('1' FORMAT JSON);
++SELECT JSON_SERIALIZE('{ "a" : 1 } ' RETURNING bytea);
++SELECT pg_typeof(JSON_SERIALIZE(NULL));
++
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON_SERIALIZE('{}');
++EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON_SERIALIZE('{}' RETURNING bytea);
++
+ -- JSON_OBJECT()
+ SELECT JSON_OBJECT();
+ SELECT JSON_OBJECT(RETURNING json);

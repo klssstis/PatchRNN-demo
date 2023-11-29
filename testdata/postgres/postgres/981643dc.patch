@@ -1,0 +1,274 @@
+From 981643dcdb70b6ce70d8a08417f71f465f236cb5 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 7 Apr 2020 22:12:14 -0400
+Subject: [PATCH] Allow partitionwise join to handle nested FULL JOIN USING
+ cases.
+
+This case didn't work because columns merged by FULL JOIN USING are
+represented in the parse tree by COALESCE expressions, and the logic
+for recognizing a partitionable join failed to match upper-level join
+clauses to such expressions.  To fix, synthesize suitable COALESCE
+expressions and add them to the nullable_partexprs lists.  This is
+pretty ugly and brute-force, but it gets the job done.  (I have
+ambitions of rethinking the way outer-join output Vars are
+represented, so maybe that will provide a cleaner solution someday.
+For now, do this.)
+
+Amit Langote, reviewed by Justin Pryzby, Richard Guo, and myself
+
+Discussion: https://postgr.es/m/CA+HiwqG2WVUGmLJqtR0tPFhniO=H=9qQ+Z3L_ZC+Y3-EVQHFGg@mail.gmail.com
+---
+ src/backend/optimizer/util/relnode.c         |  45 +++++++-
+ src/include/nodes/pathnodes.h                |   3 +
+ src/test/regress/expected/partition_join.out | 110 +++++++++++++++++++
+ src/test/regress/sql/partition_join.sql      |  18 +++
+ 4 files changed, 174 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend/optimizer/util/relnode.c b/src/backend/optimizer/util/relnode.c
+index cbb1ee3b337f..591a0a3957c5 100644
+--- a/src/backend/optimizer/util/relnode.c
++++ b/src/backend/optimizer/util/relnode.c
+@@ -17,6 +17,7 @@
+ #include <limits.h>
+ 
+ #include "miscadmin.h"
++#include "nodes/nodeFuncs.h"
+ #include "optimizer/appendinfo.h"
+ #include "optimizer/clauses.h"
+ #include "optimizer/cost.h"
+@@ -1875,7 +1876,8 @@ set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
+ 								RelOptInfo *outer_rel, RelOptInfo *inner_rel,
+ 								JoinType jointype)
+ {
+-	int			partnatts = joinrel->part_scheme->partnatts;
++	PartitionScheme part_scheme = joinrel->part_scheme;
++	int			partnatts = part_scheme->partnatts;
+ 
+ 	joinrel->partexprs = (List **) palloc0(sizeof(List *) * partnatts);
+ 	joinrel->nullable_partexprs =
+@@ -1884,7 +1886,8 @@ set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
+ 	/*
+ 	 * The joinrel's partition expressions are the same as those of the input
+ 	 * rels, but we must properly classify them as nullable or not in the
+-	 * joinrel's output.
++	 * joinrel's output.  (Also, we add some more partition expressions if
++	 * it's a FULL JOIN.)
+ 	 */
+ 	for (int cnt = 0; cnt < partnatts; cnt++)
+ 	{
+@@ -1895,6 +1898,7 @@ set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
+ 		const List *inner_null_expr = inner_rel->nullable_partexprs[cnt];
+ 		List	   *partexpr = NIL;
+ 		List	   *nullable_partexpr = NIL;
++		ListCell   *lc;
+ 
+ 		switch (jointype)
+ 		{
+@@ -1954,6 +1958,43 @@ set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
+ 												outer_null_expr);
+ 				nullable_partexpr = list_concat(nullable_partexpr,
+ 												inner_null_expr);
++
++				/*
++				 * Also add CoalesceExprs corresponding to each possible
++				 * full-join output variable (that is, left side coalesced to
++				 * right side), so that we can match equijoin expressions
++				 * using those variables.  We really only need these for
++				 * columns merged by JOIN USING, and only with the pairs of
++				 * input items that correspond to the data structures that
++				 * parse analysis would build for such variables.  But it's
++				 * hard to tell which those are, so just make all the pairs.
++				 * Extra items in the nullable_partexprs list won't cause big
++				 * problems.  (It's possible that such items will get matched
++				 * to user-written COALESCEs, but it should still be valid to
++				 * partition on those, since they're going to be either the
++				 * partition column or NULL; it's the same argument as for
++				 * partitionwise nesting of any outer join.)  We assume no
++				 * type coercions are needed to make the coalesce expressions,
++				 * since columns of different types won't have gotten
++				 * classified as the same PartitionScheme.
++				 */
++				foreach(lc, list_concat_copy(outer_expr, outer_null_expr))
++				{
++					Node	   *larg = (Node *) lfirst(lc);
++					ListCell   *lc2;
++
++					foreach(lc2, list_concat_copy(inner_expr, inner_null_expr))
++					{
++						Node	   *rarg = (Node *) lfirst(lc2);
++						CoalesceExpr *c = makeNode(CoalesceExpr);
++
++						c->coalescetype = exprType(larg);
++						c->coalescecollid = exprCollation(larg);
++						c->args = list_make2(larg, rarg);
++						c->location = -1;
++						nullable_partexpr = lappend(nullable_partexpr, c);
++					}
++				}
+ 				break;
+ 
+ 			default:
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index 2dbd928d3560..1c83772d62b5 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -615,6 +615,9 @@ typedef struct PartitionSchemeData *PartitionScheme;
+  * that expression goes in the partexprs[i] list if the base relation
+  * is not nullable by this join or any lower outer join, or in the
+  * nullable_partexprs[i] list if the base relation is nullable.
++ * Furthermore, FULL JOINs add extra nullable_partexprs expressions
++ * corresponding to COALESCE expressions of the left and right join columns,
++ * to simplify matching join clauses to those lists.
+  *----------
+  */
+ typedef enum RelOptKind
+diff --git a/src/test/regress/expected/partition_join.out b/src/test/regress/expected/partition_join.out
+index 27588c883e49..b45a590b9450 100644
+--- a/src/test/regress/expected/partition_join.out
++++ b/src/test/regress/expected/partition_join.out
+@@ -750,6 +750,116 @@ SELECT t1.a, t1.c, t2.b, t2.c, t3.a + t3.b, t3.c FROM (prt1 t1 LEFT JOIN prt2 t2
+  550 | 0550 |     |      |     1100 | 0
+ (12 rows)
+ 
++--
++-- 3-way full join
++--
++EXPLAIN (COSTS OFF)
++SELECT COUNT(*) FROM prt1 FULL JOIN prt2 p2(b,a,c) USING(a,b) FULL JOIN prt2 p3(b,a,c) USING (a, b)
++  WHERE a BETWEEN 490 AND 510;
++                                                               QUERY PLAN                                                                
++-----------------------------------------------------------------------------------------------------------------------------------------
++ Aggregate
++   ->  Append
++         ->  Hash Full Join
++               Hash Cond: ((COALESCE(prt1_1.a, p2_1.a) = p3_1.a) AND (COALESCE(prt1_1.b, p2_1.b) = p3_1.b))
++               Filter: ((COALESCE(COALESCE(prt1_1.a, p2_1.a), p3_1.a) >= 490) AND (COALESCE(COALESCE(prt1_1.a, p2_1.a), p3_1.a) <= 510))
++               ->  Hash Full Join
++                     Hash Cond: ((prt1_1.a = p2_1.a) AND (prt1_1.b = p2_1.b))
++                     ->  Seq Scan on prt1_p1 prt1_1
++                     ->  Hash
++                           ->  Seq Scan on prt2_p1 p2_1
++               ->  Hash
++                     ->  Seq Scan on prt2_p1 p3_1
++         ->  Hash Full Join
++               Hash Cond: ((COALESCE(prt1_2.a, p2_2.a) = p3_2.a) AND (COALESCE(prt1_2.b, p2_2.b) = p3_2.b))
++               Filter: ((COALESCE(COALESCE(prt1_2.a, p2_2.a), p3_2.a) >= 490) AND (COALESCE(COALESCE(prt1_2.a, p2_2.a), p3_2.a) <= 510))
++               ->  Hash Full Join
++                     Hash Cond: ((prt1_2.a = p2_2.a) AND (prt1_2.b = p2_2.b))
++                     ->  Seq Scan on prt1_p2 prt1_2
++                     ->  Hash
++                           ->  Seq Scan on prt2_p2 p2_2
++               ->  Hash
++                     ->  Seq Scan on prt2_p2 p3_2
++         ->  Hash Full Join
++               Hash Cond: ((COALESCE(prt1_3.a, p2_3.a) = p3_3.a) AND (COALESCE(prt1_3.b, p2_3.b) = p3_3.b))
++               Filter: ((COALESCE(COALESCE(prt1_3.a, p2_3.a), p3_3.a) >= 490) AND (COALESCE(COALESCE(prt1_3.a, p2_3.a), p3_3.a) <= 510))
++               ->  Hash Full Join
++                     Hash Cond: ((prt1_3.a = p2_3.a) AND (prt1_3.b = p2_3.b))
++                     ->  Seq Scan on prt1_p3 prt1_3
++                     ->  Hash
++                           ->  Seq Scan on prt2_p3 p2_3
++               ->  Hash
++                     ->  Seq Scan on prt2_p3 p3_3
++(32 rows)
++
++SELECT COUNT(*) FROM prt1 FULL JOIN prt2 p2(b,a,c) USING(a,b) FULL JOIN prt2 p3(b,a,c) USING (a, b)
++  WHERE a BETWEEN 490 AND 510;
++ count 
++-------
++    14
++(1 row)
++
++--
++-- 4-way full join
++--
++EXPLAIN (COSTS OFF)
++SELECT COUNT(*) FROM prt1 FULL JOIN prt2 p2(b,a,c) USING(a,b) FULL JOIN prt2 p3(b,a,c) USING (a, b) FULL JOIN prt1 p4 (a,b,c) USING (a, b)
++  WHERE a BETWEEN 490 AND 510;
++                                                                                 QUERY PLAN                                                                                  
++-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
++ Aggregate
++   ->  Append
++         ->  Hash Full Join
++               Hash Cond: ((COALESCE(COALESCE(prt1_1.a, p2_1.a), p3_1.a) = p4_1.a) AND (COALESCE(COALESCE(prt1_1.b, p2_1.b), p3_1.b) = p4_1.b))
++               Filter: ((COALESCE(COALESCE(COALESCE(prt1_1.a, p2_1.a), p3_1.a), p4_1.a) >= 490) AND (COALESCE(COALESCE(COALESCE(prt1_1.a, p2_1.a), p3_1.a), p4_1.a) <= 510))
++               ->  Hash Full Join
++                     Hash Cond: ((COALESCE(prt1_1.a, p2_1.a) = p3_1.a) AND (COALESCE(prt1_1.b, p2_1.b) = p3_1.b))
++                     ->  Hash Full Join
++                           Hash Cond: ((prt1_1.a = p2_1.a) AND (prt1_1.b = p2_1.b))
++                           ->  Seq Scan on prt1_p1 prt1_1
++                           ->  Hash
++                                 ->  Seq Scan on prt2_p1 p2_1
++                     ->  Hash
++                           ->  Seq Scan on prt2_p1 p3_1
++               ->  Hash
++                     ->  Seq Scan on prt1_p1 p4_1
++         ->  Hash Full Join
++               Hash Cond: ((COALESCE(COALESCE(prt1_2.a, p2_2.a), p3_2.a) = p4_2.a) AND (COALESCE(COALESCE(prt1_2.b, p2_2.b), p3_2.b) = p4_2.b))
++               Filter: ((COALESCE(COALESCE(COALESCE(prt1_2.a, p2_2.a), p3_2.a), p4_2.a) >= 490) AND (COALESCE(COALESCE(COALESCE(prt1_2.a, p2_2.a), p3_2.a), p4_2.a) <= 510))
++               ->  Hash Full Join
++                     Hash Cond: ((COALESCE(prt1_2.a, p2_2.a) = p3_2.a) AND (COALESCE(prt1_2.b, p2_2.b) = p3_2.b))
++                     ->  Hash Full Join
++                           Hash Cond: ((prt1_2.a = p2_2.a) AND (prt1_2.b = p2_2.b))
++                           ->  Seq Scan on prt1_p2 prt1_2
++                           ->  Hash
++                                 ->  Seq Scan on prt2_p2 p2_2
++                     ->  Hash
++                           ->  Seq Scan on prt2_p2 p3_2
++               ->  Hash
++                     ->  Seq Scan on prt1_p2 p4_2
++         ->  Hash Full Join
++               Hash Cond: ((COALESCE(COALESCE(prt1_3.a, p2_3.a), p3_3.a) = p4_3.a) AND (COALESCE(COALESCE(prt1_3.b, p2_3.b), p3_3.b) = p4_3.b))
++               Filter: ((COALESCE(COALESCE(COALESCE(prt1_3.a, p2_3.a), p3_3.a), p4_3.a) >= 490) AND (COALESCE(COALESCE(COALESCE(prt1_3.a, p2_3.a), p3_3.a), p4_3.a) <= 510))
++               ->  Hash Full Join
++                     Hash Cond: ((COALESCE(prt1_3.a, p2_3.a) = p3_3.a) AND (COALESCE(prt1_3.b, p2_3.b) = p3_3.b))
++                     ->  Hash Full Join
++                           Hash Cond: ((prt1_3.a = p2_3.a) AND (prt1_3.b = p2_3.b))
++                           ->  Seq Scan on prt1_p3 prt1_3
++                           ->  Hash
++                                 ->  Seq Scan on prt2_p3 p2_3
++                     ->  Hash
++                           ->  Seq Scan on prt2_p3 p3_3
++               ->  Hash
++                     ->  Seq Scan on prt1_p3 p4_3
++(44 rows)
++
++SELECT COUNT(*) FROM prt1 FULL JOIN prt2 p2(b,a,c) USING(a,b) FULL JOIN prt2 p3(b,a,c) USING (a, b) FULL JOIN prt1 p4 (a,b,c) USING (a, b)
++  WHERE a BETWEEN 490 AND 510;
++ count 
++-------
++    14
++(1 row)
++
+ -- Cases with non-nullable expressions in subquery results;
+ -- make sure these go to null as expected
+ EXPLAIN (COSTS OFF)
+diff --git a/src/test/regress/sql/partition_join.sql b/src/test/regress/sql/partition_join.sql
+index df30f851e814..2a15362b1f8e 100644
+--- a/src/test/regress/sql/partition_join.sql
++++ b/src/test/regress/sql/partition_join.sql
+@@ -145,6 +145,24 @@ EXPLAIN (COSTS OFF)
+ SELECT t1.a, t1.c, t2.b, t2.c, t3.a + t3.b, t3.c FROM (prt1 t1 LEFT JOIN prt2 t2 ON t1.a = t2.b) RIGHT JOIN prt1_e t3 ON (t1.a = (t3.a + t3.b)/2) WHERE t3.c = 0 ORDER BY t1.a, t2.b, t3.a + t3.b;
+ SELECT t1.a, t1.c, t2.b, t2.c, t3.a + t3.b, t3.c FROM (prt1 t1 LEFT JOIN prt2 t2 ON t1.a = t2.b) RIGHT JOIN prt1_e t3 ON (t1.a = (t3.a + t3.b)/2) WHERE t3.c = 0 ORDER BY t1.a, t2.b, t3.a + t3.b;
+ 
++--
++-- 3-way full join
++--
++EXPLAIN (COSTS OFF)
++SELECT COUNT(*) FROM prt1 FULL JOIN prt2 p2(b,a,c) USING(a,b) FULL JOIN prt2 p3(b,a,c) USING (a, b)
++  WHERE a BETWEEN 490 AND 510;
++SELECT COUNT(*) FROM prt1 FULL JOIN prt2 p2(b,a,c) USING(a,b) FULL JOIN prt2 p3(b,a,c) USING (a, b)
++  WHERE a BETWEEN 490 AND 510;
++
++--
++-- 4-way full join
++--
++EXPLAIN (COSTS OFF)
++SELECT COUNT(*) FROM prt1 FULL JOIN prt2 p2(b,a,c) USING(a,b) FULL JOIN prt2 p3(b,a,c) USING (a, b) FULL JOIN prt1 p4 (a,b,c) USING (a, b)
++  WHERE a BETWEEN 490 AND 510;
++SELECT COUNT(*) FROM prt1 FULL JOIN prt2 p2(b,a,c) USING(a,b) FULL JOIN prt2 p3(b,a,c) USING (a, b) FULL JOIN prt1 p4 (a,b,c) USING (a, b)
++  WHERE a BETWEEN 490 AND 510;
++
+ -- Cases with non-nullable expressions in subquery results;
+ -- make sure these go to null as expected
+ EXPLAIN (COSTS OFF)

@@ -1,0 +1,660 @@
+From 167075be3ab1547e186096bb8e6e448cd8eea5af Mon Sep 17 00:00:00 2001
+From: Tomas Vondra <tomas.vondra@postgresql.org>
+Date: Wed, 25 Jul 2018 01:09:03 +0200
+Subject: [PATCH] Add strict_multi_assignment and too_many_rows plpgsql checks
+
+Until now shadowed_variables was the only plpgsql check supported by
+plpgsql.extra_warnings and plpgsql.extra_errors.  This patch introduces
+two new checks - strict_multi_assignment and too_many_rows.  Unlike
+shadowed_variables, these new checks are enforced at run-time.
+
+strict_multi_assignment checks that commands allowing multi-assignment
+(for example SELECT INTO) have the same number of sources and targets.
+too_many_rows checks that queries with an INTO clause return one row
+exactly.
+
+These checks are aimed at cases that are technically valid and allowed,
+but are often a sign of a bug.  Therefore those checks are expected to
+be enabled primarily in development and testing environments.
+
+Author: Pavel Stehule
+Reviewed-by: Stephen Frost, Tomas Vondra
+Discussion: https://www.postgresql.org/message-id/flat/CAFj8pRA2kKRDKpUNwLY0GeG1OqOp+tLS2yQA1V41gzuSz-hCng@mail.gmail.com
+---
+ doc/src/sgml/plpgsql.sgml             | 115 +++++++++++++++++++++-----
+ src/pl/plpgsql/src/pl_exec.c          | 108 ++++++++++++++++++++++--
+ src/pl/plpgsql/src/pl_handler.c       |   4 +
+ src/pl/plpgsql/src/plpgsql.h          |  10 ++-
+ src/test/regress/expected/plpgsql.out | 107 ++++++++++++++++++++++++
+ src/test/regress/sql/plpgsql.sql      |  89 ++++++++++++++++++++
+ 6 files changed, 400 insertions(+), 33 deletions(-)
+
+diff --git a/doc/src/sgml/plpgsql.sgml b/doc/src/sgml/plpgsql.sgml
+index d6688e13f480..cabedc3ff419 100644
+--- a/doc/src/sgml/plpgsql.sgml
++++ b/doc/src/sgml/plpgsql.sgml
+@@ -5034,7 +5034,7 @@ a_output := a_output || $$ if v_$$ || referrer_keys.kind || $$ like '$$
+ 
+   </sect2>
+   <sect2 id="plpgsql-extra-checks">
+-   <title>Additional Compile-time Checks</title>
++   <title>Additional Compile-time and Run-time Checks</title>
+ 
+    <para>
+     To aid the user in finding instances of simple but common problems before
+@@ -5046,26 +5046,64 @@ a_output := a_output || $$ if v_$$ || referrer_keys.kind || $$ like '$$
+     so you are advised to test in a separate development environment.
+    </para>
+ 
+- <para>
+-  These additional checks are enabled through the configuration variables
+-  <varname>plpgsql.extra_warnings</varname> for warnings and
+-  <varname>plpgsql.extra_errors</varname> for errors. Both can be set either to
+-  a comma-separated list of checks, <literal>"none"</literal> or <literal>"all"</literal>.
+-  The default is <literal>"none"</literal>. Currently the list of available checks
+-  includes only one:
+-  <variablelist>
+-   <varlistentry>
+-    <term><varname>shadowed_variables</varname></term>
+-    <listitem>
+-     <para>
+-      Checks if a declaration shadows a previously defined variable.
+-     </para>
+-    </listitem>
+-   </varlistentry>
+-  </variablelist>
++   <para>
++    Setting <varname>plpgsql.extra_warnings</varname>, or
++    <varname>plpgsql.extra_errors</varname>, as appropriate, to <literal>"all"</literal>
++    is encouraged in development and/or testing environments.
++   </para>
++
++   <para>
++    These additional checks are enabled through the configuration variables
++    <varname>plpgsql.extra_warnings</varname> for warnings and
++    <varname>plpgsql.extra_errors</varname> for errors. Both can be set either to
++    a comma-separated list of checks, <literal>"none"</literal> or
++    <literal>"all"</literal>. The default is <literal>"none"</literal>. Currently
++    the list of available checks includes:
++    <variablelist>
++     <varlistentry>
++      <term><varname>shadowed_variables</varname></term>
++      <listitem>
++       <para>
++        Checks if a declaration shadows a previously defined variable.
++       </para>
++      </listitem>
++     </varlistentry>
+ 
+-  The following example shows the effect of <varname>plpgsql.extra_warnings</varname>
+-  set to <varname>shadowed_variables</varname>:
++     <varlistentry>
++      <term><varname>strict_multi_assignment</varname></term>
++      <listitem>
++       <para>
++        Some <application>PL/PgSQL</application> commands allow assigning
++        values to more than one variable at a time, such as
++        <command>SELECT INTO</command>.  Typically, the number of target
++        variables and the number of source variables should match, though
++        <application>PL/PgSQL</application> will use <literal>NULL</literal>
++        for missing values and extra variables are ignored.  Enabling this
++        check will cause <application>PL/PgSQL</application> to throw a
++        <literal>WARNING</literal> or <literal>ERROR</literal> whenever the
++        number of target variables and the number of source variables are
++        different.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
++      <term><varname>too_many_rows</varname></term>
++      <listitem>
++       <para>
++        Enabling this check will cause <application>PL/PgSQL</application> to
++        check if a given query returns more than one row when an
++        <literal>INTO</literal> clause is used.  As an <literal>INTO</literal>
++        statement will only ever use one row, having a query return multiple
++        rows is generally either inefficient and/or nondeterministic and
++        therefore is likely an error.
++       </para>
++      </listitem>
++     </varlistentry>
++    </variablelist>
++
++    The following example shows the effect of <varname>plpgsql.extra_warnings</varname>
++    set to <varname>shadowed_variables</varname>:
+ <programlisting>
+ SET plpgsql.extra_warnings TO 'shadowed_variables';
+ 
+@@ -5081,8 +5119,41 @@ LINE 3: f1 int;
+         ^
+ CREATE FUNCTION
+ </programlisting>
+- </para>
+- </sect2>
++    The below example shows the effects of setting
++    <varname>plpgsql.extra_warnings</varname> to
++    <varname>strict_multi_assignment</varname>:
++<programlisting>
++SET plpgsql.extra_warnings TO 'strict_multi_assignment';
++
++CREATE OR REPLACE FUNCTION public.foo()
++ RETURNS void
++ LANGUAGE plpgsql
++AS $$
++DECLARE
++  x int;
++  y int;
++BEGIN
++  SELECT 1 INTO x, y;
++  SELECT 1, 2 INTO x, y;
++  SELECT 1, 2, 3 INTO x, y;
++END;
++$$;
++
++SELECT foo();
++WARNING:  number of source and target fields in assignment do not match
++DETAIL:  strict_multi_assignment check of extra_warnings is active.
++HINT:  Make sure the query returns the exact list of columns.
++WARNING:  number of source and target fields in assignment do not match
++DETAIL:  strict_multi_assignment check of extra_warnings is active.
++HINT:  Make sure the query returns the exact list of columns.
++
++ foo 
++-----
++ 
++(1 row)
++</programlisting>
++   </para>
++  </sect2>
+  </sect1>
+ 
+   <!-- **** Porting from Oracle PL/SQL **** -->
+diff --git a/src/pl/plpgsql/src/pl_exec.c b/src/pl/plpgsql/src/pl_exec.c
+index e39f7357bd54..380d1de8f4dd 100644
+--- a/src/pl/plpgsql/src/pl_exec.c
++++ b/src/pl/plpgsql/src/pl_exec.c
+@@ -4020,6 +4020,12 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
+ 	long		tcount;
+ 	int			rc;
+ 	PLpgSQL_expr *expr = stmt->sqlstmt;
++	int			too_many_rows_level = 0;
++
++	if (plpgsql_extra_errors & PLPGSQL_XCHECK_TOOMANYROWS)
++		too_many_rows_level = ERROR;
++	else if (plpgsql_extra_warnings & PLPGSQL_XCHECK_TOOMANYROWS)
++		too_many_rows_level = WARNING;
+ 
+ 	/*
+ 	 * On the first call for this statement generate the plan, and detect
+@@ -4059,9 +4065,10 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
+ 
+ 	/*
+ 	 * If we have INTO, then we only need one row back ... but if we have INTO
+-	 * STRICT, ask for two rows, so that we can verify the statement returns
+-	 * only one.  INSERT/UPDATE/DELETE are always treated strictly. Without
+-	 * INTO, just run the statement to completion (tcount = 0).
++	 * STRICT or extra check too_many_rows, ask for two rows, so that we can
++	 * verify the statement returns only one.  INSERT/UPDATE/DELETE are always
++	 * treated strictly. Without INTO, just run the statement to completion
++	 * (tcount = 0).
+ 	 *
+ 	 * We could just ask for two rows always when using INTO, but there are
+ 	 * some cases where demanding the extra row costs significant time, eg by
+@@ -4070,7 +4077,7 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
+ 	 */
+ 	if (stmt->into)
+ 	{
+-		if (stmt->strict || stmt->mod_stmt)
++		if (stmt->strict || stmt->mod_stmt || too_many_rows_level)
+ 			tcount = 2;
+ 		else
+ 			tcount = 1;
+@@ -4187,19 +4194,23 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
+ 		}
+ 		else
+ 		{
+-			if (n > 1 && (stmt->strict || stmt->mod_stmt))
++			if (n > 1 && (stmt->strict || stmt->mod_stmt || too_many_rows_level))
+ 			{
+ 				char	   *errdetail;
++				int			errlevel;
+ 
+ 				if (estate->func->print_strict_params)
+ 					errdetail = format_expr_params(estate, expr);
+ 				else
+ 					errdetail = NULL;
+ 
+-				ereport(ERROR,
++				errlevel = (stmt->strict || stmt->mod_stmt) ? ERROR : too_many_rows_level;
++
++				ereport(errlevel,
+ 						(errcode(ERRCODE_TOO_MANY_ROWS),
+ 						 errmsg("query returned more than one row"),
+-						 errdetail ? errdetail_internal("parameters: %s", errdetail) : 0));
++						 errdetail ? errdetail_internal("parameters: %s", errdetail) : 0,
++						 errhint("Make sure the query returns a single row, or use LIMIT 1")));
+ 			}
+ 			/* Put the first result row into the target */
+ 			exec_move_row(estate, target, tuptab->vals[0], tuptab->tupdesc);
+@@ -6835,6 +6846,19 @@ exec_move_row_from_fields(PLpgSQL_execstate *estate,
+ 	int			td_natts = tupdesc ? tupdesc->natts : 0;
+ 	int			fnum;
+ 	int			anum;
++	int			strict_multiassignment_level = 0;
++
++	/*
++	 * The extra check strict strict_multi_assignment can be active,
++	 * only when input tupdesc is specified.
++	 */
++	if (tupdesc != NULL)
++	{
++		if (plpgsql_extra_errors & PLPGSQL_XCHECK_STRICTMULTIASSIGNMENT)
++			strict_multiassignment_level = ERROR;
++		else if (plpgsql_extra_warnings & PLPGSQL_XCHECK_STRICTMULTIASSIGNMENT)
++			strict_multiassignment_level = WARNING;
++	}
+ 
+ 	/* Handle RECORD-target case */
+ 	if (target->dtype == PLPGSQL_DTYPE_REC)
+@@ -6913,10 +6937,23 @@ exec_move_row_from_fields(PLpgSQL_execstate *estate,
+ 				}
+ 				else
+ 				{
++					/* no source for destination column */
+ 					value = (Datum) 0;
+ 					isnull = true;
+ 					valtype = UNKNOWNOID;
+ 					valtypmod = -1;
++
++					/* When source value is missing */
++					if (strict_multiassignment_level)
++							ereport(strict_multiassignment_level,
++									(errcode(ERRCODE_DATATYPE_MISMATCH),
++									 errmsg("number of source and target fields in assignment do not match"),
++									 /* translator: %s represents a name of an extra check */
++									 errdetail("%s check of %s is active.",
++											   "strict_multi_assignment",
++													  strict_multiassignment_level == ERROR ? "extra_errors" :
++																	  "extra_warnings"),
++									 errhint("Make sure the query returns the exact list of columns.")));
+ 				}
+ 
+ 				/* Cast the new value to the right type, if needed. */
+@@ -6930,6 +6967,29 @@ exec_move_row_from_fields(PLpgSQL_execstate *estate,
+ 				newnulls[fnum] = isnull;
+ 			}
+ 
++			/*
++			 * When strict_multiassignment extra check is active, then ensure
++			 * there are no unassigned source attributes.
++			 */
++			if (strict_multiassignment_level && anum < td_natts)
++			{
++				/* skip dropped columns in the source descriptor */
++				while (anum < td_natts &&
++					   TupleDescAttr(tupdesc, anum)->attisdropped)
++					anum++;
++
++				if (anum < td_natts)
++					ereport(strict_multiassignment_level,
++							(errcode(ERRCODE_DATATYPE_MISMATCH),
++							 errmsg("number of source and target fields in assignment do not match"),
++							 /* translator: %s represents a name of an extra check */
++							 errdetail("%s check of %s is active.",
++									   "strict_multi_assignment",
++										  strict_multiassignment_level == ERROR ? "extra_errors" :
++																	  "extra_warnings"),
++							 errhint("Make sure the query returns the exact list of columns.")));
++			}
++
+ 			values = newvalues;
+ 			nulls = newnulls;
+ 		}
+@@ -6986,16 +7046,50 @@ exec_move_row_from_fields(PLpgSQL_execstate *estate,
+ 			}
+ 			else
+ 			{
++				/* no source for destination column */
+ 				value = (Datum) 0;
+ 				isnull = true;
+ 				valtype = UNKNOWNOID;
+ 				valtypmod = -1;
++
++				if (strict_multiassignment_level)
++						ereport(strict_multiassignment_level,
++								(errcode(ERRCODE_DATATYPE_MISMATCH),
++								 errmsg("number of source and target fields in assignment do not match"),
++						 /* translator: %s represents a name of an extra check */
++						 errdetail("%s check of %s is active.",
++								  "strict_multi_assignment",
++								  strict_multiassignment_level == ERROR ? "extra_errors" :
++																	  "extra_warnings"),
++								 errhint("Make sure the query returns the exact list of columns.")));
+ 			}
+ 
+ 			exec_assign_value(estate, (PLpgSQL_datum *) var,
+ 							  value, isnull, valtype, valtypmod);
+ 		}
+ 
++		/*
++		 * When strict_multiassignment extra check is active, ensure there
++		 * are no unassigned source attributes.
++		 */
++		if (strict_multiassignment_level && anum < td_natts)
++		{
++			while (anum < td_natts &&
++				   TupleDescAttr(tupdesc, anum)->attisdropped)
++				anum++;			/* skip dropped column in tuple */
++
++			if (anum < td_natts)
++				ereport(strict_multiassignment_level,
++						(errcode(ERRCODE_DATATYPE_MISMATCH),
++						 errmsg("number of source and target fields in assignment do not match"),
++						 /* translator: %s represents a name of an extra check */
++						 errdetail("%s check of %s is active.",
++								  "strict_multi_assignment",
++								  strict_multiassignment_level == ERROR ? "extra_errors" :
++																	  "extra_warnings"),
++						 errhint("Make sure the query returns the exact list of columns.")));
++		}
++
+ 		return;
+ 	}
+ 
+diff --git a/src/pl/plpgsql/src/pl_handler.c b/src/pl/plpgsql/src/pl_handler.c
+index 61452d9f7fd6..7d3647a12df6 100644
+--- a/src/pl/plpgsql/src/pl_handler.c
++++ b/src/pl/plpgsql/src/pl_handler.c
+@@ -92,6 +92,10 @@ plpgsql_extra_checks_check_hook(char **newvalue, void **extra, GucSource source)
+ 
+ 			if (pg_strcasecmp(tok, "shadowed_variables") == 0)
+ 				extrachecks |= PLPGSQL_XCHECK_SHADOWVAR;
++			else if (pg_strcasecmp(tok, "too_many_rows") == 0)
++				extrachecks |= PLPGSQL_XCHECK_TOOMANYROWS;
++			else if (pg_strcasecmp(tok, "strict_multi_assignment") == 0)
++				extrachecks |= PLPGSQL_XCHECK_STRICTMULTIASSIGNMENT;
+ 			else if (pg_strcasecmp(tok, "all") == 0 || pg_strcasecmp(tok, "none") == 0)
+ 			{
+ 				GUC_check_errdetail("Key word \"%s\" cannot be combined with other key words.", tok);
+diff --git a/src/pl/plpgsql/src/plpgsql.h b/src/pl/plpgsql/src/plpgsql.h
+index fe617791dfd6..4a4c7cbd36e2 100644
+--- a/src/pl/plpgsql/src/plpgsql.h
++++ b/src/pl/plpgsql/src/plpgsql.h
+@@ -1135,10 +1135,12 @@ extern bool plpgsql_print_strict_params;
+ 
+ extern bool plpgsql_check_asserts;
+ 
+-/* extra compile-time checks */
+-#define PLPGSQL_XCHECK_NONE			0
+-#define PLPGSQL_XCHECK_SHADOWVAR	1
+-#define PLPGSQL_XCHECK_ALL			((int) ~0)
++/* extra compile-time and run-time checks */
++#define PLPGSQL_XCHECK_NONE						0
++#define PLPGSQL_XCHECK_SHADOWVAR				(1 << 1)
++#define PLPGSQL_XCHECK_TOOMANYROWS				(1 << 2)
++#define PLPGSQL_XCHECK_STRICTMULTIASSIGNMENT	(1 << 3)
++#define PLPGSQL_XCHECK_ALL						((int) ~0)
+ 
+ extern int	plpgsql_extra_warnings;
+ extern int	plpgsql_extra_errors;
+diff --git a/src/test/regress/expected/plpgsql.out b/src/test/regress/expected/plpgsql.out
+index dde2cc4bd09e..f78db4aae530 100644
+--- a/src/test/regress/expected/plpgsql.out
++++ b/src/test/regress/expected/plpgsql.out
+@@ -2778,6 +2778,7 @@ begin
+ end$$ language plpgsql;
+ select stricttest();
+ ERROR:  query returned more than one row
++HINT:  Make sure the query returns a single row, or use LIMIT 1
+ CONTEXT:  PL/pgSQL function stricttest() line 5 at SQL statement
+ create or replace function stricttest() returns void as $$
+ declare x record;
+@@ -2851,6 +2852,7 @@ begin
+ end$$ language plpgsql;
+ select stricttest();
+ ERROR:  query returned more than one row
++HINT:  Make sure the query returns a single row, or use LIMIT 1
+ CONTEXT:  PL/pgSQL function stricttest() line 5 at SQL statement
+ create or replace function stricttest() returns void as $$
+ declare x record;
+@@ -2916,6 +2918,7 @@ end$$ language plpgsql;
+ select stricttest();
+ ERROR:  query returned more than one row
+ DETAIL:  parameters: p1 = '2', p3 = 'foo'
++HINT:  Make sure the query returns a single row, or use LIMIT 1
+ CONTEXT:  PL/pgSQL function stricttest() line 8 at SQL statement
+ create or replace function stricttest() returns void as $$
+ declare x record;
+@@ -2926,6 +2929,7 @@ begin
+ end$$ language plpgsql;
+ select stricttest();
+ ERROR:  query returned more than one row
++HINT:  Make sure the query returns a single row, or use LIMIT 1
+ CONTEXT:  PL/pgSQL function stricttest() line 5 at SQL statement
+ create or replace function stricttest() returns void as $$
+ declare x record;
+@@ -2973,6 +2977,7 @@ begin
+ end$$ language plpgsql;
+ select stricttest();
+ ERROR:  query returned more than one row
++HINT:  Make sure the query returns a single row, or use LIMIT 1
+ CONTEXT:  PL/pgSQL function stricttest() line 10 at SQL statement
+ reset plpgsql.print_strict_params;
+ create or replace function stricttest() returns void as $$
+@@ -2990,6 +2995,7 @@ end$$ language plpgsql;
+ select stricttest();
+ ERROR:  query returned more than one row
+ DETAIL:  parameters: p1 = '2', p3 = 'foo'
++HINT:  Make sure the query returns a single row, or use LIMIT 1
+ CONTEXT:  PL/pgSQL function stricttest() line 10 at SQL statement
+ -- test warnings and errors
+ set plpgsql.extra_warnings to 'all';
+@@ -3113,6 +3119,107 @@ select shadowtest(1);
+  t
+ (1 row)
+ 
++-- runtime extra checks
++set plpgsql.extra_warnings to 'too_many_rows';
++do $$
++declare x int;
++begin
++  select v from generate_series(1,2) g(v) into x;
++end;
++$$;
++WARNING:  query returned more than one row
++HINT:  Make sure the query returns a single row, or use LIMIT 1
++set plpgsql.extra_errors to 'too_many_rows';
++do $$
++declare x int;
++begin
++  select v from generate_series(1,2) g(v) into x;
++end;
++$$;
++ERROR:  query returned more than one row
++HINT:  Make sure the query returns a single row, or use LIMIT 1
++CONTEXT:  PL/pgSQL function inline_code_block line 4 at SQL statement
++reset plpgsql.extra_errors;
++reset plpgsql.extra_warnings;
++set plpgsql.extra_warnings to 'strict_multi_assignment';
++do $$
++declare
++  x int;
++  y int;
++begin
++  select 1 into x, y;
++  select 1,2 into x, y;
++  select 1,2,3 into x, y;
++end
++$$;
++WARNING:  number of source and target fields in assignment do not match
++DETAIL:  strict_multi_assignment check of extra_warnings is active.
++HINT:  Make sure the query returns the exact list of columns.
++WARNING:  number of source and target fields in assignment do not match
++DETAIL:  strict_multi_assignment check of extra_warnings is active.
++HINT:  Make sure the query returns the exact list of columns.
++set plpgsql.extra_errors to 'strict_multi_assignment';
++do $$
++declare
++  x int;
++  y int;
++begin
++  select 1 into x, y;
++  select 1,2 into x, y;
++  select 1,2,3 into x, y;
++end
++$$;
++ERROR:  number of source and target fields in assignment do not match
++DETAIL:  strict_multi_assignment check of extra_errors is active.
++HINT:  Make sure the query returns the exact list of columns.
++CONTEXT:  PL/pgSQL function inline_code_block line 6 at SQL statement
++create table test_01(a int, b int, c int);
++alter table test_01 drop column a;
++-- the check is active only when source table is not empty
++insert into test_01 values(10,20);
++do $$
++declare
++  x int;
++  y int;
++begin
++  select * from test_01 into x, y; -- should be ok
++  raise notice 'ok';
++  select * from test_01 into x;    -- should to fail
++end;
++$$;
++NOTICE:  ok
++ERROR:  number of source and target fields in assignment do not match
++DETAIL:  strict_multi_assignment check of extra_errors is active.
++HINT:  Make sure the query returns the exact list of columns.
++CONTEXT:  PL/pgSQL function inline_code_block line 8 at SQL statement
++do $$
++declare
++  t test_01;
++begin
++  select 1, 2 into t;  -- should be ok
++  raise notice 'ok';
++  select 1, 2, 3 into t; -- should fail;
++end;
++$$;
++NOTICE:  ok
++ERROR:  number of source and target fields in assignment do not match
++DETAIL:  strict_multi_assignment check of extra_errors is active.
++HINT:  Make sure the query returns the exact list of columns.
++CONTEXT:  PL/pgSQL function inline_code_block line 7 at SQL statement
++do $$
++declare
++  t test_01;
++begin
++  select 1 into t; -- should fail;
++end;
++$$;
++ERROR:  number of source and target fields in assignment do not match
++DETAIL:  strict_multi_assignment check of extra_errors is active.
++HINT:  Make sure the query returns the exact list of columns.
++CONTEXT:  PL/pgSQL function inline_code_block line 5 at SQL statement
++drop table test_01;
++reset plpgsql.extra_errors;
++reset plpgsql.extra_warnings;
+ -- test scrollable cursor support
+ create function sc_test() returns setof integer as $$
+ declare
+diff --git a/src/test/regress/sql/plpgsql.sql b/src/test/regress/sql/plpgsql.sql
+index e71d072aa98f..01239e26bed0 100644
+--- a/src/test/regress/sql/plpgsql.sql
++++ b/src/test/regress/sql/plpgsql.sql
+@@ -2627,6 +2627,95 @@ declare f1 int; begin return 1; end $$ language plpgsql;
+ 
+ select shadowtest(1);
+ 
++-- runtime extra checks
++set plpgsql.extra_warnings to 'too_many_rows';
++
++do $$
++declare x int;
++begin
++  select v from generate_series(1,2) g(v) into x;
++end;
++$$;
++
++set plpgsql.extra_errors to 'too_many_rows';
++
++do $$
++declare x int;
++begin
++  select v from generate_series(1,2) g(v) into x;
++end;
++$$;
++
++reset plpgsql.extra_errors;
++reset plpgsql.extra_warnings;
++
++set plpgsql.extra_warnings to 'strict_multi_assignment';
++
++do $$
++declare
++  x int;
++  y int;
++begin
++  select 1 into x, y;
++  select 1,2 into x, y;
++  select 1,2,3 into x, y;
++end
++$$;
++
++set plpgsql.extra_errors to 'strict_multi_assignment';
++
++do $$
++declare
++  x int;
++  y int;
++begin
++  select 1 into x, y;
++  select 1,2 into x, y;
++  select 1,2,3 into x, y;
++end
++$$;
++
++create table test_01(a int, b int, c int);
++
++alter table test_01 drop column a;
++
++-- the check is active only when source table is not empty
++insert into test_01 values(10,20);
++
++do $$
++declare
++  x int;
++  y int;
++begin
++  select * from test_01 into x, y; -- should be ok
++  raise notice 'ok';
++  select * from test_01 into x;    -- should to fail
++end;
++$$;
++
++do $$
++declare
++  t test_01;
++begin
++  select 1, 2 into t;  -- should be ok
++  raise notice 'ok';
++  select 1, 2, 3 into t; -- should fail;
++end;
++$$;
++
++do $$
++declare
++  t test_01;
++begin
++  select 1 into t; -- should fail;
++end;
++$$;
++
++drop table test_01;
++
++reset plpgsql.extra_errors;
++reset plpgsql.extra_warnings;
++
+ -- test scrollable cursor support
+ 
+ create function sc_test() returns setof integer as $$

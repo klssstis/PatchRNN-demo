@@ -1,0 +1,222 @@
+From 652686a334b437f57f9bd0e3baa5dbd245a9e15d Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sun, 12 Jan 2020 14:36:59 -0500
+Subject: [PATCH] Fix edge-case crashes and misestimation in range containment
+ selectivity.
+
+When estimating the selectivity of "range_var <@ range_constant" or
+"range_var @> range_constant", if the upper (or respectively lower)
+bound of the range_constant was above the last bin of the range_var's
+histogram, the code would access uninitialized memory and potentially
+crash (though it seems the probability of a crash is quite low).
+Handle the endpoint cases explicitly to fix that.
+
+While at it, be more paranoid about the possibility of getting NaN
+or other silly results from the range type's subdiff function.
+And improve some comments.
+
+Ordinarily we'd probably add a regression test case demonstrating
+the bug in unpatched code.  But it's too hard to get it to crash
+reliably because of the uninitialized-memory dependence, so skip that.
+
+Per bug #16122 from Adam Scott.  It's been broken from the beginning,
+apparently, so backpatch to all supported branches.
+
+Diagnosis by Michael Paquier, patch by Andrey Borodin and Tom Lane.
+
+Discussion: https://postgr.es/m/16122-eb35bc248c806c15@postgresql.org
+---
+ src/backend/utils/adt/rangetypes_selfuncs.c | 102 ++++++++++++++------
+ 1 file changed, 72 insertions(+), 30 deletions(-)
+
+diff --git a/src/backend/utils/adt/rangetypes_selfuncs.c b/src/backend/utils/adt/rangetypes_selfuncs.c
+index a4d7a7ab42fd..25dd84f4df62 100644
+--- a/src/backend/utils/adt/rangetypes_selfuncs.c
++++ b/src/backend/utils/adt/rangetypes_selfuncs.c
+@@ -40,8 +40,8 @@ static double calc_hist_selectivity_scalar(TypeCacheEntry *typcache,
+ 										   const RangeBound *constbound,
+ 										   const RangeBound *hist, int hist_nvalues,
+ 										   bool equal);
+-static int rbound_bsearch(TypeCacheEntry *typcache, const RangeBound *value,
+-						  const RangeBound *hist, int hist_length, bool equal);
++static int	rbound_bsearch(TypeCacheEntry *typcache, const RangeBound *value,
++						   const RangeBound *hist, int hist_length, bool equal);
+ static float8 get_position(TypeCacheEntry *typcache, const RangeBound *value,
+ 						   const RangeBound *hist1, const RangeBound *hist2);
+ static float8 get_len_position(double value, double hist1, double hist2);
+@@ -400,6 +400,13 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
+ 						   ATTSTATSSLOT_VALUES)))
+ 		return -1.0;
+ 
++	/* check that it's a histogram, not just a dummy entry */
++	if (hslot.nvalues < 2)
++	{
++		free_attstatsslot(&hslot);
++		return -1.0;
++	}
++
+ 	/*
+ 	 * Convert histogram of ranges into histograms of its lower and upper
+ 	 * bounds.
+@@ -686,7 +693,8 @@ get_position(TypeCacheEntry *typcache, const RangeBound *value, const RangeBound
+ 		/*
+ 		 * Both bounds are finite. Assuming the subtype's comparison function
+ 		 * works sanely, the value must be finite, too, because it lies
+-		 * somewhere between the bounds. If it doesn't, just return something.
++		 * somewhere between the bounds.  If it doesn't, arbitrarily return
++		 * 0.5.
+ 		 */
+ 		if (value->infinite)
+ 			return 0.5;
+@@ -696,21 +704,22 @@ get_position(TypeCacheEntry *typcache, const RangeBound *value, const RangeBound
+ 			return 0.5;
+ 
+ 		/* Calculate relative position using subdiff function. */
+-		bin_width = DatumGetFloat8(FunctionCall2Coll(
+-													 &typcache->rng_subdiff_finfo,
++		bin_width = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+ 													 typcache->rng_collation,
+ 													 hist2->val,
+ 													 hist1->val));
+-		if (bin_width <= 0.0)
+-			return 0.5;			/* zero width bin */
++		if (isnan(bin_width) || bin_width <= 0.0)
++			return 0.5;			/* punt for NaN or zero-width bin */
+ 
+-		position = DatumGetFloat8(FunctionCall2Coll(
+-													&typcache->rng_subdiff_finfo,
++		position = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+ 													typcache->rng_collation,
+ 													value->val,
+ 													hist1->val))
+ 			/ bin_width;
+ 
++		if (isnan(position))
++			return 0.5;			/* punt for NaN from subdiff, Inf/Inf, etc */
++
+ 		/* Relative position must be in [0,1] range */
+ 		position = Max(position, 0.0);
+ 		position = Min(position, 1.0);
+@@ -802,15 +811,23 @@ get_distance(TypeCacheEntry *typcache, const RangeBound *bound1, const RangeBoun
+ 	if (!bound1->infinite && !bound2->infinite)
+ 	{
+ 		/*
+-		 * No bounds are infinite, use subdiff function or return default
++		 * Neither bound is infinite, use subdiff function or return default
+ 		 * value of 1.0 if no subdiff is available.
+ 		 */
+ 		if (has_subdiff)
+-			return
+-				DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+-												 typcache->rng_collation,
+-												 bound2->val,
+-												 bound1->val));
++		{
++			float8		res;
++
++			res = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
++												   typcache->rng_collation,
++												   bound2->val,
++												   bound1->val));
++			/* Reject possible NaN result, also negative result */
++			if (isnan(res) || res < 0.0)
++				return 1.0;
++			else
++				return res;
++		}
+ 		else
+ 			return 1.0;
+ 	}
+@@ -824,7 +841,7 @@ get_distance(TypeCacheEntry *typcache, const RangeBound *bound1, const RangeBoun
+ 	}
+ 	else
+ 	{
+-		/* One bound is infinite, another is not */
++		/* One bound is infinite, the other is not */
+ 		return get_float8_infinity();
+ 	}
+ }
+@@ -1020,17 +1037,31 @@ calc_hist_selectivity_contained(TypeCacheEntry *typcache,
+ 	upper_index = rbound_bsearch(typcache, upper, hist_lower, hist_nvalues,
+ 								 false);
+ 
++	/*
++	 * If the upper bound value is below the histogram's lower limit, there
++	 * are no matches.
++	 */
++	if (upper_index < 0)
++		return 0.0;
++
++	/*
++	 * If the upper bound value is at or beyond the histogram's upper limit,
++	 * start our loop at the last actual bin, as though the upper bound were
++	 * within that bin; get_position will clamp its result to 1.0 anyway.
++	 * (This corresponds to assuming that the data population above the
++	 * histogram's upper limit is empty, exactly like what we just assumed for
++	 * the lower limit.)
++	 */
++	upper_index = Min(upper_index, hist_nvalues - 2);
++
+ 	/*
+ 	 * Calculate upper_bin_width, ie. the fraction of the (upper_index,
+ 	 * upper_index + 1) bin which is greater than upper bound of query range
+ 	 * using linear interpolation of subdiff function.
+ 	 */
+-	if (upper_index >= 0 && upper_index < hist_nvalues - 1)
+-		upper_bin_width = get_position(typcache, upper,
+-									   &hist_lower[upper_index],
+-									   &hist_lower[upper_index + 1]);
+-	else
+-		upper_bin_width = 0.0;
++	upper_bin_width = get_position(typcache, upper,
++								   &hist_lower[upper_index],
++								   &hist_lower[upper_index + 1]);
+ 
+ 	/*
+ 	 * In the loop, dist and prev_dist are the distance of the "current" bin's
+@@ -1103,9 +1134,6 @@ calc_hist_selectivity_contained(TypeCacheEntry *typcache,
+  * of ranges that contain the constant lower and upper bounds. This uses
+  * the histograms of range lower bounds and range lengths, on the assumption
+  * that the range lengths are independent of the lower bounds.
+- *
+- * Note, this is "var @> const", ie. estimate the fraction of ranges that
+- * contain the constant lower and upper bounds.
+  */
+ static double
+ calc_hist_selectivity_contains(TypeCacheEntry *typcache,
+@@ -1124,16 +1152,30 @@ calc_hist_selectivity_contains(TypeCacheEntry *typcache,
+ 	lower_index = rbound_bsearch(typcache, lower, hist_lower, hist_nvalues,
+ 								 true);
+ 
++	/*
++	 * If the lower bound value is below the histogram's lower limit, there
++	 * are no matches.
++	 */
++	if (lower_index < 0)
++		return 0.0;
++
++	/*
++	 * If the lower bound value is at or beyond the histogram's upper limit,
++	 * start our loop at the last actual bin, as though the upper bound were
++	 * within that bin; get_position will clamp its result to 1.0 anyway.
++	 * (This corresponds to assuming that the data population above the
++	 * histogram's upper limit is empty, exactly like what we just assumed for
++	 * the lower limit.)
++	 */
++	lower_index = Min(lower_index, hist_nvalues - 2);
++
+ 	/*
+ 	 * Calculate lower_bin_width, ie. the fraction of the of (lower_index,
+ 	 * lower_index + 1) bin which is greater than lower bound of query range
+ 	 * using linear interpolation of subdiff function.
+ 	 */
+-	if (lower_index >= 0 && lower_index < hist_nvalues - 1)
+-		lower_bin_width = get_position(typcache, lower, &hist_lower[lower_index],
+-									   &hist_lower[lower_index + 1]);
+-	else
+-		lower_bin_width = 0.0;
++	lower_bin_width = get_position(typcache, lower, &hist_lower[lower_index],
++								   &hist_lower[lower_index + 1]);
+ 
+ 	/*
+ 	 * Loop through all the lower bound bins, smaller than the query lower
