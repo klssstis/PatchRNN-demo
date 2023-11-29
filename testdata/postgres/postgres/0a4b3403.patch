@@ -1,0 +1,129 @@
+From 0a4b34031279d938c2e59df8df7159d6c11e39b5 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 2 Nov 2020 21:11:50 -0500
+Subject: [PATCH] Fix unportable use of getnameinfo() in pg_hba_file_rules
+ view.
+
+fill_hba_line() thought it could get away with passing sizeof(struct
+sockaddr_storage) rather than the actual addrlen previously returned
+by getaddrinfo().  While that appears to work on many platforms,
+it does not work on FreeBSD 11: you get back a failure, which leads
+to the view showing NULL for the address and netmask columns in all
+rows.  The POSIX spec for getnameinfo() is pretty clearly on
+FreeBSD's side here: you should pass the actual address length.
+So it seems plausible that there are other platforms where this
+coding also fails, and we just hadn't noticed.
+
+Also, IMO the fact that getnameinfo() failure leads to a NULL output
+is pretty bogus in itself.  Our pg_getnameinfo_all() wrapper is
+careful to emit "???" on failure, and we should use that in such
+cases.  NULL should only be emitted in rows that don't have IP
+addresses.
+
+Per bug #16695 from Peter Vandivier.  Back-patch to v10 where this
+code was added.
+
+Discussion: https://postgr.es/m/16695-a665558e2f630be7@postgresql.org
+---
+ src/backend/libpq/hba.c | 31 +++++++++++++++++++++----------
+ src/include/libpq/hba.h |  7 ++++++-
+ 2 files changed, 27 insertions(+), 11 deletions(-)
+
+diff --git a/src/backend/libpq/hba.c b/src/backend/libpq/hba.c
+index 4c86fb608748..3a78d2043e57 100644
+--- a/src/backend/libpq/hba.c
++++ b/src/backend/libpq/hba.c
+@@ -1188,8 +1188,11 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
+ 
+ 			ret = pg_getaddrinfo_all(str, NULL, &hints, &gai_result);
+ 			if (ret == 0 && gai_result)
++			{
+ 				memcpy(&parsedline->addr, gai_result->ai_addr,
+ 					   gai_result->ai_addrlen);
++				parsedline->addrlen = gai_result->ai_addrlen;
++			}
+ 			else if (ret == EAI_NONAME)
+ 				parsedline->hostname = str;
+ 			else
+@@ -1238,6 +1241,7 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
+ 										token->string);
+ 					return NULL;
+ 				}
++				parsedline->masklen = parsedline->addrlen;
+ 				pfree(str);
+ 			}
+ 			else if (!parsedline->hostname)
+@@ -1288,6 +1292,7 @@ parse_hba_line(TokenizedLine *tok_line, int elevel)
+ 
+ 				memcpy(&parsedline->mask, gai_result->ai_addr,
+ 					   gai_result->ai_addrlen);
++				parsedline->masklen = gai_result->ai_addrlen;
+ 				pg_freeaddrinfo_all(hints.ai_family, gai_result);
+ 
+ 				if (parsedline->addr.ss_family != parsedline->mask.ss_family)
+@@ -2538,20 +2543,26 @@ fill_hba_line(Tuplestorestate *tuple_store, TupleDesc tupdesc,
+ 				}
+ 				else
+ 				{
+-					if (pg_getnameinfo_all(&hba->addr, sizeof(hba->addr),
+-										   buffer, sizeof(buffer),
+-										   NULL, 0,
+-										   NI_NUMERICHOST) == 0)
++					/*
++					 * Note: if pg_getnameinfo_all fails, it'll set buffer to
++					 * "???", which we want to return.
++					 */
++					if (hba->addrlen > 0)
+ 					{
+-						clean_ipv6_addr(hba->addr.ss_family, buffer);
++						if (pg_getnameinfo_all(&hba->addr, hba->addrlen,
++											   buffer, sizeof(buffer),
++											   NULL, 0,
++											   NI_NUMERICHOST) == 0)
++							clean_ipv6_addr(hba->addr.ss_family, buffer);
+ 						addrstr = pstrdup(buffer);
+ 					}
+-					if (pg_getnameinfo_all(&hba->mask, sizeof(hba->mask),
+-										   buffer, sizeof(buffer),
+-										   NULL, 0,
+-										   NI_NUMERICHOST) == 0)
++					if (hba->masklen > 0)
+ 					{
+-						clean_ipv6_addr(hba->mask.ss_family, buffer);
++						if (pg_getnameinfo_all(&hba->mask, hba->masklen,
++											   buffer, sizeof(buffer),
++											   NULL, 0,
++											   NI_NUMERICHOST) == 0)
++							clean_ipv6_addr(hba->mask.ss_family, buffer);
+ 						maskstr = pstrdup(buffer);
+ 					}
+ 				}
+diff --git a/src/include/libpq/hba.h b/src/include/libpq/hba.h
+index d638479d8849..8f09b5638f12 100644
+--- a/src/include/libpq/hba.h
++++ b/src/include/libpq/hba.h
+@@ -42,6 +42,10 @@ typedef enum UserAuth
+ #define USER_AUTH_LAST uaPeer	/* Must be last value of this enum */
+ } UserAuth;
+ 
++/*
++ * Data structures representing pg_hba.conf entries
++ */
++
+ typedef enum IPCompareMethod
+ {
+ 	ipCmpMask,
+@@ -75,11 +79,12 @@ typedef struct HbaLine
+ 	List	   *databases;
+ 	List	   *roles;
+ 	struct sockaddr_storage addr;
++	int			addrlen;		/* zero if we don't have a valid addr */
+ 	struct sockaddr_storage mask;
++	int			masklen;		/* zero if we don't have a valid mask */
+ 	IPCompareMethod ip_cmp_method;
+ 	char	   *hostname;
+ 	UserAuth	auth_method;
+-
+ 	char	   *usermap;
+ 	char	   *pamservice;
+ 	bool		pam_use_hostname;

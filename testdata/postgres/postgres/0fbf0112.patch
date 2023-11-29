@@ -1,0 +1,249 @@
+From 0fbf0112002355efb2bb525ab88edf891dbfd033 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Wed, 18 May 2022 20:28:31 +0200
+Subject: [PATCH] Check column list length in XMLTABLE/JSON_TABLE alias
+
+We weren't checking the length of the column list in the alias clause of
+an XMLTABLE or JSON_TABLE function (a "tablefunc" RTE), and it was
+possible to make the server crash by passing an overly long one.  Fix it
+by throwing an error in that case, like the other places that deal with
+alias lists.
+
+In passing, modify the equivalent test used for join RTEs to look like
+the other ones, which was different for no apparent reason.
+
+This bug came in when XMLTABLE was born in version 10; backpatch to all
+stable versions.
+
+Reported-by: Wang Ke <krking@zju.edu.cn>
+Discussion: https://postgr.es/m/17480-1c9d73565bb28e90@postgresql.org
+---
+ src/backend/parser/parse_clause.c           | 15 ---------------
+ src/backend/parser/parse_relation.c         | 19 +++++++++++++++++--
+ src/test/regress/expected/int2.out          |  4 ++++
+ src/test/regress/expected/join.out          |  3 +++
+ src/test/regress/expected/jsonb_sqljson.out |  2 ++
+ src/test/regress/expected/with.out          |  5 +++++
+ src/test/regress/expected/xml.out           |  3 +++
+ src/test/regress/sql/int2.sql               |  4 ++++
+ src/test/regress/sql/join.sql               |  3 +++
+ src/test/regress/sql/jsonb_sqljson.sql      |  2 ++
+ src/test/regress/sql/with.sql               |  3 +++
+ src/test/regress/sql/xml.sql                |  3 +++
+ 12 files changed, 49 insertions(+), 17 deletions(-)
+
+diff --git a/src/backend/parser/parse_clause.c b/src/backend/parser/parse_clause.c
+index e2baa9d852ef..249255b65f5f 100644
+--- a/src/backend/parser/parse_clause.c
++++ b/src/backend/parser/parse_clause.c
+@@ -1444,21 +1444,6 @@ transformFromClauseItem(ParseState *pstate, Node *n,
+ 									&res_colnames, &res_colvars,
+ 									res_nscolumns + res_colindex);
+ 
+-		/*
+-		 * Check alias (AS clause), if any.
+-		 */
+-		if (j->alias)
+-		{
+-			if (j->alias->colnames != NIL)
+-			{
+-				if (list_length(j->alias->colnames) > list_length(res_colnames))
+-					ereport(ERROR,
+-							(errcode(ERRCODE_SYNTAX_ERROR),
+-							 errmsg("column alias list for \"%s\" has too many entries",
+-									j->alias->aliasname)));
+-			}
+-		}
+-
+ 		/*
+ 		 * Now build an RTE and nsitem for the result of the join.
+ 		 * res_nscolumns isn't totally done yet, but that's OK because
+diff --git a/src/backend/parser/parse_relation.c b/src/backend/parser/parse_relation.c
+index 00469763e88c..926dcbf30e2f 100644
+--- a/src/backend/parser/parse_relation.c
++++ b/src/backend/parser/parse_relation.c
+@@ -1989,11 +1989,13 @@ addRangeTableEntryForTableFunc(ParseState *pstate,
+ 							   bool inFromCl)
+ {
+ 	RangeTblEntry *rte = makeNode(RangeTblEntry);
+-	char	   *refname = alias ? alias->aliasname :
+-	pstrdup(tf->functype == TFT_XMLTABLE ? "xmltable" : "json_table");
++	char	   *refname;
+ 	Alias	   *eref;
+ 	int			numaliases;
+ 
++	refname = alias ? alias->aliasname :
++		pstrdup(tf->functype == TFT_XMLTABLE ? "xmltable" : "json_table");
++
+ 	Assert(pstate != NULL);
+ 
+ 	rte->rtekind = RTE_TABLEFUNC;
+@@ -2013,6 +2015,13 @@ addRangeTableEntryForTableFunc(ParseState *pstate,
+ 		eref->colnames = list_concat(eref->colnames,
+ 									 list_copy_tail(tf->colnames, numaliases));
+ 
++	if (numaliases > list_length(tf->colnames))
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
++				 errmsg("%s function has %d columns available but %d columns specified",
++						tf->functype == TFT_XMLTABLE ? "XMLTABLE" : "JSON_TABLE",
++						list_length(tf->colnames), numaliases)));
++
+ 	rte->eref = eref;
+ 
+ 	/*
+@@ -2192,6 +2201,12 @@ addRangeTableEntryForJoin(ParseState *pstate,
+ 		eref->colnames = list_concat(eref->colnames,
+ 									 list_copy_tail(colnames, numaliases));
+ 
++	if (numaliases > list_length(colnames))
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
++				 errmsg("join expression \"%s\" has %d columns available but %d columns specified",
++						eref->aliasname, list_length(colnames), numaliases)));
++
+ 	rte->eref = eref;
+ 
+ 	/*
+diff --git a/src/test/regress/expected/int2.out b/src/test/regress/expected/int2.out
+index 0306648fa287..109cf9baaaca 100644
+--- a/src/test/regress/expected/int2.out
++++ b/src/test/regress/expected/int2.out
+@@ -45,6 +45,10 @@ SELECT * FROM INT2_TBL;
+  -32767
+ (5 rows)
+ 
++SELECT * FROM INT2_TBL AS f(a, b);
++ERROR:  table "f" has 1 columns available but 2 columns specified
++SELECT * FROM (TABLE int2_tbl) AS s (a, b);
++ERROR:  table "s" has 1 columns available but 2 columns specified
+ SELECT i.* FROM INT2_TBL i WHERE i.f1 <> int2 '0';
+    f1   
+ --------
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index bd3375f2bae0..2538bd6a79be 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -5872,6 +5872,9 @@ select * from
+  3 | 3
+ (6 rows)
+ 
++-- check the number of columns specified
++SELECT * FROM (int8_tbl i cross join int4_tbl j) ss(a,b,c,d);
++ERROR:  join expression "ss" has 3 columns available but 4 columns specified
+ -- check we don't try to do a unique-ified semijoin with LATERAL
+ explain (verbose, costs off)
+ select * from
+diff --git a/src/test/regress/expected/jsonb_sqljson.out b/src/test/regress/expected/jsonb_sqljson.out
+index 28338b4d193c..ec7dc5059332 100644
+--- a/src/test/regress/expected/jsonb_sqljson.out
++++ b/src/test/regress/expected/jsonb_sqljson.out
+@@ -1031,6 +1031,8 @@ SELECT * FROM JSON_TABLE(NULL, '$' COLUMNS ());
+ ERROR:  syntax error at or near ")"
+ LINE 1: SELECT * FROM JSON_TABLE(NULL, '$' COLUMNS ());
+                                                     ^
++SELECT * FROM JSON_TABLE (NULL::jsonb, '$' COLUMNS (v1 timestamp)) AS f (v1, v2);
++ERROR:  JSON_TABLE function has 1 columns available but 2 columns specified
+ -- NULL => empty table
+ SELECT * FROM JSON_TABLE(NULL::jsonb, '$' COLUMNS (foo int)) bar;
+  foo 
+diff --git a/src/test/regress/expected/with.out b/src/test/regress/expected/with.out
+index d7316043748f..30dd900e1141 100644
+--- a/src/test/regress/expected/with.out
++++ b/src/test/regress/expected/with.out
+@@ -1794,6 +1794,11 @@ DROP TABLE y;
+ --
+ -- error cases
+ --
++WITH x(n, b) AS (SELECT 1)
++SELECT * FROM x;
++ERROR:  WITH query "x" has 1 columns available but 2 columns specified
++LINE 1: WITH x(n, b) AS (SELECT 1)
++             ^
+ -- INTERSECT
+ WITH RECURSIVE x(n) AS (SELECT 1 INTERSECT SELECT n+1 FROM x)
+ 	SELECT * FROM x;
+diff --git a/src/test/regress/expected/xml.out b/src/test/regress/expected/xml.out
+index 55b65ef324d2..55ac49be261c 100644
+--- a/src/test/regress/expected/xml.out
++++ b/src/test/regress/expected/xml.out
+@@ -1145,6 +1145,9 @@ EXPLAIN (COSTS OFF, VERBOSE) SELECT * FROM xmltableview1;
+          Table Function Call: XMLTABLE(('/ROWS/ROW'::text) PASSING (xmldata.data) COLUMNS id integer PATH ('@id'::text), _id FOR ORDINALITY, country_name text PATH ('COUNTRY_NAME/text()'::text) NOT NULL, country_id text PATH ('COUNTRY_ID'::text), region_id integer PATH ('REGION_ID'::text), size double precision PATH ('SIZE'::text), unit text PATH ('SIZE/@unit'::text), premier_name text DEFAULT ('not specified'::text) PATH ('PREMIER_NAME'::text))
+ (7 rows)
+ 
++-- errors
++SELECT * FROM XMLTABLE (ROW () PASSING null COLUMNS v1 timestamp) AS f (v1, v2);
++ERROR:  XMLTABLE function has 1 columns available but 2 columns specified
+ -- XMLNAMESPACES tests
+ SELECT * FROM XMLTABLE(XMLNAMESPACES('http://x.y' AS zz),
+                       '/zz:rows/zz:row'
+diff --git a/src/test/regress/sql/int2.sql b/src/test/regress/sql/int2.sql
+index 8e8d33892db6..ea29066b78ee 100644
+--- a/src/test/regress/sql/int2.sql
++++ b/src/test/regress/sql/int2.sql
+@@ -17,6 +17,10 @@ INSERT INTO INT2_TBL(f1) VALUES ('');
+ 
+ SELECT * FROM INT2_TBL;
+ 
++SELECT * FROM INT2_TBL AS f(a, b);
++
++SELECT * FROM (TABLE int2_tbl) AS s (a, b);
++
+ SELECT i.* FROM INT2_TBL i WHERE i.f1 <> int2 '0';
+ 
+ SELECT i.* FROM INT2_TBL i WHERE i.f1 <> int4 '0';
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index 6dd01b022e98..a27a72086ef7 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -1985,6 +1985,9 @@ select * from
+    (select q1.v)
+   ) as q2;
+ 
++-- check the number of columns specified
++SELECT * FROM (int8_tbl i cross join int4_tbl j) ss(a,b,c,d);
++
+ -- check we don't try to do a unique-ified semijoin with LATERAL
+ explain (verbose, costs off)
+ select * from
+diff --git a/src/test/regress/sql/jsonb_sqljson.sql b/src/test/regress/sql/jsonb_sqljson.sql
+index ba1895d42db6..fff253748082 100644
+--- a/src/test/regress/sql/jsonb_sqljson.sql
++++ b/src/test/regress/sql/jsonb_sqljson.sql
+@@ -328,6 +328,8 @@ SELECT JSON_TABLE('[]', '$');
+ -- Should fail (no columns)
+ SELECT * FROM JSON_TABLE(NULL, '$' COLUMNS ());
+ 
++SELECT * FROM JSON_TABLE (NULL::jsonb, '$' COLUMNS (v1 timestamp)) AS f (v1, v2);
++
+ -- NULL => empty table
+ SELECT * FROM JSON_TABLE(NULL::jsonb, '$' COLUMNS (foo int)) bar;
+ 
+diff --git a/src/test/regress/sql/with.sql b/src/test/regress/sql/with.sql
+index 3251c29584bd..5c52561a8aa4 100644
+--- a/src/test/regress/sql/with.sql
++++ b/src/test/regress/sql/with.sql
+@@ -803,6 +803,9 @@ DROP TABLE y;
+ -- error cases
+ --
+ 
++WITH x(n, b) AS (SELECT 1)
++SELECT * FROM x;
++
+ -- INTERSECT
+ WITH RECURSIVE x(n) AS (SELECT 1 INTERSECT SELECT n+1 FROM x)
+ 	SELECT * FROM x;
+diff --git a/src/test/regress/sql/xml.sql b/src/test/regress/sql/xml.sql
+index f3f83c7827d1..e3f90db4d568 100644
+--- a/src/test/regress/sql/xml.sql
++++ b/src/test/regress/sql/xml.sql
+@@ -384,6 +384,9 @@ SELECT * FROM xmltableview1;
+ EXPLAIN (COSTS OFF) SELECT * FROM xmltableview1;
+ EXPLAIN (COSTS OFF, VERBOSE) SELECT * FROM xmltableview1;
+ 
++-- errors
++SELECT * FROM XMLTABLE (ROW () PASSING null COLUMNS v1 timestamp) AS f (v1, v2);
++
+ -- XMLNAMESPACES tests
+ SELECT * FROM XMLTABLE(XMLNAMESPACES('http://x.y' AS zz),
+                       '/zz:rows/zz:row'

@@ -1,0 +1,525 @@
+From 0c882e52a8660114234a0c4a29db919bb727e552 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 5 Jun 2020 16:55:16 -0400
+Subject: [PATCH] Improve ineq_histogram_selectivity's behavior for non-default
+ orderings.
+
+ineq_histogram_selectivity() can be invoked in situations where the
+ordering we care about is not that of the column's histogram.  We could
+be considering some other collation, or even more drastically, the
+query operator might not agree at all with what was used to construct
+the histogram.  (We'll get here for anything using scalarineqsel-based
+estimators, so that's quite likely to happen for extension operators.)
+
+Up to now we just ignored this issue and assumed we were dealing with
+an operator/collation whose sort order exactly matches the histogram,
+possibly resulting in junk estimates if the binary search gets confused.
+It's past time to improve that, since the use of nondefault collations
+is increasing.  What we can do is verify that the given operator and
+collation match what's recorded in pg_statistic, and use the existing
+code only if so.  When they don't match, instead execute the operator
+against each histogram entry, and take the fraction of successes as our
+selectivity estimate.  This gives an estimate that is probably good to
+about 1/histogram_size, with no assumptions about ordering.  (The quality
+of the estimate is likely to degrade near the ends of the value range,
+since the two orderings probably don't agree on what is an extremal value;
+but this is surely going to be more reliable than what we did before.)
+
+At some point we might further improve matters by storing more than one
+histogram calculated according to different orderings.  But this code
+would still be good fallback logic when no matches exist, so that is
+not an argument for not doing this.
+
+While here, also improve get_variable_range() to deal more honestly
+with non-default collations.
+
+This isn't back-patchable, because it requires adding another argument
+to ineq_histogram_selectivity, and because it might have significant
+impact on the estimation results for extension operators relying on
+scalarineqsel --- mostly for the better, one hopes, but in any case
+destabilizing plan choices in back branches is best avoided.
+
+Per investigation of a report from James Lucas.
+
+Discussion: https://postgr.es/m/CAAFmbbOvfi=wMM=3qRsPunBSLb8BFREno2oOzSBS=mzfLPKABw@mail.gmail.com
+---
+ src/backend/utils/adt/like_support.c     |   4 +-
+ src/backend/utils/adt/selfuncs.c         | 206 ++++++++++++++++-------
+ src/backend/utils/cache/lsyscache.c      |  62 +++++--
+ src/include/utils/lsyscache.h            |   1 +
+ src/include/utils/selfuncs.h             |   3 +-
+ src/test/regress/expected/privileges.out |   3 +
+ src/test/regress/sql/privileges.sql      |   3 +
+ 7 files changed, 205 insertions(+), 77 deletions(-)
+
+diff --git a/src/backend/utils/adt/like_support.c b/src/backend/utils/adt/like_support.c
+index ae5c8f084e93..bcfbaa1c3d18 100644
+--- a/src/backend/utils/adt/like_support.c
++++ b/src/backend/utils/adt/like_support.c
+@@ -1217,7 +1217,7 @@ prefix_selectivity(PlannerInfo *root, VariableStatData *vardata,
+ 	fmgr_info(get_opcode(geopr), &opproc);
+ 
+ 	prefixsel = ineq_histogram_selectivity(root, vardata,
+-										   &opproc, true, true,
++										   geopr, &opproc, true, true,
+ 										   collation,
+ 										   prefixcon->constvalue,
+ 										   prefixcon->consttype);
+@@ -1238,7 +1238,7 @@ prefix_selectivity(PlannerInfo *root, VariableStatData *vardata,
+ 		Selectivity topsel;
+ 
+ 		topsel = ineq_histogram_selectivity(root, vardata,
+-											&opproc, false, false,
++											ltopr, &opproc, false, false,
+ 											collation,
+ 											greaterstrcon->constvalue,
+ 											greaterstrcon->consttype);
+diff --git a/src/backend/utils/adt/selfuncs.c b/src/backend/utils/adt/selfuncs.c
+index 233227730785..0f02f32ffd5e 100644
+--- a/src/backend/utils/adt/selfuncs.c
++++ b/src/backend/utils/adt/selfuncs.c
+@@ -192,6 +192,10 @@ static void examine_simple_variable(PlannerInfo *root, Var *var,
+ static bool get_variable_range(PlannerInfo *root, VariableStatData *vardata,
+ 							   Oid sortop, Oid collation,
+ 							   Datum *min, Datum *max);
++static void get_stats_slot_range(AttStatsSlot *sslot,
++								 Oid opfuncoid, FmgrInfo *opproc,
++								 Oid collation, int16 typLen, bool typByVal,
++								 Datum *min, Datum *max, bool *p_have_data);
+ static bool get_actual_variable_range(PlannerInfo *root,
+ 									  VariableStatData *vardata,
+ 									  Oid sortop, Oid collation,
+@@ -679,7 +683,7 @@ scalarineqsel(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
+ 	 * compute the resulting contribution to selectivity.
+ 	 */
+ 	hist_selec = ineq_histogram_selectivity(root, vardata,
+-											&opproc, isgt, iseq,
++											operator, &opproc, isgt, iseq,
+ 											collation,
+ 											constval, consttype);
+ 
+@@ -1019,6 +1023,9 @@ generic_restriction_selectivity(PlannerInfo *root, Oid oproid, Oid collation,
+  * satisfies the inequality condition, ie, VAR < (or <=, >, >=) CONST.
+  * The isgt and iseq flags distinguish which of the four cases apply.
+  *
++ * While opproc could be looked up from the operator OID, common callers
++ * also need to call it separately, so we make the caller pass both.
++ *
+  * Returns -1 if there is no histogram (valid results will always be >= 0).
+  *
+  * Note that the result disregards both the most-common-values (if any) and
+@@ -1030,7 +1037,7 @@ generic_restriction_selectivity(PlannerInfo *root, Oid oproid, Oid collation,
+ double
+ ineq_histogram_selectivity(PlannerInfo *root,
+ 						   VariableStatData *vardata,
+-						   FmgrInfo *opproc, bool isgt, bool iseq,
++						   Oid opoid, FmgrInfo *opproc, bool isgt, bool iseq,
+ 						   Oid collation,
+ 						   Datum constval, Oid consttype)
+ {
+@@ -1042,14 +1049,14 @@ ineq_histogram_selectivity(PlannerInfo *root,
+ 	/*
+ 	 * Someday, ANALYZE might store more than one histogram per rel/att,
+ 	 * corresponding to more than one possible sort ordering defined for the
+-	 * column type.  However, to make that work we will need to figure out
+-	 * which staop to search for --- it's not necessarily the one we have at
+-	 * hand!  (For example, we might have a '<=' operator rather than the '<'
+-	 * operator that will appear in staop.)  The collation might not agree
+-	 * either.  For now, just assume that whatever appears in pg_statistic is
+-	 * sorted the same way our operator sorts, or the reverse way if isgt is
+-	 * true.  This could result in a bogus estimate, but it still seems better
+-	 * than falling back to the default estimate.
++	 * column type.  Right now, we know there is only one, so just grab it and
++	 * see if it matches the query.
++	 *
++	 * Note that we can't use opoid as search argument; the staop appearing in
++	 * pg_statistic will be for the relevant '<' operator, but what we have
++	 * might be some other inequality operator such as '>='.  (Even if opoid
++	 * is a '<' operator, it could be cross-type.)  Hence we must use
++	 * comparison_ops_are_compatible() to see if the operators match.
+ 	 */
+ 	if (HeapTupleIsValid(vardata->statsTuple) &&
+ 		statistic_proc_security_check(vardata, opproc->fn_oid) &&
+@@ -1057,16 +1064,15 @@ ineq_histogram_selectivity(PlannerInfo *root,
+ 						 STATISTIC_KIND_HISTOGRAM, InvalidOid,
+ 						 ATTSTATSSLOT_VALUES))
+ 	{
+-		if (sslot.nvalues > 1)
++		if (sslot.nvalues > 1 &&
++			sslot.stacoll == collation &&
++			comparison_ops_are_compatible(sslot.staop, opoid))
+ 		{
+ 			/*
+ 			 * Use binary search to find the desired location, namely the
+ 			 * right end of the histogram bin containing the comparison value,
+ 			 * which is the leftmost entry for which the comparison operator
+-			 * succeeds (if isgt) or fails (if !isgt).  (If the given operator
+-			 * isn't actually sort-compatible with the histogram, you'll get
+-			 * garbage results ... but probably not any more garbage-y than
+-			 * you would have from the old linear search.)
++			 * succeeds (if isgt) or fails (if !isgt).
+ 			 *
+ 			 * In this loop, we pay no attention to whether the operator iseq
+ 			 * or not; that detail will be mopped up below.  (We cannot tell,
+@@ -1332,6 +1338,50 @@ ineq_histogram_selectivity(PlannerInfo *root,
+ 					hist_selec = 1.0 - cutoff;
+ 			}
+ 		}
++		else if (sslot.nvalues > 1)
++		{
++			/*
++			 * If we get here, we have a histogram but it's not sorted the way
++			 * we want.  Do a brute-force search to see how many of the
++			 * entries satisfy the comparison condition, and take that
++			 * fraction as our estimate.  (This is identical to the inner loop
++			 * of histogram_selectivity; maybe share code?)
++			 */
++			LOCAL_FCINFO(fcinfo, 2);
++			int			nmatch = 0;
++
++			InitFunctionCallInfoData(*fcinfo, opproc, 2, collation,
++									 NULL, NULL);
++			fcinfo->args[0].isnull = false;
++			fcinfo->args[1].isnull = false;
++			fcinfo->args[1].value = constval;
++			for (int i = 0; i < sslot.nvalues; i++)
++			{
++				Datum		fresult;
++
++				fcinfo->args[0].value = sslot.values[i];
++				fcinfo->isnull = false;
++				fresult = FunctionCallInvoke(fcinfo);
++				if (!fcinfo->isnull && DatumGetBool(fresult))
++					nmatch++;
++			}
++			hist_selec = ((double) nmatch) / ((double) sslot.nvalues);
++
++			/*
++			 * As above, clamp to a hundredth of the histogram resolution.
++			 * This case is surely even less trustworthy than the normal one,
++			 * so we shouldn't believe exact 0 or 1 selectivity.  (Maybe the
++			 * clamp should be more restrictive in this case?)
++			 */
++			{
++				double		cutoff = 0.01 / (double) (sslot.nvalues - 1);
++
++				if (hist_selec < cutoff)
++					hist_selec = cutoff;
++				else if (hist_selec > 1.0 - cutoff)
++					hist_selec = 1.0 - cutoff;
++			}
++		}
+ 
+ 		free_attstatsslot(&sslot);
+ 	}
+@@ -5363,8 +5413,8 @@ get_variable_range(PlannerInfo *root, VariableStatData *vardata,
+ 	int16		typLen;
+ 	bool		typByVal;
+ 	Oid			opfuncoid;
++	FmgrInfo	opproc;
+ 	AttStatsSlot sslot;
+-	int			i;
+ 
+ 	/*
+ 	 * XXX It's very tempting to try to use the actual column min and max, if
+@@ -5395,20 +5445,19 @@ get_variable_range(PlannerInfo *root, VariableStatData *vardata,
+ 									   (opfuncoid = get_opcode(sortop))))
+ 		return false;
+ 
++	opproc.fn_oid = InvalidOid; /* mark this as not looked up yet */
++
+ 	get_typlenbyval(vardata->atttype, &typLen, &typByVal);
+ 
+ 	/*
+-	 * If there is a histogram, grab the first and last values.
+-	 *
+-	 * If there is a histogram that is sorted with some other operator than
+-	 * the one we want, fail --- this suggests that there is data we can't
+-	 * use.  XXX consider collation too.
++	 * If there is a histogram with the ordering we want, grab the first and
++	 * last values.
+ 	 */
+ 	if (get_attstatsslot(&sslot, vardata->statsTuple,
+ 						 STATISTIC_KIND_HISTOGRAM, sortop,
+ 						 ATTSTATSSLOT_VALUES))
+ 	{
+-		if (sslot.nvalues > 0)
++		if (sslot.stacoll == collation && sslot.nvalues > 0)
+ 		{
+ 			tmin = datumCopy(sslot.values[0], typByVal, typLen);
+ 			tmax = datumCopy(sslot.values[sslot.nvalues - 1], typByVal, typLen);
+@@ -5416,57 +5465,36 @@ get_variable_range(PlannerInfo *root, VariableStatData *vardata,
+ 		}
+ 		free_attstatsslot(&sslot);
+ 	}
+-	else if (get_attstatsslot(&sslot, vardata->statsTuple,
+-							  STATISTIC_KIND_HISTOGRAM, InvalidOid,
+-							  0))
++
++	/*
++	 * Otherwise, if there is a histogram with some other ordering, scan it
++	 * and get the min and max values according to the ordering we want.  This
++	 * of course may not find values that are really extremal according to our
++	 * ordering, but it beats ignoring available data.
++	 */
++	if (!have_data &&
++		get_attstatsslot(&sslot, vardata->statsTuple,
++						 STATISTIC_KIND_HISTOGRAM, InvalidOid,
++						 ATTSTATSSLOT_VALUES))
+ 	{
++		get_stats_slot_range(&sslot, opfuncoid, &opproc,
++							 collation, typLen, typByVal,
++							 &tmin, &tmax, &have_data);
+ 		free_attstatsslot(&sslot);
+-		return false;
+ 	}
+ 
+ 	/*
+ 	 * If we have most-common-values info, look for extreme MCVs.  This is
+ 	 * needed even if we also have a histogram, since the histogram excludes
+-	 * the MCVs.  However, usually the MCVs will not be the extreme values, so
+-	 * avoid unnecessary data copying.
++	 * the MCVs.
+ 	 */
+ 	if (get_attstatsslot(&sslot, vardata->statsTuple,
+ 						 STATISTIC_KIND_MCV, InvalidOid,
+ 						 ATTSTATSSLOT_VALUES))
+ 	{
+-		bool		tmin_is_mcv = false;
+-		bool		tmax_is_mcv = false;
+-		FmgrInfo	opproc;
+-
+-		fmgr_info(opfuncoid, &opproc);
+-
+-		for (i = 0; i < sslot.nvalues; i++)
+-		{
+-			if (!have_data)
+-			{
+-				tmin = tmax = sslot.values[i];
+-				tmin_is_mcv = tmax_is_mcv = have_data = true;
+-				continue;
+-			}
+-			if (DatumGetBool(FunctionCall2Coll(&opproc,
+-											   collation,
+-											   sslot.values[i], tmin)))
+-			{
+-				tmin = sslot.values[i];
+-				tmin_is_mcv = true;
+-			}
+-			if (DatumGetBool(FunctionCall2Coll(&opproc,
+-											   collation,
+-											   tmax, sslot.values[i])))
+-			{
+-				tmax = sslot.values[i];
+-				tmax_is_mcv = true;
+-			}
+-		}
+-		if (tmin_is_mcv)
+-			tmin = datumCopy(tmin, typByVal, typLen);
+-		if (tmax_is_mcv)
+-			tmax = datumCopy(tmax, typByVal, typLen);
++		get_stats_slot_range(&sslot, opfuncoid, &opproc,
++							 collation, typLen, typByVal,
++							 &tmin, &tmax, &have_data);
+ 		free_attstatsslot(&sslot);
+ 	}
+ 
+@@ -5475,6 +5503,62 @@ get_variable_range(PlannerInfo *root, VariableStatData *vardata,
+ 	return have_data;
+ }
+ 
++/*
++ * get_stats_slot_range: scan sslot for min/max values
++ *
++ * Subroutine for get_variable_range: update min/max/have_data according
++ * to what we find in the statistics array.
++ */
++static void
++get_stats_slot_range(AttStatsSlot *sslot, Oid opfuncoid, FmgrInfo *opproc,
++					 Oid collation, int16 typLen, bool typByVal,
++					 Datum *min, Datum *max, bool *p_have_data)
++{
++	Datum		tmin = *min;
++	Datum		tmax = *max;
++	bool		have_data = *p_have_data;
++	bool		found_tmin = false;
++	bool		found_tmax = false;
++
++	/* Look up the comparison function, if we didn't already do so */
++	if (opproc->fn_oid != opfuncoid)
++		fmgr_info(opfuncoid, opproc);
++
++	/* Scan all the slot's values */
++	for (int i = 0; i < sslot->nvalues; i++)
++	{
++		if (!have_data)
++		{
++			tmin = tmax = sslot->values[i];
++			found_tmin = found_tmax = true;
++			*p_have_data = have_data = true;
++			continue;
++		}
++		if (DatumGetBool(FunctionCall2Coll(opproc,
++										   collation,
++										   sslot->values[i], tmin)))
++		{
++			tmin = sslot->values[i];
++			found_tmin = true;
++		}
++		if (DatumGetBool(FunctionCall2Coll(opproc,
++										   collation,
++										   tmax, sslot->values[i])))
++		{
++			tmax = sslot->values[i];
++			found_tmax = true;
++		}
++	}
++
++	/*
++	 * Copy the slot's values, if we found new extreme values.
++	 */
++	if (found_tmin)
++		*min = datumCopy(tmin, typByVal, typLen);
++	if (found_tmax)
++		*max = datumCopy(tmax, typByVal, typLen);
++}
++
+ 
+ /*
+  * get_actual_variable_range
+diff --git a/src/backend/utils/cache/lsyscache.c b/src/backend/utils/cache/lsyscache.c
+index 63d1263502d2..f3bf413829fc 100644
+--- a/src/backend/utils/cache/lsyscache.c
++++ b/src/backend/utils/cache/lsyscache.c
+@@ -731,6 +731,55 @@ equality_ops_are_compatible(Oid opno1, Oid opno2)
+ 	return result;
+ }
+ 
++/*
++ * comparison_ops_are_compatible
++ *		Return true if the two given comparison operators have compatible
++ *		semantics.
++ *
++ * This is trivially true if they are the same operator.  Otherwise,
++ * we look to see if they can be found in the same btree opfamily.
++ * For example, '<' and '>=' ops match if they belong to the same family.
++ *
++ * (This is identical to equality_ops_are_compatible(), except that we
++ * don't bother to examine hash opclasses.)
++ */
++bool
++comparison_ops_are_compatible(Oid opno1, Oid opno2)
++{
++	bool		result;
++	CatCList   *catlist;
++	int			i;
++
++	/* Easy if they're the same operator */
++	if (opno1 == opno2)
++		return true;
++
++	/*
++	 * We search through all the pg_amop entries for opno1.
++	 */
++	catlist = SearchSysCacheList1(AMOPOPID, ObjectIdGetDatum(opno1));
++
++	result = false;
++	for (i = 0; i < catlist->n_members; i++)
++	{
++		HeapTuple	op_tuple = &catlist->members[i]->tuple;
++		Form_pg_amop op_form = (Form_pg_amop) GETSTRUCT(op_tuple);
++
++		if (op_form->amopmethod == BTREE_AM_OID)
++		{
++			if (op_in_opfamily(opno2, op_form->amopfamily))
++			{
++				result = true;
++				break;
++			}
++		}
++	}
++
++	ReleaseSysCacheList(catlist);
++
++	return result;
++}
++
+ 
+ /*				---------- AMPROC CACHES ----------						 */
+ 
+@@ -3028,19 +3077,6 @@ get_attstatsslot(AttStatsSlot *sslot, HeapTuple statstuple,
+ 	sslot->staop = (&stats->staop1)[i];
+ 	sslot->stacoll = (&stats->stacoll1)[i];
+ 
+-	/*
+-	 * XXX Hopefully-temporary hack: if stacoll isn't set, inject the default
+-	 * collation.  This won't matter for non-collation-aware datatypes.  For
+-	 * those that are, this covers cases where stacoll has not been set.  In
+-	 * the short term we need this because some code paths involving type NAME
+-	 * do not pass any collation to prefix_selectivity and related functions.
+-	 * Even when that's been fixed, it's likely that some add-on typanalyze
+-	 * functions won't get the word right away about filling stacoll during
+-	 * ANALYZE, so we'll probably need this for awhile.
+-	 */
+-	if (sslot->stacoll == InvalidOid)
+-		sslot->stacoll = DEFAULT_COLLATION_OID;
+-
+ 	if (flags & ATTSTATSSLOT_VALUES)
+ 	{
+ 		val = SysCacheGetAttr(STATRELATTINH, statstuple,
+diff --git a/src/include/utils/lsyscache.h b/src/include/utils/lsyscache.h
+index 91aed1f5a514..fecfe1f4f6ef 100644
+--- a/src/include/utils/lsyscache.h
++++ b/src/include/utils/lsyscache.h
+@@ -82,6 +82,7 @@ extern bool get_op_hash_functions(Oid opno,
+ 								  RegProcedure *lhs_procno, RegProcedure *rhs_procno);
+ extern List *get_op_btree_interpretation(Oid opno);
+ extern bool equality_ops_are_compatible(Oid opno1, Oid opno2);
++extern bool comparison_ops_are_compatible(Oid opno1, Oid opno2);
+ extern Oid	get_opfamily_proc(Oid opfamily, Oid lefttype, Oid righttype,
+ 							  int16 procnum);
+ extern char *get_attname(Oid relid, AttrNumber attnum, bool missing_ok);
+diff --git a/src/include/utils/selfuncs.h b/src/include/utils/selfuncs.h
+index 15d22890248b..7ac4a0639159 100644
+--- a/src/include/utils/selfuncs.h
++++ b/src/include/utils/selfuncs.h
+@@ -159,7 +159,8 @@ extern double generic_restriction_selectivity(PlannerInfo *root,
+ 											  double default_selectivity);
+ extern double ineq_histogram_selectivity(PlannerInfo *root,
+ 										 VariableStatData *vardata,
+-										 FmgrInfo *opproc, bool isgt, bool iseq,
++										 Oid opoid, FmgrInfo *opproc,
++										 bool isgt, bool iseq,
+ 										 Oid collation,
+ 										 Datum constval, Oid consttype);
+ extern double var_eq_const(VariableStatData *vardata,
+diff --git a/src/test/regress/expected/privileges.out b/src/test/regress/expected/privileges.out
+index c2d037b61419..7caf0c9b6b93 100644
+--- a/src/test/regress/expected/privileges.out
++++ b/src/test/regress/expected/privileges.out
+@@ -191,7 +191,10 @@ CREATE TABLE atest12 as
+   SELECT x AS a, 10001 - x AS b FROM generate_series(1,10000) x;
+ CREATE INDEX ON atest12 (a);
+ CREATE INDEX ON atest12 (abs(a));
++-- results below depend on having quite accurate stats for atest12
++SET default_statistics_target = 10000;
+ VACUUM ANALYZE atest12;
++RESET default_statistics_target;
+ CREATE FUNCTION leak(integer,integer) RETURNS boolean
+   AS $$begin return $1 < $2; end$$
+   LANGUAGE plpgsql immutable;
+diff --git a/src/test/regress/sql/privileges.sql b/src/test/regress/sql/privileges.sql
+index 2ba69617dcee..0ab5245b1ebf 100644
+--- a/src/test/regress/sql/privileges.sql
++++ b/src/test/regress/sql/privileges.sql
+@@ -136,7 +136,10 @@ CREATE TABLE atest12 as
+   SELECT x AS a, 10001 - x AS b FROM generate_series(1,10000) x;
+ CREATE INDEX ON atest12 (a);
+ CREATE INDEX ON atest12 (abs(a));
++-- results below depend on having quite accurate stats for atest12
++SET default_statistics_target = 10000;
+ VACUUM ANALYZE atest12;
++RESET default_statistics_target;
+ 
+ CREATE FUNCTION leak(integer,integer) RETURNS boolean
+   AS $$begin return $1 < $2; end$$

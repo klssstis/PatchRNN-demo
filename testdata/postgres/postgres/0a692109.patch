@@ -1,0 +1,518 @@
+From 0a692109dcc73178962069addf7478ac89950e4d Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Thu, 5 Aug 2021 12:09:19 -0700
+Subject: [PATCH] process startup: Move AuxiliaryProcessMain into its own file.
+
+After the preceding commits the auxprocess code is independent from
+bootstrap.c - so a dedicated file seems less confusing.
+
+Author: Andres Freund <andres@anarazel.de>
+Reviewed-By: Kyotaro Horiguchi <horikyota.ntt@gmail.com>
+Reviewed-By: Robert Haas <robertmhaas@gmail.com>
+Discussion: https://postgr.es/m/20210802164124.ufo5buo4apl6yuvs@alap3.anarazel.de
+---
+ src/backend/bootstrap/bootstrap.c   | 157 ----------------------
+ src/backend/postmaster/Makefile     |   1 +
+ src/backend/postmaster/auxprocess.c | 194 ++++++++++++++++++++++++++++
+ src/backend/postmaster/postmaster.c |   2 +-
+ src/include/bootstrap/bootstrap.h   |   2 -
+ src/include/miscadmin.h             |   2 +-
+ src/include/postmaster/auxprocess.h |  20 +++
+ 7 files changed, 217 insertions(+), 161 deletions(-)
+ create mode 100644 src/backend/postmaster/auxprocess.c
+ create mode 100644 src/include/postmaster/auxprocess.h
+
+diff --git a/src/backend/bootstrap/bootstrap.c b/src/backend/bootstrap/bootstrap.c
+index e2c01e562593..80dc3b585f61 100644
+--- a/src/backend/bootstrap/bootstrap.c
++++ b/src/backend/bootstrap/bootstrap.c
+@@ -33,11 +33,6 @@
+ #include "miscadmin.h"
+ #include "nodes/makefuncs.h"
+ #include "pg_getopt.h"
+-#include "pgstat.h"
+-#include "postmaster/bgwriter.h"
+-#include "postmaster/startup.h"
+-#include "postmaster/walwriter.h"
+-#include "replication/walreceiver.h"
+ #include "storage/bufmgr.h"
+ #include "storage/bufpage.h"
+ #include "storage/condition_variable.h"
+@@ -47,7 +42,6 @@
+ #include "utils/builtins.h"
+ #include "utils/fmgroids.h"
+ #include "utils/memutils.h"
+-#include "utils/ps_status.h"
+ #include "utils/rel.h"
+ #include "utils/relmapper.h"
+ 
+@@ -56,7 +50,6 @@ uint32		bootstrap_data_checksum_version = 0;	/* No checksum */
+ 
+ static void CheckerModeMain(void);
+ static void bootstrap_signals(void);
+-static void ShutdownAuxiliaryProcess(int code, Datum arg);
+ static Form_pg_attribute AllocateAttribute(void);
+ static void populate_typ_list(void);
+ static Oid	gettype(char *type);
+@@ -67,8 +60,6 @@ static void cleanup(void);
+  * ----------------
+  */
+ 
+-AuxProcType MyAuxProcType = NotAnAuxProcess;	/* declared in miscadmin.h */
+-
+ Relation	boot_reldesc;		/* current relation descriptor */
+ 
+ Form_pg_attribute attrtypes[MAXATTR];	/* points to attribute info */
+@@ -184,139 +175,6 @@ typedef struct _IndexList
+ static IndexList *ILHead = NULL;
+ 
+ 
+-/*
+- *	 AuxiliaryProcessMain
+- *
+- *	 The main entry point for auxiliary processes, such as the bgwriter,
+- *	 walwriter, walreceiver, bootstrapper and the shared memory checker code.
+- *
+- *	 This code is here just because of historical reasons.
+- */
+-void
+-AuxiliaryProcessMain(AuxProcType auxtype)
+-{
+-	Assert(IsUnderPostmaster);
+-
+-	MyAuxProcType = auxtype;
+-
+-	switch (MyAuxProcType)
+-	{
+-		case StartupProcess:
+-			MyBackendType = B_STARTUP;
+-			break;
+-		case ArchiverProcess:
+-			MyBackendType = B_ARCHIVER;
+-			break;
+-		case BgWriterProcess:
+-			MyBackendType = B_BG_WRITER;
+-			break;
+-		case CheckpointerProcess:
+-			MyBackendType = B_CHECKPOINTER;
+-			break;
+-		case WalWriterProcess:
+-			MyBackendType = B_WAL_WRITER;
+-			break;
+-		case WalReceiverProcess:
+-			MyBackendType = B_WAL_RECEIVER;
+-			break;
+-		default:
+-			elog(ERROR, "something has gone wrong");
+-			MyBackendType = B_INVALID;
+-	}
+-
+-	init_ps_display(NULL);
+-
+-	SetProcessingMode(BootstrapProcessing);
+-	IgnoreSystemIndexes = true;
+-
+-	BaseInit();
+-
+-	/*
+-	 * As an auxiliary process, we aren't going to do the full InitPostgres
+-	 * pushups, but there are a couple of things that need to get lit up even
+-	 * in an auxiliary process.
+-	 */
+-
+-	/*
+-	 * Create a PGPROC so we can use LWLocks.  In the EXEC_BACKEND case, this
+-	 * was already done by SubPostmasterMain().
+-	 */
+-#ifndef EXEC_BACKEND
+-	InitAuxiliaryProcess();
+-#endif
+-
+-	/*
+-	 * Assign the ProcSignalSlot for an auxiliary process.  Since it doesn't
+-	 * have a BackendId, the slot is statically allocated based on the
+-	 * auxiliary process type (MyAuxProcType).  Backends use slots indexed in
+-	 * the range from 1 to MaxBackends (inclusive), so we use MaxBackends +
+-	 * AuxProcType + 1 as the index of the slot for an auxiliary process.
+-	 *
+-	 * This will need rethinking if we ever want more than one of a particular
+-	 * auxiliary process type.
+-	 */
+-	ProcSignalInit(MaxBackends + MyAuxProcType + 1);
+-
+-	/* finish setting up bufmgr.c */
+-	InitBufferPoolBackend();
+-
+-	/*
+-	 * Auxiliary processes don't run transactions, but they may need a
+-	 * resource owner anyway to manage buffer pins acquired outside
+-	 * transactions (and, perhaps, other things in future).
+-	 */
+-	CreateAuxProcessResourceOwner();
+-
+-	/* Initialize statistics reporting */
+-	pgstat_initialize();
+-
+-	/* Initialize backend status information */
+-	pgstat_beinit();
+-	pgstat_bestart();
+-
+-	/* register a before-shutdown callback for LWLock cleanup */
+-	before_shmem_exit(ShutdownAuxiliaryProcess, 0);
+-
+-	SetProcessingMode(NormalProcessing);
+-
+-	switch (MyAuxProcType)
+-	{
+-		case CheckerProcess:
+-		case BootstrapProcess:
+-			pg_unreachable();
+-			break;
+-
+-		case StartupProcess:
+-			StartupProcessMain();
+-			proc_exit(1);
+-
+-		case ArchiverProcess:
+-			PgArchiverMain();
+-			proc_exit(1);
+-
+-		case BgWriterProcess:
+-			BackgroundWriterMain();
+-			proc_exit(1);
+-
+-		case CheckpointerProcess:
+-			CheckpointerMain();
+-			proc_exit(1);
+-
+-		case WalWriterProcess:
+-			InitXLOGAccess();
+-			WalWriterMain();
+-			proc_exit(1);
+-
+-		case WalReceiverProcess:
+-			WalReceiverMain();
+-			proc_exit(1);
+-
+-		default:
+-			elog(PANIC, "unrecognized process type: %d", (int) MyAuxProcType);
+-			proc_exit(1);
+-	}
+-}
+-
+ /*
+  * In shared memory checker mode, all we really want to do is create shared
+  * memory and semaphores (just to prove we can do it with the current GUC
+@@ -554,21 +412,6 @@ bootstrap_signals(void)
+ 	pqsignal(SIGQUIT, SIG_DFL);
+ }
+ 
+-/*
+- * Begin shutdown of an auxiliary process.  This is approximately the equivalent
+- * of ShutdownPostgres() in postinit.c.  We can't run transactions in an
+- * auxiliary process, so most of the work of AbortTransaction() is not needed,
+- * but we do need to make sure we've released any LWLocks we are holding.
+- * (This is only critical during an error exit.)
+- */
+-static void
+-ShutdownAuxiliaryProcess(int code, Datum arg)
+-{
+-	LWLockReleaseAll();
+-	ConditionVariableCancelSleep();
+-	pgstat_report_wait_end();
+-}
+-
+ /* ----------------------------------------------------------------
+  *				MANUAL BACKEND INTERACTIVE INTERFACE COMMANDS
+  * ----------------------------------------------------------------
+diff --git a/src/backend/postmaster/Makefile b/src/backend/postmaster/Makefile
+index bfdf6a833db3..787c6a2c3bf0 100644
+--- a/src/backend/postmaster/Makefile
++++ b/src/backend/postmaster/Makefile
+@@ -14,6 +14,7 @@ include $(top_builddir)/src/Makefile.global
+ 
+ OBJS = \
+ 	autovacuum.o \
++	auxprocess.o \
+ 	bgworker.o \
+ 	bgwriter.o \
+ 	checkpointer.o \
+diff --git a/src/backend/postmaster/auxprocess.c b/src/backend/postmaster/auxprocess.c
+new file mode 100644
+index 000000000000..c391c963db09
+--- /dev/null
++++ b/src/backend/postmaster/auxprocess.c
+@@ -0,0 +1,194 @@
++/*-------------------------------------------------------------------------
++ * auxprocess.c
++ *	  functions related to auxiliary processes.
++ *
++ *
++ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *	  src/backend/postmaster/auxprocess.c
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include <unistd.h>
++#include <signal.h>
++
++#include "libpq/pqsignal.h"
++#include "miscadmin.h"
++#include "pgstat.h"
++#include "postmaster/auxprocess.h"
++#include "postmaster/bgwriter.h"
++#include "postmaster/startup.h"
++#include "postmaster/walwriter.h"
++#include "replication/walreceiver.h"
++#include "storage/bufmgr.h"
++#include "storage/bufpage.h"
++#include "storage/condition_variable.h"
++#include "storage/ipc.h"
++#include "storage/proc.h"
++#include "tcop/tcopprot.h"
++#include "utils/memutils.h"
++#include "utils/ps_status.h"
++#include "utils/rel.h"
++
++
++static void ShutdownAuxiliaryProcess(int code, Datum arg);
++
++
++/* ----------------
++ *		global variables
++ * ----------------
++ */
++
++AuxProcType MyAuxProcType = NotAnAuxProcess;	/* declared in miscadmin.h */
++
++
++/*
++ *	 AuxiliaryProcessMain
++ *
++ *	 The main entry point for auxiliary processes, such as the bgwriter,
++ *	 walwriter, walreceiver, bootstrapper and the shared memory checker code.
++ *
++ *	 This code is here just because of historical reasons.
++ */
++void
++AuxiliaryProcessMain(AuxProcType auxtype)
++{
++	Assert(IsUnderPostmaster);
++
++	MyAuxProcType = auxtype;
++
++	switch (MyAuxProcType)
++	{
++		case StartupProcess:
++			MyBackendType = B_STARTUP;
++			break;
++		case ArchiverProcess:
++			MyBackendType = B_ARCHIVER;
++			break;
++		case BgWriterProcess:
++			MyBackendType = B_BG_WRITER;
++			break;
++		case CheckpointerProcess:
++			MyBackendType = B_CHECKPOINTER;
++			break;
++		case WalWriterProcess:
++			MyBackendType = B_WAL_WRITER;
++			break;
++		case WalReceiverProcess:
++			MyBackendType = B_WAL_RECEIVER;
++			break;
++		default:
++			elog(ERROR, "something has gone wrong");
++			MyBackendType = B_INVALID;
++	}
++
++	init_ps_display(NULL);
++
++	SetProcessingMode(BootstrapProcessing);
++	IgnoreSystemIndexes = true;
++
++	BaseInit();
++
++	/*
++	 * As an auxiliary process, we aren't going to do the full InitPostgres
++	 * pushups, but there are a couple of things that need to get lit up even
++	 * in an auxiliary process.
++	 */
++
++	/*
++	 * Create a PGPROC so we can use LWLocks.  In the EXEC_BACKEND case, this
++	 * was already done by SubPostmasterMain().
++	 */
++#ifndef EXEC_BACKEND
++	InitAuxiliaryProcess();
++#endif
++
++	/*
++	 * Assign the ProcSignalSlot for an auxiliary process.  Since it doesn't
++	 * have a BackendId, the slot is statically allocated based on the
++	 * auxiliary process type (MyAuxProcType).  Backends use slots indexed in
++	 * the range from 1 to MaxBackends (inclusive), so we use MaxBackends +
++	 * AuxProcType + 1 as the index of the slot for an auxiliary process.
++	 *
++	 * This will need rethinking if we ever want more than one of a particular
++	 * auxiliary process type.
++	 */
++	ProcSignalInit(MaxBackends + MyAuxProcType + 1);
++
++	/* finish setting up bufmgr.c */
++	InitBufferPoolBackend();
++
++	/*
++	 * Auxiliary processes don't run transactions, but they may need a
++	 * resource owner anyway to manage buffer pins acquired outside
++	 * transactions (and, perhaps, other things in future).
++	 */
++	CreateAuxProcessResourceOwner();
++
++	/* Initialize statistics reporting */
++	pgstat_initialize();
++
++	/* Initialize backend status information */
++	pgstat_beinit();
++	pgstat_bestart();
++
++	/* register a before-shutdown callback for LWLock cleanup */
++	before_shmem_exit(ShutdownAuxiliaryProcess, 0);
++
++	SetProcessingMode(NormalProcessing);
++
++	switch (MyAuxProcType)
++	{
++		case CheckerProcess:
++		case BootstrapProcess:
++			pg_unreachable();
++			break;
++
++		case StartupProcess:
++			StartupProcessMain();
++			proc_exit(1);
++
++		case ArchiverProcess:
++			PgArchiverMain();
++			proc_exit(1);
++
++		case BgWriterProcess:
++			BackgroundWriterMain();
++			proc_exit(1);
++
++		case CheckpointerProcess:
++			CheckpointerMain();
++			proc_exit(1);
++
++		case WalWriterProcess:
++			InitXLOGAccess();
++			WalWriterMain();
++			proc_exit(1);
++
++		case WalReceiverProcess:
++			WalReceiverMain();
++			proc_exit(1);
++
++		default:
++			elog(PANIC, "unrecognized process type: %d", (int) MyAuxProcType);
++			proc_exit(1);
++	}
++}
++
++/*
++ * Begin shutdown of an auxiliary process.  This is approximately the equivalent
++ * of ShutdownPostgres() in postinit.c.  We can't run transactions in an
++ * auxiliary process, so most of the work of AbortTransaction() is not needed,
++ * but we do need to make sure we've released any LWLocks we are holding.
++ * (This is only critical during an error exit.)
++ */
++static void
++ShutdownAuxiliaryProcess(int code, Datum arg)
++{
++	LWLockReleaseAll();
++	ConditionVariableCancelSleep();
++	pgstat_report_wait_end();
++}
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index fb948b725795..386469121599 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -95,7 +95,6 @@
+ 
+ #include "access/transam.h"
+ #include "access/xlog.h"
+-#include "bootstrap/bootstrap.h"
+ #include "catalog/pg_control.h"
+ #include "common/file_perm.h"
+ #include "common/ip.h"
+@@ -109,6 +108,7 @@
+ #include "pgstat.h"
+ #include "port/pg_bswap.h"
+ #include "postmaster/autovacuum.h"
++#include "postmaster/auxprocess.h"
+ #include "postmaster/bgworker_internals.h"
+ #include "postmaster/fork_process.h"
+ #include "postmaster/interrupt.h"
+diff --git a/src/include/bootstrap/bootstrap.h b/src/include/bootstrap/bootstrap.h
+index 0f8762afaf80..a9829124104e 100644
+--- a/src/include/bootstrap/bootstrap.h
++++ b/src/include/bootstrap/bootstrap.h
+@@ -15,7 +15,6 @@
+ #define BOOTSTRAP_H
+ 
+ #include "nodes/execnodes.h"
+-#include "miscadmin.h"
+ 
+ 
+ /*
+@@ -34,7 +33,6 @@ extern int	numattr;
+ 
+ 
+ extern void BootstrapModeMain(int argc, char *argv[]) pg_attribute_noreturn();
+-extern void AuxiliaryProcessMain(AuxProcType auxtype) pg_attribute_noreturn();
+ 
+ extern void closerel(char *name);
+ extern void boot_openrel(char *name);
+diff --git a/src/include/miscadmin.h b/src/include/miscadmin.h
+index 68d840d6996f..1b7422d6366c 100644
+--- a/src/include/miscadmin.h
++++ b/src/include/miscadmin.h
+@@ -421,7 +421,7 @@ extern ProcessingMode Mode;
+ /*
+  * Auxiliary-process type identifiers.  These used to be in bootstrap.h
+  * but it seems saner to have them here, with the ProcessingMode stuff.
+- * The MyAuxProcType global is defined and set in bootstrap.c.
++ * The MyAuxProcType global is defined and set in auxprocess.c.
+  */
+ 
+ typedef enum
+diff --git a/src/include/postmaster/auxprocess.h b/src/include/postmaster/auxprocess.h
+new file mode 100644
+index 000000000000..bc3f541d2990
+--- /dev/null
++++ b/src/include/postmaster/auxprocess.h
+@@ -0,0 +1,20 @@
++/*-------------------------------------------------------------------------
++ * auxprocess.h
++ *	  include file for functions related to auxiliary processes.
++ *
++ *
++ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *		src/include/postmaster/auxprocess.h
++ *-------------------------------------------------------------------------
++ */
++#ifndef AUXPROCESS_H
++#define AUXPROCESS_H
++
++#include "miscadmin.h"
++
++extern void AuxiliaryProcessMain(AuxProcType auxtype) pg_attribute_noreturn();
++
++#endif							/* AUXPROCESS_H */

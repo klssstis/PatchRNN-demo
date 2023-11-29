@@ -1,0 +1,164 @@
+From 0e5290312851557ee24e3d6103baf14d6066695c Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 15 Feb 2021 10:17:58 -0500
+Subject: [PATCH] Simplify loop logic in nodeIncrementalSort.c.
+
+The inner loop in switchToPresortedPrefixMode() can be implemented
+as a conventional integer-counter for() loop, removing a couple of
+redundant boolean state variables.  The old logic here was a remnant
+of earlier development, but as things now stand there's no reason
+for extra complexity.
+
+Also, annotate the test case added by 82e0e2930 to explain why it
+manages to hit the corner case fixed in that commit, and add an
+EXPLAIN to verify that it's creating an incremental-sort plan.
+
+Back-patch to v13, like the previous patch.
+
+James Coleman and Tom Lane
+
+Discussion: https://postgr.es/m/16846-ae49f51ac379a4cb@postgresql.org
+---
+ src/backend/executor/nodeIncrementalSort.c    | 45 +++++--------------
+ .../regress/expected/incremental_sort.out     | 15 +++++++
+ src/test/regress/sql/incremental_sort.sql     |  4 ++
+ 3 files changed, 30 insertions(+), 34 deletions(-)
+
+diff --git a/src/backend/executor/nodeIncrementalSort.c b/src/backend/executor/nodeIncrementalSort.c
+index 82fa800cb171..459c879f0bbc 100644
+--- a/src/backend/executor/nodeIncrementalSort.c
++++ b/src/backend/executor/nodeIncrementalSort.c
+@@ -288,9 +288,7 @@ switchToPresortedPrefixMode(PlanState *pstate)
+ {
+ 	IncrementalSortState *node = castNode(IncrementalSortState, pstate);
+ 	ScanDirection dir;
+-	int64		nTuples = 0;
+-	bool		lastTuple = false;
+-	bool		firstTuple = true;
++	int64		nTuples;
+ 	TupleDesc	tupDesc;
+ 	PlanState  *outerNode;
+ 	IncrementalSort *plannode = castNode(IncrementalSort, node->ss.ps.plan);
+@@ -343,20 +341,16 @@ switchToPresortedPrefixMode(PlanState *pstate)
+ 	 * Copy as many tuples as we can (i.e., in the same prefix key group) from
+ 	 * the full sort state to the prefix sort state.
+ 	 */
+-	for (;;)
++	for (nTuples = 0; nTuples < node->n_fullsort_remaining; nTuples++)
+ 	{
+-		lastTuple = node->n_fullsort_remaining - nTuples == 1;
+-
+ 		/*
+ 		 * When we encounter multiple prefix key groups inside the full sort
+ 		 * tuplesort we have to carry over the last read tuple into the next
+ 		 * batch.
+ 		 */
+-		if (firstTuple && !TupIsNull(node->transfer_tuple))
++		if (nTuples == 0 && !TupIsNull(node->transfer_tuple))
+ 		{
+ 			tuplesort_puttupleslot(node->prefixsort_state, node->transfer_tuple);
+-			nTuples++;
+-
+ 			/* The carried over tuple is our new group pivot tuple. */
+ 			ExecCopySlot(node->group_pivot, node->transfer_tuple);
+ 		}
+@@ -376,7 +370,6 @@ switchToPresortedPrefixMode(PlanState *pstate)
+ 			if (isCurrentGroup(node, node->group_pivot, node->transfer_tuple))
+ 			{
+ 				tuplesort_puttupleslot(node->prefixsort_state, node->transfer_tuple);
+-				nTuples++;
+ 			}
+ 			else
+ 			{
+@@ -395,27 +388,10 @@ switchToPresortedPrefixMode(PlanState *pstate)
+ 				 */
+ 				ExecClearTuple(node->group_pivot);
+ 
+-				/*
+-				 * Also make sure we take the didn't-consume-all-the-tuples
+-				 * path below, even if this happened to be the last tuple of
+-				 * the batch.
+-				 */
+-				lastTuple = false;
++				/* Break out of for-loop early */
+ 				break;
+ 			}
+ 		}
+-
+-		firstTuple = false;
+-
+-		/*
+-		 * If we've copied all of the tuples from the full sort state into the
+-		 * prefix sort state, then we don't actually know that we've yet found
+-		 * the last tuple in that prefix key group until we check the next
+-		 * tuple from the outer plan node, so we retain the current group
+-		 * pivot tuple prefix key group comparison.
+-		 */
+-		if (lastTuple)
+-			break;
+ 	}
+ 
+ 	/*
+@@ -428,14 +404,15 @@ switchToPresortedPrefixMode(PlanState *pstate)
+ 	node->n_fullsort_remaining -= nTuples;
+ 	SO1_printf("Setting n_fullsort_remaining to " INT64_FORMAT "\n", node->n_fullsort_remaining);
+ 
+-	if (lastTuple)
++	if (node->n_fullsort_remaining == 0)
+ 	{
+ 		/*
+-		 * We've confirmed that all tuples remaining in the full sort batch is
+-		 * in the same prefix key group and moved all of those tuples into the
+-		 * presorted prefix tuplesort. Now we can save our pivot comparison
+-		 * tuple and continue fetching tuples from the outer execution node to
+-		 * load into the presorted prefix tuplesort.
++		 * We've found that all tuples remaining in the full sort batch are in
++		 * the same prefix key group and moved all of those tuples into the
++		 * presorted prefix tuplesort.  We don't know that we've yet found the
++		 * last tuple in the current prefix key group, so save our pivot
++		 * comparison tuple and continue fetching tuples from the outer
++		 * execution node to load into the presorted prefix tuplesort.
+ 		 */
+ 		ExecCopySlot(node->group_pivot, node->transfer_tuple);
+ 		SO_printf("Setting execution_status to INCSORT_LOADPREFIXSORT (switchToPresortedPrefixMode)\n");
+diff --git a/src/test/regress/expected/incremental_sort.out b/src/test/regress/expected/incremental_sort.out
+index d5745838440b..68ca321163b5 100644
+--- a/src/test/regress/expected/incremental_sort.out
++++ b/src/test/regress/expected/incremental_sort.out
+@@ -676,6 +676,21 @@ select * from (select * from t order by a) s order by a, b limit 70;
+ (70 rows)
+ 
+ -- Checks case where we hit a group boundary at the last tuple of a batch.
++-- Because the full sort state is bounded, we scan 64 tuples (the mode
++-- transition point) but only retain 5. Thus when we transition modes, all
++-- tuples in the full sort state have different prefix keys.
++explain (costs off) select * from (select * from t order by a) s order by a, b limit 5;
++           QUERY PLAN            
++---------------------------------
++ Limit
++   ->  Incremental Sort
++         Sort Key: t.a, t.b
++         Presorted Key: t.a
++         ->  Sort
++               Sort Key: t.a
++               ->  Seq Scan on t
++(7 rows)
++
+ select * from (select * from t order by a) s order by a, b limit 5;
+  a | b 
+ ---+---
+diff --git a/src/test/regress/sql/incremental_sort.sql b/src/test/regress/sql/incremental_sort.sql
+index 9965fcd77765..81429164d45d 100644
+--- a/src/test/regress/sql/incremental_sort.sql
++++ b/src/test/regress/sql/incremental_sort.sql
+@@ -150,6 +150,10 @@ analyze t;
+ explain (costs off) select * from (select * from t order by a) s order by a, b limit 70;
+ select * from (select * from t order by a) s order by a, b limit 70;
+ -- Checks case where we hit a group boundary at the last tuple of a batch.
++-- Because the full sort state is bounded, we scan 64 tuples (the mode
++-- transition point) but only retain 5. Thus when we transition modes, all
++-- tuples in the full sort state have different prefix keys.
++explain (costs off) select * from (select * from t order by a) s order by a, b limit 5;
+ select * from (select * from t order by a) s order by a, b limit 5;
+ 
+ -- Test rescan.

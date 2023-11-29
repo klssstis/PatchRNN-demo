@@ -1,0 +1,218 @@
+From 0e733278e346f19df93843bce9a81c8183df6e1d Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Wed, 14 Sep 2022 15:17:23 +0200
+Subject: [PATCH] Add subxid-overflow "isolation" test
+
+This test covers a few lines of subxid-overflow-handling code in various
+part of the backend, which are otherwise uncovered.
+
+Author: Simon Riggs <simon.riggs@enterprisedb.com>
+Reviewed-by: Dilip Kumar <dilipbalaut@gmail.com>
+Discussion: https://postgr.es/m/CANbhV-H8ov5+nCMBYQFKhO+UZJjrFgY_ORiMWr3RhS4+x44PzA@mail.gmail.com
+---
+ src/include/storage/proc.h                    |  2 +
+ .../isolation/expected/subxid-overflow.out    | 82 +++++++++++++++++++
+ src/test/isolation/isolation_schedule         |  1 +
+ src/test/isolation/specs/subxid-overflow.spec | 79 ++++++++++++++++++
+ 4 files changed, 164 insertions(+)
+ create mode 100644 src/test/isolation/expected/subxid-overflow.out
+ create mode 100644 src/test/isolation/specs/subxid-overflow.spec
+
+diff --git a/src/include/storage/proc.h b/src/include/storage/proc.h
+index 2579e619ebcd..91824b469180 100644
+--- a/src/include/storage/proc.h
++++ b/src/include/storage/proc.h
+@@ -32,6 +32,8 @@
+  * If none of the caches have overflowed, we can assume that an XID that's not
+  * listed anywhere in the PGPROC array is not a running transaction.  Else we
+  * have to look at pg_subtrans.
++ *
++ * See src/test/isolation/specs/subxid-overflow.spec if you change this.
+  */
+ #define PGPROC_MAX_CACHED_SUBXIDS 64	/* XXX guessed-at value */
+ 
+diff --git a/src/test/isolation/expected/subxid-overflow.out b/src/test/isolation/expected/subxid-overflow.out
+new file mode 100644
+index 000000000000..9b0396f451fe
+--- /dev/null
++++ b/src/test/isolation/expected/subxid-overflow.out
+@@ -0,0 +1,82 @@
++Parsed test spec with 3 sessions
++
++starting permutation: ins subxov xmax s2sel s1c
++step ins: TRUNCATE subxids; INSERT INTO subxids VALUES (0, 0);
++step subxov: BEGIN; SELECT gen_subxids(100);
++gen_subxids
++-----------
++           
++(1 row)
++
++step xmax: BEGIN; INSERT INTO subxids VALUES (99, 0); COMMIT;
++step s2sel: SELECT val FROM subxids WHERE subx = 0;
++val
++---
++  0
++(1 row)
++
++step s1c: COMMIT;
++
++starting permutation: ins subxov sub3 xmax s2brr s2s3 s3c s2s3 s2c s1c
++step ins: TRUNCATE subxids; INSERT INTO subxids VALUES (0, 0);
++step subxov: BEGIN; SELECT gen_subxids(100);
++gen_subxids
++-----------
++           
++(1 row)
++
++step sub3: BEGIN; SAVEPOINT s; INSERT INTO subxids VALUES (1, 0);
++step xmax: BEGIN; INSERT INTO subxids VALUES (99, 0); COMMIT;
++step s2brr: BEGIN ISOLATION LEVEL REPEATABLE READ;
++step s2s3: SELECT val FROM subxids WHERE subx = 1;
++val
++---
++(0 rows)
++
++step s3c: COMMIT;
++step s2s3: SELECT val FROM subxids WHERE subx = 1;
++val
++---
++(0 rows)
++
++step s2c: COMMIT;
++step s1c: COMMIT;
++
++starting permutation: ins subxov sub3 xmax s2brc s2s3 s3c s2s3 s2c s1c
++step ins: TRUNCATE subxids; INSERT INTO subxids VALUES (0, 0);
++step subxov: BEGIN; SELECT gen_subxids(100);
++gen_subxids
++-----------
++           
++(1 row)
++
++step sub3: BEGIN; SAVEPOINT s; INSERT INTO subxids VALUES (1, 0);
++step xmax: BEGIN; INSERT INTO subxids VALUES (99, 0); COMMIT;
++step s2brc: BEGIN ISOLATION LEVEL READ COMMITTED;
++step s2s3: SELECT val FROM subxids WHERE subx = 1;
++val
++---
++(0 rows)
++
++step s3c: COMMIT;
++step s2s3: SELECT val FROM subxids WHERE subx = 1;
++val
++---
++  0
++(1 row)
++
++step s2c: COMMIT;
++step s1c: COMMIT;
++
++starting permutation: ins subxov xmax s2upd s1c
++step ins: TRUNCATE subxids; INSERT INTO subxids VALUES (0, 0);
++step subxov: BEGIN; SELECT gen_subxids(100);
++gen_subxids
++-----------
++           
++(1 row)
++
++step xmax: BEGIN; INSERT INTO subxids VALUES (99, 0); COMMIT;
++step s2upd: UPDATE subxids SET val = 1 WHERE subx = 0; <waiting ...>
++step s1c: COMMIT;
++step s2upd: <... completed>
+diff --git a/src/test/isolation/isolation_schedule b/src/test/isolation/isolation_schedule
+index 529a4cbd4da0..5413a59a8073 100644
+--- a/src/test/isolation/isolation_schedule
++++ b/src/test/isolation/isolation_schedule
+@@ -34,6 +34,7 @@ test: fk-deadlock2
+ test: fk-partitioned-1
+ test: fk-partitioned-2
+ test: fk-snapshot
++test: subxid-overflow
+ test: eval-plan-qual
+ test: eval-plan-qual-trigger
+ test: lock-update-delete
+diff --git a/src/test/isolation/specs/subxid-overflow.spec b/src/test/isolation/specs/subxid-overflow.spec
+new file mode 100644
+index 000000000000..9a69db45e8a1
+--- /dev/null
++++ b/src/test/isolation/specs/subxid-overflow.spec
+@@ -0,0 +1,79 @@
++# Subtransaction overflow
++#
++# This test is designed to cover some code paths which only occur when
++# one transaction has overflowed the subtransaction cache.
++
++setup
++{
++DROP TABLE IF EXISTS subxids;
++CREATE TABLE subxids (subx integer, val integer);
++
++CREATE OR REPLACE FUNCTION gen_subxids (n integer)
++ RETURNS VOID
++ LANGUAGE plpgsql
++AS $$
++BEGIN
++  IF n <= 0 THEN
++	UPDATE subxids SET val = 1 WHERE subx = 0;
++    RETURN;
++  ELSE
++    PERFORM gen_subxids(n - 1);
++    RETURN;
++  END IF;
++EXCEPTION /* generates a subxid */
++  WHEN raise_exception THEN NULL;
++END;
++$$;
++}
++
++teardown
++{
++ DROP TABLE subxids;
++ DROP FUNCTION gen_subxids(integer);
++}
++
++session s1
++# setup step for each test
++step ins	{ TRUNCATE subxids; INSERT INTO subxids VALUES (0, 0); }
++# long running transaction with overflowed subxids
++step subxov	{ BEGIN; SELECT gen_subxids(100); }
++# commit should always come last to make this long running
++step s1c	{ COMMIT; }
++
++session s2
++# move xmax forwards
++step xmax	{ BEGIN; INSERT INTO subxids VALUES (99, 0); COMMIT;}
++
++# step for test1
++step s2sel	{ SELECT val FROM subxids WHERE subx = 0; }
++
++# steps for test2
++step s2brr { BEGIN ISOLATION LEVEL REPEATABLE READ; }
++step s2brc { BEGIN ISOLATION LEVEL READ COMMITTED; }
++# look for data written by sub3
++step s2s3	{ SELECT val FROM subxids WHERE subx = 1; }
++step s2c	{ COMMIT; }
++
++# step for test3
++step s2upd	{ UPDATE subxids SET val = 1 WHERE subx = 0; }
++
++session s3
++# transaction with subxids that can commit before s1c
++step sub3	{ BEGIN; SAVEPOINT s; INSERT INTO subxids VALUES (1, 0); }
++step s3c	{ COMMIT; }
++
++# test1
++# s2sel will see subxid as still running
++# designed to test XidInMVCCSnapshot() when overflows, xid is found
++permutation ins subxov xmax s2sel s1c
++
++# test2
++# designed to test XidInMVCCSnapshot() when overflows, xid is not found
++# both SELECTs invisible
++permutation ins subxov sub3 xmax s2brr s2s3 s3c s2s3 s2c s1c
++# 2nd SELECT visible after commit
++permutation ins subxov sub3 xmax s2brc s2s3 s3c s2s3 s2c s1c
++
++# test3
++# designed to test XactLockTableWait() for overflows
++permutation ins subxov xmax s2upd s1c

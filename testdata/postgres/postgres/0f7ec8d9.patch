@@ -1,0 +1,159 @@
+From 0f7ec8d9c3aeb8964d3539561e5c8d4caef42bf6 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 12 Dec 2018 13:49:41 -0500
+Subject: [PATCH] Repair bogus handling of multi-assignment Params in upper
+ plan levels.
+
+Our support for multiple-set-clauses in UPDATE assumes that the Params
+referencing a MULTIEXPR_SUBLINK SubPlan will appear before that SubPlan
+in the targetlist of the plan node that calculates the updated row.
+(Yeah, it's a hack...)  In some PG branches it's possible that a Result
+node gets inserted between the primary calculation of the update tlist
+and the ModifyTable node.  setrefs.c did the wrong thing in this case
+and left the upper-level Params as Params, causing a crash at runtime.
+What it should do is replace them with "outer" Vars referencing the child
+plan node's output.  That's a result of careless ordering of operations
+in fix_upper_expr_mutator, so we can fix it just by reordering the code.
+
+Fix fix_join_expr_mutator similarly for consistency, even though join
+nodes could never appear in such a context.  (In general, it seems
+likely to be a bit cheaper to use Vars than Params in such situations
+anyway, so this patch might offer a tiny performance improvement.)
+
+The hazard extends back to 9.5 where the MULTIEXPR_SUBLINK stuff
+was introduced, so back-patch that far.  However, this may be a live
+bug only in 9.6.x and 10.x, as the other branches don't seem to want
+to calculate the final tlist below the Result node.  (That plan shape
+change between branches might be a mini-bug in itself, but I'm not
+really interested in digging into the reasons for that right now.
+Still, add a regression test memorializing what we expect there,
+so we'll notice if it changes again.)
+
+Per bug report from Eduards Bezverhijs.
+
+Discussion: https://postgr.es/m/b6cd572a-3e44-8785-75e9-c512a5a17a73@tieto.com
+---
+ src/backend/optimizer/plan/setrefs.c | 24 +++++++++++----------
+ src/test/regress/expected/update.out | 31 ++++++++++++++++++++++++++++
+ src/test/regress/sql/update.sql      | 10 +++++++++
+ 3 files changed, 54 insertions(+), 11 deletions(-)
+
+diff --git a/src/backend/optimizer/plan/setrefs.c b/src/backend/optimizer/plan/setrefs.c
+index 6d6ef1c3769d..a181aad83099 100644
+--- a/src/backend/optimizer/plan/setrefs.c
++++ b/src/backend/optimizer/plan/setrefs.c
+@@ -2325,8 +2325,6 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
+ 		/* If not supplied by input plans, evaluate the contained expr */
+ 		return fix_join_expr_mutator((Node *) phv->phexpr, context);
+ 	}
+-	if (IsA(node, Param))
+-		return fix_param_node(context->root, (Param *) node);
+ 	/* Try matching more complex expressions too, if tlists have any */
+ 	if (context->outer_itlist && context->outer_itlist->has_non_vars)
+ 	{
+@@ -2344,6 +2342,9 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
+ 		if (newvar)
+ 			return (Node *) newvar;
+ 	}
++	/* Special cases (apply only AFTER failing to match to lower tlist) */
++	if (IsA(node, Param))
++		return fix_param_node(context->root, (Param *) node);
+ 	fix_expr_common(context->root, node);
+ 	return expression_tree_mutator(node,
+ 								   fix_join_expr_mutator,
+@@ -2431,6 +2432,16 @@ fix_upper_expr_mutator(Node *node, fix_upper_expr_context *context)
+ 		/* If not supplied by input plan, evaluate the contained expr */
+ 		return fix_upper_expr_mutator((Node *) phv->phexpr, context);
+ 	}
++	/* Try matching more complex expressions too, if tlist has any */
++	if (context->subplan_itlist->has_non_vars)
++	{
++		newvar = search_indexed_tlist_for_non_var((Expr *) node,
++												  context->subplan_itlist,
++												  context->newvarno);
++		if (newvar)
++			return (Node *) newvar;
++	}
++	/* Special cases (apply only AFTER failing to match to lower tlist) */
+ 	if (IsA(node, Param))
+ 		return fix_param_node(context->root, (Param *) node);
+ 	if (IsA(node, Aggref))
+@@ -2455,15 +2466,6 @@ fix_upper_expr_mutator(Node *node, fix_upper_expr_context *context)
+ 		}
+ 		/* If no match, just fall through to process it normally */
+ 	}
+-	/* Try matching more complex expressions too, if tlist has any */
+-	if (context->subplan_itlist->has_non_vars)
+-	{
+-		newvar = search_indexed_tlist_for_non_var((Expr *) node,
+-												  context->subplan_itlist,
+-												  context->newvarno);
+-		if (newvar)
+-			return (Node *) newvar;
+-	}
+ 	fix_expr_common(context->root, node);
+ 	return expression_tree_mutator(node,
+ 								   fix_upper_expr_mutator,
+diff --git a/src/test/regress/expected/update.out b/src/test/regress/expected/update.out
+index d09326c18246..2083345c8eea 100644
+--- a/src/test/regress/expected/update.out
++++ b/src/test/regress/expected/update.out
+@@ -167,6 +167,37 @@ SELECT a, b, char_length(c) FROM update_test;
+  42 |  12 |       10000
+ (4 rows)
+ 
++-- Check multi-assignment with a Result node to handle a one-time filter.
++EXPLAIN (VERBOSE, COSTS OFF)
++UPDATE update_test t
++  SET (a, b) = (SELECT b, a FROM update_test s WHERE s.a = t.a)
++  WHERE CURRENT_USER = SESSION_USER;
++                            QUERY PLAN                            
++------------------------------------------------------------------
++ Update on public.update_test t
++   ->  Result
++         Output: $1, $2, t.c, (SubPlan 1 (returns $1,$2)), t.ctid
++         One-Time Filter: (CURRENT_USER = SESSION_USER)
++         ->  Seq Scan on public.update_test t
++               Output: t.c, t.a, t.ctid
++         SubPlan 1 (returns $1,$2)
++           ->  Seq Scan on public.update_test s
++                 Output: s.b, s.a
++                 Filter: (s.a = t.a)
++(10 rows)
++
++UPDATE update_test t
++  SET (a, b) = (SELECT b, a FROM update_test s WHERE s.a = t.a)
++  WHERE CURRENT_USER = SESSION_USER;
++SELECT a, b, char_length(c) FROM update_test;
++  a  | b  | char_length 
++-----+----+-------------
++     |    |            
++ 100 | 21 |            
++  12 | 41 |       10000
++  12 | 42 |       10000
++(4 rows)
++
+ -- Test ON CONFLICT DO UPDATE
+ INSERT INTO upsert_test VALUES(1, 'Boo');
+ -- uncorrelated  sub-select:
+diff --git a/src/test/regress/sql/update.sql b/src/test/regress/sql/update.sql
+index c9bb3b53d35e..8754ccb7b01a 100644
+--- a/src/test/regress/sql/update.sql
++++ b/src/test/regress/sql/update.sql
+@@ -89,6 +89,16 @@ UPDATE update_test AS t SET b = update_test.b + 10 WHERE t.a = 10;
+ UPDATE update_test SET c = repeat('x', 10000) WHERE c = 'car';
+ SELECT a, b, char_length(c) FROM update_test;
+ 
++-- Check multi-assignment with a Result node to handle a one-time filter.
++EXPLAIN (VERBOSE, COSTS OFF)
++UPDATE update_test t
++  SET (a, b) = (SELECT b, a FROM update_test s WHERE s.a = t.a)
++  WHERE CURRENT_USER = SESSION_USER;
++UPDATE update_test t
++  SET (a, b) = (SELECT b, a FROM update_test s WHERE s.a = t.a)
++  WHERE CURRENT_USER = SESSION_USER;
++SELECT a, b, char_length(c) FROM update_test;
++
+ -- Test ON CONFLICT DO UPDATE
+ INSERT INTO upsert_test VALUES(1, 'Boo');
+ -- uncorrelated  sub-select:

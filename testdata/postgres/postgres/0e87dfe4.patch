@@ -1,0 +1,620 @@
+From 0e87dfe46443286e630e9bcbc0c39a39c2c2cbb2 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 10 Oct 2022 18:45:34 -0400
+Subject: [PATCH] Harden memory context allocators against bogus chunk
+ pointers.
+
+Before commit c6e0fe1f2, functions such as AllocSetFree could pretty
+safely presume that they were given a valid chunk pointer for their
+own type of context, because the indirect call through a memory
+context object and method struct would be very unlikely to work
+otherwise.  But now, if pfree() is mistakenly invoked on a pointer
+to garbage, we have three chances in eight of ending up at one of
+these functions.  That means we need to take extra measures to
+verify that we are looking at what we're supposed to be looking at,
+especially in debug builds.
+
+Hence, add code to verify that the chunk's back-link to a block header
+leads to a memory context object that satisfies the right sort of
+IsA() check.  This is still a bit weaker than what we did before,
+but for the moment assume that an IsA() check is sufficient.
+
+As a compromise between speed and safety, implement these checks
+as Asserts when dealing with small chunks but plain test-and-elogs
+when dealing with large (external) chunks.  The latter case should
+not be too performance-critical, but the former case probably is.
+In slab.c, all chunks are small; but nonetheless use a plain test
+in SlabRealloc, because that is certainly not performance-critical,
+indeed we should be suspicious that it's being called in error.
+
+In aset.c, additionally add some assertions that the "value" field
+of the chunk header is within the small range allowed for freelist
+indexes.  Without that, we might find ourselves trying to wipe
+most of memory when CLOBBER_FREED_MEMORY is enabled, or scribbling
+on a "freelist header" that's far away from the context object.
+
+Eventually, field experience might show us that it's smarter for
+these tests to be active always, but for now we'll try to get
+away with just having them as assertions.
+
+While at it, also be more uniform about asserting that context
+objects passed as parameters are of the type we expect.  Some
+places missed that altogether, and slab.c was for no very good
+reason doing it differently from the other allocators.
+
+Discussion: https://postgr.es/m/3578387.1665244345@sss.pgh.pa.us
+---
+ src/backend/utils/mmgr/aset.c       | 114 ++++++++++++++++++++--------
+ src/backend/utils/mmgr/generation.c |  53 ++++++++++++-
+ src/backend/utils/mmgr/slab.c       |  71 ++++++++++++-----
+ 3 files changed, 187 insertions(+), 51 deletions(-)
+
+diff --git a/src/backend/utils/mmgr/aset.c b/src/backend/utils/mmgr/aset.c
+index ec423375ae8b..db402e3a4166 100644
+--- a/src/backend/utils/mmgr/aset.c
++++ b/src/backend/utils/mmgr/aset.c
+@@ -132,6 +132,10 @@ typedef struct AllocFreeListLink
+ #define GetFreeListLink(chkptr) \
+ 	(AllocFreeListLink *) ((char *) (chkptr) + ALLOC_CHUNKHDRSZ)
+ 
++/* Validate a freelist index retrieved from a chunk header */
++#define FreeListIdxIsValid(fidx) \
++	((fidx) >= 0 && (fidx) < ALLOCSET_NUM_FREELISTS)
++
+ /* Determine the size of the chunk based on the freelist index */
+ #define GetChunkSizeFromFreeListIdx(fidx) \
+ 	((((Size) 1) << ALLOC_MINBITS) << (fidx))
+@@ -202,7 +206,15 @@ typedef struct AllocBlockData
+  * AllocSetIsValid
+  *		True iff set is valid allocation set.
+  */
+-#define AllocSetIsValid(set) PointerIsValid(set)
++#define AllocSetIsValid(set) \
++	(PointerIsValid(set) && IsA(set, AllocSetContext))
++
++/*
++ * AllocBlockIsValid
++ *		True iff block is valid block of allocation set.
++ */
++#define AllocBlockIsValid(block) \
++	(PointerIsValid(block) && AllocSetIsValid((block)->aset))
+ 
+ /*
+  * We always store external chunks on a dedicated block.  This makes fetching
+@@ -530,8 +542,7 @@ AllocSetReset(MemoryContext context)
+ {
+ 	AllocSet	set = (AllocSet) context;
+ 	AllocBlock	block;
+-	Size		keepersize PG_USED_FOR_ASSERTS_ONLY
+-	= set->keeper->endptr - ((char *) set);
++	Size		keepersize PG_USED_FOR_ASSERTS_ONLY;
+ 
+ 	AssertArg(AllocSetIsValid(set));
+ 
+@@ -540,6 +551,9 @@ AllocSetReset(MemoryContext context)
+ 	AllocSetCheck(context);
+ #endif
+ 
++	/* Remember keeper block size for Assert below */
++	keepersize = set->keeper->endptr - ((char *) set);
++
+ 	/* Clear chunk freelists */
+ 	MemSetAligned(set->freelist, 0, sizeof(set->freelist));
+ 
+@@ -598,8 +612,7 @@ AllocSetDelete(MemoryContext context)
+ {
+ 	AllocSet	set = (AllocSet) context;
+ 	AllocBlock	block = set->blocks;
+-	Size		keepersize PG_USED_FOR_ASSERTS_ONLY
+-	= set->keeper->endptr - ((char *) set);
++	Size		keepersize PG_USED_FOR_ASSERTS_ONLY;
+ 
+ 	AssertArg(AllocSetIsValid(set));
+ 
+@@ -608,6 +621,9 @@ AllocSetDelete(MemoryContext context)
+ 	AllocSetCheck(context);
+ #endif
+ 
++	/* Remember keeper block size for Assert below */
++	keepersize = set->keeper->endptr - ((char *) set);
++
+ 	/*
+ 	 * If the context is a candidate for a freelist, put it into that freelist
+ 	 * instead of destroying it.
+@@ -994,9 +1010,16 @@ AllocSetFree(void *pointer)
+ 
+ 	if (MemoryChunkIsExternal(chunk))
+ 	{
+-
++		/* Release single-chunk block. */
+ 		AllocBlock	block = ExternalChunkGetBlock(chunk);
+ 
++		/*
++		 * Try to verify that we have a sane block pointer: the block header
++		 * should reference an aset and the freeptr should match the endptr.
++		 */
++		if (!AllocBlockIsValid(block) || block->freeptr != block->endptr)
++			elog(ERROR, "could not find block containing chunk %p", chunk);
++
+ 		set = block->aset;
+ 
+ #ifdef MEMORY_CONTEXT_CHECKING
+@@ -1011,14 +1034,6 @@ AllocSetFree(void *pointer)
+ 		}
+ #endif
+ 
+-
+-		/*
+-		 * Try to verify that we have a sane block pointer, the freeptr should
+-		 * match the endptr.
+-		 */
+-		if (block->freeptr != block->endptr)
+-			elog(ERROR, "could not find block containing chunk %p", chunk);
+-
+ 		/* OK, remove block from aset's list and free it */
+ 		if (block->prev)
+ 			block->prev->next = block->next;
+@@ -1036,12 +1051,23 @@ AllocSetFree(void *pointer)
+ 	}
+ 	else
+ 	{
+-		int			fidx = MemoryChunkGetValue(chunk);
+ 		AllocBlock	block = MemoryChunkGetBlock(chunk);
+-		AllocFreeListLink *link = GetFreeListLink(chunk);
++		int			fidx;
++		AllocFreeListLink *link;
+ 
++		/*
++		 * In this path, for speed reasons we just Assert that the referenced
++		 * block is good.  We can also Assert that the value field is sane.
++		 * Future field experience may show that these Asserts had better
++		 * become regular runtime test-and-elog checks.
++		 */
++		AssertArg(AllocBlockIsValid(block));
+ 		set = block->aset;
+ 
++		fidx = MemoryChunkGetValue(chunk);
++		Assert(FreeListIdxIsValid(fidx));
++		link = GetFreeListLink(chunk);
++
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 		/* Test for someone scribbling on unused space in chunk */
+ 		if (chunk->requested_size < GetChunkSizeFromFreeListIdx(fidx))
+@@ -1089,6 +1115,7 @@ AllocSetRealloc(void *pointer, Size size)
+ 	AllocSet	set;
+ 	MemoryChunk *chunk = PointerGetMemoryChunk(pointer);
+ 	Size		oldsize;
++	int			fidx;
+ 
+ 	/* Allow access to private part of chunk header. */
+ 	VALGRIND_MAKE_MEM_DEFINED(chunk, ALLOCCHUNK_PRIVATE_LEN);
+@@ -1105,9 +1132,18 @@ AllocSetRealloc(void *pointer, Size size)
+ 		Size		oldblksize;
+ 
+ 		block = ExternalChunkGetBlock(chunk);
+-		oldsize = block->endptr - (char *) pointer;
++
++		/*
++		 * Try to verify that we have a sane block pointer: the block header
++		 * should reference an aset and the freeptr should match the endptr.
++		 */
++		if (!AllocBlockIsValid(block) || block->freeptr != block->endptr)
++			elog(ERROR, "could not find block containing chunk %p", chunk);
++
+ 		set = block->aset;
+ 
++		oldsize = block->endptr - (char *) pointer;
++
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 		/* Test for someone scribbling on unused space in chunk */
+ 		Assert(chunk->requested_size < oldsize);
+@@ -1116,13 +1152,6 @@ AllocSetRealloc(void *pointer, Size size)
+ 				 set->header.name, chunk);
+ #endif
+ 
+-		/*
+-		 * Try to verify that we have a sane block pointer, the freeptr should
+-		 * match the endptr.
+-		 */
+-		if (block->freeptr != block->endptr)
+-			elog(ERROR, "could not find block containing chunk %p", chunk);
+-
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 		/* ensure there's always space for the sentinel byte */
+ 		chksize = MAXALIGN(size + 1);
+@@ -1201,9 +1230,20 @@ AllocSetRealloc(void *pointer, Size size)
+ 	}
+ 
+ 	block = MemoryChunkGetBlock(chunk);
+-	oldsize = GetChunkSizeFromFreeListIdx(MemoryChunkGetValue(chunk));
++
++	/*
++	 * In this path, for speed reasons we just Assert that the referenced
++	 * block is good. We can also Assert that the value field is sane. Future
++	 * field experience may show that these Asserts had better become regular
++	 * runtime test-and-elog checks.
++	 */
++	AssertArg(AllocBlockIsValid(block));
+ 	set = block->aset;
+ 
++	fidx = MemoryChunkGetValue(chunk);
++	Assert(FreeListIdxIsValid(fidx));
++	oldsize = GetChunkSizeFromFreeListIdx(fidx);
++
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 	/* Test for someone scribbling on unused space in chunk */
+ 	if (chunk->requested_size < oldsize)
+@@ -1328,6 +1368,7 @@ AllocSetGetChunkContext(void *pointer)
+ 	else
+ 		block = (AllocBlock) MemoryChunkGetBlock(chunk);
+ 
++	AssertArg(AllocBlockIsValid(block));
+ 	set = block->aset;
+ 
+ 	return &set->header;
+@@ -1342,16 +1383,19 @@ Size
+ AllocSetGetChunkSpace(void *pointer)
+ {
+ 	MemoryChunk *chunk = PointerGetMemoryChunk(pointer);
++	int			fidx;
+ 
+ 	if (MemoryChunkIsExternal(chunk))
+ 	{
+ 		AllocBlock	block = ExternalChunkGetBlock(chunk);
+ 
++		AssertArg(AllocBlockIsValid(block));
+ 		return block->endptr - (char *) chunk;
+ 	}
+ 
+-	return GetChunkSizeFromFreeListIdx(MemoryChunkGetValue(chunk)) +
+-		ALLOC_CHUNKHDRSZ;
++	fidx = MemoryChunkGetValue(chunk);
++	Assert(FreeListIdxIsValid(fidx));
++	return GetChunkSizeFromFreeListIdx(fidx) + ALLOC_CHUNKHDRSZ;
+ }
+ 
+ /*
+@@ -1361,6 +1405,8 @@ AllocSetGetChunkSpace(void *pointer)
+ bool
+ AllocSetIsEmpty(MemoryContext context)
+ {
++	AssertArg(AllocSetIsValid(context));
++
+ 	/*
+ 	 * For now, we say "empty" only if the context is new or just reset. We
+ 	 * could examine the freelists to determine if all space has been freed,
+@@ -1394,6 +1440,8 @@ AllocSetStats(MemoryContext context,
+ 	AllocBlock	block;
+ 	int			fidx;
+ 
++	AssertArg(AllocSetIsValid(set));
++
+ 	/* Include context header in totalspace */
+ 	totalspace = MAXALIGN(sizeof(AllocSetContext));
+ 
+@@ -1405,14 +1453,14 @@ AllocSetStats(MemoryContext context,
+ 	}
+ 	for (fidx = 0; fidx < ALLOCSET_NUM_FREELISTS; fidx++)
+ 	{
++		Size		chksz = GetChunkSizeFromFreeListIdx(fidx);
+ 		MemoryChunk *chunk = set->freelist[fidx];
+ 
+ 		while (chunk != NULL)
+ 		{
+-			Size		chksz = GetChunkSizeFromFreeListIdx(MemoryChunkGetValue(chunk));
+ 			AllocFreeListLink *link = GetFreeListLink(chunk);
+ 
+-			Assert(GetChunkSizeFromFreeListIdx(fidx) == chksz);
++			Assert(MemoryChunkGetValue(chunk) == fidx);
+ 
+ 			freechunks++;
+ 			freespace += chksz + ALLOC_CHUNKHDRSZ;
+@@ -1522,7 +1570,13 @@ AllocSetCheck(MemoryContext context)
+ 			}
+ 			else
+ 			{
+-				chsize = GetChunkSizeFromFreeListIdx(MemoryChunkGetValue(chunk));	/* aligned chunk size */
++				int			fidx = MemoryChunkGetValue(chunk);
++
++				if (!FreeListIdxIsValid(fidx))
++					elog(WARNING, "problem in alloc set %s: bad chunk size for chunk %p in block %p",
++						 name, chunk, block);
++
++				chsize = GetChunkSizeFromFreeListIdx(fidx); /* aligned chunk size */
+ 
+ 				/*
+ 				 * Check the stored block offset correctly references this
+diff --git a/src/backend/utils/mmgr/generation.c b/src/backend/utils/mmgr/generation.c
+index c743b24fa7de..4cb75f493ff8 100644
+--- a/src/backend/utils/mmgr/generation.c
++++ b/src/backend/utils/mmgr/generation.c
+@@ -105,11 +105,20 @@ struct GenerationBlock
+  * simplicity.
+  */
+ #define GENERATIONCHUNK_PRIVATE_LEN	offsetof(MemoryChunk, hdrmask)
++
+ /*
+  * GenerationIsValid
+- *		True iff set is valid allocation set.
++ *		True iff set is valid generation set.
++ */
++#define GenerationIsValid(set) \
++	(PointerIsValid(set) && IsA(set, GenerationContext))
++
++/*
++ * GenerationBlockIsValid
++ *		True iff block is valid block of generation set.
+  */
+-#define GenerationIsValid(set) PointerIsValid(set)
++#define GenerationBlockIsValid(block) \
++	(PointerIsValid(block) && GenerationIsValid((block)->context))
+ 
+ /*
+  * We always store external chunks on a dedicated block.  This makes fetching
+@@ -345,6 +354,8 @@ GenerationAlloc(MemoryContext context, Size size)
+ 	Size		chunk_size;
+ 	Size		required_size;
+ 
++	AssertArg(GenerationIsValid(set));
++
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 	/* ensure there's always space for the sentinel byte */
+ 	chunk_size = MAXALIGN(size + 1);
+@@ -625,6 +636,14 @@ GenerationFree(void *pointer)
+ 	if (MemoryChunkIsExternal(chunk))
+ 	{
+ 		block = ExternalChunkGetBlock(chunk);
++
++		/*
++		 * Try to verify that we have a sane block pointer: the block header
++		 * should reference a generation context.
++		 */
++		if (!GenerationBlockIsValid(block))
++			elog(ERROR, "could not find block containing chunk %p", chunk);
++
+ #if defined(MEMORY_CONTEXT_CHECKING) || defined(CLOBBER_FREED_MEMORY)
+ 		chunksize = block->endptr - (char *) pointer;
+ #endif
+@@ -632,6 +651,14 @@ GenerationFree(void *pointer)
+ 	else
+ 	{
+ 		block = MemoryChunkGetBlock(chunk);
++
++		/*
++		 * In this path, for speed reasons we just Assert that the referenced
++		 * block is good.  Future field experience may show that this Assert
++		 * had better become a regular runtime test-and-elog check.
++		 */
++		AssertArg(GenerationBlockIsValid(block));
++
+ #if defined(MEMORY_CONTEXT_CHECKING) || defined(CLOBBER_FREED_MEMORY)
+ 		chunksize = MemoryChunkGetValue(chunk);
+ #endif
+@@ -723,11 +750,27 @@ GenerationRealloc(void *pointer, Size size)
+ 	if (MemoryChunkIsExternal(chunk))
+ 	{
+ 		block = ExternalChunkGetBlock(chunk);
++
++		/*
++		 * Try to verify that we have a sane block pointer: the block header
++		 * should reference a generation context.
++		 */
++		if (!GenerationBlockIsValid(block))
++			elog(ERROR, "could not find block containing chunk %p", chunk);
++
+ 		oldsize = block->endptr - (char *) pointer;
+ 	}
+ 	else
+ 	{
+ 		block = MemoryChunkGetBlock(chunk);
++
++		/*
++		 * In this path, for speed reasons we just Assert that the referenced
++		 * block is good.  Future field experience may show that this Assert
++		 * had better become a regular runtime test-and-elog check.
++		 */
++		AssertArg(GenerationBlockIsValid(block));
++
+ 		oldsize = MemoryChunkGetValue(chunk);
+ 	}
+ 
+@@ -845,6 +888,7 @@ GenerationGetChunkContext(void *pointer)
+ 	else
+ 		block = (GenerationBlock *) MemoryChunkGetBlock(chunk);
+ 
++	AssertArg(GenerationBlockIsValid(block));
+ 	return &block->context->header;
+ }
+ 
+@@ -863,6 +907,7 @@ GenerationGetChunkSpace(void *pointer)
+ 	{
+ 		GenerationBlock *block = ExternalChunkGetBlock(chunk);
+ 
++		AssertArg(GenerationBlockIsValid(block));
+ 		chunksize = block->endptr - (char *) pointer;
+ 	}
+ 	else
+@@ -881,6 +926,8 @@ GenerationIsEmpty(MemoryContext context)
+ 	GenerationContext *set = (GenerationContext *) context;
+ 	dlist_iter	iter;
+ 
++	AssertArg(GenerationIsValid(set));
++
+ 	dlist_foreach(iter, &set->blocks)
+ 	{
+ 		GenerationBlock *block = dlist_container(GenerationBlock, node, iter.cur);
+@@ -917,6 +964,8 @@ GenerationStats(MemoryContext context,
+ 	Size		freespace = 0;
+ 	dlist_iter	iter;
+ 
++	AssertArg(GenerationIsValid(set));
++
+ 	/* Include context header in totalspace */
+ 	totalspace = MAXALIGN(sizeof(GenerationContext));
+ 
+diff --git a/src/backend/utils/mmgr/slab.c b/src/backend/utils/mmgr/slab.c
+index 9149aaafcb0a..1a0b28f9ea12 100644
+--- a/src/backend/utils/mmgr/slab.c
++++ b/src/backend/utils/mmgr/slab.c
+@@ -111,6 +111,21 @@ typedef struct SlabBlock
+ #define SlabChunkIndex(slab, block, chunk)	\
+ 	(((char *) chunk - SlabBlockStart(block)) / slab->fullChunkSize)
+ 
++/*
++ * SlabIsValid
++ *		True iff set is valid slab allocation set.
++ */
++#define SlabIsValid(set) \
++	(PointerIsValid(set) && IsA(set, SlabContext))
++
++/*
++ * SlabBlockIsValid
++ *		True iff block is valid block of slab allocation set.
++ */
++#define SlabBlockIsValid(block) \
++	(PointerIsValid(block) && SlabIsValid((block)->slab))
++
++
+ /*
+  * SlabContextCreate
+  *		Create a new Slab context.
+@@ -236,10 +251,10 @@ SlabContextCreate(MemoryContext parent,
+ void
+ SlabReset(MemoryContext context)
+ {
++	SlabContext *slab = (SlabContext *) context;
+ 	int			i;
+-	SlabContext *slab = castNode(SlabContext, context);
+ 
+-	Assert(slab);
++	AssertArg(SlabIsValid(slab));
+ 
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 	/* Check for corruption and leaks before freeing */
+@@ -293,12 +308,12 @@ SlabDelete(MemoryContext context)
+ void *
+ SlabAlloc(MemoryContext context, Size size)
+ {
+-	SlabContext *slab = castNode(SlabContext, context);
++	SlabContext *slab = (SlabContext *) context;
+ 	SlabBlock  *block;
+ 	MemoryChunk *chunk;
+ 	int			idx;
+ 
+-	Assert(slab);
++	AssertArg(SlabIsValid(slab));
+ 
+ 	Assert((slab->minFreeChunks >= 0) &&
+ 		   (slab->minFreeChunks < slab->chunksPerBlock));
+@@ -450,10 +465,18 @@ SlabAlloc(MemoryContext context, Size size)
+ void
+ SlabFree(void *pointer)
+ {
+-	int			idx;
+ 	MemoryChunk *chunk = PointerGetMemoryChunk(pointer);
+ 	SlabBlock  *block = MemoryChunkGetBlock(chunk);
+-	SlabContext *slab = block->slab;
++	SlabContext *slab;
++	int			idx;
++
++	/*
++	 * For speed reasons we just Assert that the referenced block is good.
++	 * Future field experience may show that this Assert had better become a
++	 * regular runtime test-and-elog check.
++	 */
++	AssertArg(SlabBlockIsValid(block));
++	slab = block->slab;
+ 
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 	/* Test for someone scribbling on unused space in chunk */
+@@ -540,9 +563,18 @@ SlabRealloc(void *pointer, Size size)
+ {
+ 	MemoryChunk *chunk = PointerGetMemoryChunk(pointer);
+ 	SlabBlock  *block = MemoryChunkGetBlock(chunk);
+-	SlabContext *slab = block->slab;
++	SlabContext *slab;
++
++	/*
++	 * Try to verify that we have a sane block pointer: the block header
++	 * should reference a slab context.  (We use a test-and-elog, not just
++	 * Assert, because it seems highly likely that we're here in error in the
++	 * first place.)
++	 */
++	if (!SlabBlockIsValid(block))
++		elog(ERROR, "could not find block containing chunk %p", chunk);
++	slab = block->slab;
+ 
+-	Assert(slab);
+ 	/* can't do actual realloc with slab, but let's try to be gentle */
+ 	if (size == slab->chunkSize)
+ 		return pointer;
+@@ -560,11 +592,9 @@ SlabGetChunkContext(void *pointer)
+ {
+ 	MemoryChunk *chunk = PointerGetMemoryChunk(pointer);
+ 	SlabBlock  *block = MemoryChunkGetBlock(chunk);
+-	SlabContext *slab = block->slab;
+-
+-	Assert(slab != NULL);
+ 
+-	return &slab->header;
++	AssertArg(SlabBlockIsValid(block));
++	return &block->slab->header;
+ }
+ 
+ /*
+@@ -577,9 +607,10 @@ SlabGetChunkSpace(void *pointer)
+ {
+ 	MemoryChunk *chunk = PointerGetMemoryChunk(pointer);
+ 	SlabBlock  *block = MemoryChunkGetBlock(chunk);
+-	SlabContext *slab = block->slab;
++	SlabContext *slab;
+ 
+-	Assert(slab);
++	AssertArg(SlabBlockIsValid(block));
++	slab = block->slab;
+ 
+ 	return slab->fullChunkSize;
+ }
+@@ -591,9 +622,9 @@ SlabGetChunkSpace(void *pointer)
+ bool
+ SlabIsEmpty(MemoryContext context)
+ {
+-	SlabContext *slab = castNode(SlabContext, context);
++	SlabContext *slab = (SlabContext *) context;
+ 
+-	Assert(slab);
++	AssertArg(SlabIsValid(slab));
+ 
+ 	return (slab->nblocks == 0);
+ }
+@@ -613,13 +644,15 @@ SlabStats(MemoryContext context,
+ 		  MemoryContextCounters *totals,
+ 		  bool print_to_stderr)
+ {
+-	SlabContext *slab = castNode(SlabContext, context);
++	SlabContext *slab = (SlabContext *) context;
+ 	Size		nblocks = 0;
+ 	Size		freechunks = 0;
+ 	Size		totalspace;
+ 	Size		freespace = 0;
+ 	int			i;
+ 
++	AssertArg(SlabIsValid(slab));
++
+ 	/* Include context header in totalspace */
+ 	totalspace = slab->headerSize;
+ 
+@@ -672,11 +705,11 @@ SlabStats(MemoryContext context,
+ void
+ SlabCheck(MemoryContext context)
+ {
++	SlabContext *slab = (SlabContext *) context;
+ 	int			i;
+-	SlabContext *slab = castNode(SlabContext, context);
+ 	const char *name = slab->header.name;
+ 
+-	Assert(slab);
++	AssertArg(SlabIsValid(slab));
+ 	Assert(slab->chunksPerBlock > 0);
+ 
+ 	/* walk all the freelists */

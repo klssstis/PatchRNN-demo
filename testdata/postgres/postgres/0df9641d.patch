@@ -1,0 +1,196 @@
+From 0df9641d39057f431655b92b8a490b89c508a0b3 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Thu, 2 Dec 2021 10:31:20 +0900
+Subject: [PATCH] Move into separate file all the SQL queries used in
+ pg_upgrade tests
+
+The existing pg_upgrade/test.sh and the buildfarm code have been holding
+the same set of SQL queries when doing cross-version upgrade tests to
+adapt the objects created by the regression tests before the upgrade
+(mostly, incompatible or non-existing objects need to be dropped from
+the origin, perhaps re-created).
+
+This moves all those SQL queries into a new, separate, file with a set
+of \if clauses to handle the version checks depending on the old version
+of the cluster to-be-upgraded.
+
+The long-term plan is to make the buildfarm code re-use this new SQL
+file, so as committers are able to fix any compatibility issues in the
+tests of pg_upgrade with a refresh of the core code, without having to
+poke at the buildfarm client.  Note that this is only able to handle the
+main regression test suite, and that nothing is done yet for contrib
+modules yet (these have more issues like their database names).
+
+A backpatch down to 10 is done, adapting the version checks as this
+script needs to be only backward-compatible, so as it becomes possible
+to clean up a maximum amount of code within the buildfarm client.
+
+Author: Justin Pryzby, Michael Paquier
+Discussion: https://postgr.es/m/20201206180248.GI24052@telsasoft.com
+Backpatch-through: 10
+---
+ src/bin/pg_upgrade/test.sh           | 52 ++--------------
+ src/bin/pg_upgrade/upgrade_adapt.sql | 91 ++++++++++++++++++++++++++++
+ 2 files changed, 96 insertions(+), 47 deletions(-)
+ create mode 100644 src/bin/pg_upgrade/upgrade_adapt.sql
+
+diff --git a/src/bin/pg_upgrade/test.sh b/src/bin/pg_upgrade/test.sh
+index 859348890774..f353e565b516 100644
+--- a/src/bin/pg_upgrade/test.sh
++++ b/src/bin/pg_upgrade/test.sh
+@@ -181,53 +181,11 @@ if "$MAKE" -C "$oldsrc" installcheck-parallel; then
+ 	# Before dumping, tweak the database of the old instance depending
+ 	# on its version.
+ 	if [ "$newsrc" != "$oldsrc" ]; then
+-		fix_sql=""
+-		# Get rid of objects not feasible in later versions
+-		case $oldpgversion in
+-			804??)
+-				fix_sql="DROP FUNCTION public.myfunc(integer);"
+-				;;
+-		esac
+-
+-		# Last appeared in v9.6
+-		if [ $oldpgversion -lt 100000 ]; then
+-			fix_sql="$fix_sql
+-					 DROP FUNCTION IF EXISTS
+-						public.oldstyle_length(integer, text);"
+-		fi
+-		# Last appeared in v13
+-		if [ $oldpgversion -lt 140000 ]; then
+-			fix_sql="$fix_sql
+-				 DROP FUNCTION IF EXISTS
+-					public.putenv(text);	-- last in v13
+-				 DROP OPERATOR IF EXISTS	-- last in v13
+-					public.#@# (pg_catalog.int8, NONE),
+-					public.#%# (pg_catalog.int8, NONE),
+-					public.!=- (pg_catalog.int8, NONE),
+-					public.#@%# (pg_catalog.int8, NONE);"
+-		fi
+-		psql -X -d regression -c "$fix_sql;" || psql_fix_sql_status=$?
+-
+-		# WITH OIDS is not supported anymore in v12, so remove support
+-		# for any relations marked as such.
+-		if [ $oldpgversion -lt 120000 ]; then
+-			fix_sql="DO \$stmt\$
+-				DECLARE
+-					rec text;
+-				BEGIN
+-				FOR rec in
+-					SELECT oid::regclass::text
+-					FROM pg_class
+-					WHERE relname !~ '^pg_'
+-						AND relhasoids
+-						AND relkind in ('r','m')
+-					ORDER BY 1
+-				LOOP
+-					execute 'ALTER TABLE ' || rec || ' SET WITHOUT OIDS';
+-				END LOOP;
+-				END; \$stmt\$;"
+-			psql -X -d regression -c "$fix_sql;" || psql_fix_sql_status=$?
+-		fi
++		# This SQL script has its own idea of the cleanup that needs to be
++		# done on the cluster to-be-upgraded, and includes version checks.
++		# Note that this uses the script stored on the new branch.
++		psql -X -d regression -f "$newsrc/src/bin/pg_upgrade/upgrade_adapt.sql" \
++			|| psql_fix_sql_status=$?
+ 
+ 		# Handling of --extra-float-digits gets messy after v12.
+ 		# Note that this changes the dumps from the old and new
+diff --git a/src/bin/pg_upgrade/upgrade_adapt.sql b/src/bin/pg_upgrade/upgrade_adapt.sql
+new file mode 100644
+index 000000000000..27c4c7fd011a
+--- /dev/null
++++ b/src/bin/pg_upgrade/upgrade_adapt.sql
+@@ -0,0 +1,91 @@
++--
++-- SQL queries for upgrade tests across different major versions.
++--
++-- This file includes a set of SQL queries to make a cluster to-be-upgraded
++-- compatible with the version this file is based on.  Note that this
++-- requires psql, as per-version queries are controlled with a set of \if
++-- clauses.
++
++-- This script is backward-compatible, so it is able to work with any version
++-- newer than 9.2 we are upgrading from, up to the branch this script is stored
++-- on (even if this would not run if running pg_upgrade with the same version
++-- for the origin and the target).
++
++-- \if accepts a simple boolean value, so all the version checks are
++-- saved based on this assumption.
++SELECT
++  ver <= 902 AS oldpgversion_le92,
++  ver <= 904 AS oldpgversion_le94,
++  ver <= 906 AS oldpgversion_le96,
++  ver <= 1000 AS oldpgversion_le10,
++  ver <= 1100 AS oldpgversion_le11,
++  ver <= 1300 AS oldpgversion_le13
++  FROM (SELECT current_setting('server_version_num')::int / 100 AS ver) AS v;
++\gset
++
++-- Objects last appearing in 9.2.
++\if :oldpgversion_le92
++-- Note that those tables are removed from the regression tests in 9.3
++-- and newer versions.
++DROP TABLE abstime_tbl;
++DROP TABLE reltime_tbl;
++DROP TABLE tinterval_tbl;
++\endif
++
++-- Objects last appearing in 9.4.
++\if :oldpgversion_le94
++-- This aggregate has been fixed in 9.5 and later versions, so drop
++-- and re-create it.
++DROP AGGREGATE array_cat_accum(anyarray);
++CREATE AGGREGATE array_larger_accum (anyarray) (
++                  sfunc = array_larger,
++                  stype = anyarray,
++                  initcond = $${}$$);
++-- This operator has been fixed in 9.5 and later versions, so drop and
++-- re-create it.
++DROP OPERATOR @#@ (NONE, bigint);
++CREATE OPERATOR @#@ (PROCEDURE = factorial,
++                     RIGHTARG = bigint);
++\endif
++
++-- Objects last appearing in 9.6.
++\if :oldpgversion_le96
++DROP FUNCTION public.oldstyle_length(integer, text);
++\endif
++
++-- Objects last appearing in 10.
++\if :oldpgversion_le10
++DROP FUNCTION IF EXISTS boxarea(box);
++DROP FUNCTION IF EXISTS funny_dup17();
++\endif
++
++-- Objects last appearing in 11.
++\if :oldpgversion_le11
++-- WITH OIDS is supported until v11, so remove its support for any
++-- relations marked as such.
++DO $stmt$
++  DECLARE
++    rec text;
++  BEGIN
++  FOR rec in
++    SELECT oid::regclass::text
++    FROM pg_class
++    WHERE relname !~ '^pg_'
++      AND relhasoids
++      AND relkind in ('r','m')
++    ORDER BY 1
++  LOOP
++    execute 'ALTER TABLE ' || rec || ' SET WITHOUT OIDS';
++  END LOOP;
++  END; $stmt$;
++\endif
++
++-- Objects last appearing in 13.
++\if :oldpgversion_le13
++-- Until v10, operators could only be dropped one at a time, so be careful
++-- to stick with one command for each drop here.
++DROP OPERATOR public.#@# (pg_catalog.int8, NONE);
++DROP OPERATOR public.#%# (pg_catalog.int8, NONE);
++DROP OPERATOR public.!=- (pg_catalog.int8, NONE);
++DROP OPERATOR public.#@%# (pg_catalog.int8, NONE);
++\endif

@@ -1,0 +1,312 @@
+From 0e480385ec59aa7f769366eb24462acc2b7a40d7 Mon Sep 17 00:00:00 2001
+From: David Rowley <drowley@postgresql.org>
+Date: Wed, 7 Sep 2022 15:46:57 +1200
+Subject: [PATCH] Make more effort to put a sentinel at the end of allocated
+ memory
+
+Traditionally, in MEMORY_CONTEXT_CHECKING builds, we only ever marked a
+sentinel byte just beyond the requested size if there happened to be
+enough space on the chunk to do so.  For Slab and Generation context
+types, we only rounded the size of the chunk up to the next maxalign
+boundary, so it was often not that likely that those would ever have space
+for the sentinel given that the majority of allocation requests are going
+to be for sizes which are maxaligned.  For AllocSet, it was a little
+different as smaller allocations are rounded up to the next power-of-2
+value rather than the next maxalign boundary, so we're a bit more likely
+to have space for the sentinel byte, especially when we get away from tiny
+sized allocations such as 8 or 16 bytes.
+
+Here we make more of an effort to allow space so that there is enough room
+for the sentinel byte in more cases.  This makes it more likely that we'll
+detect when buggy code accidentally writes beyond the end of any of its
+memory allocations.
+
+Each of the 3 MemoryContext types has been changed as follows:
+
+The Slab allocator will now always set a sentinel byte.  Both the current
+usages of this MemoryContext type happen to use chunk sizes which were on
+the maxalign boundary, so these never used sentinel bytes previously.
+
+For the Generation allocator, we now always ensure there's enough space in
+the allocation for a sentinel byte.
+
+For AllocSet, this commit makes an adjustment for allocation sizes which
+are greater than allocChunkLimit.  We now ensure there is always space for
+a sentinel byte.  We don't alter the sentinel behavior for request sizes
+<= allocChunkLimit.  Making way for the sentinel byte for power-of-2
+request sizes would require doubling up to the next power of 2.  Some
+analysis done on the request sizes made during installcheck shows that a
+fairly large portion of allocation requests are for power-of-2 sizes.  The
+amount of additional memory for the sentinel there seems prohibitive, so
+we do nothing for those here.
+
+Author: David Rowley
+Discussion: https://postgr.es/m/3478405.1661824539@sss.pgh.pa.us
+---
+ src/backend/utils/mmgr/aset.c       | 41 +++++++++++++++++++--------
+ src/backend/utils/mmgr/generation.c | 43 +++++++++++++++++------------
+ src/backend/utils/mmgr/slab.c       | 37 +++++++++++++------------
+ 3 files changed, 74 insertions(+), 47 deletions(-)
+
+diff --git a/src/backend/utils/mmgr/aset.c b/src/backend/utils/mmgr/aset.c
+index b6eeb8abab11..ec423375ae8b 100644
+--- a/src/backend/utils/mmgr/aset.c
++++ b/src/backend/utils/mmgr/aset.c
+@@ -705,7 +705,13 @@ AllocSetAlloc(MemoryContext context, Size size)
+ 	 */
+ 	if (size > set->allocChunkLimit)
+ 	{
++#ifdef MEMORY_CONTEXT_CHECKING
++		/* ensure there's always space for the sentinel byte */
++		chunk_size = MAXALIGN(size + 1);
++#else
+ 		chunk_size = MAXALIGN(size);
++#endif
++
+ 		blksize = chunk_size + ALLOC_BLOCKHDRSZ + ALLOC_CHUNKHDRSZ;
+ 		block = (AllocBlock) malloc(blksize);
+ 		if (block == NULL)
+@@ -724,8 +730,8 @@ AllocSetAlloc(MemoryContext context, Size size)
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 		chunk->requested_size = size;
+ 		/* set mark to catch clobber of "unused" space */
+-		if (size < chunk_size)
+-			set_sentinel(MemoryChunkGetPointer(chunk), size);
++		Assert(size < chunk_size);
++		set_sentinel(MemoryChunkGetPointer(chunk), size);
+ #endif
+ #ifdef RANDOMIZE_ALLOCATED_MEMORY
+ 		/* fill the allocated space with junk */
+@@ -766,6 +772,12 @@ AllocSetAlloc(MemoryContext context, Size size)
+ 	 * corresponding free list to see if there is a free chunk we could reuse.
+ 	 * If one is found, remove it from the free list, make it again a member
+ 	 * of the alloc set and return its data address.
++	 *
++	 * Note that we don't attempt to ensure there's space for the sentinel
++	 * byte here.  We expect a large proportion of allocations to be for sizes
++	 * which are already a power of 2.  If we were to always make space for a
++	 * sentinel byte in MEMORY_CONTEXT_CHECKING builds, then we'd end up
++	 * doubling the memory requirements for such allocations.
+ 	 */
+ 	fidx = AllocSetFreeIndex(size);
+ 	chunk = set->freelist[fidx];
+@@ -992,10 +1004,10 @@ AllocSetFree(void *pointer)
+ 			Size		chunk_size = block->endptr - (char *) pointer;
+ 
+ 			/* Test for someone scribbling on unused space in chunk */
+-			if (chunk->requested_size < chunk_size)
+-				if (!sentinel_ok(pointer, chunk->requested_size))
+-					elog(WARNING, "detected write past chunk end in %s %p",
+-						 set->header.name, chunk);
++			Assert(chunk->requested_size < chunk_size);
++			if (!sentinel_ok(pointer, chunk->requested_size))
++				elog(WARNING, "detected write past chunk end in %s %p",
++					 set->header.name, chunk);
+ 		}
+ #endif
+ 
+@@ -1098,10 +1110,10 @@ AllocSetRealloc(void *pointer, Size size)
+ 
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 		/* Test for someone scribbling on unused space in chunk */
+-		if (chunk->requested_size < oldsize)
+-			if (!sentinel_ok(pointer, chunk->requested_size))
+-				elog(WARNING, "detected write past chunk end in %s %p",
+-					 set->header.name, chunk);
++		Assert(chunk->requested_size < oldsize);
++		if (!sentinel_ok(pointer, chunk->requested_size))
++			elog(WARNING, "detected write past chunk end in %s %p",
++				 set->header.name, chunk);
+ #endif
+ 
+ 		/*
+@@ -1111,7 +1123,12 @@ AllocSetRealloc(void *pointer, Size size)
+ 		if (block->freeptr != block->endptr)
+ 			elog(ERROR, "could not find block containing chunk %p", chunk);
+ 
++#ifdef MEMORY_CONTEXT_CHECKING
++		/* ensure there's always space for the sentinel byte */
++		chksize = MAXALIGN(size + 1);
++#else
+ 		chksize = MAXALIGN(size);
++#endif
+ 
+ 		/* Do the realloc */
+ 		blksize = chksize + ALLOC_BLOCKHDRSZ + ALLOC_CHUNKHDRSZ;
+@@ -1162,8 +1179,8 @@ AllocSetRealloc(void *pointer, Size size)
+ 
+ 		chunk->requested_size = size;
+ 		/* set mark to catch clobber of "unused" space */
+-		if (size < chksize)
+-			set_sentinel(pointer, size);
++		Assert(size < chksize);
++		set_sentinel(pointer, size);
+ #else							/* !MEMORY_CONTEXT_CHECKING */
+ 
+ 		/*
+diff --git a/src/backend/utils/mmgr/generation.c b/src/backend/utils/mmgr/generation.c
+index b39894ec9465..c743b24fa7de 100644
+--- a/src/backend/utils/mmgr/generation.c
++++ b/src/backend/utils/mmgr/generation.c
+@@ -342,8 +342,16 @@ GenerationAlloc(MemoryContext context, Size size)
+ 	GenerationContext *set = (GenerationContext *) context;
+ 	GenerationBlock *block;
+ 	MemoryChunk *chunk;
+-	Size		chunk_size = MAXALIGN(size);
+-	Size		required_size = chunk_size + Generation_CHUNKHDRSZ;
++	Size		chunk_size;
++	Size		required_size;
++
++#ifdef MEMORY_CONTEXT_CHECKING
++	/* ensure there's always space for the sentinel byte */
++	chunk_size = MAXALIGN(size + 1);
++#else
++	chunk_size = MAXALIGN(size);
++#endif
++	required_size = chunk_size + Generation_CHUNKHDRSZ;
+ 
+ 	/* is it an over-sized chunk? if yes, allocate special block */
+ 	if (chunk_size > set->allocChunkLimit)
+@@ -373,8 +381,8 @@ GenerationAlloc(MemoryContext context, Size size)
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 		chunk->requested_size = size;
+ 		/* set mark to catch clobber of "unused" space */
+-		if (size < chunk_size)
+-			set_sentinel(MemoryChunkGetPointer(chunk), size);
++		Assert(size < chunk_size);
++		set_sentinel(MemoryChunkGetPointer(chunk), size);
+ #endif
+ #ifdef RANDOMIZE_ALLOCATED_MEMORY
+ 		/* fill the allocated space with junk */
+@@ -491,8 +499,8 @@ GenerationAlloc(MemoryContext context, Size size)
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 	chunk->requested_size = size;
+ 	/* set mark to catch clobber of "unused" space */
+-	if (size < chunk_size)
+-		set_sentinel(MemoryChunkGetPointer(chunk), size);
++	Assert(size < chunk_size);
++	set_sentinel(MemoryChunkGetPointer(chunk), size);
+ #endif
+ #ifdef RANDOMIZE_ALLOCATED_MEMORY
+ 	/* fill the allocated space with junk */
+@@ -634,10 +642,10 @@ GenerationFree(void *pointer)
+ 
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 	/* Test for someone scribbling on unused space in chunk */
+-	if (chunk->requested_size < chunksize)
+-		if (!sentinel_ok(pointer, chunk->requested_size))
+-			elog(WARNING, "detected write past chunk end in %s %p",
+-				 ((MemoryContext) block->context)->name, chunk);
++	Assert(chunk->requested_size < chunksize);
++	if (!sentinel_ok(pointer, chunk->requested_size))
++		elog(WARNING, "detected write past chunk end in %s %p",
++			 ((MemoryContext) block->context)->name, chunk);
+ #endif
+ 
+ #ifdef CLOBBER_FREED_MEMORY
+@@ -727,10 +735,10 @@ GenerationRealloc(void *pointer, Size size)
+ 
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 	/* Test for someone scribbling on unused space in chunk */
+-	if (chunk->requested_size < oldsize)
+-		if (!sentinel_ok(pointer, chunk->requested_size))
+-			elog(WARNING, "detected write past chunk end in %s %p",
+-				 ((MemoryContext) set)->name, chunk);
++	Assert(chunk->requested_size < oldsize);
++	if (!sentinel_ok(pointer, chunk->requested_size))
++		elog(WARNING, "detected write past chunk end in %s %p",
++			 ((MemoryContext) set)->name, chunk);
+ #endif
+ 
+ 	/*
+@@ -769,8 +777,7 @@ GenerationRealloc(void *pointer, Size size)
+ 									   oldsize - size);
+ 
+ 		/* set mark to catch clobber of "unused" space */
+-		if (size < oldsize)
+-			set_sentinel(pointer, size);
++		set_sentinel(pointer, size);
+ #else							/* !MEMORY_CONTEXT_CHECKING */
+ 
+ 		/*
+@@ -1034,8 +1041,8 @@ GenerationCheck(MemoryContext context)
+ 						 name, block, chunk);
+ 
+ 				/* check sentinel */
+-				if (chunk->requested_size < chunksize &&
+-					!sentinel_ok(chunk, Generation_CHUNKHDRSZ + chunk->requested_size))
++				Assert(chunk->requested_size < chunksize);
++				if (!sentinel_ok(chunk, Generation_CHUNKHDRSZ + chunk->requested_size))
+ 					elog(WARNING, "problem in Generation %s: detected write past chunk end in block %p, chunk %p",
+ 						 name, block, chunk);
+ 			}
+diff --git a/src/backend/utils/mmgr/slab.c b/src/backend/utils/mmgr/slab.c
+index 2d70adef09d8..9149aaafcb0a 100644
+--- a/src/backend/utils/mmgr/slab.c
++++ b/src/backend/utils/mmgr/slab.c
+@@ -145,7 +145,12 @@ SlabContextCreate(MemoryContext parent,
+ 		chunkSize = sizeof(int);
+ 
+ 	/* chunk, including SLAB header (both addresses nicely aligned) */
++#ifdef MEMORY_CONTEXT_CHECKING
++	/* ensure there's always space for the sentinel byte */
++	fullChunkSize = Slab_CHUNKHDRSZ + MAXALIGN(chunkSize + 1);
++#else
+ 	fullChunkSize = Slab_CHUNKHDRSZ + MAXALIGN(chunkSize);
++#endif
+ 
+ 	/* Make sure the block can store at least one chunk. */
+ 	if (blockSize < fullChunkSize + Slab_BLOCKHDRSZ)
+@@ -420,14 +425,12 @@ SlabAlloc(MemoryContext context, Size size)
+ 						  MCTX_SLAB_ID);
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 	/* slab mark to catch clobber of "unused" space */
+-	if (slab->chunkSize < (slab->fullChunkSize - Slab_CHUNKHDRSZ))
+-	{
+-		set_sentinel(MemoryChunkGetPointer(chunk), size);
+-		VALGRIND_MAKE_MEM_NOACCESS(((char *) chunk) +
+-								   Slab_CHUNKHDRSZ + slab->chunkSize,
+-								   slab->fullChunkSize -
+-								   (slab->chunkSize + Slab_CHUNKHDRSZ));
+-	}
++	Assert(slab->chunkSize < (slab->fullChunkSize - Slab_CHUNKHDRSZ));
++	set_sentinel(MemoryChunkGetPointer(chunk), size);
++	VALGRIND_MAKE_MEM_NOACCESS(((char *) chunk) +
++							   Slab_CHUNKHDRSZ + slab->chunkSize,
++							   slab->fullChunkSize -
++							   (slab->chunkSize + Slab_CHUNKHDRSZ));
+ #endif
+ 
+ #ifdef RANDOMIZE_ALLOCATED_MEMORY
+@@ -454,10 +457,10 @@ SlabFree(void *pointer)
+ 
+ #ifdef MEMORY_CONTEXT_CHECKING
+ 	/* Test for someone scribbling on unused space in chunk */
+-	if (slab->chunkSize < (slab->fullChunkSize - Slab_CHUNKHDRSZ))
+-		if (!sentinel_ok(pointer, slab->chunkSize))
+-			elog(WARNING, "detected write past chunk end in %s %p",
+-				 slab->header.name, chunk);
++	Assert(slab->chunkSize < (slab->fullChunkSize - Slab_CHUNKHDRSZ));
++	if (!sentinel_ok(pointer, slab->chunkSize))
++		elog(WARNING, "detected write past chunk end in %s %p",
++			 slab->header.name, chunk);
+ #endif
+ 
+ 	/* compute index of the chunk with respect to block start */
+@@ -744,11 +747,11 @@ SlabCheck(MemoryContext context)
+ 						elog(WARNING, "problem in slab %s: bogus block link in block %p, chunk %p",
+ 							 name, block, chunk);
+ 
+-					/* there might be sentinel (thanks to alignment) */
+-					if (slab->chunkSize < (slab->fullChunkSize - Slab_CHUNKHDRSZ))
+-						if (!sentinel_ok(chunk, Slab_CHUNKHDRSZ + slab->chunkSize))
+-							elog(WARNING, "problem in slab %s: detected write past chunk end in block %p, chunk %p",
+-								 name, block, chunk);
++					/* check the sentinel byte is intact */
++					Assert(slab->chunkSize < (slab->fullChunkSize - Slab_CHUNKHDRSZ));
++					if (!sentinel_ok(chunk, Slab_CHUNKHDRSZ + slab->chunkSize))
++						elog(WARNING, "problem in slab %s: detected write past chunk end in block %p, chunk %p",
++							 name, block, chunk);
+ 				}
+ 			}
+ 

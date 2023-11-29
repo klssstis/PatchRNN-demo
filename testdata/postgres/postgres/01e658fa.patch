@@ -1,0 +1,916 @@
+From 01e658fa74cb7e3292448f6663b549135958003b Mon Sep 17 00:00:00 2001
+From: Peter Eisentraut <peter@eisentraut.org>
+Date: Thu, 19 Nov 2020 09:24:37 +0100
+Subject: [PATCH] Hash support for row types
+
+Add hash functions for the record type as well as a hash operator
+family and operator class for the record type.  This enables all the
+hash functionality for the record type such as hash-based plans for
+UNION/INTERSECT/EXCEPT DISTINCT, recursive queries using UNION
+DISTINCT, hash joins, and hash partitioning.
+
+Reviewed-by: Tom Lane <tgl@sss.pgh.pa.us>
+Discussion: https://www.postgresql.org/message-id/flat/38eccd35-4e2d-6767-1b3c-dada1eac3124%402ndquadrant.com
+---
+ doc/src/sgml/queries.sgml               |   9 -
+ src/backend/utils/adt/rowtypes.c        | 249 ++++++++++++++++++++++++
+ src/backend/utils/cache/lsyscache.c     |   7 +-
+ src/backend/utils/cache/typcache.c      |  78 +++++---
+ src/include/catalog/catversion.h        |   2 +-
+ src/include/catalog/pg_amop.dat         |   5 +
+ src/include/catalog/pg_amproc.dat       |   4 +
+ src/include/catalog/pg_opclass.dat      |   2 +
+ src/include/catalog/pg_operator.dat     |   2 +-
+ src/include/catalog/pg_opfamily.dat     |   2 +
+ src/include/catalog/pg_proc.dat         |   7 +
+ src/test/regress/expected/hash_func.out |  21 ++
+ src/test/regress/expected/join.out      |   1 +
+ src/test/regress/expected/union.out     |  83 ++++----
+ src/test/regress/expected/with.out      |  33 +++-
+ src/test/regress/sql/hash_func.sql      |  17 ++
+ src/test/regress/sql/join.sql           |   1 +
+ src/test/regress/sql/union.sql          |  12 +-
+ src/test/regress/sql/with.sql           |   2 +-
+ 19 files changed, 462 insertions(+), 75 deletions(-)
+
+diff --git a/doc/src/sgml/queries.sgml b/doc/src/sgml/queries.sgml
+index dedb5684e631..ca5120487562 100644
+--- a/doc/src/sgml/queries.sgml
++++ b/doc/src/sgml/queries.sgml
+@@ -2182,15 +2182,6 @@ SELECT * FROM search_tree <emphasis>ORDER BY path</emphasis>;
+ </programlisting>
+    </para>
+ 
+-   <note>
+-    <para>
+-     The queries shown in this and the following section involving
+-     <literal>ROW</literal> constructors in the target list only support
+-     <literal>UNION ALL</literal> (not plain <literal>UNION</literal>) in the
+-     current implementation.
+-    </para>
+-   </note>
+-
+    <tip>
+     <para>
+      Omit the <literal>ROW()</literal> syntax in the common case where only one
+diff --git a/src/backend/utils/adt/rowtypes.c b/src/backend/utils/adt/rowtypes.c
+index 674cf0a55d86..5c4648bccff7 100644
+--- a/src/backend/utils/adt/rowtypes.c
++++ b/src/backend/utils/adt/rowtypes.c
+@@ -19,6 +19,7 @@
+ #include "access/detoast.h"
+ #include "access/htup_details.h"
+ #include "catalog/pg_type.h"
++#include "common/hashfn.h"
+ #include "funcapi.h"
+ #include "libpq/pqformat.h"
+ #include "miscadmin.h"
+@@ -1766,3 +1767,251 @@ btrecordimagecmp(PG_FUNCTION_ARGS)
+ {
+ 	PG_RETURN_INT32(record_image_cmp(fcinfo));
+ }
++
++
++/*
++ * Row type hash functions
++ */
++
++Datum
++hash_record(PG_FUNCTION_ARGS)
++{
++	HeapTupleHeader record = PG_GETARG_HEAPTUPLEHEADER(0);
++	uint32		result = 0;
++	Oid			tupType;
++	int32		tupTypmod;
++	TupleDesc	tupdesc;
++	HeapTupleData tuple;
++	int			ncolumns;
++	RecordCompareData *my_extra;
++	Datum	   *values;
++	bool	   *nulls;
++
++	check_stack_depth();		/* recurses for record-type columns */
++
++	/* Extract type info from tuple */
++	tupType = HeapTupleHeaderGetTypeId(record);
++	tupTypmod = HeapTupleHeaderGetTypMod(record);
++	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
++	ncolumns = tupdesc->natts;
++
++	/* Build temporary HeapTuple control structure */
++	tuple.t_len = HeapTupleHeaderGetDatumLength(record);
++	ItemPointerSetInvalid(&(tuple.t_self));
++	tuple.t_tableOid = InvalidOid;
++	tuple.t_data = record;
++
++	/*
++	 * We arrange to look up the needed hashing info just once per series
++	 * of calls, assuming the record type doesn't change underneath us.
++	 */
++	my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
++	if (my_extra == NULL ||
++		my_extra->ncolumns < ncolumns)
++	{
++		fcinfo->flinfo->fn_extra =
++			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
++							   offsetof(RecordCompareData, columns) +
++							   ncolumns * sizeof(ColumnCompareData));
++		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
++		my_extra->ncolumns = ncolumns;
++		my_extra->record1_type = InvalidOid;
++		my_extra->record1_typmod = 0;
++	}
++
++	if (my_extra->record1_type != tupType ||
++		my_extra->record1_typmod != tupTypmod)
++	{
++		MemSet(my_extra->columns, 0, ncolumns * sizeof(ColumnCompareData));
++		my_extra->record1_type = tupType;
++		my_extra->record1_typmod = tupTypmod;
++	}
++
++	/* Break down the tuple into fields */
++	values = (Datum *) palloc(ncolumns * sizeof(Datum));
++	nulls = (bool *) palloc(ncolumns * sizeof(bool));
++	heap_deform_tuple(&tuple, tupdesc, values, nulls);
++
++	for (int i = 0; i < ncolumns; i++)
++	{
++		Form_pg_attribute att;
++		TypeCacheEntry *typentry;
++		uint32		element_hash;
++
++		att = TupleDescAttr(tupdesc, i);
++
++		if (att->attisdropped)
++			continue;
++
++		/*
++		 * Lookup the hash function if not done already
++		 */
++		typentry = my_extra->columns[i].typentry;
++		if (typentry == NULL ||
++			typentry->type_id != att->atttypid)
++		{
++			typentry = lookup_type_cache(att->atttypid,
++										 TYPECACHE_HASH_PROC_FINFO);
++			if (!OidIsValid(typentry->hash_proc_finfo.fn_oid))
++				ereport(ERROR,
++						(errcode(ERRCODE_UNDEFINED_FUNCTION),
++						 errmsg("could not identify a hash function for type %s",
++								format_type_be(typentry->type_id))));
++			my_extra->columns[i].typentry = typentry;
++		}
++
++		/* Compute hash of element */
++		if (nulls[i])
++		{
++			element_hash = 0;
++		}
++		else
++		{
++			LOCAL_FCINFO(locfcinfo, 1);
++
++			InitFunctionCallInfoData(*locfcinfo, &typentry->hash_proc_finfo, 1,
++									 att->attcollation, NULL, NULL);
++			locfcinfo->args[0].value = values[i];
++			locfcinfo->args[0].isnull = false;
++			element_hash = DatumGetUInt32(FunctionCallInvoke(locfcinfo));
++
++			/* We don't expect hash support functions to return null */
++			Assert(!locfcinfo->isnull);
++		}
++
++		/* see hash_array() */
++		result = (result << 5) - result + element_hash;
++	}
++
++	pfree(values);
++	pfree(nulls);
++	ReleaseTupleDesc(tupdesc);
++
++	/* Avoid leaking memory when handed toasted input. */
++	PG_FREE_IF_COPY(record, 0);
++
++	PG_RETURN_UINT32(result);
++}
++
++Datum
++hash_record_extended(PG_FUNCTION_ARGS)
++{
++	HeapTupleHeader record = PG_GETARG_HEAPTUPLEHEADER(0);
++	uint64		seed = PG_GETARG_INT64(1);
++	uint64		result = 0;
++	Oid			tupType;
++	int32		tupTypmod;
++	TupleDesc	tupdesc;
++	HeapTupleData tuple;
++	int			ncolumns;
++	RecordCompareData *my_extra;
++	Datum	   *values;
++	bool	   *nulls;
++
++	check_stack_depth();		/* recurses for record-type columns */
++
++	/* Extract type info from tuple */
++	tupType = HeapTupleHeaderGetTypeId(record);
++	tupTypmod = HeapTupleHeaderGetTypMod(record);
++	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
++	ncolumns = tupdesc->natts;
++
++	/* Build temporary HeapTuple control structure */
++	tuple.t_len = HeapTupleHeaderGetDatumLength(record);
++	ItemPointerSetInvalid(&(tuple.t_self));
++	tuple.t_tableOid = InvalidOid;
++	tuple.t_data = record;
++
++	/*
++	 * We arrange to look up the needed hashing info just once per series
++	 * of calls, assuming the record type doesn't change underneath us.
++	 */
++	my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
++	if (my_extra == NULL ||
++		my_extra->ncolumns < ncolumns)
++	{
++		fcinfo->flinfo->fn_extra =
++			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
++							   offsetof(RecordCompareData, columns) +
++							   ncolumns * sizeof(ColumnCompareData));
++		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
++		my_extra->ncolumns = ncolumns;
++		my_extra->record1_type = InvalidOid;
++		my_extra->record1_typmod = 0;
++	}
++
++	if (my_extra->record1_type != tupType ||
++		my_extra->record1_typmod != tupTypmod)
++	{
++		MemSet(my_extra->columns, 0, ncolumns * sizeof(ColumnCompareData));
++		my_extra->record1_type = tupType;
++		my_extra->record1_typmod = tupTypmod;
++	}
++
++	/* Break down the tuple into fields */
++	values = (Datum *) palloc(ncolumns * sizeof(Datum));
++	nulls = (bool *) palloc(ncolumns * sizeof(bool));
++	heap_deform_tuple(&tuple, tupdesc, values, nulls);
++
++	for (int i = 0; i < ncolumns; i++)
++	{
++		Form_pg_attribute att;
++		TypeCacheEntry *typentry;
++		uint64		element_hash;
++
++		att = TupleDescAttr(tupdesc, i);
++
++		if (att->attisdropped)
++			continue;
++
++		/*
++		 * Lookup the hash function if not done already
++		 */
++		typentry = my_extra->columns[i].typentry;
++		if (typentry == NULL ||
++			typentry->type_id != att->atttypid)
++		{
++			typentry = lookup_type_cache(att->atttypid,
++										 TYPECACHE_HASH_EXTENDED_PROC_FINFO);
++			if (!OidIsValid(typentry->hash_extended_proc_finfo.fn_oid))
++				ereport(ERROR,
++						(errcode(ERRCODE_UNDEFINED_FUNCTION),
++						 errmsg("could not identify an extended hash function for type %s",
++								format_type_be(typentry->type_id))));
++			my_extra->columns[i].typentry = typentry;
++		}
++
++		/* Compute hash of element */
++		if (nulls[i])
++		{
++			element_hash = 0;
++		}
++		else
++		{
++			LOCAL_FCINFO(locfcinfo, 2);
++
++			InitFunctionCallInfoData(*locfcinfo, &typentry->hash_extended_proc_finfo, 2,
++									 att->attcollation, NULL, NULL);
++			locfcinfo->args[0].value = values[i];
++			locfcinfo->args[0].isnull = false;
++			locfcinfo->args[1].value = Int64GetDatum(seed);
++			locfcinfo->args[0].isnull = false;
++			element_hash = DatumGetUInt64(FunctionCallInvoke(locfcinfo));
++
++			/* We don't expect hash support functions to return null */
++			Assert(!locfcinfo->isnull);
++		}
++
++		/* see hash_array_extended() */
++		result = (result << 5) - result + element_hash;
++	}
++
++	pfree(values);
++	pfree(nulls);
++	ReleaseTupleDesc(tupdesc);
++
++	/* Avoid leaking memory when handed toasted input. */
++	PG_FREE_IF_COPY(record, 0);
++
++	PG_RETURN_UINT64(result);
++}
+diff --git a/src/backend/utils/cache/lsyscache.c b/src/backend/utils/cache/lsyscache.c
+index 140339073b63..ae2329916237 100644
+--- a/src/backend/utils/cache/lsyscache.c
++++ b/src/backend/utils/cache/lsyscache.c
+@@ -1358,13 +1358,18 @@ op_hashjoinable(Oid opno, Oid inputtype)
+ 	TypeCacheEntry *typentry;
+ 
+ 	/* As in op_mergejoinable, let the typcache handle the hard cases */
+-	/* Eventually we'll need a similar case for record_eq ... */
+ 	if (opno == ARRAY_EQ_OP)
+ 	{
+ 		typentry = lookup_type_cache(inputtype, TYPECACHE_HASH_PROC);
+ 		if (typentry->hash_proc == F_HASH_ARRAY)
+ 			result = true;
+ 	}
++	else if (opno == RECORD_EQ_OP)
++	{
++		typentry = lookup_type_cache(inputtype, TYPECACHE_HASH_PROC);
++		if (typentry->hash_proc == F_HASH_RECORD)
++			result = true;
++	}
+ 	else
+ 	{
+ 		/* For all other operators, rely on pg_operator.oprcanhash */
+diff --git a/src/backend/utils/cache/typcache.c b/src/backend/utils/cache/typcache.c
+index 98ab14ace2a4..dca1d48e8958 100644
+--- a/src/backend/utils/cache/typcache.c
++++ b/src/backend/utils/cache/typcache.c
+@@ -97,8 +97,10 @@ static TypeCacheEntry *firstDomainTypeEntry = NULL;
+ #define TCFLAGS_CHECKED_FIELD_PROPERTIES	0x004000
+ #define TCFLAGS_HAVE_FIELD_EQUALITY			0x008000
+ #define TCFLAGS_HAVE_FIELD_COMPARE			0x010000
+-#define TCFLAGS_CHECKED_DOMAIN_CONSTRAINTS	0x020000
+-#define TCFLAGS_DOMAIN_BASE_IS_COMPOSITE	0x040000
++#define TCFLAGS_HAVE_FIELD_HASHING			0x020000
++#define TCFLAGS_HAVE_FIELD_EXTENDED_HASHING	0x040000
++#define TCFLAGS_CHECKED_DOMAIN_CONSTRAINTS	0x080000
++#define TCFLAGS_DOMAIN_BASE_IS_COMPOSITE	0x100000
+ 
+ /* The flags associated with equality/comparison/hashing are all but these: */
+ #define TCFLAGS_OPERATOR_FLAGS \
+@@ -297,6 +299,8 @@ static bool array_element_has_extended_hashing(TypeCacheEntry *typentry);
+ static void cache_array_element_properties(TypeCacheEntry *typentry);
+ static bool record_fields_have_equality(TypeCacheEntry *typentry);
+ static bool record_fields_have_compare(TypeCacheEntry *typentry);
++static bool record_fields_have_hashing(TypeCacheEntry *typentry);
++static bool record_fields_have_extended_hashing(TypeCacheEntry *typentry);
+ static void cache_record_field_properties(TypeCacheEntry *typentry);
+ static bool range_element_has_hashing(TypeCacheEntry *typentry);
+ static bool range_element_has_extended_hashing(TypeCacheEntry *typentry);
+@@ -677,18 +681,16 @@ lookup_type_cache(Oid type_id, int flags)
+ 										  HASHSTANDARD_PROC);
+ 
+ 		/*
+-		 * As above, make sure hash_array will succeed.  We don't currently
+-		 * support hashing for composite types, but when we do, we'll need
+-		 * more logic here to check that case too.
++		 * As above, make sure hash_array, hash_record, or hash_range will
++		 * succeed.
+ 		 */
+ 		if (hash_proc == F_HASH_ARRAY &&
+ 			!array_element_has_hashing(typentry))
+ 			hash_proc = InvalidOid;
+-
+-		/*
+-		 * Likewise for hash_range.
+-		 */
+-		if (hash_proc == F_HASH_RANGE &&
++		else if (hash_proc == F_HASH_RECORD &&
++				 !record_fields_have_hashing(typentry))
++			hash_proc = InvalidOid;
++		else if (hash_proc == F_HASH_RANGE &&
+ 			!range_element_has_hashing(typentry))
+ 			hash_proc = InvalidOid;
+ 
+@@ -721,18 +723,16 @@ lookup_type_cache(Oid type_id, int flags)
+ 												   HASHEXTENDED_PROC);
+ 
+ 		/*
+-		 * As above, make sure hash_array_extended will succeed.  We don't
+-		 * currently support hashing for composite types, but when we do,
+-		 * we'll need more logic here to check that case too.
++		 * As above, make sure hash_array_extended, hash_record_extended, or
++		 * hash_range_extended will succeed.
+ 		 */
+ 		if (hash_extended_proc == F_HASH_ARRAY_EXTENDED &&
+ 			!array_element_has_extended_hashing(typentry))
+ 			hash_extended_proc = InvalidOid;
+-
+-		/*
+-		 * Likewise for hash_range_extended.
+-		 */
+-		if (hash_extended_proc == F_HASH_RANGE_EXTENDED &&
++		else if (hash_extended_proc == F_HASH_RECORD_EXTENDED &&
++			!record_fields_have_extended_hashing(typentry))
++			hash_extended_proc = InvalidOid;
++		else if (hash_extended_proc == F_HASH_RANGE_EXTENDED &&
+ 			!range_element_has_extended_hashing(typentry))
+ 			hash_extended_proc = InvalidOid;
+ 
+@@ -1447,6 +1447,22 @@ record_fields_have_compare(TypeCacheEntry *typentry)
+ 	return (typentry->flags & TCFLAGS_HAVE_FIELD_COMPARE) != 0;
+ }
+ 
++static bool
++record_fields_have_hashing(TypeCacheEntry *typentry)
++{
++	if (!(typentry->flags & TCFLAGS_CHECKED_FIELD_PROPERTIES))
++		cache_record_field_properties(typentry);
++	return (typentry->flags & TCFLAGS_HAVE_FIELD_HASHING) != 0;
++}
++
++static bool
++record_fields_have_extended_hashing(TypeCacheEntry *typentry)
++{
++	if (!(typentry->flags & TCFLAGS_CHECKED_FIELD_PROPERTIES))
++		cache_record_field_properties(typentry);
++	return (typentry->flags & TCFLAGS_HAVE_FIELD_EXTENDED_HASHING) != 0;
++}
++
+ static void
+ cache_record_field_properties(TypeCacheEntry *typentry)
+ {
+@@ -1456,8 +1472,12 @@ cache_record_field_properties(TypeCacheEntry *typentry)
+ 	 * everything will (we may get a failure at runtime ...)
+ 	 */
+ 	if (typentry->type_id == RECORDOID)
++	{
+ 		typentry->flags |= (TCFLAGS_HAVE_FIELD_EQUALITY |
+-							TCFLAGS_HAVE_FIELD_COMPARE);
++							TCFLAGS_HAVE_FIELD_COMPARE |
++							TCFLAGS_HAVE_FIELD_HASHING |
++							TCFLAGS_HAVE_FIELD_EXTENDED_HASHING);
++	}
+ 	else if (typentry->typtype == TYPTYPE_COMPOSITE)
+ 	{
+ 		TupleDesc	tupdesc;
+@@ -1474,7 +1494,9 @@ cache_record_field_properties(TypeCacheEntry *typentry)
+ 
+ 		/* Have each property if all non-dropped fields have the property */
+ 		newflags = (TCFLAGS_HAVE_FIELD_EQUALITY |
+-					TCFLAGS_HAVE_FIELD_COMPARE);
++					TCFLAGS_HAVE_FIELD_COMPARE |
++					TCFLAGS_HAVE_FIELD_HASHING |
++					TCFLAGS_HAVE_FIELD_EXTENDED_HASHING);
+ 		for (i = 0; i < tupdesc->natts; i++)
+ 		{
+ 			TypeCacheEntry *fieldentry;
+@@ -1485,11 +1507,17 @@ cache_record_field_properties(TypeCacheEntry *typentry)
+ 
+ 			fieldentry = lookup_type_cache(attr->atttypid,
+ 										   TYPECACHE_EQ_OPR |
+-										   TYPECACHE_CMP_PROC);
++										   TYPECACHE_CMP_PROC |
++										   TYPECACHE_HASH_PROC |
++										   TYPECACHE_HASH_EXTENDED_PROC);
+ 			if (!OidIsValid(fieldentry->eq_opr))
+ 				newflags &= ~TCFLAGS_HAVE_FIELD_EQUALITY;
+ 			if (!OidIsValid(fieldentry->cmp_proc))
+ 				newflags &= ~TCFLAGS_HAVE_FIELD_COMPARE;
++			if (!OidIsValid(fieldentry->hash_proc))
++				newflags &= ~TCFLAGS_HAVE_FIELD_HASHING;
++			if (!OidIsValid(fieldentry->hash_extended_proc))
++				newflags &= ~TCFLAGS_HAVE_FIELD_EXTENDED_HASHING;
+ 
+ 			/* We can drop out of the loop once we disprove all bits */
+ 			if (newflags == 0)
+@@ -1514,12 +1542,16 @@ cache_record_field_properties(TypeCacheEntry *typentry)
+ 		}
+ 		baseentry = lookup_type_cache(typentry->domainBaseType,
+ 									  TYPECACHE_EQ_OPR |
+-									  TYPECACHE_CMP_PROC);
++									  TYPECACHE_CMP_PROC |
++									  TYPECACHE_HASH_PROC |
++									  TYPECACHE_HASH_EXTENDED_PROC);
+ 		if (baseentry->typtype == TYPTYPE_COMPOSITE)
+ 		{
+ 			typentry->flags |= TCFLAGS_DOMAIN_BASE_IS_COMPOSITE;
+ 			typentry->flags |= baseentry->flags & (TCFLAGS_HAVE_FIELD_EQUALITY |
+-												   TCFLAGS_HAVE_FIELD_COMPARE);
++												   TCFLAGS_HAVE_FIELD_COMPARE |
++												   TCFLAGS_HAVE_FIELD_HASHING |
++												   TCFLAGS_HAVE_FIELD_EXTENDED_HASHING);
+ 		}
+ 	}
+ 	typentry->flags |= TCFLAGS_CHECKED_FIELD_PROPERTIES;
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index aa85dc301533..c6da0df86836 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202011044
++#define CATALOG_VERSION_NO	202011191
+ 
+ #endif
+diff --git a/src/include/catalog/pg_amop.dat b/src/include/catalog/pg_amop.dat
+index bbe357fbc0e8..c7fee9f3ab0c 100644
+--- a/src/include/catalog/pg_amop.dat
++++ b/src/include/catalog/pg_amop.dat
+@@ -979,6 +979,11 @@
+   amoprighttype => 'oidvector', amopstrategy => '1',
+   amopopr => '=(oidvector,oidvector)', amopmethod => 'hash' },
+ 
++# record_ops
++{ amopfamily => 'hash/record_ops', amoplefttype => 'record',
++  amoprighttype => 'record', amopstrategy => '1',
++  amopopr => '=(record,record)', amopmethod => 'hash' },
++
+ # text_ops
+ { amopfamily => 'hash/text_ops', amoplefttype => 'text',
+   amoprighttype => 'text', amopstrategy => '1', amopopr => '=(text,text)',
+diff --git a/src/include/catalog/pg_amproc.dat b/src/include/catalog/pg_amproc.dat
+index a8e0c4ff8a52..db3e8c2d01a5 100644
+--- a/src/include/catalog/pg_amproc.dat
++++ b/src/include/catalog/pg_amproc.dat
+@@ -433,6 +433,10 @@
+   amprocrighttype => 'uuid', amprocnum => '1', amproc => 'uuid_hash' },
+ { amprocfamily => 'hash/uuid_ops', amproclefttype => 'uuid',
+   amprocrighttype => 'uuid', amprocnum => '2', amproc => 'uuid_hash_extended' },
++{ amprocfamily => 'hash/record_ops', amproclefttype => 'record',
++  amprocrighttype => 'record', amprocnum => '1', amproc => 'hash_record' },
++{ amprocfamily => 'hash/record_ops', amproclefttype => 'record',
++  amprocrighttype => 'record', amprocnum => '2', amproc => 'hash_record_extended' },
+ { amprocfamily => 'hash/pg_lsn_ops', amproclefttype => 'pg_lsn',
+   amprocrighttype => 'pg_lsn', amprocnum => '1', amproc => 'pg_lsn_hash' },
+ { amprocfamily => 'hash/pg_lsn_ops', amproclefttype => 'pg_lsn',
+diff --git a/src/include/catalog/pg_opclass.dat b/src/include/catalog/pg_opclass.dat
+index f2342bb328cb..be5712692fef 100644
+--- a/src/include/catalog/pg_opclass.dat
++++ b/src/include/catalog/pg_opclass.dat
+@@ -114,6 +114,8 @@
+   opcfamily => 'hash/oidvector_ops', opcintype => 'oidvector' },
+ { opcmethod => 'btree', opcname => 'record_ops',
+   opcfamily => 'btree/record_ops', opcintype => 'record' },
++{ opcmethod => 'hash', opcname => 'record_ops',
++  opcfamily => 'hash/record_ops', opcintype => 'record' },
+ { opcmethod => 'btree', opcname => 'record_image_ops',
+   opcfamily => 'btree/record_image_ops', opcintype => 'record',
+   opcdefault => 'f' },
+diff --git a/src/include/catalog/pg_operator.dat b/src/include/catalog/pg_operator.dat
+index ede7bb96ab38..b3f5645977d7 100644
+--- a/src/include/catalog/pg_operator.dat
++++ b/src/include/catalog/pg_operator.dat
+@@ -3000,7 +3000,7 @@
+ 
+ # generic record comparison operators
+ { oid => '2988', oid_symbol => 'RECORD_EQ_OP', descr => 'equal',
+-  oprname => '=', oprcanmerge => 't', oprleft => 'record', oprright => 'record',
++  oprname => '=', oprcanmerge => 't', oprcanhash => 't', oprleft => 'record', oprright => 'record',
+   oprresult => 'bool', oprcom => '=(record,record)',
+   oprnegate => '<>(record,record)', oprcode => 'record_eq', oprrest => 'eqsel',
+   oprjoin => 'eqjoinsel' },
+diff --git a/src/include/catalog/pg_opfamily.dat b/src/include/catalog/pg_opfamily.dat
+index cf0fb325b342..11c7ad2c1454 100644
+--- a/src/include/catalog/pg_opfamily.dat
++++ b/src/include/catalog/pg_opfamily.dat
+@@ -76,6 +76,8 @@
+   opfmethod => 'hash', opfname => 'oidvector_ops' },
+ { oid => '2994',
+   opfmethod => 'btree', opfname => 'record_ops' },
++{ oid => '9611',
++  opfmethod => 'hash', opfname => 'record_ops' },
+ { oid => '3194',
+   opfmethod => 'btree', opfname => 'record_image_ops' },
+ { oid => '1994', oid_symbol => 'TEXT_BTREE_FAM_OID',
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index c01da4bf01e3..33dacfd34030 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -9683,6 +9683,13 @@
+   proname => 'btrecordcmp', prorettype => 'int4',
+   proargtypes => 'record record', prosrc => 'btrecordcmp' },
+ 
++{ oid => '9609', descr => 'hash',
++  proname => 'hash_record', prorettype => 'int4', proargtypes => 'record',
++  prosrc => 'hash_record' },
++{ oid => '9610', descr => 'hash',
++  proname => 'hash_record_extended', prorettype => 'int8', proargtypes => 'record int8',
++  prosrc => 'hash_record_extended' },
++
+ # record comparison using raw byte images
+ { oid => '3181',
+   proname => 'record_image_eq', prorettype => 'bool',
+diff --git a/src/test/regress/expected/hash_func.out b/src/test/regress/expected/hash_func.out
+index e7d615fde597..daeb3e118dd8 100644
+--- a/src/test/regress/expected/hash_func.out
++++ b/src/test/regress/expected/hash_func.out
+@@ -305,3 +305,24 @@ WHERE  hash_range(v)::bit(32) != hash_range_extended(v, 0)::bit(32)
+ -------+----------+-----------+-----------
+ (0 rows)
+ 
++CREATE TYPE t1 AS (a int, b text);
++SELECT v as value, hash_record(v)::bit(32) as standard,
++       hash_record_extended(v, 0)::bit(32) as extended0,
++       hash_record_extended(v, 1)::bit(32) as extended1
++FROM   (VALUES (row(1, 'aaa')::t1, row(2, 'bbb'), row(-1, 'ccc'))) x(v)
++WHERE  hash_record(v)::bit(32) != hash_record_extended(v, 0)::bit(32)
++       OR hash_record(v)::bit(32) = hash_record_extended(v, 1)::bit(32);
++ value | standard | extended0 | extended1 
++-------+----------+-----------+-----------
++(0 rows)
++
++DROP TYPE t1;
++-- record hashing with non-hashable field type
++CREATE TYPE t2 AS (a money, b text);
++SELECT v as value, hash_record(v)::bit(32) as standard
++FROM   (VALUES (row(1, 'aaa')::t2)) x(v);
++ERROR:  could not identify a hash function for type money
++SELECT v as value, hash_record_extended(v, 0)::bit(32) as extended0
++FROM   (VALUES (row(1, 'aaa')::t2)) x(v);
++ERROR:  could not identify an extended hash function for type money
++DROP TYPE t2;
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index 6c9a5e26ddeb..60b621b651f1 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -2707,6 +2707,7 @@ select a.idv, b.idv from tidv a, tidv b where a.idv = b.idv;
+ (5 rows)
+ 
+ set enable_mergejoin = 0;
++set enable_hashjoin = 0;
+ explain (costs off)
+ select a.idv, b.idv from tidv a, tidv b where a.idv = b.idv;
+                      QUERY PLAN                     
+diff --git a/src/test/regress/expected/union.out b/src/test/regress/expected/union.out
+index 22e1ff5c42d9..75f78db8f581 100644
+--- a/src/test/regress/expected/union.out
++++ b/src/test/regress/expected/union.out
+@@ -646,40 +646,36 @@ select x from (values (array[1, 2]), (array[1, 3])) _(x) except select x from (v
+ reset enable_hashagg;
+ -- records
+ set enable_hashagg to on;
+--- currently no hashing support for record, so these will still run with sort plans:
+ explain (costs off)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) union select x from (values (row(1, 2)), (row(1, 4))) _(x);
+-                  QUERY PLAN                   
+------------------------------------------------
+- Unique
+-   ->  Sort
+-         Sort Key: "*VALUES*".column1
+-         ->  Append
+-               ->  Values Scan on "*VALUES*"
+-               ->  Values Scan on "*VALUES*_1"
+-(6 rows)
++               QUERY PLAN                
++-----------------------------------------
++ HashAggregate
++   Group Key: "*VALUES*".column1
++   ->  Append
++         ->  Values Scan on "*VALUES*"
++         ->  Values Scan on "*VALUES*_1"
++(5 rows)
+ 
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) union select x from (values (row(1, 2)), (row(1, 4))) _(x);
+    x   
+ -------
+- (1,2)
+- (1,3)
+  (1,4)
++ (1,3)
++ (1,2)
+ (3 rows)
+ 
+ explain (costs off)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) intersect select x from (values (row(1, 2)), (row(1, 4))) _(x);
+-                     QUERY PLAN                      
+------------------------------------------------------
+- SetOp Intersect
+-   ->  Sort
+-         Sort Key: "*SELECT* 1".x
+-         ->  Append
+-               ->  Subquery Scan on "*SELECT* 1"
+-                     ->  Values Scan on "*VALUES*"
+-               ->  Subquery Scan on "*SELECT* 2"
+-                     ->  Values Scan on "*VALUES*_1"
+-(8 rows)
++                  QUERY PLAN                   
++-----------------------------------------------
++ HashSetOp Intersect
++   ->  Append
++         ->  Subquery Scan on "*SELECT* 1"
++               ->  Values Scan on "*VALUES*"
++         ->  Subquery Scan on "*SELECT* 2"
++               ->  Values Scan on "*VALUES*_1"
++(6 rows)
+ 
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) intersect select x from (values (row(1, 2)), (row(1, 4))) _(x);
+    x   
+@@ -689,17 +685,15 @@ select x from (values (row(1, 2)), (row(1, 3))) _(x) intersect select x from (va
+ 
+ explain (costs off)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) except select x from (values (row(1, 2)), (row(1, 4))) _(x);
+-                     QUERY PLAN                      
+------------------------------------------------------
+- SetOp Except
+-   ->  Sort
+-         Sort Key: "*SELECT* 1".x
+-         ->  Append
+-               ->  Subquery Scan on "*SELECT* 1"
+-                     ->  Values Scan on "*VALUES*"
+-               ->  Subquery Scan on "*SELECT* 2"
+-                     ->  Values Scan on "*VALUES*_1"
+-(8 rows)
++                  QUERY PLAN                   
++-----------------------------------------------
++ HashSetOp Except
++   ->  Append
++         ->  Subquery Scan on "*SELECT* 1"
++               ->  Values Scan on "*VALUES*"
++         ->  Subquery Scan on "*SELECT* 2"
++               ->  Values Scan on "*VALUES*_1"
++(6 rows)
+ 
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) except select x from (values (row(1, 2)), (row(1, 4))) _(x);
+    x   
+@@ -708,8 +702,26 @@ select x from (values (row(1, 2)), (row(1, 3))) _(x) except select x from (value
+ (1 row)
+ 
+ -- non-hashable type
++-- With an anonymous row type, the typcache reports that the type is
++-- hashable, but then it will fail at run time.
+ explain (costs off)
+ select x from (values (row(100::money)), (row(200::money))) _(x) union select x from (values (row(100::money)), (row(300::money))) _(x);
++               QUERY PLAN                
++-----------------------------------------
++ HashAggregate
++   Group Key: "*VALUES*".column1
++   ->  Append
++         ->  Values Scan on "*VALUES*"
++         ->  Values Scan on "*VALUES*_1"
++(5 rows)
++
++select x from (values (row(100::money)), (row(200::money))) _(x) union select x from (values (row(100::money)), (row(300::money))) _(x);
++ERROR:  could not identify a hash function for type money
++-- With a defined row type, the typcache can inspect the type's fields
++-- for hashability.
++create type ct1 as (f1 money);
++explain (costs off)
++select x from (values (row(100::money)::ct1), (row(200::money)::ct1)) _(x) union select x from (values (row(100::money)::ct1), (row(300::money)::ct1)) _(x);
+                   QUERY PLAN                   
+ -----------------------------------------------
+  Unique
+@@ -720,7 +732,7 @@ select x from (values (row(100::money)), (row(200::money))) _(x) union select x
+                ->  Values Scan on "*VALUES*_1"
+ (6 rows)
+ 
+-select x from (values (row(100::money)), (row(200::money))) _(x) union select x from (values (row(100::money)), (row(300::money))) _(x);
++select x from (values (row(100::money)::ct1), (row(200::money)::ct1)) _(x) union select x from (values (row(100::money)::ct1), (row(300::money)::ct1)) _(x);
+      x     
+ -----------
+  ($100.00)
+@@ -728,6 +740,7 @@ select x from (values (row(100::money)), (row(200::money))) _(x) union select x
+  ($300.00)
+ (3 rows)
+ 
++drop type ct1;
+ set enable_hashagg to off;
+ explain (costs off)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) union select x from (values (row(1, 2)), (row(1, 4))) _(x);
+diff --git a/src/test/regress/expected/with.out b/src/test/regress/expected/with.out
+index 1f984a9fa482..96835a517eec 100644
+--- a/src/test/regress/expected/with.out
++++ b/src/test/regress/expected/with.out
+@@ -625,7 +625,7 @@ select * from search_graph;
+  2 | 3 | arc 2 -> 3 | f        | {"(1,4)","(4,5)","(5,1)","(1,2)","(2,3)"}
+ (25 rows)
+ 
+--- UNION DISTINCT currently not supported here because row types not hashable
++-- UNION DISTINCT exercises row type hashing support
+ with recursive search_graph(f, t, label, is_cycle, path) as (
+ 	select *, false, array[row(g.f, g.t)] from graph g
+ 	union distinct
+@@ -634,8 +634,35 @@ with recursive search_graph(f, t, label, is_cycle, path) as (
+ 	where g.f = sg.t and not is_cycle
+ )
+ select * from search_graph;
+-ERROR:  could not implement recursive UNION
+-DETAIL:  All column datatypes must be hashable.
++ f | t |   label    | is_cycle |                   path                    
++---+---+------------+----------+-------------------------------------------
++ 1 | 2 | arc 1 -> 2 | f        | {"(1,2)"}
++ 1 | 3 | arc 1 -> 3 | f        | {"(1,3)"}
++ 2 | 3 | arc 2 -> 3 | f        | {"(2,3)"}
++ 1 | 4 | arc 1 -> 4 | f        | {"(1,4)"}
++ 4 | 5 | arc 4 -> 5 | f        | {"(4,5)"}
++ 5 | 1 | arc 5 -> 1 | f        | {"(5,1)"}
++ 1 | 2 | arc 1 -> 2 | f        | {"(5,1)","(1,2)"}
++ 1 | 3 | arc 1 -> 3 | f        | {"(5,1)","(1,3)"}
++ 1 | 4 | arc 1 -> 4 | f        | {"(5,1)","(1,4)"}
++ 2 | 3 | arc 2 -> 3 | f        | {"(1,2)","(2,3)"}
++ 4 | 5 | arc 4 -> 5 | f        | {"(1,4)","(4,5)"}
++ 5 | 1 | arc 5 -> 1 | f        | {"(4,5)","(5,1)"}
++ 1 | 2 | arc 1 -> 2 | f        | {"(4,5)","(5,1)","(1,2)"}
++ 1 | 3 | arc 1 -> 3 | f        | {"(4,5)","(5,1)","(1,3)"}
++ 1 | 4 | arc 1 -> 4 | f        | {"(4,5)","(5,1)","(1,4)"}
++ 2 | 3 | arc 2 -> 3 | f        | {"(5,1)","(1,2)","(2,3)"}
++ 4 | 5 | arc 4 -> 5 | f        | {"(5,1)","(1,4)","(4,5)"}
++ 5 | 1 | arc 5 -> 1 | f        | {"(1,4)","(4,5)","(5,1)"}
++ 1 | 2 | arc 1 -> 2 | f        | {"(1,4)","(4,5)","(5,1)","(1,2)"}
++ 1 | 3 | arc 1 -> 3 | f        | {"(1,4)","(4,5)","(5,1)","(1,3)"}
++ 1 | 4 | arc 1 -> 4 | t        | {"(1,4)","(4,5)","(5,1)","(1,4)"}
++ 2 | 3 | arc 2 -> 3 | f        | {"(4,5)","(5,1)","(1,2)","(2,3)"}
++ 4 | 5 | arc 4 -> 5 | t        | {"(4,5)","(5,1)","(1,4)","(4,5)"}
++ 5 | 1 | arc 5 -> 1 | t        | {"(5,1)","(1,4)","(4,5)","(5,1)"}
++ 2 | 3 | arc 2 -> 3 | f        | {"(1,4)","(4,5)","(5,1)","(1,2)","(2,3)"}
++(25 rows)
++
+ -- ordering by the path column has same effect as SEARCH DEPTH FIRST
+ with recursive search_graph(f, t, label, is_cycle, path) as (
+ 	select *, false, array[row(g.f, g.t)] from graph g
+diff --git a/src/test/regress/sql/hash_func.sql b/src/test/regress/sql/hash_func.sql
+index de84e68ba31d..280b05958348 100644
+--- a/src/test/regress/sql/hash_func.sql
++++ b/src/test/regress/sql/hash_func.sql
+@@ -226,3 +226,20 @@ FROM   (VALUES (int4range(10, 20)), (int4range(23, 43)),
+         (int4range(550274, 1550274)), (int4range(1550275, 208112489))) x(v)
+ WHERE  hash_range(v)::bit(32) != hash_range_extended(v, 0)::bit(32)
+        OR hash_range(v)::bit(32) = hash_range_extended(v, 1)::bit(32);
++
++CREATE TYPE t1 AS (a int, b text);
++SELECT v as value, hash_record(v)::bit(32) as standard,
++       hash_record_extended(v, 0)::bit(32) as extended0,
++       hash_record_extended(v, 1)::bit(32) as extended1
++FROM   (VALUES (row(1, 'aaa')::t1, row(2, 'bbb'), row(-1, 'ccc'))) x(v)
++WHERE  hash_record(v)::bit(32) != hash_record_extended(v, 0)::bit(32)
++       OR hash_record(v)::bit(32) = hash_record_extended(v, 1)::bit(32);
++DROP TYPE t1;
++
++-- record hashing with non-hashable field type
++CREATE TYPE t2 AS (a money, b text);
++SELECT v as value, hash_record(v)::bit(32) as standard
++FROM   (VALUES (row(1, 'aaa')::t2)) x(v);
++SELECT v as value, hash_record_extended(v, 0)::bit(32) as extended0
++FROM   (VALUES (row(1, 'aaa')::t2)) x(v);
++DROP TYPE t2;
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index dd60d6a1f3b8..d687216618c8 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -700,6 +700,7 @@ explain (costs off)
+ select a.idv, b.idv from tidv a, tidv b where a.idv = b.idv;
+ 
+ set enable_mergejoin = 0;
++set enable_hashjoin = 0;
+ 
+ explain (costs off)
+ select a.idv, b.idv from tidv a, tidv b where a.idv = b.idv;
+diff --git a/src/test/regress/sql/union.sql b/src/test/regress/sql/union.sql
+index 6cee454a4cf1..ce22f34c719e 100644
+--- a/src/test/regress/sql/union.sql
++++ b/src/test/regress/sql/union.sql
+@@ -206,7 +206,6 @@ reset enable_hashagg;
+ -- records
+ set enable_hashagg to on;
+ 
+--- currently no hashing support for record, so these will still run with sort plans:
+ explain (costs off)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) union select x from (values (row(1, 2)), (row(1, 4))) _(x);
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) union select x from (values (row(1, 2)), (row(1, 4))) _(x);
+@@ -218,10 +217,21 @@ select x from (values (row(1, 2)), (row(1, 3))) _(x) except select x from (value
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) except select x from (values (row(1, 2)), (row(1, 4))) _(x);
+ 
+ -- non-hashable type
++
++-- With an anonymous row type, the typcache reports that the type is
++-- hashable, but then it will fail at run time.
+ explain (costs off)
+ select x from (values (row(100::money)), (row(200::money))) _(x) union select x from (values (row(100::money)), (row(300::money))) _(x);
+ select x from (values (row(100::money)), (row(200::money))) _(x) union select x from (values (row(100::money)), (row(300::money))) _(x);
+ 
++-- With a defined row type, the typcache can inspect the type's fields
++-- for hashability.
++create type ct1 as (f1 money);
++explain (costs off)
++select x from (values (row(100::money)::ct1), (row(200::money)::ct1)) _(x) union select x from (values (row(100::money)::ct1), (row(300::money)::ct1)) _(x);
++select x from (values (row(100::money)::ct1), (row(200::money)::ct1)) _(x) union select x from (values (row(100::money)::ct1), (row(300::money)::ct1)) _(x);
++drop type ct1;
++
+ set enable_hashagg to off;
+ 
+ explain (costs off)
+diff --git a/src/test/regress/sql/with.sql b/src/test/regress/sql/with.sql
+index c6ce01a2d111..b1b79eb1722f 100644
+--- a/src/test/regress/sql/with.sql
++++ b/src/test/regress/sql/with.sql
+@@ -325,7 +325,7 @@ with recursive search_graph(f, t, label, is_cycle, path) as (
+ )
+ select * from search_graph;
+ 
+--- UNION DISTINCT currently not supported here because row types not hashable
++-- UNION DISTINCT exercises row type hashing support
+ with recursive search_graph(f, t, label, is_cycle, path) as (
+ 	select *, false, array[row(g.f, g.t)] from graph g
+ 	union distinct

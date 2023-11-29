@@ -1,0 +1,186 @@
+From 0a7d771f0f63eb120e7f0a60aecd543ab25ba197 Mon Sep 17 00:00:00 2001
+From: Peter Geoghegan <pg@bowt.ie>
+Date: Fri, 7 Aug 2020 15:27:56 -0700
+Subject: [PATCH] Make nbtree split REDO locking match original execution.
+
+Make the nbtree page split REDO routine consistent with original
+execution in its approach to acquiring and releasing buffer locks (at
+least for pages on the tree level of the page being split).  This brings
+btree_xlog_split() in line with btree_xlog_unlink_page(), which was
+taught to couple buffer locks by commit 9a9db08a.
+
+Note that the precise order in which we both acquire and release sibling
+buffer locks in btree_xlog_split() now matches original execution
+exactly (the precise order in which the locks are released probably
+doesn't matter much, but we might as well be consistent about it).
+
+The rule for nbtree REDO routines from here on is that same-level locks
+should be acquired in an order that's consistent with original
+execution.  It's not practical to have a similar rule for cross-level
+page locks, since for the most part original execution holds those locks
+for a period that spans multiple atomic actions/WAL records.  It's also
+not necessary, because clearly the cross-level lock coupling is only
+truly needed during original execution because of the presence of
+concurrent inserters.
+
+This is not a bug fix (unlike the similar aforementioned commit, commit
+9a9db08a).  The immediate reason to tighten things up in this area is to
+enable an upcoming enhancement to contrib/amcheck that allows it to
+verify that sibling links are in agreement with only an AccessShareLock
+(this check produced false positives when run on a replica server on
+account of the inconsistency fixed by this commit).  But that's not the
+only reason to be stricter here.
+
+It is generally useful to make locking on replicas be as close to what
+happens during original execution as practically possible.  It makes it
+less likely that hard to catch bugs will slip in in the future.  The
+previous state of affairs seems to be a holdover from before the
+introduction of Hot Standby, when buffer lock acquisitions during
+recovery were totally unnecessary.  See also: commit 3bbf668d, which
+tightened things up in this area a few years after the introduction of
+Hot Standby.
+
+Discussion: https://postgr.es/m/CAH2-Wz=465cJj11YXD9RKH8z=nhQa2dofOZ_23h67EXUGOJ00Q@mail.gmail.com
+---
+ src/backend/access/nbtree/README    | 23 +++---------
+ src/backend/access/nbtree/nbtxlog.c | 58 ++++++++++++++---------------
+ 2 files changed, 35 insertions(+), 46 deletions(-)
+
+diff --git a/src/backend/access/nbtree/README b/src/backend/access/nbtree/README
+index 9d5fc424a574..abce31a5a96b 100644
+--- a/src/backend/access/nbtree/README
++++ b/src/backend/access/nbtree/README
+@@ -572,23 +572,12 @@ replay of page deletion records does not hold a write lock on the target
+ leaf page throughout; only the primary needs to block out concurrent
+ writers that insert on to the page being deleted.)
+ 
+-There are also locking differences between the primary and WAL replay
+-for the first stage of a page split (i.e. same-level differences in
+-locking).  Replay of the first phase of a page split can get away with
+-locking and updating the original right sibling page (which is also the
+-new right sibling page's right sibling) after locks on the original page
+-and its new right sibling have been released.  Again, this is okay
+-because there are no writers.  Page deletion WAL replay cannot get away
+-with being lax about same-level locking during replay, though -- doing
+-so risks confusing concurrent backwards scans.
+-
+-Page deletion's second phase locks the left sibling page, target page,
+-and right page in order on the standby, just like on the primary.  This
+-allows backwards scans running on a standby to reason about page
+-deletion on the leaf level; a page cannot appear deleted without that
+-being reflected in the sibling pages.  It's probably possible to be more
+-lax about how locks are acquired on the standby during the second phase
+-of page deletion, but that hardly seems worth it.
++WAL replay holds same-level locks in a way that matches the approach
++taken during original execution, though. This prevent readers from
++observing same-level inconsistencies. It's probably possible to be more
++lax about how same-level locks are acquired during recovery (most kinds
++of readers could still move right to recover if we didn't couple
++same-level locks), but we prefer to be conservative here.
+ 
+ During recovery all index scans start with ignore_killed_tuples = false
+ and we never set kill_prior_tuple. We do this because the oldest xmin
+diff --git a/src/backend/access/nbtree/nbtxlog.c b/src/backend/access/nbtree/nbtxlog.c
+index 1fd639246328..dbec58d5249c 100644
+--- a/src/backend/access/nbtree/nbtxlog.c
++++ b/src/backend/access/nbtree/nbtxlog.c
+@@ -172,10 +172,10 @@ btree_xlog_insert(bool isleaf, bool ismeta, bool posting,
+ 	 * Insertion to an internal page finishes an incomplete split at the child
+ 	 * level.  Clear the incomplete-split flag in the child.  Note: during
+ 	 * normal operation, the child and parent pages are locked at the same
+-	 * time, so that clearing the flag and inserting the downlink appear
+-	 * atomic to other backends.  We don't bother with that during replay,
+-	 * because readers don't care about the incomplete-split flag and there
+-	 * cannot be updates happening.
++	 * time (the locks are coupled), so that clearing the flag and inserting
++	 * the downlink appear atomic to other backends.  We don't bother with
++	 * that during replay, because readers don't care about the
++	 * incomplete-split flag and there cannot be updates happening.
+ 	 */
+ 	if (!isleaf)
+ 		_bt_clear_incomplete_split(record, 1);
+@@ -272,9 +272,17 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
+ 		spagenumber = P_NONE;
+ 
+ 	/*
+-	 * Clear the incomplete split flag on the left sibling of the child page
+-	 * this is a downlink for.  (Like in btree_xlog_insert, this can be done
+-	 * before locking the other pages)
++	 * Clear the incomplete split flag on the appropriate child page one level
++	 * down when origpage/buf is an internal page (there must have been
++	 * cascading page splits during original execution in the event of an
++	 * internal page split).  This is like the corresponding btree_xlog_insert
++	 * call for internal pages.  We're not clearing the incomplete split flag
++	 * for the current page split here (you can think of this as part of the
++	 * insert of newitem that the page split action needs to perform in
++	 * passing).
++	 *
++	 * Like in btree_xlog_insert, this can be done before locking other pages.
++	 * We never need to couple cross-level locks in REDO routines.
+ 	 */
+ 	if (!isleaf)
+ 		_bt_clear_incomplete_split(record, 3);
+@@ -427,22 +435,7 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
+ 		MarkBufferDirty(buf);
+ 	}
+ 
+-	/*
+-	 * We no longer need the buffers.  They must be released together, so that
+-	 * readers cannot observe two inconsistent halves.
+-	 */
+-	if (BufferIsValid(buf))
+-		UnlockReleaseBuffer(buf);
+-	UnlockReleaseBuffer(rbuf);
+-
+-	/*
+-	 * Fix left-link of the page to the right of the new right sibling.
+-	 *
+-	 * Note: in normal operation, we do this while still holding lock on the
+-	 * two split pages.  However, that's not necessary for correctness in WAL
+-	 * replay, because no other index update can be in progress, and readers
+-	 * will cope properly when following an obsolete left-link.
+-	 */
++	/* Fix left-link of the page to the right of the new right sibling */
+ 	if (spagenumber != P_NONE)
+ 	{
+ 		Buffer		sbuf;
+@@ -460,6 +453,14 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
+ 		if (BufferIsValid(sbuf))
+ 			UnlockReleaseBuffer(sbuf);
+ 	}
++
++	/*
++	 * Finally, release the remaining buffers.  sbuf, rbuf, and buf must be
++	 * released together, so that readers cannot observe inconsistencies.
++	 */
++	UnlockReleaseBuffer(rbuf);
++	if (BufferIsValid(buf))
++		UnlockReleaseBuffer(buf);
+ }
+ 
+ static void
+@@ -733,6 +734,11 @@ btree_xlog_mark_page_halfdead(uint8 info, XLogReaderState *record)
+ 		PageSetLSN(page, lsn);
+ 		MarkBufferDirty(buffer);
+ 	}
++
++	/*
++	 * Don't need to couple cross-level locks in REDO routines, so release
++	 * lock on internal page immediately
++	 */
+ 	if (BufferIsValid(buffer))
+ 		UnlockReleaseBuffer(buffer);
+ 
+@@ -789,12 +795,6 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
+ 	 * the pages in the same standard left-to-right order (leftsib, target,
+ 	 * rightsib), and don't release the sibling locks until the target is
+ 	 * marked deleted.
+-	 *
+-	 * btree_xlog_split() can get away with fixing its right sibling page's
+-	 * left link last of all, after dropping all other locks.  We prefer to
+-	 * avoid dropping locks on same-level pages early compared to normal
+-	 * operation.  This keeps things simple for backwards scans.  See
+-	 * nbtree/README.
+ 	 */
+ 
+ 	/* Fix right-link of left sibling, if any */

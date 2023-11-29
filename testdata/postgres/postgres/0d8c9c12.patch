@@ -1,0 +1,4379 @@
+From 0d8c9c1210c44b36ec2efcb223a1dfbe897a3661 Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Fri, 3 Apr 2020 14:59:47 -0400
+Subject: [PATCH] Generate backup manifests for base backups, and validate
+ them.
+
+A manifest is a JSON document which includes (1) the file name, size,
+last modification time, and an optional checksum for each file backed
+up, (2) timelines and LSNs for whatever WAL will need to be replayed
+to make the backup consistent, and (3) a checksum for the manifest
+itself. By default, we use CRC-32C when checksumming data files,
+because we are trying to detect corruption and user error, not foil an
+adversary. However, pg_basebackup and the server-side BASE_BACKUP
+command now have options to select a different algorithm, so users
+wanting a cryptographic hash function can select SHA-224, SHA-256,
+SHA-384, or SHA-512. Users not wanting file checksums at all can
+disable them, or disable generating of the backup manifest altogether.
+Using a cryptographic hash function in place of CRC-32C consumes
+significantly more CPU cycles, which may slow down backups in some
+cases.
+
+A new tool called pg_validatebackup can validate a backup against the
+manifest. If no checksums are present, it can still check that the
+right files exist and that they have the expected sizes. If checksums
+are present, it can also verify that each file has the expected
+checksum. Additionally, it calls pg_waldump to verify that the
+expected WAL files are present and parseable. Only plain format
+backups can be validated directly, but tar format backups can be
+validated after extracting them.
+
+Robert Haas, with help, ideas, review, and testing from David Steele,
+Stephen Frost, Andrew Dunstan, Rushabh Lathia, Suraj Kharage, Tushar
+Ahuja, Rajkumar Raghuwanshi, Mark Dilger, Davinder Singh, Jeevan
+Chalke, Amit Kapila, Andres Freund, and Noah Misch.
+
+Discussion: http://postgr.es/m/CA+TgmoZV8dw1H2bzZ9xkKwdrk8+XYa+DC9H=F7heO2zna5T6qg@mail.gmail.com
+---
+ doc/src/sgml/protocol.sgml                    |  37 +-
+ doc/src/sgml/ref/allfiles.sgml                |   1 +
+ doc/src/sgml/ref/pg_basebackup.sgml           |  64 ++
+ doc/src/sgml/ref/pg_validatebackup.sgml       | 291 ++++++
+ doc/src/sgml/reference.sgml                   |   1 +
+ src/backend/access/transam/xlog.c             |   3 +-
+ src/backend/replication/basebackup.c          | 537 ++++++++++-
+ src/backend/replication/repl_gram.y           |  13 +
+ src/backend/replication/repl_scanner.l        |   2 +
+ src/backend/replication/walsender.c           |  30 +
+ src/bin/Makefile                              |   1 +
+ src/bin/pg_basebackup/pg_basebackup.c         | 208 +++-
+ src/bin/pg_basebackup/t/010_pg_basebackup.pl  |   8 +-
+ src/bin/pg_validatebackup/.gitignore          |   2 +
+ src/bin/pg_validatebackup/Makefile            |  39 +
+ src/bin/pg_validatebackup/parse_manifest.c    | 740 ++++++++++++++
+ src/bin/pg_validatebackup/parse_manifest.h    |  45 +
+ src/bin/pg_validatebackup/pg_validatebackup.c | 905 ++++++++++++++++++
+ src/bin/pg_validatebackup/t/001_basic.pl      |  30 +
+ src/bin/pg_validatebackup/t/002_algorithm.pl  |  58 ++
+ src/bin/pg_validatebackup/t/003_corruption.pl | 251 +++++
+ src/bin/pg_validatebackup/t/004_options.pl    |  89 ++
+ .../pg_validatebackup/t/005_bad_manifest.pl   | 201 ++++
+ src/bin/pg_validatebackup/t/006_encoding.pl   |  27 +
+ src/bin/pg_validatebackup/t/007_wal.pl        |  55 ++
+ src/include/replication/basebackup.h          |   7 +-
+ src/include/replication/walsender.h           |   1 +
+ 27 files changed, 3614 insertions(+), 32 deletions(-)
+ create mode 100644 doc/src/sgml/ref/pg_validatebackup.sgml
+ create mode 100644 src/bin/pg_validatebackup/.gitignore
+ create mode 100644 src/bin/pg_validatebackup/Makefile
+ create mode 100644 src/bin/pg_validatebackup/parse_manifest.c
+ create mode 100644 src/bin/pg_validatebackup/parse_manifest.h
+ create mode 100644 src/bin/pg_validatebackup/pg_validatebackup.c
+ create mode 100644 src/bin/pg_validatebackup/t/001_basic.pl
+ create mode 100644 src/bin/pg_validatebackup/t/002_algorithm.pl
+ create mode 100644 src/bin/pg_validatebackup/t/003_corruption.pl
+ create mode 100644 src/bin/pg_validatebackup/t/004_options.pl
+ create mode 100644 src/bin/pg_validatebackup/t/005_bad_manifest.pl
+ create mode 100644 src/bin/pg_validatebackup/t/006_encoding.pl
+ create mode 100644 src/bin/pg_validatebackup/t/007_wal.pl
+
+diff --git a/doc/src/sgml/protocol.sgml b/doc/src/sgml/protocol.sgml
+index f139ba023128..536de9a698e2 100644
+--- a/doc/src/sgml/protocol.sgml
++++ b/doc/src/sgml/protocol.sgml
+@@ -2466,7 +2466,7 @@ The commands accepted in replication mode are:
+   </varlistentry>
+ 
+   <varlistentry id="protocol-replication-base-backup" xreflabel="BASE_BACKUP">
+-    <term><literal>BASE_BACKUP</literal> [ <literal>LABEL</literal> <replaceable>'label'</replaceable> ] [ <literal>PROGRESS</literal> ] [ <literal>FAST</literal> ] [ <literal>WAL</literal> ] [ <literal>NOWAIT</literal> ] [ <literal>MAX_RATE</literal> <replaceable>rate</replaceable> ] [ <literal>TABLESPACE_MAP</literal> ] [ <literal>NOVERIFY_CHECKSUMS</literal> ]
++    <term><literal>BASE_BACKUP</literal> [ <literal>LABEL</literal> <replaceable>'label'</replaceable> ] [ <literal>PROGRESS</literal> ] [ <literal>FAST</literal> ] [ <literal>WAL</literal> ] [ <literal>NOWAIT</literal> ] [ <literal>MAX_RATE</literal> <replaceable>rate</replaceable> ] [ <literal>TABLESPACE_MAP</literal> ] [ <literal>NOVERIFY_CHECKSUMS</literal> ] [ <literal>MANIFEST</literal> <replaceable>manifest_option</replaceable> ] [ <literal>MANIFEST_CHECKSUMS</literal> <replaceable>checksum_algorithm</replaceable> ]
+      <indexterm><primary>BASE_BACKUP</primary></indexterm>
+     </term>
+     <listitem>
+@@ -2576,6 +2576,41 @@ The commands accepted in replication mode are:
+          </para>
+         </listitem>
+        </varlistentry>
++
++       <varlistentry>
++        <term><literal>MANIFEST</literal></term>
++        <listitem>
++         <para>
++          When this option is specified with a value of <literal>yes</literal>
++          or <literal>force-escape</literal>, a backup manifest is created
++          and sent along with the backup.  The manifest is a list of every
++          file present in the backup with the exception of any WAL files that
++          may be included. It also stores the size, last modification time, and
++          an optional checksum for each file.
++          A value of <literal>force-escape</literal> forces all filenames
++          to be hex-encoded; otherwise, this type of encoding is performed only
++          for files whose names are non-UTF8 octet sequences.
++          <literal>force-escape</literal> is intended primarily for testing
++          purposes, to be sure that clients which read the backup manifest
++          can handle this case. For compatibility with previous releases,
++          the default is <literal>MANIFEST 'no'</literal>.
++         </para>
++        </listitem>
++       </varlistentry>
++
++       <varlistentry>
++        <term><literal>MANIFEST_CHECKSUMS</literal></term>
++        <listitem>
++         <para>
++          Specifies the algorithm that should be applied to each file included
++          in the backup manifest. Currently, the available
++          algorithms are <literal>NONE</literal>, <literal>CRC32C</literal>,
++          <literal>SHA224</literal>, <literal>SHA256</literal>,
++          <literal>SHA384</literal>, and <literal>SHA512</literal>.
++          The default is <literal>CRC32C</literal>.
++         </para>
++        </listitem>
++       </varlistentry>
+       </variablelist>
+      </para>
+      <para>
+diff --git a/doc/src/sgml/ref/allfiles.sgml b/doc/src/sgml/ref/allfiles.sgml
+index 8d91f3529e66..ab71176cdf3b 100644
+--- a/doc/src/sgml/ref/allfiles.sgml
++++ b/doc/src/sgml/ref/allfiles.sgml
+@@ -211,6 +211,7 @@ Complete list of usable sgml source files in this directory.
+ <!ENTITY pgResetwal         SYSTEM "pg_resetwal.sgml">
+ <!ENTITY pgRestore          SYSTEM "pg_restore.sgml">
+ <!ENTITY pgRewind           SYSTEM "pg_rewind.sgml">
++<!ENTITY pgValidateBackup   SYSTEM "pg_validatebackup.sgml">
+ <!ENTITY pgtestfsync        SYSTEM "pgtestfsync.sgml">
+ <!ENTITY pgtesttiming       SYSTEM "pgtesttiming.sgml">
+ <!ENTITY pgupgrade          SYSTEM "pgupgrade.sgml">
+diff --git a/doc/src/sgml/ref/pg_basebackup.sgml b/doc/src/sgml/ref/pg_basebackup.sgml
+index c8e040bacfc0..d9c981cebb99 100644
+--- a/doc/src/sgml/ref/pg_basebackup.sgml
++++ b/doc/src/sgml/ref/pg_basebackup.sgml
+@@ -561,6 +561,70 @@ PostgreSQL documentation
+        </para>
+       </listitem>
+      </varlistentry>
++
++     <varlistentry>
++      <term><option>--no-manifest</option></term>
++      <listitem>
++       <para>
++        Disables generation of a backup manifest. If this option is not
++        specified, the server will generate and send a backup manifest
++        which can be verified using <xref linkend="app-pgvalidatebackup" />.
++        The manifest is a list of every file present in the backup with the
++        exception of any WAL files that may be included. It also stores the
++        size, last modification time, and an optional checksum for each file.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
++      <term><option>--manifest-force-encode</option></term>
++      <listitem>
++       <para>
++        Forces all filenames in the backup manifest to be hex-encoded.
++        If this option is not specified, only non-UTF8 filenames are
++        hex-encoded. This option is mostly intended to test that tools which
++        read a backup manifest file properly handle this case.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
++      <term><option>--manifest-checksums=<replaceable class="parameter">algorithm</replaceable></option></term>
++      <listitem>
++       <para>
++        Specifies the checksum algorithm that should be applied to each file
++        included in the backup manifest. Currently, the available
++        algorithms are <literal>NONE</literal>, <literal>CRC32C</literal>,
++        <literal>SHA224</literal>, <literal>SHA256</literal>,
++        <literal>SHA384</literal>, and <literal>SHA512</literal>.
++        The default is <literal>CRC32C</literal>.
++       </para>
++       <para>
++        If <literal>NONE</literal> is selected, the backup manifest will
++        not contain any checksums. Otherwise, it will contain a checksum
++        of each file in the backup using the specified algorithm. In addition,
++        the manifest will always contain a <literal>SHA256</literal>
++        checksum of its own contents. The <literal>SHA</literal> algorithms
++        are significantly more CPU-intensive than <literal>CRC32C</literal>,
++        so selecting one of them may increase the time required to complete
++        the backup.
++       </para>
++       <para>
++        Using a SHA hash function provides a cryptographically secure digest
++        of each file for users who wish to verify that the backup has not been
++        tampered with, while the CRC32C algorithm provides a checksum which is
++        much faster to calculate and good at catching errors due to accidental
++        changes but is not resistant to targeted modifications.  Note that, to
++        be useful against an adversary who has access to the backup, the backup
++        manifest would need to be stored securely elsewhere or otherwise
++        verified not to have been modified since the backup was taken.
++       </para>
++       <para>
++        <xref linkend="app-pgvalidatebackup" /> can be used to check the
++        integrity of a backup against the backup manifest.
++       </para>
++      </listitem>
++     </varlistentry>
+     </variablelist>
+    </para>
+ 
+diff --git a/doc/src/sgml/ref/pg_validatebackup.sgml b/doc/src/sgml/ref/pg_validatebackup.sgml
+new file mode 100644
+index 000000000000..19888dc19663
+--- /dev/null
++++ b/doc/src/sgml/ref/pg_validatebackup.sgml
+@@ -0,0 +1,291 @@
++<!--
++doc/src/sgml/ref/pg_validatebackup.sgml
++PostgreSQL documentation
++-->
++
++<refentry id="app-pgvalidatebackup">
++ <indexterm zone="app-pgvalidatebackup">
++  <primary>pg_validatebackup</primary>
++ </indexterm>
++
++ <refmeta>
++  <refentrytitle>pg_validatebackup</refentrytitle>
++  <manvolnum>1</manvolnum>
++  <refmiscinfo>Application</refmiscinfo>
++ </refmeta>
++
++ <refnamediv>
++  <refname>pg_validatebackup</refname>
++  <refpurpose>verify the integrity of a base backup of a
++  <productname>PostgreSQL</productname> cluster</refpurpose>
++ </refnamediv>
++
++ <refsynopsisdiv>
++  <cmdsynopsis>
++   <command>pg_validatebackup</command>
++   <arg rep="repeat"><replaceable>option</replaceable></arg>
++  </cmdsynopsis>
++ </refsynopsisdiv>
++
++ <refsect1>
++  <title>
++   Description
++  </title>
++  <para>
++   <application>pg_validatebackup</application> is used to check the
++   integrity of a database cluster backup taken using
++   <command>pg_basebackup</command> against a
++   <literal>backup_manifest</literal> generated by the server at the time
++   of the backup.  The backup must be stored in the "plain"
++   format; a "tar" format backup can be checked after extracting it.
++  </para>
++
++  <para>
++   It is important to note that that the validation which is performed by
++   <application>pg_validatebackup</application> does not and can not include
++   every check which will be performed by a running server when attempting
++   to make use of the backup. Even if you use this tool, you should still
++   perform test restores and verify that the resulting databases work as
++   expected and that they appear to contain the correct data. However,
++   <application>pg_validatebackup</application> can detect many problems
++   that commonly occur due to storage problems or user error.
++  </para>
++
++  <para>
++   Backup verification proceeds in four stages. First,
++   <literal>pg_validatebackup</literal> reads the
++   <literal>backup_manifest</literal> file. If that file
++   does not exist, cannot be read, is malformed, or fails verification
++   against its own internal checksum, <literal>pg_validatebackup</literal>
++   will terminate with a fatal error.
++  </para>
++
++  <para>
++   Second, <literal>pg_validatebackup</literal> will attempt to verify that
++   the data files currently stored on disk are exactly the same as the data
++   files which the server intended to send, with some exceptions that are
++   described below. Extra and missing files will be detected, with a few
++   exceptions.  This step will ignore the presence or absence of, or any
++   modifications to, <literal>postgresql.auto.conf</literal>,
++   <literal>standby.signal</literal>, and <literal>recovery.signal</literal>,
++   because it is expected that these files may have been created or modified
++   as part of the process of taking the backup. It also won't complain about
++   a <literal>backup_manifest</literal> file in the target directory or
++   about anything inside <literal>pg_wal</literal>, even though these
++   files won't be listed in the backup manifest. Only files are checked;
++   the presence or absence or directories is not verified, except
++   indirectly: if a directory is missing, any files it should have contained
++   will necessarily also be missing. 
++  </para>
++
++  <para>
++   Next, <literal>pg_validatebackup</literal> will checksum all the files,
++   compare the checksums against the values in the manifest, and emit errors
++   for any files for which the computed checksum does not match the
++   checksum stored in the manifest. This step is not performed for any files
++   which produced errors in the previous step, since they are already known
++   to have problems. Also, files which were ignored in the previous step are
++   also ignored in this step.
++  </para>
++
++  <para>
++   Finally, <literal>pg_validatebackup</literal> will use the manifest to
++   verify that the write-ahead log records which will be needed to recover
++   the backup are present and that they can be read and parsed. The
++   <literal>backup_manifest</literal> contains information about which
++   write-ahead log records will be needed, and
++   <literal>pg_validatebackup</literal> will use that information to
++   invoke <literal>pg_waldump</literal> to parse those write-ahed log
++   records. The <literal>--quiet</literal> flag will be used, so that
++   <literal>pg_waldump</literal> will only report errors, without producing
++   any other output. While this level of verification is sufficient to
++   detect obvious problems such as a missing file or one whose internal
++   checksums do not match, they aren't extensive enough to detect every
++   possible problem that might occur when attempting to recover. For
++   instance, a server bug that produces write-ahead log records that have
++   the correct checksums but specify nonsensical actions can't be detected
++   by this method.
++  </para>
++
++  <para>
++   Note that if extra WAL files which are not required to recover the backup
++   are present, they will not be checked by this tool, although
++   a separate invocation of <literal>pg_waldump</literal> could be used for
++   that purpose. Also note that WAL verification is version-specific: you
++   must use the version of <literal>pg_validatebackup</literal>, and thus of
++   <literal>pg_waldump</literal>, which pertains to the backup being checked.
++   In contrast, the data file integrity checks should work with any version
++   of the server that generates a <literal>backup_manifest</literal> file.
++  </para>
++ </refsect1>
++
++ <refsect1>
++  <title>Options</title>
++
++   <para>
++    The following command-line options control the behavior.
++
++    <variablelist>
++     <varlistentry>
++      <term><option>-e</option></term>
++      <term><option>--exit-on-error</option></term>
++      <listitem>
++       <para>
++        Exit as soon as a problem with the backup is detected. If this option
++        is not specified, <literal>pg_basebackup</literal> will continue
++        checking the backup even after a problem has been detected, and will
++        report all problems detected as errors.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
++      <term><option>-i <replaceable class="parameter">path</replaceable></option></term>
++      <term><option>--ignore=<replaceable class="parameter">path</replaceable></option></term>
++      <listitem>
++       <para>
++        Ignore the specified file or directory, which should be expressed
++        as a relative pathname, when comparing the list of data files
++        actually present in the backup to those listed in the
++        <literal>backup_manifest</literal> file.  If a directory is
++        specified, this option affects the entire subtree rooted at that
++        location. Complaints about extra files, missing files, file size
++        differences, or checksum mismatches will be suppressed if the
++        relative pathname matches the specified pathname. This option
++        can be specified multiple times.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
++      <term><option>-m <replaceable class="parameter">path</replaceable></option></term>
++      <term><option>--manifest-path=<replaceable class="parameter">path</replaceable></option></term>
++      <listitem>
++       <para>
++        Use the manifest file at the specified path, rather than one located
++        in the root of the backup directory.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
++      <term><option>-n</option></term>
++      <term><option>--no-parse-wal</option></term>
++      <listitem>
++       <para>
++        Don't attempt to parse write-ahead log data that will be needed
++        to recover from this backup.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
++      <term><option>-q</option></term>
++      <term><option>--quiet</option></term>
++      <listitem>
++       <para>
++        Don't print anything when a backup is successfully validated.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
++      <term><option>-s</option></term>
++      <term><option>--skip-checksums</option></term>
++      <listitem>
++       <para>
++        Do not validate data file checksums. The presence or absence of
++        files and the sizes of those files will still be checked. This is
++        much faster, because the files themselves do not need to be read.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
++      <term><option>-w <replaceable class="parameter">path</replaceable></option></term>
++      <term><option>--wal-directory=<replaceable class="parameter">path</replaceable></option></term>
++      <listitem>
++       <para>
++        Try to parse WAL files stored in the specified directory, rather than
++        in <literal>pg_wal</literal>. This may be useful if the backup is
++        stored in a separate location from the WAL archive.
++       </para>
++      </listitem>
++     </varlistentry>
++    </variablelist>
++   </para>
++
++   <para>
++    Other options are also available:
++
++    <variablelist>
++     <varlistentry>
++       <term><option>-V</option></term>
++       <term><option>--version</option></term>
++       <listitem>
++       <para>
++       Print the <application>pg_validatebackup</application> version and exit.
++       </para>
++       </listitem>
++     </varlistentry>
++
++     <varlistentry>
++       <term><option>-?</option></term>
++       <term><option>--help</option></term>
++       <listitem>
++       <para>
++       Show help about <application>pg_validatebackup</application> command
++       line arguments, and exit.
++       </para>
++       </listitem>
++     </varlistentry>
++
++    </variablelist>
++   </para>
++
++ </refsect1>
++
++ <refsect1>
++  <title>Examples</title>
++
++  <para>
++   To create a base backup of the server at <literal>mydbserver</literal> and
++   validate the integrity of the backup:
++<screen>
++<prompt>$</prompt> <userinput>pg_basebackup -h mydbserver -D /usr/local/pgsql/data</userinput>
++<prompt>$</prompt> <userinput>pg_validatebackup /usr/local/pgsql/data</userinput>
++</screen>
++  </para>
++
++  <para>
++   To create a base backup of the server at <literal>mydbserver</literal>, move
++   the manifest somewhere outside the backup directory, and validate the
++   backup:
++<screen>
++<prompt>$</prompt> <userinput>pg_basebackup -h mydbserver -D /usr/local/pgsql/backup1234</userinput>
++<prompt>$</prompt> <userinput>mv /usr/local/pgsql/backup1234/backup_manifest /my/secure/location/backup_manifest.1234</userinput>
++<prompt>$</prompt> <userinput>pg_validatebackup -m /my/secure/location/backup_manifest.1234 /usr/local/pgsql/backup1234</userinput>
++</screen>
++  </para>
++
++  <para>
++   To validate a backup while ignoring a file that was added manually to the
++   backup directory, and also skipping checksum verification:
++<screen>
++<prompt>$</prompt> <userinput>pg_basebackup -h mydbserver -D /usr/local/pgsql/data</userinput>
++<prompt>$</prompt> <userinput>edit /usr/local/pgsql/data/note.to.self</userinput>
++<prompt>$</prompt> <userinput>pg_validatebackup --ignore=note.to.self --skip-checksums /usr/local/pgsql/data</userinput>
++</screen>
++  </para>
++
++ </refsect1>
++
++ <refsect1>
++  <title>See Also</title>
++
++  <simplelist type="inline">
++   <member><xref linkend="app-pgbasebackup"/></member>
++  </simplelist>
++ </refsect1>
++
++</refentry>
+diff --git a/doc/src/sgml/reference.sgml b/doc/src/sgml/reference.sgml
+index cef09dd38b34..d25a77b13c8e 100644
+--- a/doc/src/sgml/reference.sgml
++++ b/doc/src/sgml/reference.sgml
+@@ -255,6 +255,7 @@
+    &pgReceivewal;
+    &pgRecvlogical;
+    &pgRestore;
++   &pgValidateBackup;
+    &psqlRef;
+    &reindexdb;
+    &vacuumdb;
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 977d448f5023..a29456f78906 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -10642,7 +10642,8 @@ do_pg_start_backup(const char *backupidstr, bool fast, TimeLineID *starttli_p,
+ 			ti->oid = pstrdup(de->d_name);
+ 			ti->path = pstrdup(buflinkpath.data);
+ 			ti->rpath = relpath ? pstrdup(relpath) : NULL;
+-			ti->size = infotbssize ? sendTablespace(fullpath, true) : -1;
++			ti->size = infotbssize ?
++				sendTablespace(fullpath, ti->oid, true, NULL) : -1;
+ 
+ 			if (tablespaces)
+ 				*tablespaces = lappend(*tablespaces, ti);
+diff --git a/src/backend/replication/basebackup.c b/src/backend/replication/basebackup.c
+index a2e28b064cdd..3b18e733cdfa 100644
+--- a/src/backend/replication/basebackup.c
++++ b/src/backend/replication/basebackup.c
+@@ -16,8 +16,10 @@
+ #include <unistd.h>
+ #include <time.h>
+ 
++#include "access/timeline.h"
+ #include "access/xlog_internal.h"	/* for pg_start/stop_backup */
+ #include "catalog/pg_type.h"
++#include "common/checksum_helper.h"
+ #include "common/file_perm.h"
+ #include "commands/progress.h"
+ #include "lib/stringinfo.h"
+@@ -32,6 +34,7 @@
+ #include "replication/basebackup.h"
+ #include "replication/walsender.h"
+ #include "replication/walsender_private.h"
++#include "storage/buffile.h"
+ #include "storage/bufpage.h"
+ #include "storage/checksum.h"
+ #include "storage/dsm_impl.h"
+@@ -39,10 +42,19 @@
+ #include "storage/ipc.h"
+ #include "storage/reinit.h"
+ #include "utils/builtins.h"
++#include "utils/json.h"
+ #include "utils/ps_status.h"
+ #include "utils/relcache.h"
++#include "utils/resowner.h"
+ #include "utils/timestamp.h"
+ 
++typedef enum manifest_option
++{
++	MANIFEST_OPTION_YES,
++	MANIFEST_OPTION_NO,
++	MANIFEST_OPTION_FORCE_ENCODE
++} manifest_option;
++
+ typedef struct
+ {
+ 	const char *label;
+@@ -52,20 +64,47 @@ typedef struct
+ 	bool		includewal;
+ 	uint32		maxrate;
+ 	bool		sendtblspcmapfile;
++	manifest_option manifest;
++	pg_checksum_type manifest_checksum_type;
+ } basebackup_options;
+ 
++struct manifest_info
++{
++	BufFile    *buffile;
++	pg_checksum_type checksum_type;
++	pg_sha256_ctx manifest_ctx;
++	uint64		manifest_size;
++	bool		force_encode;
++	bool		first_file;
++	bool		still_checksumming;
++};
++
+ 
+ static int64 sendDir(const char *path, int basepathlen, bool sizeonly,
+-					 List *tablespaces, bool sendtblspclinks);
++					 List *tablespaces, bool sendtblspclinks,
++					 manifest_info *manifest, const char *spcoid);
+ static bool sendFile(const char *readfilename, const char *tarfilename,
+-					 struct stat *statbuf, bool missing_ok, Oid dboid);
+-static void sendFileWithContent(const char *filename, const char *content);
++					 struct stat *statbuf, bool missing_ok, Oid dboid,
++					 manifest_info *manifest, const char *spcoid);
++static void sendFileWithContent(const char *filename, const char *content,
++								manifest_info *manifest);
+ static int64 _tarWriteHeader(const char *filename, const char *linktarget,
+ 							 struct stat *statbuf, bool sizeonly);
+ static int64 _tarWriteDir(const char *pathbuf, int basepathlen, struct stat *statbuf,
+ 						  bool sizeonly);
+ static void send_int8_string(StringInfoData *buf, int64 intval);
+ static void SendBackupHeader(List *tablespaces);
++static bool IsManifestEnabled(manifest_info *manifest);
++static void InitializeManifest(manifest_info *manifest,
++							   basebackup_options *opt);
++static void AppendStringToManifest(manifest_info *manifest, char *s);
++static void AddFileToManifest(manifest_info *manifest, const char *spcoid,
++							  const char *pathname, size_t size, time_t mtime,
++							  pg_checksum_context *checksum_ctx);
++static void AddWALInfoToManifest(manifest_info *manifest, XLogRecPtr startptr,
++								 TimeLineID starttli, XLogRecPtr endptr,
++								 TimeLineID endtli);
++static void SendBackupManifest(manifest_info *manifest);
+ static void perform_base_backup(basebackup_options *opt);
+ static void parse_basebackup_options(List *options, basebackup_options *opt);
+ static void SendXlogRecPtrResult(XLogRecPtr ptr, TimeLineID tli);
+@@ -102,6 +141,16 @@ do { \
+ 				(errmsg("could not read from file \"%s\"", filename))); \
+ } while (0)
+ 
++/*
++ * Convenience macro for appending data to the backup manifest.
++ */
++#define AppendToManifest(manifest, ...) \
++	{ \
++		char *_manifest_s = psprintf(__VA_ARGS__);	\
++		AppendStringToManifest(manifest, _manifest_s);	\
++		pfree(_manifest_s);	\
++	}
++
+ /* The actual number of bytes, transfer of which may cause sleep. */
+ static uint64 throttling_sample;
+ 
+@@ -254,6 +303,7 @@ perform_base_backup(basebackup_options *opt)
+ 	TimeLineID	endtli;
+ 	StringInfo	labelfile;
+ 	StringInfo	tblspc_map_file = NULL;
++	manifest_info manifest;
+ 	int			datadirpathlen;
+ 	List	   *tablespaces = NIL;
+ 
+@@ -273,12 +323,17 @@ perform_base_backup(basebackup_options *opt)
+ 									 backup_total);
+ 	}
+ 
++	/* we're going to use a BufFile, so we need a ResourceOwner */
++	Assert(CurrentResourceOwner == NULL);
++	CurrentResourceOwner = ResourceOwnerCreate(NULL, "base backup");
++
+ 	datadirpathlen = strlen(DataDir);
+ 
+ 	backup_started_in_recovery = RecoveryInProgress();
+ 
+ 	labelfile = makeStringInfo();
+ 	tblspc_map_file = makeStringInfo();
++	InitializeManifest(&manifest, opt);
+ 
+ 	total_checksum_failures = 0;
+ 
+@@ -316,7 +371,10 @@ perform_base_backup(basebackup_options *opt)
+ 
+ 		/* Add a node for the base directory at the end */
+ 		ti = palloc0(sizeof(tablespaceinfo));
+-		ti->size = opt->progress ? sendDir(".", 1, true, tablespaces, true) : -1;
++		if (opt->progress)
++			ti->size = sendDir(".", 1, true, tablespaces, true, NULL, NULL);
++		else
++			ti->size = -1;
+ 		tablespaces = lappend(tablespaces, ti);
+ 
+ 		/*
+@@ -395,7 +453,8 @@ perform_base_backup(basebackup_options *opt)
+ 				struct stat statbuf;
+ 
+ 				/* In the main tar, include the backup_label first... */
+-				sendFileWithContent(BACKUP_LABEL_FILE, labelfile->data);
++				sendFileWithContent(BACKUP_LABEL_FILE, labelfile->data,
++									&manifest);
+ 
+ 				/*
+ 				 * Send tablespace_map file if required and then the bulk of
+@@ -403,11 +462,14 @@ perform_base_backup(basebackup_options *opt)
+ 				 */
+ 				if (tblspc_map_file && opt->sendtblspcmapfile)
+ 				{
+-					sendFileWithContent(TABLESPACE_MAP, tblspc_map_file->data);
+-					sendDir(".", 1, false, tablespaces, false);
++					sendFileWithContent(TABLESPACE_MAP, tblspc_map_file->data,
++										&manifest);
++					sendDir(".", 1, false, tablespaces, false,
++							&manifest, NULL);
+ 				}
+ 				else
+-					sendDir(".", 1, false, tablespaces, true);
++					sendDir(".", 1, false, tablespaces, true,
++							&manifest, NULL);
+ 
+ 				/* ... and pg_control after everything else. */
+ 				if (lstat(XLOG_CONTROL_FILE, &statbuf) != 0)
+@@ -415,10 +477,11 @@ perform_base_backup(basebackup_options *opt)
+ 							(errcode_for_file_access(),
+ 							 errmsg("could not stat file \"%s\": %m",
+ 									XLOG_CONTROL_FILE)));
+-				sendFile(XLOG_CONTROL_FILE, XLOG_CONTROL_FILE, &statbuf, false, InvalidOid);
++				sendFile(XLOG_CONTROL_FILE, XLOG_CONTROL_FILE, &statbuf,
++						 false, InvalidOid, &manifest, NULL);
+ 			}
+ 			else
+-				sendTablespace(ti->path, false);
++				sendTablespace(ti->path, ti->oid, false, &manifest);
+ 
+ 			/*
+ 			 * If we're including WAL, and this is the main data directory we
+@@ -647,7 +710,7 @@ perform_base_backup(basebackup_options *opt)
+ 			 * complete segment.
+ 			 */
+ 			StatusFilePath(pathbuf, walFileName, ".done");
+-			sendFileWithContent(pathbuf, "");
++			sendFileWithContent(pathbuf, "", &manifest);
+ 		}
+ 
+ 		/*
+@@ -670,16 +733,22 @@ perform_base_backup(basebackup_options *opt)
+ 						(errcode_for_file_access(),
+ 						 errmsg("could not stat file \"%s\": %m", pathbuf)));
+ 
+-			sendFile(pathbuf, pathbuf, &statbuf, false, InvalidOid);
++			sendFile(pathbuf, pathbuf, &statbuf, false, InvalidOid,
++					 &manifest, NULL);
+ 
+ 			/* unconditionally mark file as archived */
+ 			StatusFilePath(pathbuf, fname, ".done");
+-			sendFileWithContent(pathbuf, "");
++			sendFileWithContent(pathbuf, "", &manifest);
+ 		}
+ 
+ 		/* Send CopyDone message for the last tar file */
+ 		pq_putemptymessage('c');
+ 	}
++
++	AddWALInfoToManifest(&manifest, startptr, starttli, endptr, endtli);
++
++	SendBackupManifest(&manifest);
++
+ 	SendXlogRecPtrResult(endptr, endtli);
+ 
+ 	if (total_checksum_failures)
+@@ -693,6 +762,9 @@ perform_base_backup(basebackup_options *opt)
+ 				 errmsg("checksum verification failure during base backup")));
+ 	}
+ 
++	/* clean up the resource owner we created */
++	WalSndResourceCleanup(true);
++
+ 	pgstat_progress_end_command();
+ }
+ 
+@@ -724,8 +796,13 @@ parse_basebackup_options(List *options, basebackup_options *opt)
+ 	bool		o_maxrate = false;
+ 	bool		o_tablespace_map = false;
+ 	bool		o_noverify_checksums = false;
++	bool		o_manifest = false;
++	bool		o_manifest_checksums = false;
+ 
+ 	MemSet(opt, 0, sizeof(*opt));
++	opt->manifest = MANIFEST_OPTION_NO;
++	opt->manifest_checksum_type = CHECKSUM_TYPE_CRC32C;
++
+ 	foreach(lopt, options)
+ 	{
+ 		DefElem    *defel = (DefElem *) lfirst(lopt);
+@@ -812,12 +889,61 @@ parse_basebackup_options(List *options, basebackup_options *opt)
+ 			noverify_checksums = true;
+ 			o_noverify_checksums = true;
+ 		}
++		else if (strcmp(defel->defname, "manifest") == 0)
++		{
++			char	   *optval = strVal(defel->arg);
++			bool		manifest_bool;
++
++			if (o_manifest)
++				ereport(ERROR,
++						(errcode(ERRCODE_SYNTAX_ERROR),
++						 errmsg("duplicate option \"%s\"", defel->defname)));
++			if (parse_bool(optval, &manifest_bool))
++			{
++				if (manifest_bool)
++					opt->manifest = MANIFEST_OPTION_YES;
++				else
++					opt->manifest = MANIFEST_OPTION_NO;
++			}
++			else if (pg_strcasecmp(optval, "force-encode") == 0)
++				opt->manifest = MANIFEST_OPTION_FORCE_ENCODE;
++			else
++				ereport(ERROR,
++						(errcode(ERRCODE_SYNTAX_ERROR),
++						 errmsg("unrecognized manifest option: \"%s\"",
++								optval)));
++			o_manifest = true;
++		}
++		else if (strcmp(defel->defname, "manifest_checksums") == 0)
++		{
++			char	   *optval = strVal(defel->arg);
++
++			if (o_manifest_checksums)
++				ereport(ERROR,
++						(errcode(ERRCODE_SYNTAX_ERROR),
++						 errmsg("duplicate option \"%s\"", defel->defname)));
++			if (!pg_checksum_parse_type(optval,
++										&opt->manifest_checksum_type))
++				ereport(ERROR,
++						(errcode(ERRCODE_SYNTAX_ERROR),
++						 errmsg("unrecognized checksum algorithm: \"%s\"",
++								optval)));
++			o_manifest_checksums = true;
++		}
+ 		else
+ 			elog(ERROR, "option \"%s\" not recognized",
+ 				 defel->defname);
+ 	}
+ 	if (opt->label == NULL)
+ 		opt->label = "base backup";
++	if (opt->manifest == MANIFEST_OPTION_NO)
++	{
++		if (o_manifest_checksums)
++			ereport(ERROR,
++					(errcode(ERRCODE_SYNTAX_ERROR),
++					 errmsg("manifest checksums require a backup manifest")));
++		opt->manifest_checksum_type = CHECKSUM_TYPE_NONE;
++	}
+ }
+ 
+ 
+@@ -933,6 +1059,349 @@ SendBackupHeader(List *tablespaces)
+ 	pq_puttextmessage('C', "SELECT");
+ }
+ 
++/*
++ * Does the user want a backup manifest?
++ *
++ * It's simplest to always have a manifest_info object, so that we don't need
++ * checks for NULL pointers in too many places. However, if the user doesn't
++ * want a manifest, we set manifest->buffile to NULL.
++ */
++static bool
++IsManifestEnabled(manifest_info *manifest)
++{
++	return (manifest->buffile != NULL);
++}
++
++/*
++ * Initialize state so that we can construct a backup manifest.
++ *
++ * NB: Although the checksum type for the data files is configurable, the
++ * checksum for the manifest itself always uses SHA-256. See comments in
++ * SendBackupManifest.
++ */
++static void
++InitializeManifest(manifest_info *manifest, basebackup_options *opt)
++{
++	if (opt->manifest == MANIFEST_OPTION_NO)
++		manifest->buffile = NULL;
++	else
++		manifest->buffile = BufFileCreateTemp(false);
++	manifest->checksum_type = opt->manifest_checksum_type;
++	pg_sha256_init(&manifest->manifest_ctx);
++	manifest->manifest_size = UINT64CONST(0);
++	manifest->force_encode = (opt->manifest == MANIFEST_OPTION_FORCE_ENCODE);
++	manifest->first_file = true;
++	manifest->still_checksumming = true;
++
++	if (opt->manifest != MANIFEST_OPTION_NO)
++		AppendToManifest(manifest,
++						 "{ \"PostgreSQL-Backup-Manifest-Version\": 1,\n"
++						 "\"Files\": [");
++}
++
++/*
++ * Append a cstring to the manifest.
++ */
++static void
++AppendStringToManifest(manifest_info *manifest, char *s)
++{
++	int			len = strlen(s);
++	size_t		written;
++
++	Assert(manifest != NULL);
++	if (manifest->still_checksumming)
++		pg_sha256_update(&manifest->manifest_ctx, (uint8 *) s, len);
++	written = BufFileWrite(manifest->buffile, s, len);
++	if (written != len)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not write to temporary file: %m")));
++	manifest->manifest_size += len;
++}
++
++/*
++ * Add an entry to the backup manifest for a file.
++ */
++static void
++AddFileToManifest(manifest_info *manifest, const char *spcoid,
++				  const char *pathname, size_t size, time_t mtime,
++				  pg_checksum_context *checksum_ctx)
++{
++	char		pathbuf[MAXPGPATH];
++	int			pathlen;
++	StringInfoData buf;
++
++	if (!IsManifestEnabled(manifest))
++		return;
++
++	/*
++	 * If this file is part of a tablespace, the pathname passed to this
++	 * function will be relative to the tar file that contains it. We want the
++	 * pathname relative to the data directory (ignoring the intermediate
++	 * symlink traversal).
++	 */
++	if (spcoid != NULL)
++	{
++		snprintf(pathbuf, sizeof(pathbuf), "pg_tblspc/%s/%s", spcoid,
++				 pathname);
++		pathname = pathbuf;
++	}
++
++	/*
++	 * Each file's entry need to be separated from any entry that follows by a
++	 * comma, but there's no comma before the first one or after the last one.
++	 * To make that work, adding a file to the manifest starts by terminating
++	 * the most recently added line, with a comma if appropriate, but does not
++	 * terminate the line inserted for this file.
++	 */
++	initStringInfo(&buf);
++	if (manifest->first_file)
++	{
++		appendStringInfoString(&buf, "\n");
++		manifest->first_file = false;
++	}
++	else
++		appendStringInfoString(&buf, ",\n");
++
++	/*
++	 * Write the relative pathname to this file out to the manifest. The
++	 * manifest is always stored in UTF-8, so we have to encode paths that are
++	 * not valid in that encoding.
++	 */
++	pathlen = strlen(pathname);
++	if (!manifest->force_encode &&
++		pg_verify_mbstr(PG_UTF8, pathname, pathlen, true))
++	{
++		appendStringInfoString(&buf, "{ \"Path\": ");
++		escape_json(&buf, pathname);
++		appendStringInfoString(&buf, ", ");
++	}
++	else
++	{
++		appendStringInfoString(&buf, "{ \"Encoded-Path\": \"");
++		enlargeStringInfo(&buf, 2 * pathlen);
++		buf.len += hex_encode((char *) pathname, pathlen,
++							  &buf.data[buf.len]);
++		appendStringInfoString(&buf, "\", ");
++	}
++
++	appendStringInfo(&buf, "\"Size\": %zu, ", size);
++
++	/*
++	 * Convert last modification time to a string and append it to the
++	 * manifest. Since it's not clear what time zone to use and since time
++	 * zone definitions can change, possibly causing confusion, use GMT
++	 * always.
++	 */
++	appendStringInfoString(&buf, "\"Last-Modified\": \"");
++	enlargeStringInfo(&buf, 128);
++	buf.len += pg_strftime(&buf.data[buf.len], 128, "%Y-%m-%d %H:%M:%S %Z",
++						   pg_gmtime(&mtime));
++	appendStringInfoString(&buf, "\"");
++
++	/* Add checksum information. */
++	if (checksum_ctx->type != CHECKSUM_TYPE_NONE)
++	{
++		uint8		checksumbuf[PG_CHECKSUM_MAX_LENGTH];
++		int			checksumlen;
++
++		checksumlen = pg_checksum_final(checksum_ctx, checksumbuf);
++
++		appendStringInfo(&buf,
++						 ", \"Checksum-Algorithm\": \"%s\", \"Checksum\": \"",
++						 pg_checksum_type_name(checksum_ctx->type));
++		enlargeStringInfo(&buf, 2 * checksumlen);
++		buf.len += hex_encode((char *) checksumbuf, checksumlen,
++							  &buf.data[buf.len]);
++		appendStringInfoString(&buf, "\"");
++	}
++
++	/* Close out the object. */
++	appendStringInfoString(&buf, " }");
++
++	/* OK, add it to the manifest. */
++	AppendStringToManifest(manifest, buf.data);
++
++	/* Avoid leaking memory. */
++	pfree(buf.data);
++}
++
++/*
++ * Add information about the WAL that will need to be replayed when restoring
++ * this backup to the manifest.
++ */
++static void
++AddWALInfoToManifest(manifest_info *manifest, XLogRecPtr startptr,
++					 TimeLineID starttli, XLogRecPtr endptr, TimeLineID endtli)
++{
++	List	   *timelines;
++	ListCell   *lc;
++	bool		first_wal_range = true;
++	bool		found_start_timeline = false;
++
++	if (!IsManifestEnabled(manifest))
++		return;
++
++	/* Terminate the list of files. */
++	AppendStringToManifest(manifest, "\n],\n");
++
++	/* Read the timeline history for the ending timeline. */
++	timelines = readTimeLineHistory(endtli);
++
++	/* Start a list of LSN ranges. */
++	AppendStringToManifest(manifest, "\"WAL-Ranges\": [\n");
++
++	foreach(lc, timelines)
++	{
++		TimeLineHistoryEntry *entry = lfirst(lc);
++		XLogRecPtr	tl_beginptr;
++
++		/*
++		 * We only care about timelines that were active during the backup.
++		 * Skip any that ended before the backup started. (Note that if
++		 * entry->end is InvalidXLogRecPtr, it means that the timeline has not
++		 * yet ended.)
++		 */
++		if (!XLogRecPtrIsInvalid(entry->end) && entry->end < startptr)
++			continue;
++
++		/*
++		 * Because the timeline history file lists newer timelines before
++		 * older ones, the first timeline we encounter that is new enough to
++		 * matter ought to match the ending timeline of the backup.
++		 */
++		if (first_wal_range && endtli != entry->tli)
++			ereport(ERROR,
++					errmsg("expected end timeline %u but found timeline %u",
++						   starttli, entry->tli));
++
++		if (!XLogRecPtrIsInvalid(entry->begin))
++			tl_beginptr = entry->begin;
++		else
++		{
++			tl_beginptr = startptr;
++
++			/*
++			 * If we reach a TLI that has no valid beginning LSN, there can't
++			 * be any more timelines in the history after this point, so we'd
++			 * better have arrived at the expected starting TLI. If not,
++			 * something's gone horribly wrong.
++			 */
++			if (starttli != entry->tli)
++				ereport(ERROR,
++						errmsg("expected start timeline %u but found timeline %u",
++							   starttli, entry->tli));
++		}
++
++		AppendToManifest(manifest,
++						 "%s{ \"Timeline\": %u, \"Start-LSN\": \"%X/%X\", \"End-LSN\": \"%X/%X\" }",
++						 first_wal_range ? "" : ",\n",
++						 entry->tli,
++						 (uint32) (tl_beginptr >> 32), (uint32) tl_beginptr,
++						 (uint32) (endptr >> 32), (uint32) endptr);
++
++		if (starttli == entry->tli)
++		{
++			found_start_timeline = true;
++			break;
++		}
++
++		endptr = entry->begin;
++		first_wal_range = false;
++	}
++
++	/*
++	 * The last entry in the timeline history for the ending timeline should
++	 * be the ending timeline itself. Verify that this is what we observed.
++	 */
++	if (!found_start_timeline)
++		ereport(ERROR,
++				errmsg("start timeline %u not found history of timeline %u",
++					   starttli, endtli));
++
++	/* Terminate the list of WAL ranges. */
++	AppendStringToManifest(manifest, "\n],\n");
++}
++
++/*
++ * Finalize the backup manifest, and send it to the client.
++ */
++static void
++SendBackupManifest(manifest_info *manifest)
++{
++	StringInfoData protobuf;
++	uint8		checksumbuf[PG_SHA256_DIGEST_LENGTH];
++	char		checksumstringbuf[PG_SHA256_DIGEST_STRING_LENGTH];
++	size_t		manifest_bytes_done = 0;
++
++	if (!IsManifestEnabled(manifest))
++		return;
++
++	/*
++	 * Append manifest checksum, so that the problems with the manifest itself
++	 * can be detected.
++	 *
++	 * We always use SHA-256 for this, regardless of what algorithm is chosen
++	 * for checksumming the files.  If we ever want to make the checksum
++	 * algorithm used for the manifest file variable, the client will need a
++	 * way to figure out which algorithm to use as close to the beginning of
++	 * the manifest file as possible, to avoid having to read the whole thing
++	 * twice.
++	 */
++	manifest->still_checksumming = false;
++	pg_sha256_final(&manifest->manifest_ctx, checksumbuf);
++	AppendStringToManifest(manifest, "\"Manifest-Checksum\": \"");
++	hex_encode((char *) checksumbuf, sizeof checksumbuf, checksumstringbuf);
++	checksumstringbuf[PG_SHA256_DIGEST_STRING_LENGTH - 1] = '\0';
++	AppendStringToManifest(manifest, checksumstringbuf);
++	AppendStringToManifest(manifest, "\"}\n");
++
++	/*
++	 * We've written all the data to the manifest file.  Rewind the file so
++	 * that we can read it all back.
++	 */
++	if (BufFileSeek(manifest->buffile, 0, 0L, SEEK_SET))
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not rewind temporary file: %m")));
++
++	/* Send CopyOutResponse message */
++	pq_beginmessage(&protobuf, 'H');
++	pq_sendbyte(&protobuf, 0);	/* overall format */
++	pq_sendint16(&protobuf, 0); /* natts */
++	pq_endmessage(&protobuf);
++
++	/*
++	 * Send CopyData messages.
++	 *
++	 * We choose to read back the data from the temporary file in chunks of
++	 * size BLCKSZ; this isn't necessary, but buffile.c uses that as the I/O
++	 * size, so it seems to make sense to match that value here.
++	 */
++	while (manifest_bytes_done < manifest->manifest_size)
++	{
++		char		manifestbuf[BLCKSZ];
++		size_t		bytes_to_read;
++		size_t		rc;
++
++		bytes_to_read = Min(sizeof(manifestbuf),
++							manifest->manifest_size - manifest_bytes_done);
++		rc = BufFileRead(manifest->buffile, manifestbuf, bytes_to_read);
++		if (rc != bytes_to_read)
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("could not read from temporary file: %m")));
++		pq_putmessage('d', manifestbuf, bytes_to_read);
++		manifest_bytes_done += bytes_to_read;
++	}
++
++	/* No more data, so send CopyDone message */
++	pq_putemptymessage('c');
++
++	/* Release resources */
++	BufFileClose(manifest->buffile);
++}
++
+ /*
+  * Send a single resultset containing just a single
+  * XLogRecPtr record (in text format)
+@@ -993,11 +1462,15 @@ SendXlogRecPtrResult(XLogRecPtr ptr, TimeLineID tli)
+  * Inject a file with given name and content in the output tar stream.
+  */
+ static void
+-sendFileWithContent(const char *filename, const char *content)
++sendFileWithContent(const char *filename, const char *content,
++					manifest_info *manifest)
+ {
+ 	struct stat statbuf;
+ 	int			pad,
+ 				len;
++	pg_checksum_context checksum_ctx;
++
++	pg_checksum_init(&checksum_ctx, manifest->checksum_type);
+ 
+ 	len = strlen(content);
+ 
+@@ -1032,6 +1505,10 @@ sendFileWithContent(const char *filename, const char *content)
+ 		pq_putmessage('d', buf, pad);
+ 		update_basebackup_progress(pad);
+ 	}
++
++	pg_checksum_update(&checksum_ctx, (uint8 *) content, len);
++	AddFileToManifest(manifest, NULL, filename, len, statbuf.st_mtime,
++					  &checksum_ctx);
+ }
+ 
+ /*
+@@ -1042,7 +1519,8 @@ sendFileWithContent(const char *filename, const char *content)
+  * Only used to send auxiliary tablespaces, not PGDATA.
+  */
+ int64
+-sendTablespace(char *path, bool sizeonly)
++sendTablespace(char *path, char *spcoid, bool sizeonly,
++			   manifest_info *manifest)
+ {
+ 	int64		size;
+ 	char		pathbuf[MAXPGPATH];
+@@ -1075,7 +1553,8 @@ sendTablespace(char *path, bool sizeonly)
+ 						   sizeonly);
+ 
+ 	/* Send all the files in the tablespace version directory */
+-	size += sendDir(pathbuf, strlen(path), sizeonly, NIL, true);
++	size += sendDir(pathbuf, strlen(path), sizeonly, NIL, true, manifest,
++					spcoid);
+ 
+ 	return size;
+ }
+@@ -1094,7 +1573,7 @@ sendTablespace(char *path, bool sizeonly)
+  */
+ static int64
+ sendDir(const char *path, int basepathlen, bool sizeonly, List *tablespaces,
+-		bool sendtblspclinks)
++		bool sendtblspclinks, manifest_info *manifest, const char *spcoid)
+ {
+ 	DIR		   *dir;
+ 	struct dirent *de;
+@@ -1374,7 +1853,8 @@ sendDir(const char *path, int basepathlen, bool sizeonly, List *tablespaces,
+ 				skip_this_dir = true;
+ 
+ 			if (!skip_this_dir)
+-				size += sendDir(pathbuf, basepathlen, sizeonly, tablespaces, sendtblspclinks);
++				size += sendDir(pathbuf, basepathlen, sizeonly, tablespaces,
++								sendtblspclinks, manifest, spcoid);
+ 		}
+ 		else if (S_ISREG(statbuf.st_mode))
+ 		{
+@@ -1382,7 +1862,8 @@ sendDir(const char *path, int basepathlen, bool sizeonly, List *tablespaces,
+ 
+ 			if (!sizeonly)
+ 				sent = sendFile(pathbuf, pathbuf + basepathlen + 1, &statbuf,
+-								true, isDbDir ? atooid(lastDir + 1) : InvalidOid);
++								true, isDbDir ? atooid(lastDir + 1) : InvalidOid,
++								manifest, spcoid);
+ 
+ 			if (sent || sizeonly)
+ 			{
+@@ -1452,8 +1933,9 @@ is_checksummed_file(const char *fullpath, const char *filename)
+  * and the file did not exist.
+  */
+ static bool
+-sendFile(const char *readfilename, const char *tarfilename, struct stat *statbuf,
+-		 bool missing_ok, Oid dboid)
++sendFile(const char *readfilename, const char *tarfilename,
++		 struct stat *statbuf, bool missing_ok, Oid dboid,
++		 manifest_info *manifest, const char *spcoid)
+ {
+ 	FILE	   *fp;
+ 	BlockNumber blkno = 0;
+@@ -1470,6 +1952,9 @@ sendFile(const char *readfilename, const char *tarfilename, struct stat *statbuf
+ 	int			segmentno = 0;
+ 	char	   *segmentpath;
+ 	bool		verify_checksum = false;
++	pg_checksum_context checksum_ctx;
++
++	pg_checksum_init(&checksum_ctx, manifest->checksum_type);
+ 
+ 	fp = AllocateFile(readfilename, "rb");
+ 	if (fp == NULL)
+@@ -1640,6 +2125,9 @@ sendFile(const char *readfilename, const char *tarfilename, struct stat *statbuf
+ 					(errmsg("base backup could not send data, aborting backup")));
+ 		update_basebackup_progress(cnt);
+ 
++		/* Also feed it to the checksum machinery. */
++		pg_checksum_update(&checksum_ctx, (uint8 *) buf, cnt);
++
+ 		len += cnt;
+ 		throttle(cnt);
+ 
+@@ -1664,6 +2152,7 @@ sendFile(const char *readfilename, const char *tarfilename, struct stat *statbuf
+ 		{
+ 			cnt = Min(sizeof(buf), statbuf->st_size - len);
+ 			pq_putmessage('d', buf, cnt);
++			pg_checksum_update(&checksum_ctx, (uint8 *) buf, cnt);
+ 			update_basebackup_progress(cnt);
+ 			len += cnt;
+ 			throttle(cnt);
+@@ -1672,7 +2161,8 @@ sendFile(const char *readfilename, const char *tarfilename, struct stat *statbuf
+ 
+ 	/*
+ 	 * Pad to 512 byte boundary, per tar format requirements. (This small
+-	 * piece of data is probably not worth throttling.)
++	 * piece of data is probably not worth throttling, and is not checksummed
++	 * because it's not actually part of the file.)
+ 	 */
+ 	pad = ((len + 511) & ~511) - len;
+ 	if (pad > 0)
+@@ -1697,6 +2187,9 @@ sendFile(const char *readfilename, const char *tarfilename, struct stat *statbuf
+ 
+ 	total_checksum_failures += checksum_failures;
+ 
++	AddFileToManifest(manifest, spcoid, tarfilename, statbuf->st_size,
++					  statbuf->st_mtime, &checksum_ctx);
++
+ 	return true;
+ }
+ 
+diff --git a/src/backend/replication/repl_gram.y b/src/backend/replication/repl_gram.y
+index 14fcd532218b..f93a0de2187f 100644
+--- a/src/backend/replication/repl_gram.y
++++ b/src/backend/replication/repl_gram.y
+@@ -87,6 +87,8 @@ static SQLCmd *make_sqlcmd(void);
+ %token K_EXPORT_SNAPSHOT
+ %token K_NOEXPORT_SNAPSHOT
+ %token K_USE_SNAPSHOT
++%token K_MANIFEST
++%token K_MANIFEST_CHECKSUMS
+ 
+ %type <node>	command
+ %type <node>	base_backup start_replication start_logical_replication
+@@ -156,6 +158,7 @@ var_name:	IDENT	{ $$ = $1; }
+ /*
+  * BASE_BACKUP [LABEL '<label>'] [PROGRESS] [FAST] [WAL] [NOWAIT]
+  * [MAX_RATE %d] [TABLESPACE_MAP] [NOVERIFY_CHECKSUMS]
++ * [MANIFEST %s] [MANIFEST_CHECKSUMS %s]
+  */
+ base_backup:
+ 			K_BASE_BACKUP base_backup_opt_list
+@@ -214,6 +217,16 @@ base_backup_opt:
+ 				  $$ = makeDefElem("noverify_checksums",
+ 								   (Node *)makeInteger(true), -1);
+ 				}
++			| K_MANIFEST SCONST
++				{
++				  $$ = makeDefElem("manifest",
++								   (Node *)makeString($2), -1);
++				}
++			| K_MANIFEST_CHECKSUMS SCONST
++				{
++				  $$ = makeDefElem("manifest_checksums",
++								   (Node *)makeString($2), -1);
++				}
+ 			;
+ 
+ create_replication_slot:
+diff --git a/src/backend/replication/repl_scanner.l b/src/backend/replication/repl_scanner.l
+index 14c9a1e798a7..452ad9fc278e 100644
+--- a/src/backend/replication/repl_scanner.l
++++ b/src/backend/replication/repl_scanner.l
+@@ -107,6 +107,8 @@ EXPORT_SNAPSHOT		{ return K_EXPORT_SNAPSHOT; }
+ NOEXPORT_SNAPSHOT	{ return K_NOEXPORT_SNAPSHOT; }
+ USE_SNAPSHOT		{ return K_USE_SNAPSHOT; }
+ WAIT				{ return K_WAIT; }
++MANIFEST			{ return K_MANIFEST; }
++MANIFEST_CHECKSUMS	{ return K_MANIFEST_CHECKSUMS; }
+ 
+ ","				{ return ','; }
+ ";"				{ return ';'; }
+diff --git a/src/backend/replication/walsender.c b/src/backend/replication/walsender.c
+index 76ec3c7dd09c..3b117d836733 100644
+--- a/src/backend/replication/walsender.c
++++ b/src/backend/replication/walsender.c
+@@ -315,6 +315,8 @@ WalSndErrorCleanup(void)
+ 
+ 	replication_active = false;
+ 
++	WalSndResourceCleanup(false);
++
+ 	if (got_STOPPING || got_SIGUSR2)
+ 		proc_exit(0);
+ 
+@@ -322,6 +324,34 @@ WalSndErrorCleanup(void)
+ 	WalSndSetState(WALSNDSTATE_STARTUP);
+ }
+ 
++/*
++ * Clean up any ResourceOwner we created.
++ */
++void
++WalSndResourceCleanup(bool isCommit)
++{
++	ResourceOwner	resowner;
++
++	if (CurrentResourceOwner == NULL)
++		return;
++
++	/*
++	 * Deleting CurrentResourceOwner is not allowed, so we must save a
++	 * pointer in a local variable and clear it first.
++	 */
++	resowner = CurrentResourceOwner;
++	CurrentResourceOwner = NULL;
++
++	/* Now we can release resources and delete it. */
++	ResourceOwnerRelease(resowner,
++						 RESOURCE_RELEASE_BEFORE_LOCKS, isCommit, true);
++	ResourceOwnerRelease(resowner,
++						 RESOURCE_RELEASE_LOCKS, isCommit, true);
++	ResourceOwnerRelease(resowner,
++						 RESOURCE_RELEASE_AFTER_LOCKS, isCommit, true);
++	ResourceOwnerDelete(resowner);
++}
++
+ /*
+  * Handle a client's connection abort in an orderly manner.
+  */
+diff --git a/src/bin/Makefile b/src/bin/Makefile
+index 7f4120a34fd0..77bceea4fe68 100644
+--- a/src/bin/Makefile
++++ b/src/bin/Makefile
+@@ -27,6 +27,7 @@ SUBDIRS = \
+ 	pg_test_fsync \
+ 	pg_test_timing \
+ 	pg_upgrade \
++	pg_validatebackup \
+ 	pg_waldump \
+ 	pgbench \
+ 	psql \
+diff --git a/src/bin/pg_basebackup/pg_basebackup.c b/src/bin/pg_basebackup/pg_basebackup.c
+index c5d95958b291..de098b3558cc 100644
+--- a/src/bin/pg_basebackup/pg_basebackup.c
++++ b/src/bin/pg_basebackup/pg_basebackup.c
+@@ -88,6 +88,12 @@ typedef struct UnpackTarState
+ 	FILE	   *file;
+ } UnpackTarState;
+ 
++typedef struct WriteManifestState
++{
++	char		filename[MAXPGPATH];
++	FILE	   *file;
++} WriteManifestState;
++
+ typedef void (*WriteDataCallback) (size_t nbytes, char *buf,
+ 								   void *callback_data);
+ 
+@@ -136,6 +142,9 @@ static bool temp_replication_slot = true;
+ static bool create_slot = false;
+ static bool no_slot = false;
+ static bool verify_checksums = true;
++static bool manifest = true;
++static bool manifest_force_encode = false;
++static char *manifest_checksums = NULL;
+ 
+ static bool success = false;
+ static bool made_new_pgdata = false;
+@@ -181,6 +190,12 @@ static void ReceiveTarCopyChunk(size_t r, char *copybuf, void *callback_data);
+ static void ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum);
+ static void ReceiveTarAndUnpackCopyChunk(size_t r, char *copybuf,
+ 										 void *callback_data);
++static void ReceiveBackupManifest(PGconn *conn);
++static void ReceiveBackupManifestChunk(size_t r, char *copybuf,
++									   void *callback_data);
++static void ReceiveBackupManifestInMemory(PGconn *conn, PQExpBuffer buf);
++static void ReceiveBackupManifestInMemoryChunk(size_t r, char *copybuf,
++											   void *callback_data);
+ static void BaseBackup(void);
+ 
+ static bool reached_end_position(XLogRecPtr segendpos, uint32 timeline,
+@@ -388,6 +403,11 @@ usage(void)
+ 	printf(_("      --no-verify-checksums\n"
+ 			 "                         do not verify checksums\n"));
+ 	printf(_("      --no-estimate-size do not estimate backup size in server side\n"));
++	printf(_("      --no-manifest      suppress generation of backup manifest\n"));
++	printf(_("      --manifest-force-encode\n"
++			 "                         hex encode all filenames in manifest\n"));
++	printf(_("      --manifest-checksums=SHA{224,256,384,512}|CRC32C|NONE\n"
++			 "                         use algorithm for manifest checksums\n"));
+ 	printf(_("  -?, --help             show this help, then exit\n"));
+ 	printf(_("\nConnection options:\n"));
+ 	printf(_("  -d, --dbname=CONNSTR   connection string\n"));
+@@ -1186,6 +1206,31 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
+ 		}
+ 	}
+ 
++	/*
++	 * Normally, we emit the backup manifest as a separate file, but when
++	 * we're writing a tarfile to stdout, we don't have that option, so
++	 * include it in the one tarfile we've got.
++	 */
++	if (strcmp(basedir, "-") == 0)
++	{
++		char		header[512];
++		PQExpBufferData	buf;
++
++		initPQExpBuffer(&buf);
++		ReceiveBackupManifestInMemory(conn, &buf);
++		if (PQExpBufferDataBroken(buf))
++		{
++			pg_log_error("out of memory");
++			exit(1);
++		}
++		tarCreateHeader(header, "backup_manifest", NULL, buf.len,
++						pg_file_create_mode, 04000, 02000,
++						time(NULL));
++		writeTarData(&state, header, sizeof(header));
++		writeTarData(&state, buf.data, buf.len);
++		termPQExpBuffer(&buf);
++	}
++
+ 	/* 2 * 512 bytes empty data at end of file */
+ 	writeTarData(&state, zerobuf, sizeof(zerobuf));
+ 
+@@ -1657,6 +1702,64 @@ ReceiveTarAndUnpackCopyChunk(size_t r, char *copybuf, void *callback_data)
+ 	}							/* continuing data in existing file */
+ }
+ 
++/*
++ * Receive the backup manifest file and write it out to a file.
++ */
++static void
++ReceiveBackupManifest(PGconn *conn)
++{
++	WriteManifestState state;
++
++	snprintf(state.filename, sizeof(state.filename),
++			 "%s/backup_manifest.tmp", basedir);
++	state.file = fopen(state.filename, "wb");
++	if (state.file == NULL)
++	{
++		pg_log_error("could not create file \"%s\": %m", state.filename);
++		exit(1);
++	}
++
++	ReceiveCopyData(conn, ReceiveBackupManifestChunk, &state);
++
++	fclose(state.file);
++}
++
++/*
++ * Receive one chunk of the backup manifest file and write it out to a file.
++ */
++static void
++ReceiveBackupManifestChunk(size_t r, char *copybuf, void *callback_data)
++{
++	WriteManifestState *state = callback_data;
++
++	if (fwrite(copybuf, r, 1, state->file) != 1)
++	{
++		pg_log_error("could not write to file \"%s\": %m", state->filename);
++		exit(1);
++	}
++}
++
++/*
++ * Receive the backup manifest file and write it out to a file.
++ */
++static void
++ReceiveBackupManifestInMemory(PGconn *conn, PQExpBuffer buf)
++{
++	ReceiveCopyData(conn, ReceiveBackupManifestInMemoryChunk, buf);
++}
++
++/*
++ * Receive one chunk of the backup manifest file and write it out to a file.
++ */
++static void
++ReceiveBackupManifestInMemoryChunk(size_t r, char *copybuf,
++								   void *callback_data)
++{
++	PQExpBuffer buf = callback_data;
++
++	appendPQExpBuffer(buf, copybuf, r);
++}
++
+ static void
+ BaseBackup(void)
+ {
+@@ -1667,6 +1770,8 @@ BaseBackup(void)
+ 	char	   *basebkp;
+ 	char		escaped_label[MAXPGPATH];
+ 	char	   *maxrate_clause = NULL;
++	char	   *manifest_clause;
++	char	   *manifest_checksums_clause = "";
+ 	int			i;
+ 	char		xlogstart[64];
+ 	char		xlogend[64];
+@@ -1674,6 +1779,7 @@ BaseBackup(void)
+ 				maxServerMajor;
+ 	int			serverVersion,
+ 				serverMajor;
++	int			writing_to_stdout;
+ 
+ 	Assert(conn != NULL);
+ 
+@@ -1728,6 +1834,33 @@ BaseBackup(void)
+ 	if (maxrate > 0)
+ 		maxrate_clause = psprintf("MAX_RATE %u", maxrate);
+ 
++	if (manifest)
++	{
++		if (serverMajor < 1300)
++		{
++			const char *serverver = PQparameterStatus(conn, "server_version");
++
++			pg_log_error("backup manifests are not supported by server version %s",
++						 serverver ? serverver : "'unknown'");
++			exit(1);
++		}
++
++		if (manifest_force_encode)
++			manifest_clause = "MANIFEST 'force-encode'";
++		else
++			manifest_clause = "MANIFEST 'yes'";
++		if (manifest_checksums != NULL)
++			manifest_checksums_clause = psprintf("MANIFEST_CHECKSUMS '%s'",
++												 manifest_checksums);
++	}
++	else
++	{
++		if (serverMajor < 1300)
++			manifest_clause = "";
++		else
++			manifest_clause = "MANIFEST 'no'";
++	}
++
+ 	if (verbose)
+ 		pg_log_info("initiating base backup, waiting for checkpoint to complete");
+ 
+@@ -1741,7 +1874,7 @@ BaseBackup(void)
+ 	}
+ 
+ 	basebkp =
+-		psprintf("BASE_BACKUP LABEL '%s' %s %s %s %s %s %s %s",
++		psprintf("BASE_BACKUP LABEL '%s' %s %s %s %s %s %s %s %s %s",
+ 				 escaped_label,
+ 				 estimatesize ? "PROGRESS" : "",
+ 				 includewal == FETCH_WAL ? "WAL" : "",
+@@ -1749,7 +1882,9 @@ BaseBackup(void)
+ 				 includewal == NO_WAL ? "" : "NOWAIT",
+ 				 maxrate_clause ? maxrate_clause : "",
+ 				 format == 't' ? "TABLESPACE_MAP" : "",
+-				 verify_checksums ? "" : "NOVERIFY_CHECKSUMS");
++				 verify_checksums ? "" : "NOVERIFY_CHECKSUMS",
++				 manifest_clause,
++				 manifest_checksums_clause);
+ 
+ 	if (PQsendQuery(conn, basebkp) == 0)
+ 	{
+@@ -1837,7 +1972,8 @@ BaseBackup(void)
+ 	/*
+ 	 * When writing to stdout, require a single tablespace
+ 	 */
+-	if (format == 't' && strcmp(basedir, "-") == 0 && PQntuples(res) > 1)
++	writing_to_stdout = format == 't' && strcmp(basedir, "-") == 0;
++	if (writing_to_stdout && PQntuples(res) > 1)
+ 	{
+ 		pg_log_error("can only write single tablespace to stdout, database has %d",
+ 					 PQntuples(res));
+@@ -1866,6 +2002,19 @@ BaseBackup(void)
+ 			ReceiveAndUnpackTarFile(conn, res, i);
+ 	}							/* Loop over all tablespaces */
+ 
++	/*
++	 * Now receive backup manifest, if appropriate.
++	 *
++	 * If we're writing a tarfile to stdout, ReceiveTarFile will have already
++	 * processed the backup manifest and included it in the output tarfile.
++	 * Such a configuration doesn't allow for writing multiple files.
++	 *
++	 * If we're talking to an older server, it won't send a backup manifest,
++	 * so don't try to receive one.
++	 */
++	if (!writing_to_stdout && manifest)
++		ReceiveBackupManifest(conn);
++
+ 	if (showprogress)
+ 	{
+ 		progress_report(PQntuples(res), NULL, true);
+@@ -2031,6 +2180,29 @@ BaseBackup(void)
+ 		}
+ 	}
+ 
++	/*
++	 * After synchronizing data to disk, perform a durable rename of
++	 * backup_manifest.tmp to backup_manifest, if we wrote such a file. This
++	 * way, a failure or system crash before we reach this point will leave us
++	 * without a backup_manifest file, decreasing the chances that a directory
++	 * we leave behind will be mistaken for a valid backup.
++	 */
++	if (!writing_to_stdout && manifest)
++	{
++		char		tmp_filename[MAXPGPATH];
++		char		filename[MAXPGPATH];
++
++		if (verbose)
++			pg_log_info("renaming backup_manifest.tmp to backup_manifest");
++
++		snprintf(tmp_filename, MAXPGPATH, "%s/backup_manifest.tmp", basedir);
++		snprintf(filename, MAXPGPATH, "%s/backup_manifest", basedir);
++
++		/* durable_rename emits its own log message in case of failure */
++		if (durable_rename(tmp_filename, filename) != 0)
++			exit(1);
++	}
++
+ 	if (verbose)
+ 		pg_log_info("base backup completed");
+ }
+@@ -2069,6 +2241,9 @@ main(int argc, char **argv)
+ 		{"no-slot", no_argument, NULL, 2},
+ 		{"no-verify-checksums", no_argument, NULL, 3},
+ 		{"no-estimate-size", no_argument, NULL, 4},
++		{"no-manifest", no_argument, NULL, 5},
++		{"manifest-force-encode", no_argument, NULL, 6},
++		{"manifest-checksums", required_argument, NULL, 7},
+ 		{NULL, 0, NULL, 0}
+ 	};
+ 	int			c;
+@@ -2096,7 +2271,7 @@ main(int argc, char **argv)
+ 
+ 	atexit(cleanup_directories_atexit);
+ 
+-	while ((c = getopt_long(argc, argv, "CD:F:r:RS:T:X:l:nNzZ:d:c:h:p:U:s:wWkvP",
++	while ((c = getopt_long(argc, argv, "CD:F:r:RS:T:X:l:nNzZ:d:c:h:p:U:s:wWkvPm:",
+ 							long_options, &option_index)) != -1)
+ 	{
+ 		switch (c)
+@@ -2240,6 +2415,15 @@ main(int argc, char **argv)
+ 			case 4:
+ 				estimatesize = false;
+ 				break;
++			case 5:
++				manifest = false;
++				break;
++			case 6:
++				manifest_force_encode = true;
++				break;
++			case 7:
++				manifest_checksums = pg_strdup(optarg);
++				break;
+ 			default:
+ 
+ 				/*
+@@ -2370,6 +2554,22 @@ main(int argc, char **argv)
+ 		exit(1);
+ 	}
+ 
++	if (!manifest && manifest_checksums != NULL)
++	{
++		pg_log_error("--no-manifest and --manifest-checksums are incompatible options");
++		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
++				progname);
++		exit(1);
++	}
++
++	if (!manifest && manifest_force_encode)
++	{
++		pg_log_error("--no-manifest and --manifest-force-encode are incompatible options");
++		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
++				progname);
++		exit(1);
++	}
++
+ 	/* connection in replication mode to server */
+ 	conn = GetConnection();
+ 	if (!conn)
+diff --git a/src/bin/pg_basebackup/t/010_pg_basebackup.pl b/src/bin/pg_basebackup/t/010_pg_basebackup.pl
+index 3c70499febfc..63381764e97d 100644
+--- a/src/bin/pg_basebackup/t/010_pg_basebackup.pl
++++ b/src/bin/pg_basebackup/t/010_pg_basebackup.pl
+@@ -6,7 +6,7 @@
+ use File::Path qw(rmtree);
+ use PostgresNode;
+ use TestLib;
+-use Test::More tests => 107;
++use Test::More tests => 109;
+ 
+ program_help_ok('pg_basebackup');
+ program_version_ok('pg_basebackup');
+@@ -104,6 +104,7 @@
+ $node->command_ok([ 'pg_basebackup', '-D', "$tempdir/backup", '-X', 'none' ],
+ 	'pg_basebackup runs');
+ ok(-f "$tempdir/backup/PG_VERSION", 'backup was created');
++ok(-f "$tempdir/backup/backup_manifest", 'backup manifest included');
+ 
+ # Permissions on backup should be default
+ SKIP:
+@@ -160,11 +161,12 @@
+ 
+ $node->command_ok(
+ 	[
+-		'pg_basebackup', '-D', "$tempdir/backup2", '--waldir',
+-		"$tempdir/xlog2"
++		'pg_basebackup', '-D', "$tempdir/backup2", '--no-manifest',
++		'--waldir', "$tempdir/xlog2"
+ 	],
+ 	'separate xlog directory');
+ ok(-f "$tempdir/backup2/PG_VERSION", 'backup was created');
++ok(! -f "$tempdir/backup2/backup_manifest", 'manifest was suppressed');
+ ok(-d "$tempdir/xlog2/",             'xlog directory was created');
+ rmtree("$tempdir/backup2");
+ rmtree("$tempdir/xlog2");
+diff --git a/src/bin/pg_validatebackup/.gitignore b/src/bin/pg_validatebackup/.gitignore
+new file mode 100644
+index 000000000000..21e0a92429c9
+--- /dev/null
++++ b/src/bin/pg_validatebackup/.gitignore
+@@ -0,0 +1,2 @@
++/pg_validatebackup
++/tmp_check/
+diff --git a/src/bin/pg_validatebackup/Makefile b/src/bin/pg_validatebackup/Makefile
+new file mode 100644
+index 000000000000..04ef7d30511c
+--- /dev/null
++++ b/src/bin/pg_validatebackup/Makefile
+@@ -0,0 +1,39 @@
++# src/bin/pg_validatebackup/Makefile
++
++PGFILEDESC = "pg_validatebackup - validate a backup against a backup manifest"
++PGAPPICON = win32
++
++subdir = src/bin/pg_validatebackup
++top_builddir = ../../..
++include $(top_builddir)/src/Makefile.global
++
++# We need libpq only because fe_utils does.
++LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport)
++
++OBJS = \
++	$(WIN32RES) \
++	parse_manifest.o \
++	pg_validatebackup.o
++
++all: pg_validatebackup
++
++pg_validatebackup: $(OBJS) | submake-libpq submake-libpgport submake-libpgfeutils
++	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
++
++install: all installdirs
++	$(INSTALL_PROGRAM) pg_validatebackup$(X) '$(DESTDIR)$(bindir)/pg_validatebackup$(X)'
++
++installdirs:
++	$(MKDIR_P) '$(DESTDIR)$(bindir)'
++
++uninstall:
++	rm -f '$(DESTDIR)$(bindir)/pg_validatebackup$(X)'
++
++clean distclean maintainer-clean:
++	rm -f pg_validatebackup$(X) $(OBJS)
++
++check:
++	$(prove_check)
++
++installcheck:
++	$(prove_installcheck)
+diff --git a/src/bin/pg_validatebackup/parse_manifest.c b/src/bin/pg_validatebackup/parse_manifest.c
+new file mode 100644
+index 000000000000..0ec9dd6a13f8
+--- /dev/null
++++ b/src/bin/pg_validatebackup/parse_manifest.c
+@@ -0,0 +1,740 @@
++/*-------------------------------------------------------------------------
++ *
++ * parse_manifest.c
++ *	  Parse a backup manifest in JSON format.
++ *
++ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * src/bin/pg_validatebackup/parse_manifest.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres_fe.h"
++
++#include "parse_manifest.h"
++#include "common/jsonapi.h"
++
++/*
++ * Semantic states for JSON manifest parsing.
++ */
++typedef enum
++{
++	JM_EXPECT_TOPLEVEL_START,
++	JM_EXPECT_TOPLEVEL_END,
++	JM_EXPECT_TOPLEVEL_FIELD,
++	JM_EXPECT_VERSION_VALUE,
++	JM_EXPECT_FILES_START,
++	JM_EXPECT_FILES_NEXT,
++	JM_EXPECT_THIS_FILE_FIELD,
++	JM_EXPECT_THIS_FILE_VALUE,
++	JM_EXPECT_WAL_RANGES_START,
++	JM_EXPECT_WAL_RANGES_NEXT,
++	JM_EXPECT_THIS_WAL_RANGE_FIELD,
++	JM_EXPECT_THIS_WAL_RANGE_VALUE,
++	JM_EXPECT_MANIFEST_CHECKSUM_VALUE,
++	JM_EXPECT_EOF
++} JsonManifestSemanticState;
++
++/*
++ * Possible fields for one file as described by the manifest.
++ */
++typedef enum
++{
++	JMFF_PATH,
++	JMFF_ENCODED_PATH,
++	JMFF_SIZE,
++	JMFF_LAST_MODIFIED,
++	JMFF_CHECKSUM_ALGORITHM,
++	JMFF_CHECKSUM
++} JsonManifestFileField;
++
++/*
++ * Possible fields for one file as described by the manifest.
++ */
++typedef enum
++{
++	JMWRF_TIMELINE,
++	JMWRF_START_LSN,
++	JMWRF_END_LSN
++} JsonManifestWALRangeField;
++
++/*
++ * Internal state used while decoding the JSON-format backup manifest.
++ */
++typedef struct
++{
++	JsonManifestParseContext *context;
++	JsonManifestSemanticState state;
++
++	/* These fields are used for parsing objects in the list of files. */
++	JsonManifestFileField file_field;
++	char	   *pathname;
++	char	   *encoded_pathname;
++	char	   *size;
++	char	   *algorithm;
++	pg_checksum_type checksum_algorithm;
++	char	   *checksum;
++
++	/* These fields are used for parsing objects in the list of WAL ranges. */
++	JsonManifestWALRangeField wal_range_field;
++	char	   *timeline;
++	char	   *start_lsn;
++	char	   *end_lsn;
++
++	/* Miscellaneous other stuff. */
++	bool		saw_version_field;
++	char	   *manifest_checksum;
++} JsonManifestParseState;
++
++static void json_manifest_object_start(void *state);
++static void json_manifest_object_end(void *state);
++static void json_manifest_array_start(void *state);
++static void json_manifest_array_end(void *state);
++static void json_manifest_object_field_start(void *state, char *fname,
++											 bool isnull);
++static void json_manifest_scalar(void *state, char *token,
++								 JsonTokenType tokentype);
++static void json_manifest_finalize_file(JsonManifestParseState *parse);
++static void json_manifest_finalize_wal_range(JsonManifestParseState *parse);
++static void verify_manifest_checksum(JsonManifestParseState *parse,
++									 char *buffer, size_t size);
++static void json_manifest_parse_failure(JsonManifestParseContext *context,
++										char *msg);
++
++static int	hexdecode_char(char c);
++static bool hexdecode_string(uint8 *result, char *input, int nbytes);
++static bool parse_xlogrecptr(XLogRecPtr *result, char *input);
++
++/*
++ * Main entrypoint to parse a JSON-format backup manifest.
++ *
++ * Caller should set up the parsing context and then invoke this function.
++ * For each file whose information is extracted from the manifest,
++ * context->perfile_cb is invoked.  In case of trouble, context->error_cb is
++ * invoked and is expected not to return.
++ */
++void
++json_parse_manifest(JsonManifestParseContext *context, char *buffer,
++					size_t size)
++{
++	JsonLexContext *lex;
++	JsonParseErrorType json_error;
++	JsonSemAction sem;
++	JsonManifestParseState parse;
++
++	/* Set up our private parsing context. */
++	parse.context = context;
++	parse.state = JM_EXPECT_TOPLEVEL_START;
++	parse.saw_version_field = false;
++
++	/* Create a JSON lexing context. */
++	lex = makeJsonLexContextCstringLen(buffer, size, PG_UTF8, true);
++
++	/* Set up semantic actions. */
++	sem.semstate = &parse;
++	sem.object_start = json_manifest_object_start;
++	sem.object_end = json_manifest_object_end;
++	sem.array_start = json_manifest_array_start;
++	sem.array_end = json_manifest_array_end;
++	sem.object_field_start = json_manifest_object_field_start;
++	sem.object_field_end = NULL;
++	sem.array_element_start = NULL;
++	sem.array_element_end = NULL;
++	sem.scalar = json_manifest_scalar;
++
++	/* Run the actual JSON parser. */
++	json_error = pg_parse_json(lex, &sem);
++	if (json_error != JSON_SUCCESS)
++		json_manifest_parse_failure(context, json_errdetail(json_error, lex));
++	if (parse.state != JM_EXPECT_EOF)
++		json_manifest_parse_failure(context, "manifest ended unexpectedly");
++
++	/* Validate the checksum. */
++	verify_manifest_checksum(&parse, buffer, size);
++}
++
++/*
++ * Invoked at the start of each object in the JSON document.
++ *
++ * The document as a whole is expected to be an object; each file and each
++ * WAL range is also expected to be an object. If we're anywhere else in the
++ * document, it's an error.
++ */
++static void
++json_manifest_object_start(void *state)
++{
++	JsonManifestParseState *parse = state;
++
++	switch (parse->state)
++	{
++		case JM_EXPECT_TOPLEVEL_START:
++			parse->state = JM_EXPECT_TOPLEVEL_FIELD;
++			break;
++		case JM_EXPECT_FILES_NEXT:
++			parse->state = JM_EXPECT_THIS_FILE_FIELD;
++			parse->pathname = NULL;
++			parse->encoded_pathname = NULL;
++			parse->size = NULL;
++			parse->algorithm = NULL;
++			parse->checksum = NULL;
++			break;
++		case JM_EXPECT_WAL_RANGES_NEXT:
++			parse->state = JM_EXPECT_THIS_WAL_RANGE_FIELD;
++			parse->timeline = NULL;
++			parse->start_lsn = NULL;
++			parse->end_lsn = NULL;
++			break;
++		default:
++			json_manifest_parse_failure(parse->context,
++										"unexpected object start");
++			break;
++	}
++}
++
++/*
++ * Invoked at the end of each object in the JSON document.
++ *
++ * The possible cases here are the same as for json_manifest_object_start.
++ * There's nothing special to do at the end of the document, but when we
++ * reach the end of an object representing a particular file or WAL range,
++ * we must call json_manifest_finalize_file() to save the associated details.
++ */
++static void
++json_manifest_object_end(void *state)
++{
++	JsonManifestParseState *parse = state;
++
++	switch (parse->state)
++	{
++		case JM_EXPECT_TOPLEVEL_END:
++			parse->state = JM_EXPECT_EOF;
++			break;
++		case JM_EXPECT_THIS_FILE_FIELD:
++			json_manifest_finalize_file(parse);
++			parse->state = JM_EXPECT_FILES_NEXT;
++			break;
++		case JM_EXPECT_THIS_WAL_RANGE_FIELD:
++			json_manifest_finalize_wal_range(parse);
++			parse->state = JM_EXPECT_WAL_RANGES_NEXT;
++			break;
++		default:
++			json_manifest_parse_failure(parse->context,
++										"unexpected object end");
++			break;
++	}
++}
++
++/*
++ * Invoked at the start of each array in the JSON document.
++ *
++ * Within the toplevel object, the value associated with the "Files" key
++ * should be an array. Similarly for the "WAL-Ranges" key. No other arrays
++ * are expected.
++ */
++static void
++json_manifest_array_start(void *state)
++{
++	JsonManifestParseState *parse = state;
++
++	switch (parse->state)
++	{
++		case JM_EXPECT_FILES_START:
++			parse->state = JM_EXPECT_FILES_NEXT;
++			break;
++		case JM_EXPECT_WAL_RANGES_START:
++			parse->state = JM_EXPECT_WAL_RANGES_NEXT;
++			break;
++		default:
++			json_manifest_parse_failure(parse->context,
++										"unexpected array start");
++			break;
++	}
++}
++
++/*
++ * Invoked at the end of each array in the JSON document.
++ *
++ * The cases here are analogous to those in json_manifest_array_start.
++ */
++static void
++json_manifest_array_end(void *state)
++{
++	JsonManifestParseState *parse = state;
++
++	switch (parse->state)
++	{
++		case JM_EXPECT_FILES_NEXT:
++		case JM_EXPECT_WAL_RANGES_NEXT:
++			parse->state = JM_EXPECT_TOPLEVEL_FIELD;
++			break;
++		default:
++			json_manifest_parse_failure(parse->context,
++										"unexpected array end");
++			break;
++	}
++}
++
++/*
++ * Invoked at the start of each object field in the JSON document.
++ */
++static void
++json_manifest_object_field_start(void *state, char *fname, bool isnull)
++{
++	JsonManifestParseState *parse = state;
++
++	switch (parse->state)
++	{
++		case JM_EXPECT_TOPLEVEL_FIELD:
++
++			/*
++			 * Inside toplevel object. The version indicator should always be
++			 * the first field.
++			 */
++			if (!parse->saw_version_field)
++			{
++				if (strcmp(fname, "PostgreSQL-Backup-Manifest-Version") != 0)
++					json_manifest_parse_failure(parse->context,
++												"expected version indicator");
++				parse->state = JM_EXPECT_VERSION_VALUE;
++				parse->saw_version_field = true;
++				break;
++			}
++
++			/* Is this the list of files? */
++			if (strcmp(fname, "Files") == 0)
++			{
++				parse->state = JM_EXPECT_FILES_START;
++				break;
++			}
++
++			/* Is this the list of WAL ranges? */
++			if (strcmp(fname, "WAL-Ranges") == 0)
++			{
++				parse->state = JM_EXPECT_WAL_RANGES_START;
++				break;
++			}
++
++			/* Is this the manifest checksum? */
++			if (strcmp(fname, "Manifest-Checksum") == 0)
++			{
++				parse->state = JM_EXPECT_MANIFEST_CHECKSUM_VALUE;
++				break;
++			}
++
++			/* It's not a field we recognize. */
++			json_manifest_parse_failure(parse->context,
++										"unknown toplevel field");
++			break;
++
++		case JM_EXPECT_THIS_FILE_FIELD:
++			/* Inside object for one file; which key have we got? */
++			if (strcmp(fname, "Path") == 0)
++				parse->file_field = JMFF_PATH;
++			else if (strcmp(fname, "Encoded-Path") == 0)
++				parse->file_field = JMFF_ENCODED_PATH;
++			else if (strcmp(fname, "Size") == 0)
++				parse->file_field = JMFF_SIZE;
++			else if (strcmp(fname, "Last-Modified") == 0)
++				parse->file_field = JMFF_LAST_MODIFIED;
++			else if (strcmp(fname, "Checksum-Algorithm") == 0)
++				parse->file_field = JMFF_CHECKSUM_ALGORITHM;
++			else if (strcmp(fname, "Checksum") == 0)
++				parse->file_field = JMFF_CHECKSUM;
++			else
++				json_manifest_parse_failure(parse->context,
++											"unexpected file field");
++			parse->state = JM_EXPECT_THIS_FILE_VALUE;
++			break;
++
++		case JM_EXPECT_THIS_WAL_RANGE_FIELD:
++			/* Inside object for one file; which key have we got? */
++			if (strcmp(fname, "Timeline") == 0)
++				parse->wal_range_field = JMWRF_TIMELINE;
++			else if (strcmp(fname, "Start-LSN") == 0)
++				parse->wal_range_field = JMWRF_START_LSN;
++			else if (strcmp(fname, "End-LSN") == 0)
++				parse->wal_range_field = JMWRF_END_LSN;
++			else
++				json_manifest_parse_failure(parse->context,
++											"unexpected wal range field");
++			parse->state = JM_EXPECT_THIS_WAL_RANGE_VALUE;
++			break;
++
++		default:
++			json_manifest_parse_failure(parse->context,
++										"unexpected object field");
++			break;
++	}
++}
++
++/*
++ * Invoked at the start of each scalar in the JSON document.
++ *
++ * Object field names don't reach this code; those are handled by
++ * json_manifest_object_field_start. When we're inside of the object for
++ * a particular file or WAL range, that function will have noticed the name
++ * of the field, and we'll get the corresponding value here. When we're in
++ * the toplevel object, the parse state itself tells us which field this is.
++ *
++ * In all cases except for PostgreSQL-Backup-Manifest-Version, which we
++ * can just check on the spot, the goal here is just to save the value in
++ * the parse state for later use. We don't actually do anything until we
++ * reach either the end of the object representing this file, or the end
++ * of the manifest, as the case may be.
++ */
++static void
++json_manifest_scalar(void *state, char *token, JsonTokenType tokentype)
++{
++	JsonManifestParseState *parse = state;
++
++	switch (parse->state)
++	{
++		case JM_EXPECT_VERSION_VALUE:
++			if (strcmp(token, "1") != 0)
++				json_manifest_parse_failure(parse->context,
++											"unexpected manifest version");
++			parse->state = JM_EXPECT_TOPLEVEL_FIELD;
++			break;
++
++		case JM_EXPECT_THIS_FILE_VALUE:
++			switch (parse->file_field)
++			{
++				case JMFF_PATH:
++					parse->pathname = token;
++					break;
++				case JMFF_ENCODED_PATH:
++					parse->encoded_pathname = token;
++					break;
++				case JMFF_SIZE:
++					parse->size = token;
++					break;
++				case JMFF_LAST_MODIFIED:
++					pfree(token);	/* unused */
++					break;
++				case JMFF_CHECKSUM_ALGORITHM:
++					parse->algorithm = token;
++					break;
++				case JMFF_CHECKSUM:
++					parse->checksum = token;
++					break;
++			}
++			parse->state = JM_EXPECT_THIS_FILE_FIELD;
++			break;
++
++		case JM_EXPECT_THIS_WAL_RANGE_VALUE:
++			switch (parse->wal_range_field)
++			{
++				case JMWRF_TIMELINE:
++					parse->timeline = token;
++					break;
++				case JMWRF_START_LSN:
++					parse->start_lsn = token;
++					break;
++				case JMWRF_END_LSN:
++					parse->end_lsn = token;
++					break;
++			}
++			parse->state = JM_EXPECT_THIS_WAL_RANGE_FIELD;
++			break;
++
++		case JM_EXPECT_MANIFEST_CHECKSUM_VALUE:
++			parse->state = JM_EXPECT_TOPLEVEL_END;
++			parse->manifest_checksum = token;
++			break;
++
++		default:
++			json_manifest_parse_failure(parse->context, "unexpected scalar");
++			break;
++	}
++}
++
++/*
++ * Do additional parsing and sanity-checking of the details gathered for one
++ * file, and invoke the per-file callback so that the caller gets those
++ * details. This happens for each file when the corresponding JSON object is
++ * completely parsed.
++ */
++static void
++json_manifest_finalize_file(JsonManifestParseState *parse)
++{
++	JsonManifestParseContext *context = parse->context;
++	size_t		size;
++	char	   *ep;
++	int			checksum_string_length;
++	pg_checksum_type checksum_type;
++	int			checksum_length;
++	uint8	   *checksum_payload;
++
++	/* Pathname and size are required. */
++	if (parse->pathname == NULL && parse->encoded_pathname == NULL)
++		json_manifest_parse_failure(parse->context, "missing pathname");
++	if (parse->pathname != NULL && parse->encoded_pathname != NULL)
++		json_manifest_parse_failure(parse->context,
++									"both pathname and encoded pathname");
++	if (parse->size == NULL)
++		json_manifest_parse_failure(parse->context, "missing size");
++	if (parse->algorithm == NULL && parse->checksum != NULL)
++		json_manifest_parse_failure(parse->context,
++									"checksum without algorithm");
++
++	/* Decode encoded pathname, if that's what we have. */
++	if (parse->encoded_pathname != NULL)
++	{
++		int			encoded_length = strlen(parse->encoded_pathname);
++		int			raw_length = encoded_length / 2;
++
++		parse->pathname = palloc(raw_length + 1);
++		if (encoded_length % 2 != 0 ||
++			!hexdecode_string((uint8 *) parse->pathname,
++							  parse->encoded_pathname,
++							  raw_length))
++			json_manifest_parse_failure(parse->context,
++										"unable to decode filename");
++		parse->pathname[raw_length] = '\0';
++		pfree(parse->encoded_pathname);
++		parse->encoded_pathname = NULL;
++	}
++
++	/* Parse size. */
++	size = strtoul(parse->size, &ep, 10);
++	if (*ep)
++		json_manifest_parse_failure(parse->context,
++									"file size is not an integer");
++
++	/* Parse the checksum algorithm, if it's present. */
++	if (parse->algorithm == NULL)
++		checksum_type = CHECKSUM_TYPE_NONE;
++	else if (!pg_checksum_parse_type(parse->algorithm, &checksum_type))
++		context->error_cb(context, "unrecognized checksum algorithm: \"%s\"",
++						  parse->algorithm);
++
++	/* Parse the checksum payload, if it's present. */
++	checksum_string_length = parse->checksum == NULL ? 0
++		: strlen(parse->checksum);
++	if (checksum_string_length == 0)
++	{
++		checksum_length = 0;
++		checksum_payload = NULL;
++	}
++	else
++	{
++		checksum_length = checksum_string_length / 2;
++		checksum_payload = palloc(checksum_length);
++		if (checksum_string_length % 2 != 0 ||
++			!hexdecode_string(checksum_payload, parse->checksum,
++							  checksum_length))
++			context->error_cb(context,
++							  "invalid checksum for file \"%s\": \"%s\"",
++							  parse->pathname, parse->checksum);
++	}
++
++	/* Invoke the callback with the details we've gathered. */
++	context->perfile_cb(context, parse->pathname, size,
++						checksum_type, checksum_length, checksum_payload);
++
++	/* Free memory we no longer need. */
++	if (parse->size != NULL)
++	{
++		pfree(parse->size);
++		parse->size = NULL;
++	}
++	if (parse->algorithm != NULL)
++	{
++		pfree(parse->algorithm);
++		parse->algorithm = NULL;
++	}
++	if (parse->checksum != NULL)
++	{
++		pfree(parse->checksum);
++		parse->checksum = NULL;
++	}
++}
++
++/*
++ * Do additional parsing and sanity-checking of the details gathered for one
++ * WAL range, and invoke the per-WAL-range callback so that the caller gets
++ * those details. This happens for each WAL range when the corresponding JSON
++ * object is completely parsed.
++ */
++static void
++json_manifest_finalize_wal_range(JsonManifestParseState *parse)
++{
++	JsonManifestParseContext *context = parse->context;
++	TimeLineID	tli;
++	XLogRecPtr	start_lsn,
++				end_lsn;
++	char	   *ep;
++
++	/* Make sure all fields are present. */
++	if (parse->timeline == NULL)
++		json_manifest_parse_failure(parse->context, "missing timeline");
++	if (parse->start_lsn == NULL)
++		json_manifest_parse_failure(parse->context, "missing start LSN");
++	if (parse->end_lsn == NULL)
++		json_manifest_parse_failure(parse->context, "missing end LSN");
++
++	/* Parse timeline. */
++	tli = strtoul(parse->timeline, &ep, 10);
++	if (*ep)
++		json_manifest_parse_failure(parse->context,
++									"timeline is not an integer");
++	if (!parse_xlogrecptr(&start_lsn, parse->start_lsn))
++		json_manifest_parse_failure(parse->context,
++									"unable to parse start LSN");
++	if (!parse_xlogrecptr(&end_lsn, parse->end_lsn))
++		json_manifest_parse_failure(parse->context,
++									"unable to parse end LSN");
++
++	/* Invoke the callback with the details we've gathered. */
++	context->perwalrange_cb(context, tli, start_lsn, end_lsn);
++
++	/* Free memory we no longer need. */
++	if (parse->timeline != NULL)
++	{
++		pfree(parse->timeline);
++		parse->timeline = NULL;
++	}
++	if (parse->start_lsn != NULL)
++	{
++		pfree(parse->start_lsn);
++		parse->start_lsn = NULL;
++	}
++	if (parse->end_lsn != NULL)
++	{
++		pfree(parse->end_lsn);
++		parse->end_lsn = NULL;
++	}
++}
++
++/*
++ * Verify that the manifest checksum is correct.
++ *
++ * The last line of the manifest file is excluded from the manifest checksum,
++ * because the last line is expected to contain the checksum that covers
++ * the rest of the file.
++ */
++static void
++verify_manifest_checksum(JsonManifestParseState *parse, char *buffer,
++						 size_t size)
++{
++	JsonManifestParseContext *context = parse->context;
++	size_t		i;
++	size_t		number_of_newlines = 0;
++	size_t		ultimate_newline = 0;
++	size_t		penultimate_newline = 0;
++	pg_sha256_ctx manifest_ctx;
++	uint8		manifest_checksum_actual[PG_SHA256_DIGEST_LENGTH];
++	uint8		manifest_checksum_expected[PG_SHA256_DIGEST_LENGTH];
++
++	/* Find the last two newlines in the file. */
++	for (i = 0; i < size; ++i)
++	{
++		if (buffer[i] == '\n')
++		{
++			++number_of_newlines;
++			penultimate_newline = ultimate_newline;
++			ultimate_newline = i;
++		}
++	}
++
++	/*
++	 * Make sure that the last newline is right at the end, and that there are
++	 * at least two lines total. We need this to be true in order for the
++	 * following code, which computes the manifest checksum, to work properly.
++	 */
++	if (number_of_newlines < 2)
++		json_manifest_parse_failure(parse->context,
++									"expected at least 2 lines");
++	if (ultimate_newline != size - 1)
++		json_manifest_parse_failure(parse->context,
++									"last line not newline-terminated");
++
++	/* Checksum the rest. */
++	pg_sha256_init(&manifest_ctx);
++	pg_sha256_update(&manifest_ctx, (uint8 *) buffer, penultimate_newline + 1);
++	pg_sha256_final(&manifest_ctx, manifest_checksum_actual);
++
++	/* Now verify it. */
++	if (parse->manifest_checksum == NULL)
++		context->error_cb(parse->context, "manifest has no checksum");
++	if (strlen(parse->manifest_checksum) != PG_SHA256_DIGEST_LENGTH * 2 ||
++		!hexdecode_string(manifest_checksum_expected, parse->manifest_checksum,
++						  PG_SHA256_DIGEST_LENGTH))
++		context->error_cb(context, "invalid manifest checksum: \"%s\"",
++						  parse->manifest_checksum);
++	if (memcmp(manifest_checksum_actual, manifest_checksum_expected,
++			   PG_SHA256_DIGEST_LENGTH) != 0)
++		context->error_cb(context, "manifest checksum mismatch");
++}
++
++/*
++ * Report a parse error.
++ *
++ * This is intended to be used for fairly low-level failures that probably
++ * shouldn't occur unless somebody has deliberately constructed a bad manifest,
++ * or unless the server is generating bad manifests due to some bug. msg should
++ * be a short string giving some hint as to what the problem is.
++ */
++static void
++json_manifest_parse_failure(JsonManifestParseContext *context, char *msg)
++{
++	context->error_cb(context, "could not parse backup manifest: %s", msg);
++}
++
++/*
++ * Convert a character which represents a hexadecimal digit to an integer.
++ *
++ * Returns -1 if the character is not a hexadecimal digit.
++ */
++static int
++hexdecode_char(char c)
++{
++	if (c >= '0' && c <= '9')
++		return c - '0';
++	if (c >= 'a' && c <= 'f')
++		return c - 'a' + 10;
++	if (c >= 'A' && c <= 'F')
++		return c - 'A' + 10;
++
++	return -1;
++}
++
++/*
++ * Decode a hex string into a byte string, 2 hex chars per byte.
++ *
++ * Returns false if invalid characters are encountered; otherwise true.
++ */
++static bool
++hexdecode_string(uint8 *result, char *input, int nbytes)
++{
++	int			i;
++
++	for (i = 0; i < nbytes; ++i)
++	{
++		int			n1 = hexdecode_char(input[i * 2]);
++		int			n2 = hexdecode_char(input[i * 2 + 1]);
++
++		if (n1 < 0 || n2 < 0)
++			return false;
++		result[i] = n1 * 16 + n2;
++	}
++
++	return true;
++}
++
++/*
++ * Parse an XLogRecPtr expressed using the usual string format.
++ */
++static bool
++parse_xlogrecptr(XLogRecPtr *result, char *input)
++{
++	uint32		hi;
++	uint32		lo;
++
++	if (sscanf(input, "%X/%X", &hi, &lo) != 2)
++		return false;
++	*result = ((uint64) hi) << 32 | lo;
++	return true;
++}
+diff --git a/src/bin/pg_validatebackup/parse_manifest.h b/src/bin/pg_validatebackup/parse_manifest.h
+new file mode 100644
+index 000000000000..f0a4fac36bc9
+--- /dev/null
++++ b/src/bin/pg_validatebackup/parse_manifest.h
+@@ -0,0 +1,45 @@
++/*-------------------------------------------------------------------------
++ *
++ * parse_manifest.h
++ *	  Parse a backup manifest in JSON format.
++ *
++ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * src/bin/pg_validatebackup/parse_manifest.h
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#ifndef PARSE_MANIFEST_H
++#define PARSE_MANIFEST_H
++
++#include "access/xlogdefs.h"
++#include "common/checksum_helper.h"
++#include "mb/pg_wchar.h"
++
++struct JsonManifestParseContext;
++typedef struct JsonManifestParseContext JsonManifestParseContext;
++
++typedef void (*json_manifest_perfile_callback)(JsonManifestParseContext *,
++								 char *pathname,
++								 size_t size, pg_checksum_type checksum_type,
++								 int checksum_length, uint8 *checksum_payload);
++typedef void (*json_manifest_perwalrange_callback)(JsonManifestParseContext *,
++								 TimeLineID tli,
++								 XLogRecPtr start_lsn, XLogRecPtr end_lsn);
++typedef void (*json_manifest_error_callback)(JsonManifestParseContext *,
++								 char *fmt, ...) pg_attribute_printf(2, 3);
++
++struct JsonManifestParseContext
++{
++	void	   *private_data;
++	json_manifest_perfile_callback perfile_cb;
++	json_manifest_perwalrange_callback perwalrange_cb;
++	json_manifest_error_callback error_cb;
++};
++
++extern void json_parse_manifest(JsonManifestParseContext *context,
++								char *buffer, size_t size);
++
++#endif
+diff --git a/src/bin/pg_validatebackup/pg_validatebackup.c b/src/bin/pg_validatebackup/pg_validatebackup.c
+new file mode 100644
+index 000000000000..f27463850059
+--- /dev/null
++++ b/src/bin/pg_validatebackup/pg_validatebackup.c
+@@ -0,0 +1,905 @@
++/*-------------------------------------------------------------------------
++ *
++ * pg_validatebackup.c
++ *	  Validate a backup against a backup manifest.
++ *
++ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * src/bin/pg_validatebackup/pg_validatebackup.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres_fe.h"
++
++#include <dirent.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++
++#include "common/hashfn.h"
++#include "common/logging.h"
++#include "fe_utils/simple_list.h"
++#include "getopt_long.h"
++#include "parse_manifest.h"
++
++/*
++ * For efficiency, we'd like our hash table containing information about the
++ * manifest to start out with approximately the correct number of entries.
++ * There's no way to know the exact number of entries without reading the whole
++ * file, but we can get an estimate by dividing the file size by the estimated
++ * number of bytes per line.
++ *
++ * This could be off by about a factor of two in either direction, because the
++ * checksum algorithm has a big impact on the line lengths; e.g. a SHA512
++ * checksum is 128 hex bytes, whereas a CRC-32C value is only 8, and there
++ * might be no checksum at all.
++ */
++#define ESTIMATED_BYTES_PER_MANIFEST_LINE	100
++
++/*
++ * How many bytes should we try to read from a file at once?
++ */
++#define READ_CHUNK_SIZE				4096
++
++/*
++ * Each file described by the manifest file is parsed to produce an object
++ * like this.
++ */
++typedef struct manifest_file
++{
++	uint32		status;			/* hash status */
++	char	   *pathname;
++	size_t		size;
++	pg_checksum_type checksum_type;
++	int			checksum_length;
++	uint8	   *checksum_payload;
++	bool		matched;
++	bool		bad;
++} manifest_file;
++
++/*
++ * Define a hash table which we can use to store information about the files
++ * mentioned in the backup manifest.
++ */
++static uint32 hash_string_pointer(char *s);
++#define SH_PREFIX		manifest_files
++#define SH_ELEMENT_TYPE	manifest_file
++#define SH_KEY_TYPE		char *
++#define	SH_KEY			pathname
++#define SH_HASH_KEY(tb, key)	hash_string_pointer(key)
++#define SH_EQUAL(tb, a, b)		(strcmp(a, b) == 0)
++#define	SH_SCOPE		static inline
++#define SH_RAW_ALLOCATOR	pg_malloc0
++#define SH_DECLARE
++#define SH_DEFINE
++#include "lib/simplehash.h"
++
++/*
++ * Each WAL range described by the manifest file is parsed to produce an
++ * object like this.
++ */
++typedef struct manifest_wal_range
++{
++	TimeLineID	tli;
++	XLogRecPtr	start_lsn;
++	XLogRecPtr	end_lsn;
++	struct manifest_wal_range *next;
++	struct manifest_wal_range *prev;
++} manifest_wal_range;
++
++/*
++ * Details we need in callbacks that occur while parsing a backup manifest.
++ */
++typedef struct parser_context
++{
++	manifest_files_hash *ht;
++	manifest_wal_range *first_wal_range;
++	manifest_wal_range *last_wal_range;
++} parser_context;
++
++/*
++ * All of the context information we need while checking a backup manifest.
++ */
++typedef struct validator_context
++{
++	manifest_files_hash *ht;
++	char	   *backup_directory;
++	SimpleStringList ignore_list;
++	bool		exit_on_error;
++	bool		saw_any_error;
++} validator_context;
++
++static void parse_manifest_file(char *manifest_path,
++								manifest_files_hash **ht_p,
++								manifest_wal_range **first_wal_range_p);
++
++static void record_manifest_details_for_file(JsonManifestParseContext *context,
++											 char *pathname, size_t size,
++											 pg_checksum_type checksum_type,
++											 int checksum_length,
++											 uint8 *checksum_payload);
++static void record_manifest_details_for_wal_range(JsonManifestParseContext *context,
++												  TimeLineID tli,
++												  XLogRecPtr start_lsn,
++												  XLogRecPtr end_lsn);
++static void report_manifest_error(JsonManifestParseContext *context,
++								  char *fmt,...)
++			pg_attribute_printf(2, 3) pg_attribute_noreturn();
++
++static void validate_backup_directory(validator_context *context,
++									  char *relpath, char *fullpath);
++static void validate_backup_file(validator_context *context,
++								 char *relpath, char *fullpath);
++static void report_extra_backup_files(validator_context *context);
++static void validate_backup_checksums(validator_context *context);
++static void validate_file_checksum(validator_context *context,
++								   manifest_file *m, char *pathname);
++static void parse_required_wal(validator_context *context,
++							   char *pg_waldump_path,
++							   char *wal_directory,
++							   manifest_wal_range *first_wal_range);
++
++static void report_backup_error(validator_context *context,
++								const char *pg_restrict fmt,...)
++			pg_attribute_printf(2, 3);
++static void report_fatal_error(const char *pg_restrict fmt,...)
++			pg_attribute_printf(1, 2) pg_attribute_noreturn();
++static bool should_ignore_relpath(validator_context *context, char *relpath);
++
++static void usage(void);
++
++static const char *progname;
++
++/*
++ * Main entry point.
++ */
++int
++main(int argc, char **argv)
++{
++	static struct option long_options[] = {
++		{"exit-on-error", no_argument, NULL, 'e'},
++		{"ignore", required_argument, NULL, 'i'},
++		{"manifest-path", required_argument, NULL, 'm'},
++		{"no-parse-wal", no_argument, NULL, 'n'},
++		{"print-parse-wal", no_argument, NULL, 'p'},
++		{"quiet", no_argument, NULL, 'q'},
++		{"skip-checksums", no_argument, NULL, 's'},
++		{"wal-directory", required_argument, NULL, 'w'},
++		{NULL, 0, NULL, 0}
++	};
++
++	int			c;
++	validator_context context;
++	manifest_wal_range *first_wal_range;
++	char	   *manifest_path = NULL;
++	bool		no_parse_wal = false;
++	bool		quiet = false;
++	bool		skip_checksums = false;
++	char	   *wal_directory = NULL;
++	char	   *pg_waldump_path = NULL;
++
++	pg_logging_init(argv[0]);
++	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_validatebackup"));
++	progname = get_progname(argv[0]);
++
++	memset(&context, 0, sizeof(context));
++
++	if (argc > 1)
++	{
++		if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-?") == 0)
++		{
++			usage();
++			exit(0);
++		}
++		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
++		{
++			puts("pg_validatebackup (PostgreSQL) " PG_VERSION);
++			exit(0);
++		}
++	}
++
++	/*
++	 * Skip certain files in the toplevel directory.
++	 *
++	 * Ignore the backup_manifest file, because it's not included in the
++	 * backup manifest.
++	 *
++	 * Ignore the pg_wal directory, because those files are not included in
++	 * the backup manifest either, since they are fetched separately from the
++	 * backup itself, and validated via a separate mechanism.
++	 *
++	 * Ignore postgresql.auto.conf, recovery.signal, and standby.signal,
++	 * because we expect that those files may sometimes be created or changed
++	 * as part of the backup process. For example, pg_basebackup -R will
++	 * modify postgresql.auto.conf and create standby.signal.
++	 */
++	simple_string_list_append(&context.ignore_list, "backup_manifest");
++	simple_string_list_append(&context.ignore_list, "pg_wal");
++	simple_string_list_append(&context.ignore_list, "postgresql.auto.conf");
++	simple_string_list_append(&context.ignore_list, "recovery.signal");
++	simple_string_list_append(&context.ignore_list, "standby.signal");
++
++	while ((c = getopt_long(argc, argv, "ei:m:nqsw:", long_options, NULL)) != -1)
++	{
++		switch (c)
++		{
++			case 'e':
++				context.exit_on_error = true;
++				break;
++			case 'i':
++				{
++					char	   *arg = pstrdup(optarg);
++
++					canonicalize_path(arg);
++					simple_string_list_append(&context.ignore_list, arg);
++					break;
++				}
++			case 'm':
++				manifest_path = pstrdup(optarg);
++				canonicalize_path(manifest_path);
++				break;
++			case 'n':
++				no_parse_wal = true;
++				break;
++			case 'q':
++				quiet = true;
++				break;
++			case 's':
++				skip_checksums = true;
++				break;
++			case 'w':
++				wal_directory = pstrdup(optarg);
++				canonicalize_path(wal_directory);
++				break;
++			default:
++				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
++						progname);
++				exit(1);
++		}
++	}
++
++	/* Get backup directory name */
++	if (optind >= argc)
++	{
++		pg_log_fatal("no backup directory specified");
++		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
++				progname);
++		exit(1);
++	}
++	context.backup_directory = pstrdup(argv[optind++]);
++	canonicalize_path(context.backup_directory);
++
++	/* Complain if any arguments remain */
++	if (optind < argc)
++	{
++		pg_log_fatal("too many command-line arguments (first is \"%s\")",
++					 argv[optind]);
++		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
++				progname);
++		exit(1);
++	}
++
++	/* Unless --no-parse-wal was specified, we will need pg_waldump. */
++	if (!no_parse_wal)
++	{
++		int			ret;
++
++		pg_waldump_path = pg_malloc(MAXPGPATH);
++		ret = find_other_exec(argv[0], "pg_waldump",
++							  "pg_waldump (PostgreSQL) " PG_VERSION "\n",
++							  pg_waldump_path);
++		if (ret < 0)
++		{
++			char		full_path[MAXPGPATH];
++
++			if (find_my_exec(argv[0], full_path) < 0)
++				strlcpy(full_path, progname, sizeof(full_path));
++			if (ret == -1)
++				pg_log_fatal("The program \"%s\" is needed by %s but was\n"
++							 "not found in the same directory as \"%s\".\n"
++							 "Check your installation.",
++							 "pg_waldump", "pg_validatebackup", full_path);
++			else
++				pg_log_fatal("The program \"%s\" was found by \"%s\" but was\n"
++							 "not the same version as %s.\n"
++							 "Check your installation.",
++							 "pg_waldump", full_path, "pg_validatebackup");
++		}
++	}
++
++	/* By default, look for the manifest in the backup directory. */
++	if (manifest_path == NULL)
++		manifest_path = psprintf("%s/backup_manifest",
++								 context.backup_directory);
++
++	/* By default, look for the WAL in the backup directory, too. */
++	if (wal_directory == NULL)
++		wal_directory = psprintf("%s/pg_wal", context.backup_directory);
++
++	/*
++	 * Try to read the manifest. We treat any errors encountered while parsing
++	 * the manifest as fatal; there doesn't seem to be much point in trying to
++	 * validate the backup directory against a corrupted manifest.
++	 */
++	parse_manifest_file(manifest_path, &context.ht, &first_wal_range);
++
++	/*
++	 * Now scan the files in the backup directory. At this stage, we verify
++	 * that every file on disk is present in the manifest and that the sizes
++	 * match. We also set the "matched" flag on every manifest entry that
++	 * corresponds to a file on disk.
++	 */
++	validate_backup_directory(&context, NULL, context.backup_directory);
++
++	/*
++	 * The "matched" flag should now be set on every entry in the hash table.
++	 * Any entries for which the bit is not set are files mentioned in the
++	 * manifest that don't exist on disk.
++	 */
++	report_extra_backup_files(&context);
++
++	/*
++	 * Now do the expensive work of verifying file checksums, unless we were
++	 * told to skip it.
++	 */
++	if (!skip_checksums)
++		validate_backup_checksums(&context);
++
++	/*
++	 * Try to parse the required ranges of WAL records, unless we were told
++	 * not to do so.
++	 */
++	if (!no_parse_wal)
++		parse_required_wal(&context, pg_waldump_path,
++						   wal_directory, first_wal_range);
++
++	/*
++	 * If everything looks OK, tell the user this, unless we were asked to
++	 * work quietly.
++	 */
++	if (!context.saw_any_error && !quiet)
++		printf("backup successfully verified\n");
++
++	return context.saw_any_error ? 1 : 0;
++}
++
++/*
++ * Parse a manifest file. Construct a hash table with information about
++ * all the files it mentions, and a linked list of all the WAL ranges it
++ * mentions.
++ */
++static void
++parse_manifest_file(char *manifest_path, manifest_files_hash **ht_p,
++					manifest_wal_range **first_wal_range_p)
++{
++	int			fd;
++	struct stat statbuf;
++	off_t		estimate;
++	uint32		initial_size;
++	manifest_files_hash *ht;
++	char	   *buffer;
++	int			rc;
++	parser_context private_context;
++	JsonManifestParseContext context;
++
++	/* Open the manifest file. */
++	if ((fd = open(manifest_path, O_RDONLY | PG_BINARY, 0)) < 0)
++		report_fatal_error("could not open file \"%s\": %m", manifest_path);
++
++	/* Figure out how big the manifest is. */
++	if (fstat(fd, &statbuf) != 0)
++		report_fatal_error("could not stat file \"%s\": %m", manifest_path);
++
++	/* Guess how large to make the hash table based on the manifest size. */
++	estimate = statbuf.st_size / ESTIMATED_BYTES_PER_MANIFEST_LINE;
++	initial_size = Min(PG_UINT32_MAX, Max(estimate, 256));
++
++	/* Create the hash table. */
++	ht = manifest_files_create(initial_size, NULL);
++
++	/*
++	 * Slurp in the whole file.
++	 *
++	 * This is not ideal, but there's currently no easy way to get
++	 * pg_parse_json() to perform incremental parsing.
++	 */
++	buffer = pg_malloc(statbuf.st_size);
++	rc = read(fd, buffer, statbuf.st_size);
++	if (rc != statbuf.st_size)
++	{
++		if (rc < 0)
++			report_fatal_error("could not read file \"%s\": %m",
++							   manifest_path);
++		else
++			report_fatal_error("could not read file \"%s\": read %d of %zu",
++							   manifest_path, rc, (size_t) statbuf.st_size);
++	}
++
++	/* Close the manifest file. */
++	close(fd);
++
++	/* Parse the manifest. */
++	private_context.ht = ht;
++	private_context.first_wal_range = NULL;
++	private_context.last_wal_range = NULL;
++	context.private_data = &private_context;
++	context.perfile_cb = record_manifest_details_for_file;
++	context.perwalrange_cb = record_manifest_details_for_wal_range;
++	context.error_cb = report_manifest_error;
++	json_parse_manifest(&context, buffer, statbuf.st_size);
++
++	/* Done with the buffer. */
++	pfree(buffer);
++
++	/* Return the file hash table and WAL range list we constructed. */
++	*ht_p = ht;
++	*first_wal_range_p = private_context.first_wal_range;
++}
++
++/*
++ * Report an error while parsing the manifest.
++ *
++ * We consider all such errors to be fatal errors. The manifest parser
++ * expects this function not to return.
++ */
++static void
++report_manifest_error(JsonManifestParseContext *context, char *fmt,...)
++{
++	va_list		ap;
++
++	va_start(ap, fmt);
++	pg_log_generic_v(PG_LOG_FATAL, fmt, ap);
++	va_end(ap);
++
++	exit(1);
++}
++
++/*
++ * Record details extracted from the backup manifest for one file.
++ */
++static void
++record_manifest_details_for_file(JsonManifestParseContext *context,
++								 char *pathname, size_t size,
++								 pg_checksum_type checksum_type,
++								 int checksum_length, uint8 *checksum_payload)
++{
++	parser_context *pcxt = context->private_data;
++	manifest_files_hash *ht = pcxt->ht;
++	manifest_file *m;
++	bool		found;
++
++	/* Make a new entry in the hash table for this file. */
++	m = manifest_files_insert(ht, pathname, &found);
++	if (found)
++		report_fatal_error("duplicate pathname in backup manifest: \"%s\"",
++						   pathname);
++
++	/* Initialize the entry. */
++	m->size = size;
++	m->checksum_type = checksum_type;
++	m->checksum_length = checksum_length;
++	m->checksum_payload = checksum_payload;
++	m->matched = false;
++	m->bad = false;
++}
++
++/*
++ * Record details extracted from the backup manifest for one WAL range.
++ */
++static void
++record_manifest_details_for_wal_range(JsonManifestParseContext *context,
++									  TimeLineID tli,
++									  XLogRecPtr start_lsn, XLogRecPtr end_lsn)
++{
++	parser_context *pcxt = context->private_data;
++	manifest_wal_range *range;
++
++	/* Allocate and initialize a struct describing this WAL range. */
++	range = palloc(sizeof(manifest_wal_range));
++	range->tli = tli;
++	range->start_lsn = start_lsn;
++	range->end_lsn = end_lsn;
++	range->prev = pcxt->last_wal_range;
++	range->next = NULL;
++
++	/* Add it to the end of the list. */
++	if (pcxt->first_wal_range == NULL)
++		pcxt->first_wal_range = range;
++	else
++		pcxt->last_wal_range->next = range;
++	pcxt->last_wal_range = range;
++}
++
++/*
++ * Validate one directory.
++ *
++ * 'relpath' is NULL if we are to validate the top-level backup directory,
++ * and otherwise the relative path to the directory that is to be validated.
++ *
++ * 'fullpath' is the backup directory with 'relpath' appended; i.e. the actual
++ * filesystem path at which it can be found.
++ */
++static void
++validate_backup_directory(validator_context *context, char *relpath,
++						  char *fullpath)
++{
++	DIR		   *dir;
++	struct dirent *dirent;
++
++	dir = opendir(fullpath);
++	if (dir == NULL)
++	{
++		/*
++		 * If even the toplevel backup directory cannot be found, treat this
++		 * as a fatal error.
++		 */
++		if (relpath == NULL)
++			report_fatal_error("could not open directory \"%s\": %m", fullpath);
++
++		/*
++		 * Otherwise, treat this as a non-fatal error, but ignore any further
++		 * errors related to this path and anything beneath it.
++		 */
++		report_backup_error(context,
++							"could not open directory \"%s\": %m", fullpath);
++		simple_string_list_append(&context->ignore_list, relpath);
++
++		return;
++	}
++
++	while (errno = 0, (dirent = readdir(dir)) != NULL)
++	{
++		char	   *filename = dirent->d_name;
++		char	   *newfullpath = psprintf("%s/%s", fullpath, filename);
++		char	   *newrelpath;
++
++		/* Skip "." and ".." */
++		if (filename[0] == '.' && (filename[1] == '\0'
++								   || strcmp(filename, "..") == 0))
++			continue;
++
++		if (relpath == NULL)
++			newrelpath = pstrdup(filename);
++		else
++			newrelpath = psprintf("%s/%s", relpath, filename);
++
++		if (!should_ignore_relpath(context, newrelpath))
++			validate_backup_file(context, newrelpath, newfullpath);
++
++		pfree(newfullpath);
++		pfree(newrelpath);
++	}
++
++	if (closedir(dir))
++	{
++		report_backup_error(context,
++							"could not close directory \"%s\": %m", fullpath);
++		return;
++	}
++}
++
++/*
++ * Validate one file (which might actually be a directory or a symlink).
++ *
++ * The arguments to this function have the same meaning as the arguments to
++ * validate_backup_directory.
++ */
++static void
++validate_backup_file(validator_context *context, char *relpath, char *fullpath)
++{
++	struct stat sb;
++	manifest_file *m;
++
++	if (stat(fullpath, &sb) != 0)
++	{
++		report_backup_error(context,
++							"could not stat file or directory \"%s\": %m",
++							relpath);
++
++		/*
++		 * Suppress further errors related to this path name and, if it's a
++		 * directory, anything underneath it.
++		 */
++		simple_string_list_append(&context->ignore_list, relpath);
++
++		return;
++	}
++
++	/* If it's a directory, just recurse. */
++	if (S_ISDIR(sb.st_mode))
++	{
++		validate_backup_directory(context, relpath, fullpath);
++		return;
++	}
++
++	/* If it's not a directory, it should be a plain file. */
++	if (!S_ISREG(sb.st_mode))
++	{
++		report_backup_error(context,
++							"\"%s\" is not a file or directory",
++							relpath);
++		return;
++	}
++
++	/* Check whether there's an entry in the manifest hash. */
++	m = manifest_files_lookup(context->ht, relpath);
++	if (m == NULL)
++	{
++		report_backup_error(context,
++							"\"%s\" is present on disk but not in the manifest",
++							relpath);
++		return;
++	}
++
++	/* Flag this entry as having been encountered in the filesystem. */
++	m->matched = true;
++
++	/* Check that the size matches. */
++	if (m->size != sb.st_size)
++	{
++		report_backup_error(context,
++							"\"%s\" has size %zu on disk but size %zu in the manifest",
++							relpath, (size_t) sb.st_size, m->size);
++		m->bad = true;
++	}
++
++	/*
++	 * We don't validate checksums at this stage. We first finish validating
++	 * that we have the expected set of files with the expected sizes, and
++	 * only afterwards verify the checksums. That's because computing
++	 * checksums may take a while, and we'd like to report more obvious
++	 * problems quickly.
++	 */
++}
++
++/*
++ * Scan the hash table for entries where the 'matched' flag is not set; report
++ * that such files are present in the manifest but not on disk.
++ */
++static void
++report_extra_backup_files(validator_context *context)
++{
++	manifest_files_iterator it;
++	manifest_file *m;
++
++	manifest_files_start_iterate(context->ht, &it);
++	while ((m = manifest_files_iterate(context->ht, &it)) != NULL)
++		if (!m->matched && !should_ignore_relpath(context, m->pathname))
++			report_backup_error(context,
++								"\"%s\" is present in the manifest but not on disk",
++								m->pathname);
++}
++
++/*
++ * Validate checksums for hash table entries that are otherwise unproblematic.
++ * If we've already reported some problem related to a hash table entry, or
++ * if it has no checksum, just skip it.
++ */
++static void
++validate_backup_checksums(validator_context *context)
++{
++	manifest_files_iterator it;
++	manifest_file *m;
++
++	manifest_files_start_iterate(context->ht, &it);
++	while ((m = manifest_files_iterate(context->ht, &it)) != NULL)
++	{
++		if (m->matched && !m->bad && m->checksum_type != CHECKSUM_TYPE_NONE &&
++			!should_ignore_relpath(context, m->pathname))
++		{
++			char	   *fullpath;
++
++			/* Compute the full pathname to the target file. */
++			fullpath = psprintf("%s/%s", context->backup_directory,
++								m->pathname);
++
++			/* Do the actual checksum validation. */
++			validate_file_checksum(context, m, fullpath);
++
++			/* Avoid leaking memory. */
++			pfree(fullpath);
++		}
++	}
++}
++
++/*
++ * Validate the checksum of a single file.
++ */
++static void
++validate_file_checksum(validator_context *context, manifest_file *m,
++					   char *fullpath)
++{
++	pg_checksum_context checksum_ctx;
++	char	   *relpath = m->pathname;
++	int			fd;
++	int			rc;
++	size_t		bytes_read = 0;
++	uint8		buffer[READ_CHUNK_SIZE];
++	uint8		checksumbuf[PG_CHECKSUM_MAX_LENGTH];
++	int			checksumlen;
++
++	/* Open the target file. */
++	if ((fd = open(fullpath, O_RDONLY | PG_BINARY, 0)) < 0)
++	{
++		report_backup_error(context, "could not open file \"%s\": %m",
++							relpath);
++		return;
++	}
++
++	/* Initialize checksum context. */
++	pg_checksum_init(&checksum_ctx, m->checksum_type);
++
++	/* Read the file chunk by chunk, updating the checksum as we go. */
++	while ((rc = read(fd, buffer, READ_CHUNK_SIZE)) > 0)
++	{
++		bytes_read += rc;
++		pg_checksum_update(&checksum_ctx, buffer, rc);
++	}
++	if (rc < 0)
++		report_backup_error(context, "could not read file \"%s\": %m",
++							relpath);
++
++	/* Close the file. */
++	if (close(fd) != 0)
++	{
++		report_backup_error(context, "could not close file \"%s\": %m",
++							relpath);
++		return;
++	}
++
++	/* If we didn't manage to read the whole file, bail out now. */
++	if (rc < 0)
++		return;
++
++	/*
++	 * Double-check that we read the expected number of bytes from the file.
++	 * Normally, a file size mismatch would be caught in validate_backup_file
++	 * and this check would never be reached, but this provides additional
++	 * safety and clarity in the event of concurrent modifications or
++	 * filesystem misbehavior.
++	 */
++	if (bytes_read != m->size)
++	{
++		report_backup_error(context,
++							"file \"%s\" should contain %zu bytes, but read %zu bytes",
++							relpath, m->size, bytes_read);
++		return;
++	}
++
++	/* Get the final checksum. */
++	checksumlen = pg_checksum_final(&checksum_ctx, checksumbuf);
++
++	/* And check it against the manifest. */
++	if (checksumlen != m->checksum_length)
++		report_backup_error(context,
++							"file \"%s\" has checksum of length %d, but expected %d",
++							relpath, m->checksum_length, checksumlen);
++	else if (memcmp(checksumbuf, m->checksum_payload, checksumlen) != 0)
++		report_backup_error(context,
++							"checksum mismatch for file \"%s\"",
++							relpath);
++}
++
++/*
++ * Attempt to parse the WAL files required to restore from backup using
++ * pg_waldump.
++ */
++static void
++parse_required_wal(validator_context *context, char *pg_waldump_path,
++				   char *wal_directory, manifest_wal_range *first_wal_range)
++{
++	manifest_wal_range *this_wal_range = first_wal_range;
++
++	while (this_wal_range != NULL)
++	{
++		char	   *pg_waldump_cmd;
++
++		pg_waldump_cmd = psprintf("\"%s\" --quiet --path=\"%s\" --timeline=%u --start=%X/%X --end=%X/%X\n",
++								  pg_waldump_path, wal_directory, this_wal_range->tli,
++								  (uint32) (this_wal_range->start_lsn >> 32),
++								  (uint32) this_wal_range->start_lsn,
++								  (uint32) (this_wal_range->end_lsn >> 32),
++								  (uint32) this_wal_range->end_lsn);
++		if (system(pg_waldump_cmd) != 0)
++			report_backup_error(context,
++								"WAL parsing failed for timeline %u",
++								this_wal_range->tli);
++
++		this_wal_range = this_wal_range->next;
++	}
++}
++
++/*
++ * Report a problem with the backup.
++ *
++ * Update the context to indicate that we saw an error, and exit if the
++ * context says we should.
++ */
++static void
++report_backup_error(validator_context *context, const char *pg_restrict fmt,...)
++{
++	va_list		ap;
++
++	va_start(ap, fmt);
++	pg_log_generic_v(PG_LOG_ERROR, fmt, ap);
++	va_end(ap);
++
++	context->saw_any_error = true;
++	if (context->exit_on_error)
++		exit(1);
++}
++
++/*
++ * Report a fatal error and exit
++ */
++static void
++report_fatal_error(const char *pg_restrict fmt,...)
++{
++	va_list		ap;
++
++	va_start(ap, fmt);
++	pg_log_generic_v(PG_LOG_FATAL, fmt, ap);
++	va_end(ap);
++
++	exit(1);
++}
++
++/*
++ * Is the specified relative path, or some prefix of it, listed in the set
++ * of paths to ignore?
++ *
++ * Note that by "prefix" we mean a parent directory; for this purpose,
++ * "aa/bb" is not a prefix of "aa/bbb", but it is a prefix of "aa/bb/cc".
++ */
++static bool
++should_ignore_relpath(validator_context *context, char *relpath)
++{
++	SimpleStringListCell *cell;
++
++	for (cell = context->ignore_list.head; cell != NULL; cell = cell->next)
++	{
++		char	   *r = relpath;
++		char	   *v = cell->val;
++
++		while (*v != '\0' && *r == *v)
++			++r, ++v;
++
++		if (*v == '\0' && (*r == '\0' || *r == '/'))
++			return true;
++	}
++
++	return false;
++}
++
++/*
++ * Helper function for manifest_files hash table.
++ */
++static uint32
++hash_string_pointer(char *s)
++{
++	unsigned char *ss = (unsigned char *) s;
++
++	return hash_bytes(ss, strlen(s));
++}
++
++/*
++ * Print out usage information and exit.
++ */
++static void
++usage(void)
++{
++	printf(_("%s validates a backup against the backup manifest.\n\n"), progname);
++	printf(_("Usage:\n  %s [OPTION]... BACKUPDIR\n\n"), progname);
++	printf(_("Options:\n"));
++	printf(_("  -e, --exit-on-error         exit immediately on error\n"));
++	printf(_("  -i, --ignore=RELATIVE_PATH  ignore indicated path\n"));
++	printf(_("  -m, --manifest=PATH         use specified path for manifest\n"));
++	printf(_("  -n, --no-parse-wal          do not try to parse WAL files\n"));
++	printf(_("  -s, --skip-checksums        skip checksum verification\n"));
++	printf(_("  -w, --wal-directory=PATH    use specified path for WAL files\n"));
++	printf(_("  -V, --version               output version information, then exit\n"));
++	printf(_("  -?, --help                  show this help, then exit\n"));
++	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
++	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
++}
+diff --git a/src/bin/pg_validatebackup/t/001_basic.pl b/src/bin/pg_validatebackup/t/001_basic.pl
+new file mode 100644
+index 000000000000..6d4b8ea01a6d
+--- /dev/null
++++ b/src/bin/pg_validatebackup/t/001_basic.pl
+@@ -0,0 +1,30 @@
++use strict;
++use warnings;
++use TestLib;
++use Test::More tests => 16;
++
++my $tempdir = TestLib::tempdir;
++
++program_help_ok('pg_validatebackup');
++program_version_ok('pg_validatebackup');
++program_options_handling_ok('pg_validatebackup');
++
++command_fails_like(['pg_validatebackup'],
++				   qr/no backup directory specified/,
++				   'target directory must be specified');
++command_fails_like(['pg_validatebackup', $tempdir],
++				   qr/could not open file.*\/backup_manifest\"/,
++				   'pg_validatebackup requires a manifest');
++command_fails_like(['pg_validatebackup', $tempdir, $tempdir],
++				   qr/too many command-line arguments/,
++				   'multiple target directories not allowed');
++
++# create fake manifest file
++open(my $fh, '>', "$tempdir/backup_manifest") || die "open: $!";
++close($fh);
++
++# but then try to use an alternate, nonexisting manifest
++command_fails_like(['pg_validatebackup', '-m', "$tempdir/not_the_manifest",
++						$tempdir],
++				   qr/could not open file.*\/not_the_manifest\"/,
++				   'pg_validatebackup respects -m flag');
+diff --git a/src/bin/pg_validatebackup/t/002_algorithm.pl b/src/bin/pg_validatebackup/t/002_algorithm.pl
+new file mode 100644
+index 000000000000..98871e12a5e7
+--- /dev/null
++++ b/src/bin/pg_validatebackup/t/002_algorithm.pl
+@@ -0,0 +1,58 @@
++# Verify that we can take and validate backups with various checksum types.
++
++use strict;
++use warnings;
++use Cwd;
++use Config;
++use File::Path qw(rmtree);
++use PostgresNode;
++use TestLib;
++use Test::More tests => 19;
++
++my $master = get_new_node('master');
++$master->init(allows_streaming => 1);
++$master->start;
++
++for my $algorithm (qw(bogus none crc32c sha224 sha256 sha384 sha512))
++{
++	my $backup_path = $master->backup_dir . '/' . $algorithm;
++	my @backup = ('pg_basebackup', '-D', $backup_path,
++				  '--manifest-checksums', $algorithm,
++				  '--no-sync');
++	my @validate = ('pg_validatebackup', '-e', $backup_path);
++
++	# A backup with a bogus algorithm should fail.
++	if ($algorithm eq 'bogus')
++	{
++		$master->command_fails(\@backup,
++							   "backup fails with algorithm \"$algorithm\"");
++		next;
++	}
++
++	# A backup with a valid algorithm should work.
++	$master->command_ok(\@backup, "backup ok with algorithm \"$algorithm\"");
++
++	# We expect each real checksum algorithm to be mentioned on every line of
++	# the backup manifest file except the first and last; for simplicity, we
++	# just check that it shows up lots of times. When the checksum algorithm
++	# is none, we just check that the manifest exists.
++	if ($algorithm eq 'none')
++	{
++		ok(-f "$backup_path/backup_manifest", "backup manifest exists");
++	}
++	else
++	{
++		my $manifest = slurp_file("$backup_path/backup_manifest");
++		my $count_of_algorithm_in_manifest =
++			(() = $manifest =~ /$algorithm/mig);
++		cmp_ok($count_of_algorithm_in_manifest, '>', 100,
++			   "$algorithm is mentioned many times in the manifest");
++	}
++
++	# Make sure that it validates OK.
++	$master->command_ok(\@validate,
++						"validate backup with algorithm \"$algorithm\"");
++
++	# Remove backup immediately to save disk space.
++	rmtree($backup_path);
++}
+diff --git a/src/bin/pg_validatebackup/t/003_corruption.pl b/src/bin/pg_validatebackup/t/003_corruption.pl
+new file mode 100644
+index 000000000000..6ad29a031f86
+--- /dev/null
++++ b/src/bin/pg_validatebackup/t/003_corruption.pl
+@@ -0,0 +1,251 @@
++# Verify that various forms of corruption are detected by pg_validatebackup.
++
++use strict;
++use warnings;
++use Cwd;
++use Config;
++use File::Path qw(rmtree);
++use PostgresNode;
++use TestLib;
++use Test::More tests => 44;
++
++my $master = get_new_node('master');
++$master->init(allows_streaming => 1);
++$master->start;
++
++# Include a user-defined tablespace in the hopes of detecting problems in that
++# area.
++my $source_ts_path = TestLib::tempdir;
++$master->safe_psql('postgres', <<EOM);
++CREATE TABLE x1 (a int);
++INSERT INTO x1 VALUES (111);
++CREATE TABLESPACE ts1 LOCATION '$source_ts_path';
++CREATE TABLE x2 (a int) TABLESPACE ts1;
++INSERT INTO x1 VALUES (222);
++EOM
++
++my @scenario = (
++	{
++		'name' => 'extra_file',
++		'mutilate' => \&mutilate_extra_file,
++		'fails_like' =>
++			qr/extra_file.*present on disk but not in the manifest/
++	},
++	{
++		'name' => 'extra_tablespace_file',
++		'mutilate' => \&mutilate_extra_tablespace_file,
++		'fails_like' =>
++			qr/extra_ts_file.*present on disk but not in the manifest/
++	},
++	{
++		'name' => 'missing_file',
++		'mutilate' => \&mutilate_missing_file,
++		'fails_like' =>
++			qr/pg_xact\/0000.*present in the manifest but not on disk/
++	},
++	{
++		'name' => 'missing_tablespace',
++		'mutilate' => \&mutilate_missing_tablespace,
++		'fails_like' =>
++			qr/pg_tblspc.*present in the manifest but not on disk/
++	},
++	{
++		'name' => 'append_to_file',
++		'mutilate' => \&mutilate_append_to_file,
++		'fails_like' =>
++			qr/has size \d+ on disk but size \d+ in the manifest/
++	},
++	{
++		'name' => 'truncate_file',
++		'mutilate' => \&mutilate_truncate_file,
++		'fails_like' =>
++			qr/has size 0 on disk but size \d+ in the manifest/
++	},
++	{
++		'name' => 'replace_file',
++		'mutilate' => \&mutilate_replace_file,
++		'fails_like' => qr/checksum mismatch for file/
++	},
++	{
++		'name' => 'bad_manifest',
++		'mutilate' => \&mutilate_bad_manifest,
++		'fails_like' => qr/manifest checksum mismatch/
++	},
++	{
++		'name' => 'open_file_fails',
++		'mutilate' => \&mutilate_open_file_fails,
++		'fails_like' => qr/could not open file/,
++		'skip_on_windows' => 1
++	},
++	{
++		'name' => 'open_directory_fails',
++		'mutilate' => \&mutilate_open_directory_fails,
++		'fails_like' => qr/could not open directory/,
++		'skip_on_windows' => 1
++	},
++	{
++		'name' => 'search_directory_fails',
++		'mutilate' => \&mutilate_search_directory_fails,
++		'cleanup' => \&cleanup_search_directory_fails,
++		'fails_like' => qr/could not stat file or directory/,
++		'skip_on_windows' => 1
++	}
++);
++
++for my $scenario (@scenario)
++{
++	my $name = $scenario->{'name'};
++
++	SKIP:
++	{
++		skip "unix-style permissions not supported on Windows", 4
++			if $scenario->{'skip_on_windows'} && $windows_os;
++
++		# Take a backup and check that it validates OK.
++		my $backup_path = $master->backup_dir . '/' . $name;
++		my $backup_ts_path = TestLib::tempdir;
++		$master->command_ok(['pg_basebackup', '-D', $backup_path, '--no-sync',
++							'-T', "${source_ts_path}=${backup_ts_path}"],
++							"base backup ok");
++		command_ok(['pg_validatebackup', $backup_path ],
++				   "intact backup validated");
++
++		# Mutilate the backup in some way.
++		$scenario->{'mutilate'}->($backup_path);
++
++		# Now check that the backup no longer validates.
++		command_fails_like(['pg_validatebackup', $backup_path ],
++						   $scenario->{'fails_like'},
++						   "corrupt backup fails validation: $name");
++
++		# Run cleanup hook, if provided.
++		$scenario->{'cleanup'}->($backup_path)
++			if exists $scenario->{'cleanup'};
++
++		# Finally, use rmtree to reclaim space.
++		rmtree($backup_path);
++	}
++}
++
++sub create_extra_file
++{
++	my ($backup_path, $relative_path) = @_;
++	my $pathname = "$backup_path/$relative_path";
++	open(my $fh, '>', $pathname) || die "open $pathname: $!";
++	print $fh "This is an extra file.\n";
++	close($fh);
++}
++
++# Add a file into the root directory of the backup.
++sub mutilate_extra_file
++{
++	my ($backup_path) = @_;
++	create_extra_file($backup_path, "extra_file");
++}
++
++# Add a file inside the user-defined tablespace.
++sub mutilate_extra_tablespace_file
++{
++	my ($backup_path) = @_;
++	my ($tsoid) = grep { $_ ne '.' && $_ ne '..' }
++		 slurp_dir("$backup_path/pg_tblspc");
++	my ($catvdir) = grep { $_ ne '.' && $_ ne '..' }
++		 slurp_dir("$backup_path/pg_tblspc/$tsoid");
++	my ($tsdboid) = grep { $_ ne '.' && $_ ne '..' }
++		 slurp_dir("$backup_path/pg_tblspc/$tsoid/$catvdir");
++	create_extra_file($backup_path,
++					  "pg_tblspc/$tsoid/$catvdir/$tsdboid/extra_ts_file");
++}
++
++# Remove a file.
++sub mutilate_missing_file
++{
++	my ($backup_path) = @_;
++	my $pathname = "$backup_path/pg_xact/0000";
++	unlink($pathname) || die "$pathname: $!";
++}
++
++# Remove the symlink to the user-defined tablespace.
++sub mutilate_missing_tablespace
++{
++	my ($backup_path) = @_;
++	my ($tsoid) = grep { $_ ne '.' && $_ ne '..' }
++		 slurp_dir("$backup_path/pg_tblspc");
++	my $pathname = "$backup_path/pg_tblspc/$tsoid";
++	if ($windows_os)
++	{
++		rmdir($pathname) || die "$pathname: $!";
++	}
++	else
++	{
++		unlink($pathname) || die "$pathname: $!";
++	}
++}
++
++# Append an additional bytes to a file.
++sub mutilate_append_to_file
++{
++	my ($backup_path) = @_;
++	append_to_file "$backup_path/global/pg_control", 'x';
++}
++
++# Truncate a file to zero length.
++sub mutilate_truncate_file
++{
++	my ($backup_path) = @_;
++	my $pathname = "$backup_path/global/pg_control";
++	open(my $fh, '>', $pathname) || die "open $pathname: $!";
++	close($fh);
++}
++
++# Replace a file's contents without changing the length of the file. This is
++# not a particularly efficient way to do this, so we pick a file that's
++# expected to be short.
++sub mutilate_replace_file
++{
++	my ($backup_path) = @_;
++	my $pathname = "$backup_path/PG_VERSION";
++	my $contents = slurp_file($pathname);
++	open(my $fh, '>', $pathname) || die "open $pathname: $!";
++	print $fh 'q' x length($contents);
++	close($fh);
++}
++
++# Corrupt the backup manifest.
++sub mutilate_bad_manifest
++{
++	my ($backup_path) = @_;
++	append_to_file "$backup_path/backup_manifest", "\n";
++}
++
++# Create a file that can't be opened. (This is skipped on Windows.)
++sub mutilate_open_file_fails
++{
++	my ($backup_path) = @_;
++	my $pathname = "$backup_path/PG_VERSION";
++	chmod(0, $pathname) || die "chmod $pathname: $!";
++}
++
++# Create a directory that can't be opened. (This is skipped on Windows.)
++sub mutilate_open_directory_fails
++{
++	my ($backup_path) = @_;
++	my $pathname = "$backup_path/pg_subtrans";
++	chmod(0, $pathname) || die "chmod $pathname: $!";
++}
++
++# Create a directory that can't be searched. (This is skipped on Windows.)
++sub mutilate_search_directory_fails
++{
++	my ($backup_path) = @_;
++	my $pathname = "$backup_path/base";
++	chmod(0400, $pathname) || die "chmod $pathname: $!";
++}
++
++# rmtree can't cope with a mode 400 directory, so change back to 700.
++sub cleanup_search_directory_fails 
++{
++	my ($backup_path) = @_;
++	my $pathname = "$backup_path/base";
++	chmod(0700, $pathname) || die "chmod $pathname: $!";
++}
+diff --git a/src/bin/pg_validatebackup/t/004_options.pl b/src/bin/pg_validatebackup/t/004_options.pl
+new file mode 100644
+index 000000000000..8f185626ed6e
+--- /dev/null
++++ b/src/bin/pg_validatebackup/t/004_options.pl
+@@ -0,0 +1,89 @@
++# Verify the behavior of assorted pg_validatebackup options.
++
++use strict;
++use warnings;
++use Cwd;
++use Config;
++use File::Path qw(rmtree);
++use PostgresNode;
++use TestLib;
++use Test::More tests => 25;
++
++# Start up the server and take a backup.
++my $master = get_new_node('master');
++$master->init(allows_streaming => 1);
++$master->start;
++my $backup_path = $master->backup_dir . '/test_options';
++$master->command_ok(['pg_basebackup', '-D', $backup_path, '--no-sync' ],
++					"base backup ok");
++
++# Verify that pg_validatebackup -q succeeds and produces no output.
++my $stdout;
++my $stderr;
++my $result = IPC::Run::run ['pg_validatebackup', '-q', $backup_path ],
++	'>', \$stdout, '2>', \$stderr;
++ok($result, "-q succeeds: exit code 0");
++is($stdout, '', "-q succeeds: no stdout");
++is($stderr, '', "-q succeeds: no stderr");
++
++# Corrupt the PG_VERSION file.
++my $version_pathname = "$backup_path/PG_VERSION";
++my $version_contents = slurp_file($version_pathname);
++open(my $fh, '>', $version_pathname) || die "open $version_pathname: $!";
++print $fh 'q' x length($version_contents);
++close($fh);
++
++# Verify that pg_validatebackup -q now fails.
++command_fails_like(['pg_validatebackup', '-q', $backup_path ],
++				   qr/checksum mismatch for file \"PG_VERSION\"/,
++				   '-q checksum mismatch');
++
++# Since we didn't change the length of the file, validation should succeed
++# if we ignore checksums. Check that we get the right message, too.
++command_like(['pg_validatebackup', '-s', $backup_path ],
++			 qr/backup successfully verified/,
++			 '-s skips checksumming');
++
++# Validation should succeed if we ignore the problem file.
++command_like(['pg_validatebackup', '-i', 'PG_VERSION', $backup_path ],
++			 qr/backup successfully verified/,
++			 '-i ignores problem file');
++
++# PG_VERSION is already corrupt; let's try also removing all of pg_xact.
++rmtree($backup_path . "/pg_xact");
++
++# We're ignoring the problem with PG_VERSION, but not the problem with
++# pg_xact, so validation should fail here.
++command_fails_like(['pg_validatebackup', '-i', 'PG_VERSION', $backup_path ],
++				   qr/pg_xact.*is present in the manifest but not on disk/,
++				   '-i does not ignore all problems');
++
++# If we use -i twice, we should be able to ignore all of the problems.
++command_like(['pg_validatebackup', '-i', 'PG_VERSION', '-i', 'pg_xact',
++				$backup_path ],
++			 qr/backup successfully verified/,
++			 'multiple -i options work');
++
++# Verify that when -i is not used, both problems are reported.
++$result = IPC::Run::run ['pg_validatebackup', $backup_path ],
++	'>', \$stdout, '2>', \$stderr;
++ok(!$result, "multiple problems: fails");
++like($stderr, qr/pg_xact.*is present in the manifest but not on disk/,
++	 "multiple problems: missing files reported");
++like($stderr, qr/checksum mismatch for file \"PG_VERSION\"/,
++	 "multiple problems: checksum mismatch reported");
++
++# Verify that when -e is used, only the problem detected first is reported.
++$result = IPC::Run::run ['pg_validatebackup', '-e', $backup_path ],
++	'>', \$stdout, '2>', \$stderr;
++ok(!$result, "-e reports 1 error: fails");
++like($stderr, qr/pg_xact.*is present in the manifest but not on disk/,
++	 "-e reports 1 error: missing files reported");
++unlike($stderr, qr/checksum mismatch for file \"PG_VERSION\"/,
++	   "-e reports 1 error: checksum mismatch not reported");
++
++# Test valid manifest with nonexistent backup directory.
++command_fails_like(['pg_validatebackup', '-m', "$backup_path/backup_manifest",
++						"$backup_path/fake" ],
++				   qr/could not open directory/,
++				   'nonexistent backup directory');
+diff --git a/src/bin/pg_validatebackup/t/005_bad_manifest.pl b/src/bin/pg_validatebackup/t/005_bad_manifest.pl
+new file mode 100644
+index 000000000000..8f2a486c83c8
+--- /dev/null
++++ b/src/bin/pg_validatebackup/t/005_bad_manifest.pl
+@@ -0,0 +1,201 @@
++# Test the behavior of pg_validatebackup when the backup manifest has
++# problems.
++
++use strict;
++use warnings;
++use Cwd;
++use Config;
++use PostgresNode;
++use TestLib;
++use Test::More tests => 58;
++
++my $tempdir = TestLib::tempdir;
++
++test_bad_manifest('input string ended unexpectedly',
++	  qr/could not parse backup manifest: The input string ended unexpectedly/,
++	  <<EOM);
++{
++EOM
++
++test_parse_error('unexpected object end', <<EOM);
++{}
++EOM
++
++test_parse_error('unexpected array start', <<EOM);
++[]
++EOM
++
++test_parse_error('expected version indicator', <<EOM);
++{"not-expected": 1}
++EOM
++
++test_parse_error('unexpected manifest version', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": "phooey"}
++EOM
++
++test_parse_error('unexpected scalar', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": true}
++EOM
++
++test_parse_error('unknown toplevel field', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Oops": 1}
++EOM
++
++test_parse_error('unexpected object start', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": {}}
++EOM
++
++test_parse_error('missing pathname', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [{}]}
++EOM
++
++test_parse_error('both pathname and encoded pathname', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [
++    {"Path": "x", "Encoded-Path": "1234"}
++]}
++EOM
++
++test_parse_error('unexpected file field', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [
++    {"Oops": 1}
++]}
++EOM
++
++test_parse_error('missing size', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [
++    {"Path": "x"}
++]}
++EOM
++
++test_parse_error('file size is not an integer', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [
++    {"Path": "x", "Size": "Oops"}
++]}
++EOM
++
++test_parse_error('unable to decode filename', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [
++    {"Encoded-Path": "123", "Size": 0}
++]}
++EOM
++
++test_fatal_error('duplicate pathname in backup manifest', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [
++    {"Path": "x", "Size": 0},
++    {"Path": "x", "Size": 0}
++]}
++EOM
++
++test_parse_error('checksum without algorithm', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [
++    {"Path": "x", "Size": 100, "Checksum": "Oops"}
++]}
++EOM
++
++test_fatal_error('unrecognized checksum algorithm', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [
++    {"Path": "x", "Size": 100, "Checksum-Algorithm": "Oops", "Checksum": "00"}
++]}
++EOM
++
++test_fatal_error('invalid checksum for file', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [
++    {"Path": "x", "Size": 100, "Checksum-Algorithm": "CRC32C", "Checksum": "0"}
++]}
++EOM
++
++test_parse_error('missing start LSN', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "WAL-Ranges": [
++    {"Timeline": 1}
++]}
++EOM
++
++test_parse_error('missing end LSN', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "WAL-Ranges": [
++    {"Timeline": 1, "Start-LSN": "0/0"}
++]}
++EOM
++
++test_parse_error('unexpected wal range field', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "WAL-Ranges": [
++    {"Oops": 1}
++]}
++EOM
++
++test_parse_error('missing timeline', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "WAL-Ranges": [
++    {}
++]}
++EOM
++
++test_parse_error('unexpected object end', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "WAL-Ranges": [
++    {"Timeline": 1, "Start-LSN": "0/0", "End-LSN": "0/0"}
++]}
++EOM
++
++test_parse_error('timeline is not an integer', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "WAL-Ranges": [
++    {"Timeline": true, "Start-LSN": "0/0", "End-LSN": "0/0"}
++]}
++EOM
++
++test_parse_error('unable to parse start LSN', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "WAL-Ranges": [
++    {"Timeline": 1, "Start-LSN": "oops", "End-LSN": "0/0"}
++]}
++EOM
++
++test_parse_error('unable to parse end LSN', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "WAL-Ranges": [
++    {"Timeline": 1, "Start-LSN": "0/0", "End-LSN": "oops"}
++]}
++EOM
++
++test_parse_error('expected at least 2 lines', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [], "Manifest-Checksum": null}
++EOM
++
++my $manifest_without_newline = <<EOM;
++{"PostgreSQL-Backup-Manifest-Version": 1,
++ "Files": [],
++ "Manifest-Checksum": null}
++EOM
++chomp($manifest_without_newline);
++test_parse_error('last line not newline-terminated',
++				 $manifest_without_newline);
++
++test_fatal_error('invalid manifest checksum', <<EOM);
++{"PostgreSQL-Backup-Manifest-Version": 1, "Files": [],
++ "Manifest-Checksum": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01234567890-"}
++EOM
++
++sub test_parse_error
++{
++	my ($test_name, $manifest_contents) = @_;
++
++	test_bad_manifest($test_name,
++					  qr/could not parse backup manifest: $test_name/,
++					  $manifest_contents);
++}
++
++sub test_fatal_error
++{
++	my ($test_name, $manifest_contents) = @_;
++
++	test_bad_manifest($test_name,
++					  qr/fatal: $test_name/,
++					  $manifest_contents);
++}
++
++sub test_bad_manifest
++{
++	my ($test_name, $regexp, $manifest_contents) = @_;
++
++	open(my $fh, '>', "$tempdir/backup_manifest") || die "open: $!";
++	print $fh $manifest_contents;
++	close($fh);
++
++	command_fails_like(['pg_validatebackup', $tempdir], $regexp,
++					   $test_name);
++}
+diff --git a/src/bin/pg_validatebackup/t/006_encoding.pl b/src/bin/pg_validatebackup/t/006_encoding.pl
+new file mode 100644
+index 000000000000..5e3e7152a524
+--- /dev/null
++++ b/src/bin/pg_validatebackup/t/006_encoding.pl
+@@ -0,0 +1,27 @@
++# Verify that pg_validatebackup handles hex-encoded filenames correctly.
++
++use strict;
++use warnings;
++use Cwd;
++use Config;
++use PostgresNode;
++use TestLib;
++use Test::More tests => 5;
++
++my $master = get_new_node('master');
++$master->init(allows_streaming => 1);
++$master->start;
++my $backup_path = $master->backup_dir . '/test_encoding';
++$master->command_ok(['pg_basebackup', '-D', $backup_path, '--no-sync',
++					'--manifest-force-encode' ],
++					"backup ok with forced hex encoding");
++
++my $manifest = slurp_file("$backup_path/backup_manifest");
++my $count_of_encoded_path_in_manifest =
++	(() = $manifest =~ /Encoded-Path/mig);
++cmp_ok($count_of_encoded_path_in_manifest, '>', 100,
++	   "many paths are encoded in the manifest");
++
++command_like(['pg_validatebackup', '-s', $backup_path ],
++			 qr/backup successfully verified/,
++			 'backup with forced encoding validated');
+diff --git a/src/bin/pg_validatebackup/t/007_wal.pl b/src/bin/pg_validatebackup/t/007_wal.pl
+new file mode 100644
+index 000000000000..b755e0f5e7ff
+--- /dev/null
++++ b/src/bin/pg_validatebackup/t/007_wal.pl
+@@ -0,0 +1,55 @@
++# Test pg_validatebackup's WAL validation.
++
++use strict;
++use warnings;
++use Cwd;
++use Config;
++use File::Path qw(rmtree);
++use PostgresNode;
++use TestLib;
++use Test::More tests => 7;
++
++# Start up the server and take a backup.
++my $master = get_new_node('master');
++$master->init(allows_streaming => 1);
++$master->start;
++my $backup_path = $master->backup_dir . '/test_wal';
++$master->command_ok(['pg_basebackup', '-D', $backup_path, '--no-sync' ],
++					"base backup ok");
++
++# Rename pg_wal.
++my $original_pg_wal = $backup_path . '/pg_wal';
++my $relocated_pg_wal = $master->backup_dir . '/relocated_pg_wal';
++rename($original_pg_wal, $relocated_pg_wal) || die "rename pg_wal: $!";
++
++# WAL validation should fail.
++command_fails_like(['pg_validatebackup', $backup_path ],
++				   qr/WAL parsing failed for timeline 1/,
++				   'missing pg_wal causes failure');
++
++# Should work if we skip WAL verification.
++command_ok(['pg_validatebackup', '-n', $backup_path ],
++		   'missing pg_wal OK if not verifying WAL');
++
++# Should also work if we specify the correct WAL location.
++command_ok(['pg_validatebackup', '-w', $relocated_pg_wal, $backup_path ],
++		   '-w can be used to specify WAL directory');
++
++# Move directory back to original location.
++rename($relocated_pg_wal, $original_pg_wal) || die "rename pg_wal back: $!";
++
++# Get a list of files in that directory that look like WAL files.
++my @walfiles = grep { /^[0-9A-F]{24}$/ } slurp_dir($original_pg_wal);
++
++# Replace the contents of one of the files with garbage of equal length.
++my $wal_corruption_target = $original_pg_wal . '/' . $walfiles[0];
++my $wal_size = -s $wal_corruption_target;
++open(my $fh, '>', $wal_corruption_target)
++	|| die "open $wal_corruption_target: $!";
++print $fh 'w' x $wal_size;
++close($fh);
++
++# WAL validation should fail.
++command_fails_like(['pg_validatebackup', $backup_path ],
++				   qr/WAL parsing failed for timeline 1/,
++				   'corrupt WAL file causes failure');
+diff --git a/src/include/replication/basebackup.h b/src/include/replication/basebackup.h
+index 07ed281bd637..d5b594c928d2 100644
+--- a/src/include/replication/basebackup.h
++++ b/src/include/replication/basebackup.h
+@@ -12,6 +12,7 @@
+ #ifndef _BASEBACKUP_H
+ #define _BASEBACKUP_H
+ 
++#include "lib/stringinfo.h"
+ #include "nodes/replnodes.h"
+ 
+ /*
+@@ -29,8 +30,12 @@ typedef struct
+ 	int64		size;
+ } tablespaceinfo;
+ 
++struct manifest_info;
++typedef struct manifest_info manifest_info;
++
+ extern void SendBaseBackup(BaseBackupCmd *cmd);
+ 
+-extern int64 sendTablespace(char *path, bool sizeonly);
++extern int64 sendTablespace(char *path, char *oid, bool sizeonly,
++							manifest_info *manifest);
+ 
+ #endif							/* _BASEBACKUP_H */
+diff --git a/src/include/replication/walsender.h b/src/include/replication/walsender.h
+index fd4305e53fa3..40d81b87f07b 100644
+--- a/src/include/replication/walsender.h
++++ b/src/include/replication/walsender.h
+@@ -38,6 +38,7 @@ extern bool log_replication_commands;
+ extern void InitWalSender(void);
+ extern bool exec_replication_command(const char *query_string);
+ extern void WalSndErrorCleanup(void);
++extern void WalSndResourceCleanup(bool isCommit);
+ extern void WalSndSignals(void);
+ extern Size WalSndShmemSize(void);
+ extern void WalSndShmemInit(void);

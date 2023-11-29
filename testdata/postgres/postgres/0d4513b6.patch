@@ -1,0 +1,350 @@
+From 0d4513b6138650355fcc981a9f34ff57b8d69db4 Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Tue, 8 Feb 2022 11:17:21 -0500
+Subject: [PATCH] Remove server support for the previous base backup protocol.
+
+Commit cc333f32336f5146b75190f57ef587dff225f565 added a new COPY
+sub-protocol for taking base backups, but retained support for the
+previous protocol. For the same reasons articulated in the message
+for commit 9cd28c2e5f11dfeef64a14035b82e70acead65fd, remove support
+for the previous protocol from the server.
+
+Discussion: http://postgr.es/m/CA+TgmoazKcKUWtqVa0xZqSzbKgTH+X-aw4V7GyLD68EpDLMh8A@mail.gmail.com
+---
+ doc/src/sgml/protocol.sgml                |  34 +----
+ src/backend/replication/basebackup.c      |  11 +-
+ src/backend/replication/basebackup_copy.c | 172 ++--------------------
+ src/include/replication/basebackup_sink.h |   1 -
+ 4 files changed, 21 insertions(+), 197 deletions(-)
+
+diff --git a/doc/src/sgml/protocol.sgml b/doc/src/sgml/protocol.sgml
+index 71f746e891fe..fd03c860bdf5 100644
+--- a/doc/src/sgml/protocol.sgml
++++ b/doc/src/sgml/protocol.sgml
+@@ -2634,13 +2634,8 @@ The commands accepted in replication mode are:
+         <term><literal>TARGET</literal> <replaceable>'target'</replaceable></term>
+         <listitem>
+          <para>
+-          Tells the server where to send the backup. If not specified,
+-          the legacy base backup protocol will be used. Otherwise, the new
+-          protocol will be used, as described below.
+-         </para>
+-
+-         <para>
+-          If the target is <literal>client</literal>, the backup data is
++          Tells the server where to send the backup.  If the target is
++          <literal>client</literal>, which is the default, the backup data is
+           sent to the client. If it is <literal>server</literal>, the backup
+           data is written to the server at the pathname specified by the
+           <literal>TARGET_DETAIL</literal> option. If it is
+@@ -2866,25 +2861,8 @@ The commands accepted in replication mode are:
+      </para>
+ 
+      <para>
+-      After the second regular result set, one or more CopyOutResponse results
+-      will be sent. If the <literal>TARGET</literal> option is not specified,
+-      the legacy base backup protocol will be used. In this mode,
+-      there will be one CopyOutResponse for the main directory, one for each
+-      additional tablespace other than <literal>pg_default</literal> and
+-      <literal>pg_global</literal>, and one for the backup manifested if
+-      requested. The main data directory and any additional tablespaces will
+-      be sent in tar format (following the <quote>ustar interchange
+-      format</quote> specified in the POSIX 1003.1-2008 standard), and
+-      the manifest will sent as a plain file.  Prior to
+-      <literal>PostgreSQL</literal> 15, the server omitted the two trailing
+-      blocks of zeroes specified in the standard, but this is no longer the
+-      case.
+-     </para>
+- 
+-     <para>
+-      New applications should specify the <literal>TARGET</literal> option.
+-      When that option is used, a single CopyOutResponse will be sent, and
+-      the payload of each CopyData message will contain a message in one of
++      After the second regular result set, a CopyOutResponse will be sent.
++      The payload of each CopyData message will contain a message in one of
+       the following formats:
+      </para>
+ 
+@@ -2898,6 +2876,10 @@ The commands accepted in replication mode are:
+             <term>Byte1('n')</term>
+             <listitem><para>
+               Identifes the messaage as indicating the start of a new archive.
++              There will be one archive for the main data directory and one
++              for each additional tablespace; each will use tar format
++              (following the <quote>ustar interchange format</quote> specified
++              in the POSIX 1003.1-2008 standard).
+             </para></listitem>
+           </varlistentry>
+           <varlistentry>
+diff --git a/src/backend/replication/basebackup.c b/src/backend/replication/basebackup.c
+index 10ce2406c0f8..fcd9161f749e 100644
+--- a/src/backend/replication/basebackup.c
++++ b/src/backend/replication/basebackup.c
+@@ -56,7 +56,6 @@
+ typedef enum
+ {
+ 	BACKUP_TARGET_BLACKHOLE,
+-	BACKUP_TARGET_COMPAT,
+ 	BACKUP_TARGET_CLIENT,
+ 	BACKUP_TARGET_SERVER
+ } backup_target_type;
+@@ -719,7 +718,7 @@ parse_basebackup_options(List *options, basebackup_options *opt)
+ 	bool		o_compression_level = false;
+ 
+ 	MemSet(opt, 0, sizeof(*opt));
+-	opt->target = BACKUP_TARGET_COMPAT;
++	opt->target = BACKUP_TARGET_CLIENT;
+ 	opt->manifest = MANIFEST_OPTION_NO;
+ 	opt->manifest_checksum_type = CHECKSUM_TYPE_CRC32C;
+ 	opt->compression = BACKUP_COMPRESSION_NONE;
+@@ -992,16 +991,11 @@ SendBaseBackup(BaseBackupCmd *cmd)
+ 	 * protocol. If the target is specifically 'client' then set up to stream
+ 	 * the backup to the client; otherwise, it's being sent someplace else and
+ 	 * should not be sent to the client.
+-	 *
+-	 * If the TARGET option was not specified, we must fall back to the older
+-	 * and less capable copy-tablespace protocol.
+ 	 */
+ 	if (opt.target == BACKUP_TARGET_CLIENT)
+ 		sink = bbsink_copystream_new(true);
+-	else if (opt.target != BACKUP_TARGET_COMPAT)
+-		sink = bbsink_copystream_new(false);
+ 	else
+-		sink = bbsink_copytblspc_new();
++		sink = bbsink_copystream_new(false);
+ 
+ 	/*
+ 	 * If a non-default backup target is in use, arrange to send the data
+@@ -1012,7 +1006,6 @@ SendBaseBackup(BaseBackupCmd *cmd)
+ 		case BACKUP_TARGET_BLACKHOLE:
+ 			/* Nothing to do, just discard data. */
+ 			break;
+-		case BACKUP_TARGET_COMPAT:
+ 		case BACKUP_TARGET_CLIENT:
+ 			/* Nothing to do, handling above is sufficient. */
+ 			break;
+diff --git a/src/backend/replication/basebackup_copy.c b/src/backend/replication/basebackup_copy.c
+index 938e19a6a439..de7875552cef 100644
+--- a/src/backend/replication/basebackup_copy.c
++++ b/src/backend/replication/basebackup_copy.c
+@@ -3,25 +3,18 @@
+  * basebackup_copy.c
+  *	  send basebackup archives using COPY OUT
+  *
+- * We have two different ways of doing this.
++ * We send a result set with information about the tabelspaces to be included
++ * in the backup before starting COPY OUT. Then, we start a single COPY OUT
++ * operation and transmits all the archives and the manifest if present during
++ * the course of that single COPY OUT. Each CopyData message begins with a
++ * type byte, allowing us to signal the start of a new archive, or the
++ * manifest, by some means other than ending the COPY stream. This also allows
++ * for future protocol extensions, since we can include arbitrary information
++ * in the message stream as long as we're certain that the client will know
++ * what to do with it.
+  *
+- * 'copytblspc' is an older method still supported for compatibility
+- * with releases prior to v15. In this method, a separate COPY OUT
+- * operation is used for each tablespace. The manifest, if it is sent,
+- * uses an additional COPY OUT operation.
+- *
+- * 'copystream' sends a starts a single COPY OUT operation and transmits
+- * all the archives and the manifest if present during the course of that
+- * single COPY OUT. Each CopyData message begins with a type byte,
+- * allowing us to signal the start of a new archive, or the manifest,
+- * by some means other than ending the COPY stream. This also allows
+- * this protocol to be extended more easily, since we can include
+- * arbitrary information in the message stream as long as we're certain
+- * that the client will know what to do with it.
+- *
+- * Regardless of which method is used, we sent a result set with
+- * information about the tabelspaces to be included in the backup before
+- * starting COPY OUT. This result has the same format in every method.
++ * An older method that sent each archive using a separate COPY OUT
++ * operation is no longer supported.
+  *
+  * Portions Copyright (c) 2010-2022, PostgreSQL Global Development Group
+  *
+@@ -87,20 +80,7 @@ static void bbsink_copystream_end_backup(bbsink *sink, XLogRecPtr endptr,
+ 										 TimeLineID endtli);
+ static void bbsink_copystream_cleanup(bbsink *sink);
+ 
+-static void bbsink_copytblspc_begin_backup(bbsink *sink);
+-static void bbsink_copytblspc_begin_archive(bbsink *sink,
+-											const char *archive_name);
+-static void bbsink_copytblspc_archive_contents(bbsink *sink, size_t len);
+-static void bbsink_copytblspc_end_archive(bbsink *sink);
+-static void bbsink_copytblspc_begin_manifest(bbsink *sink);
+-static void bbsink_copytblspc_manifest_contents(bbsink *sink, size_t len);
+-static void bbsink_copytblspc_end_manifest(bbsink *sink);
+-static void bbsink_copytblspc_end_backup(bbsink *sink, XLogRecPtr endptr,
+-										 TimeLineID endtli);
+-static void bbsink_copytblspc_cleanup(bbsink *sink);
+-
+ static void SendCopyOutResponse(void);
+-static void SendCopyData(const char *data, size_t len);
+ static void SendCopyDone(void);
+ static void SendXlogRecPtrResult(XLogRecPtr ptr, TimeLineID tli);
+ static void SendTablespaceList(List *tablespaces);
+@@ -118,18 +98,6 @@ const bbsink_ops bbsink_copystream_ops = {
+ 	.cleanup = bbsink_copystream_cleanup
+ };
+ 
+-const bbsink_ops bbsink_copytblspc_ops = {
+-	.begin_backup = bbsink_copytblspc_begin_backup,
+-	.begin_archive = bbsink_copytblspc_begin_archive,
+-	.archive_contents = bbsink_copytblspc_archive_contents,
+-	.end_archive = bbsink_copytblspc_end_archive,
+-	.begin_manifest = bbsink_copytblspc_begin_manifest,
+-	.manifest_contents = bbsink_copytblspc_manifest_contents,
+-	.end_manifest = bbsink_copytblspc_end_manifest,
+-	.end_backup = bbsink_copytblspc_end_backup,
+-	.cleanup = bbsink_copytblspc_cleanup
+-};
+-
+ /*
+  * Create a new 'copystream' bbsink.
+  */
+@@ -338,115 +306,6 @@ bbsink_copystream_cleanup(bbsink *sink)
+ 	/* Nothing to do. */
+ }
+ 
+-/*
+- * Create a new 'copytblspc' bbsink.
+- */
+-bbsink *
+-bbsink_copytblspc_new(void)
+-{
+-	bbsink	   *sink = palloc0(sizeof(bbsink));
+-
+-	*((const bbsink_ops **) &sink->bbs_ops) = &bbsink_copytblspc_ops;
+-
+-	return sink;
+-}
+-
+-/*
+- * Begin backup.
+- */
+-static void
+-bbsink_copytblspc_begin_backup(bbsink *sink)
+-{
+-	bbsink_state *state = sink->bbs_state;
+-
+-	/* Create a suitable buffer. */
+-	sink->bbs_buffer = palloc(sink->bbs_buffer_length);
+-
+-	/* Tell client the backup start location. */
+-	SendXlogRecPtrResult(state->startptr, state->starttli);
+-
+-	/* Send client a list of tablespaces. */
+-	SendTablespaceList(state->tablespaces);
+-
+-	/* Send a CommandComplete message */
+-	pq_puttextmessage('C', "SELECT");
+-}
+-
+-/*
+- * Each archive is set as a separate stream of COPY data, and thus begins
+- * with a CopyOutResponse message.
+- */
+-static void
+-bbsink_copytblspc_begin_archive(bbsink *sink, const char *archive_name)
+-{
+-	SendCopyOutResponse();
+-}
+-
+-/*
+- * Each chunk of data within the archive is sent as a CopyData message.
+- */
+-static void
+-bbsink_copytblspc_archive_contents(bbsink *sink, size_t len)
+-{
+-	SendCopyData(sink->bbs_buffer, len);
+-}
+-
+-/*
+- * The archive is terminated by a CopyDone message.
+- */
+-static void
+-bbsink_copytblspc_end_archive(bbsink *sink)
+-{
+-	SendCopyDone();
+-}
+-
+-/*
+- * The backup manifest is sent as a separate stream of COPY data, and thus
+- * begins with a CopyOutResponse message.
+- */
+-static void
+-bbsink_copytblspc_begin_manifest(bbsink *sink)
+-{
+-	SendCopyOutResponse();
+-}
+-
+-/*
+- * Each chunk of manifest data is sent using a CopyData message.
+- */
+-static void
+-bbsink_copytblspc_manifest_contents(bbsink *sink, size_t len)
+-{
+-	SendCopyData(sink->bbs_buffer, len);
+-}
+-
+-/*
+- * When we've finished sending the manifest, send a CopyDone message.
+- */
+-static void
+-bbsink_copytblspc_end_manifest(bbsink *sink)
+-{
+-	SendCopyDone();
+-}
+-
+-/*
+- * Send end-of-backup wire protocol messages.
+- */
+-static void
+-bbsink_copytblspc_end_backup(bbsink *sink, XLogRecPtr endptr,
+-							 TimeLineID endtli)
+-{
+-	SendXlogRecPtrResult(endptr, endtli);
+-}
+-
+-/*
+- * Cleanup.
+- */
+-static void
+-bbsink_copytblspc_cleanup(bbsink *sink)
+-{
+-	/* Nothing to do. */
+-}
+-
+ /*
+  * Send a CopyOutResponse message.
+  */
+@@ -461,15 +320,6 @@ SendCopyOutResponse(void)
+ 	pq_endmessage(&buf);
+ }
+ 
+-/*
+- * Send a CopyData message.
+- */
+-static void
+-SendCopyData(const char *data, size_t len)
+-{
+-	pq_putmessage('d', data, len);
+-}
+-
+ /*
+  * Send a CopyDone message.
+  */
+diff --git a/src/include/replication/basebackup_sink.h b/src/include/replication/basebackup_sink.h
+index d3276b2487b6..2cfa816bb816 100644
+--- a/src/include/replication/basebackup_sink.h
++++ b/src/include/replication/basebackup_sink.h
+@@ -283,7 +283,6 @@ extern void bbsink_forward_cleanup(bbsink *sink);
+ 
+ /* Constructors for various types of sinks. */
+ extern bbsink *bbsink_copystream_new(bool send_to_client);
+-extern bbsink *bbsink_copytblspc_new(void);
+ extern bbsink *bbsink_gzip_new(bbsink *next, int compresslevel);
+ extern bbsink *bbsink_progress_new(bbsink *next, bool estimate_backup_size);
+ extern bbsink *bbsink_server_new(bbsink *next, char *pathname);

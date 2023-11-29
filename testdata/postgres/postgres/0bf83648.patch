@@ -1,0 +1,206 @@
+From 0bf83648a52df96f7c8677edbbdf141bfa0cf32b Mon Sep 17 00:00:00 2001
+From: Peter Eisentraut <peter@eisentraut.org>
+Date: Wed, 3 Feb 2021 11:27:13 +0100
+Subject: [PATCH] pg_dump: Fix dumping of inherited generated columns
+
+Generation expressions of generated columns are always inherited, so
+there is no need to set them separately in child tables, and there is
+no syntax to do so either.  The code previously used the code paths
+for the handling of default values, for which different rules apply;
+in particular it might want to set a default value explicitly for an
+inherited column.  This resulted in unrestorable dumps.  For generated
+columns, just skip them in inherited tables.
+
+Reviewed-by: Tom Lane <tgl@sss.pgh.pa.us>
+Discussion: https://www.postgresql.org/message-id/flat/15830.1575468847%40sss.pgh.pa.us
+---
+ src/bin/pg_dump/common.c         | 31 ++++++++++++++++-----
+ src/bin/pg_dump/pg_dump.c        | 37 +++++++++++++++++++++----
+ src/bin/pg_dump/t/002_pg_dump.pl | 46 ++++++++++++++++++++++++++++++++
+ 3 files changed, 102 insertions(+), 12 deletions(-)
+
+diff --git a/src/bin/pg_dump/common.c b/src/bin/pg_dump/common.c
+index b0f02bc1f6e5..1a261a554566 100644
+--- a/src/bin/pg_dump/common.c
++++ b/src/bin/pg_dump/common.c
+@@ -467,12 +467,22 @@ flagInhIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
+ /* flagInhAttrs -
+  *	 for each dumpable table in tblinfo, flag its inherited attributes
+  *
+- * What we need to do here is detect child columns that inherit NOT NULL
+- * bits from their parents (so that we needn't specify that again for the
+- * child) and child columns that have DEFAULT NULL when their parents had
+- * some non-null default.  In the latter case, we make up a dummy AttrDefInfo
+- * object so that we'll correctly emit the necessary DEFAULT NULL clause;
+- * otherwise the backend will apply an inherited default to the column.
++ * What we need to do here is:
++ *
++ * - Detect child columns that inherit NOT NULL bits from their parents, so
++ *   that we needn't specify that again for the child.
++ *
++ * - Detect child columns that have DEFAULT NULL when their parents had some
++ *   non-null default.  In this case, we make up a dummy AttrDefInfo object so
++ *   that we'll correctly emit the necessary DEFAULT NULL clause; otherwise
++ *   the backend will apply an inherited default to the column.
++ *
++ * - Detect child columns that have a generation expression when their parents
++ *   also have one.  Generation expressions are always inherited, so there is
++ *   no need to set them again in child tables, and there is no syntax for it
++ *   either.  (Exception: In binary upgrade mode we dump them because
++ *   inherited tables are recreated standalone first and then reattached to
++ *   the parent.)
+  *
+  * modifies tblinfo
+  */
+@@ -510,6 +520,7 @@ flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables)
+ 		{
+ 			bool		foundNotNull;	/* Attr was NOT NULL in a parent */
+ 			bool		foundDefault;	/* Found a default in a parent */
++			bool		foundGenerated;	/* Found a generated in a parent */
+ 
+ 			/* no point in examining dropped columns */
+ 			if (tbinfo->attisdropped[j])
+@@ -517,6 +528,7 @@ flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables)
+ 
+ 			foundNotNull = false;
+ 			foundDefault = false;
++			foundGenerated = false;
+ 			for (k = 0; k < numParents; k++)
+ 			{
+ 				TableInfo  *parent = parents[k];
+@@ -528,7 +540,8 @@ flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables)
+ 				if (inhAttrInd >= 0)
+ 				{
+ 					foundNotNull |= parent->notnull[inhAttrInd];
+-					foundDefault |= (parent->attrdefs[inhAttrInd] != NULL);
++					foundDefault |= (parent->attrdefs[inhAttrInd] != NULL && !parent->attgenerated[inhAttrInd]);
++					foundGenerated |= parent->attgenerated[inhAttrInd];
+ 				}
+ 			}
+ 
+@@ -570,6 +583,10 @@ flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables)
+ 
+ 				tbinfo->attrdefs[j] = attrDef;
+ 			}
++
++			/* Remove generation expression from child */
++			if (foundGenerated && !dopt->binary_upgrade)
++				tbinfo->attrdefs[j] = NULL;
+ 		}
+ 	}
+ }
+diff --git a/src/bin/pg_dump/pg_dump.c b/src/bin/pg_dump/pg_dump.c
+index 39da742e32c6..d99b61e6215f 100644
+--- a/src/bin/pg_dump/pg_dump.c
++++ b/src/bin/pg_dump/pg_dump.c
+@@ -8839,13 +8839,37 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
+ 				attrdefs[j].dobj.dump = tbinfo->dobj.dump;
+ 
+ 				/*
+-				 * Defaults on a VIEW must always be dumped as separate ALTER
+-				 * TABLE commands.  Defaults on regular tables are dumped as
+-				 * part of the CREATE TABLE if possible, which it won't be if
+-				 * the column is not going to be emitted explicitly.
++				 * Figure out whether the default/generation expression should
++				 * be dumped as part of the main CREATE TABLE (or similar)
++				 * command or as a separate ALTER TABLE (or similar) command.
++				 * The preference is to put it into the CREATE command, but in
++				 * some cases that's not possible.
+ 				 */
+-				if (tbinfo->relkind == RELKIND_VIEW)
++				if (tbinfo->attgenerated[adnum - 1])
+ 				{
++					/*
++					 * Column generation expressions cannot be dumped
++					 * separately, because there is no syntax for it.  The
++					 * !shouldPrintColumn case below will be tempted to set
++					 * them to separate if they are attached to an inherited
++					 * column without a local definition, but that would be
++					 * wrong and unnecessary, because generation expressions
++					 * are always inherited, so there is no need to set them
++					 * again in child tables, and there is no syntax for it
++					 * either.  By setting separate to false here we prevent
++					 * the "default" from being processed as its own dumpable
++					 * object, and flagInhAttrs() will remove it from the
++					 * table when it detects that it belongs to an inherited
++					 * column.
++					 */
++					attrdefs[j].separate = false;
++				}
++				else if (tbinfo->relkind == RELKIND_VIEW)
++				{
++					/*
++					 * Defaults on a VIEW must always be dumped as separate
++					 * ALTER TABLE commands.
++					 */
+ 					attrdefs[j].separate = true;
+ 				}
+ 				else if (!shouldPrintColumn(dopt, tbinfo, adnum - 1))
+@@ -8856,7 +8880,10 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
+ 				else
+ 				{
+ 					attrdefs[j].separate = false;
++				}
+ 
++				if (!attrdefs[j].separate)
++				{
+ 					/*
+ 					 * Mark the default as needing to appear before the table,
+ 					 * so that any dependencies it has must be emitted before
+diff --git a/src/bin/pg_dump/t/002_pg_dump.pl b/src/bin/pg_dump/t/002_pg_dump.pl
+index 798884da36b1..737e46464ab7 100644
+--- a/src/bin/pg_dump/t/002_pg_dump.pl
++++ b/src/bin/pg_dump/t/002_pg_dump.pl
+@@ -2493,6 +2493,52 @@
+ 		unlike => { exclude_dump_test_schema => 1, },
+ 	},
+ 
++	'CREATE TABLE test_table_generated_child1 (without local columns)' => {
++		create_order => 4,
++		create_sql   => 'CREATE TABLE dump_test.test_table_generated_child1 ()
++						 INHERITS (dump_test.test_table_generated);',
++		regexp => qr/^
++			\QCREATE TABLE dump_test.test_table_generated_child1 (\E\n
++			\)\n
++			\QINHERITS (dump_test.test_table_generated);\E\n
++			/xms,
++		like =>
++		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
++		unlike => {
++			binary_upgrade           => 1,
++			exclude_dump_test_schema => 1,
++		},
++	},
++
++	'ALTER TABLE test_table_generated_child1' => {
++		regexp =>
++		  qr/^\QALTER TABLE ONLY dump_test.test_table_generated_child1 ALTER COLUMN col2 \E/m,
++
++		# should not get emitted
++		like => {},
++	},
++
++	'CREATE TABLE test_table_generated_child2 (with local columns)' => {
++		create_order => 4,
++		create_sql   => 'CREATE TABLE dump_test.test_table_generated_child2 (
++						   col1 int,
++						   col2 int
++						 ) INHERITS (dump_test.test_table_generated);',
++		regexp => qr/^
++			\QCREATE TABLE dump_test.test_table_generated_child2 (\E\n
++			\s+\Qcol1 integer,\E\n
++			\s+\Qcol2 integer\E\n
++			\)\n
++			\QINHERITS (dump_test.test_table_generated);\E\n
++			/xms,
++		like =>
++		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
++		unlike => {
++			binary_upgrade           => 1,
++			exclude_dump_test_schema => 1,
++		},
++	},
++
+ 	'CREATE TABLE table_with_stats' => {
+ 		create_order => 98,
+ 		create_sql   => 'CREATE TABLE dump_test.table_index_stats (
