@@ -1,0 +1,318 @@
+From 05c0258966b502fae1bd63dcbe74d52f5c6f6948 Mon Sep 17 00:00:00 2001
+From: Jeff Davis <jdavis@postgresql.org>
+Date: Sat, 26 Dec 2020 17:25:30 -0800
+Subject: [PATCH] Fix bug #16784 in Disk-based Hash Aggregation.
+
+Before processing tuples, agg_refill_hash_table() was setting all
+pergroup pointers to NULL to signal to advance_aggregates() that it
+should not attempt to advance groups that had spilled.
+
+The problem was that it also set the pergroups for sorted grouping
+sets to NULL, which caused rescanning to fail.
+
+Instead, change agg_refill_hash_table() to only set the pergroups for
+hashed grouping sets to NULL; and when compiling the expression, pass
+doSort=false.
+
+Reported-by: Alexander Lakhin
+Discussion: https://postgr.es/m/16784-7ff169bf2c3d1588%40postgresql.org
+Backpatch-through: 13
+---
+ src/backend/executor/nodeAgg.c             |  24 ++-
+ src/test/regress/expected/groupingsets.out | 207 +++++++++++++++++++++
+ src/test/regress/sql/groupingsets.sql      |  21 +++
+ 3 files changed, 245 insertions(+), 7 deletions(-)
+
+diff --git a/src/backend/executor/nodeAgg.c b/src/backend/executor/nodeAgg.c
+index dc640feb6311..da483268cf70 100644
+--- a/src/backend/executor/nodeAgg.c
++++ b/src/backend/executor/nodeAgg.c
+@@ -1750,9 +1750,15 @@ hashagg_recompile_expressions(AggState *aggstate, bool minslot, bool nullcheck)
+ 		const TupleTableSlotOps *outerops = aggstate->ss.ps.outerops;
+ 		bool		outerfixed = aggstate->ss.ps.outeropsfixed;
+ 		bool		dohash = true;
+-		bool		dosort;
++		bool		dosort = false;
+ 
+-		dosort = aggstate->aggstrategy == AGG_MIXED ? true : false;
++		/*
++		 * If minslot is true, that means we are processing a spilled batch
++		 * (inside agg_refill_hash_table()), and we must not advance the
++		 * sorted grouping sets.
++		 */
++		if (aggstate->aggstrategy == AGG_MIXED && !minslot)
++			dosort = true;
+ 
+ 		/* temporarily change the outerops while compiling the expression */
+ 		if (minslot)
+@@ -2593,11 +2599,15 @@ agg_refill_hash_table(AggState *aggstate)
+ 						batch->used_bits, &aggstate->hash_mem_limit,
+ 						&aggstate->hash_ngroups_limit, NULL);
+ 
+-	/* there could be residual pergroup pointers; clear them */
+-	for (int setoff = 0;
+-		 setoff < aggstate->maxsets + aggstate->num_hashes;
+-		 setoff++)
+-		aggstate->all_pergroups[setoff] = NULL;
++	/*
++	 * Each batch only processes one grouping set; set the rest to NULL so
++	 * that advance_aggregates() knows to ignore them. We don't touch
++	 * pergroups for sorted grouping sets here, because they will be needed if
++	 * we rescan later. The expressions for sorted grouping sets will not be
++	 * evaluated after we recompile anyway.
++	 */
++	MemSet(aggstate->hash_pergroup, 0,
++		   sizeof(AggStatePerGroup) * aggstate->num_hashes);
+ 
+ 	/* free memory and reset hash tables */
+ 	ReScanExprContext(aggstate->hashcontext);
+diff --git a/src/test/regress/expected/groupingsets.out b/src/test/regress/expected/groupingsets.out
+index 701d52b465d5..c00b2dd64883 100644
+--- a/src/test/regress/expected/groupingsets.out
++++ b/src/test/regress/expected/groupingsets.out
+@@ -1665,6 +1665,213 @@ select v||'a', case when grouping(v||'a') = 1 then 1 else 0 end, count(*)
+           |    1 |     2
+ (4 rows)
+ 
++-- Bug #16784
++CREATE TABLE bug_16784(i INT, j INT);
++ANALYZE bug_16784;
++ALTER TABLE bug_16784 SET (autovacuum_enabled = 'false');
++UPDATE pg_class SET reltuples = 10 WHERE relname='bug_16784';
++INSERT INTO bug_16784 SELECT g/10, g FROM generate_series(1,40) g;
++SET work_mem='64kB';
++explain (costs off) select * from
++  (values (1),(2)) v(a),
++  lateral (select v.a, i, j, count(*) from
++             bug_16784 group by cube(i,j)) s
++  order by v.a, i, j;
++                        QUERY PLAN                        
++----------------------------------------------------------
++ Sort
++   Sort Key: "*VALUES*".column1, bug_16784.i, bug_16784.j
++   ->  Nested Loop
++         ->  Values Scan on "*VALUES*"
++         ->  MixedAggregate
++               Hash Key: bug_16784.i, bug_16784.j
++               Hash Key: bug_16784.i
++               Hash Key: bug_16784.j
++               Group Key: ()
++               ->  Seq Scan on bug_16784
++(10 rows)
++
++select * from
++  (values (1),(2)) v(a),
++  lateral (select a, i, j, count(*) from
++             bug_16784 group by cube(i,j)) s
++  order by v.a, i, j;
++ a | a | i | j  | count 
++---+---+---+----+-------
++ 1 | 1 | 0 |  1 |     1
++ 1 | 1 | 0 |  2 |     1
++ 1 | 1 | 0 |  3 |     1
++ 1 | 1 | 0 |  4 |     1
++ 1 | 1 | 0 |  5 |     1
++ 1 | 1 | 0 |  6 |     1
++ 1 | 1 | 0 |  7 |     1
++ 1 | 1 | 0 |  8 |     1
++ 1 | 1 | 0 |  9 |     1
++ 1 | 1 | 0 |    |     9
++ 1 | 1 | 1 | 10 |     1
++ 1 | 1 | 1 | 11 |     1
++ 1 | 1 | 1 | 12 |     1
++ 1 | 1 | 1 | 13 |     1
++ 1 | 1 | 1 | 14 |     1
++ 1 | 1 | 1 | 15 |     1
++ 1 | 1 | 1 | 16 |     1
++ 1 | 1 | 1 | 17 |     1
++ 1 | 1 | 1 | 18 |     1
++ 1 | 1 | 1 | 19 |     1
++ 1 | 1 | 1 |    |    10
++ 1 | 1 | 2 | 20 |     1
++ 1 | 1 | 2 | 21 |     1
++ 1 | 1 | 2 | 22 |     1
++ 1 | 1 | 2 | 23 |     1
++ 1 | 1 | 2 | 24 |     1
++ 1 | 1 | 2 | 25 |     1
++ 1 | 1 | 2 | 26 |     1
++ 1 | 1 | 2 | 27 |     1
++ 1 | 1 | 2 | 28 |     1
++ 1 | 1 | 2 | 29 |     1
++ 1 | 1 | 2 |    |    10
++ 1 | 1 | 3 | 30 |     1
++ 1 | 1 | 3 | 31 |     1
++ 1 | 1 | 3 | 32 |     1
++ 1 | 1 | 3 | 33 |     1
++ 1 | 1 | 3 | 34 |     1
++ 1 | 1 | 3 | 35 |     1
++ 1 | 1 | 3 | 36 |     1
++ 1 | 1 | 3 | 37 |     1
++ 1 | 1 | 3 | 38 |     1
++ 1 | 1 | 3 | 39 |     1
++ 1 | 1 | 3 |    |    10
++ 1 | 1 | 4 | 40 |     1
++ 1 | 1 | 4 |    |     1
++ 1 | 1 |   |  1 |     1
++ 1 | 1 |   |  2 |     1
++ 1 | 1 |   |  3 |     1
++ 1 | 1 |   |  4 |     1
++ 1 | 1 |   |  5 |     1
++ 1 | 1 |   |  6 |     1
++ 1 | 1 |   |  7 |     1
++ 1 | 1 |   |  8 |     1
++ 1 | 1 |   |  9 |     1
++ 1 | 1 |   | 10 |     1
++ 1 | 1 |   | 11 |     1
++ 1 | 1 |   | 12 |     1
++ 1 | 1 |   | 13 |     1
++ 1 | 1 |   | 14 |     1
++ 1 | 1 |   | 15 |     1
++ 1 | 1 |   | 16 |     1
++ 1 | 1 |   | 17 |     1
++ 1 | 1 |   | 18 |     1
++ 1 | 1 |   | 19 |     1
++ 1 | 1 |   | 20 |     1
++ 1 | 1 |   | 21 |     1
++ 1 | 1 |   | 22 |     1
++ 1 | 1 |   | 23 |     1
++ 1 | 1 |   | 24 |     1
++ 1 | 1 |   | 25 |     1
++ 1 | 1 |   | 26 |     1
++ 1 | 1 |   | 27 |     1
++ 1 | 1 |   | 28 |     1
++ 1 | 1 |   | 29 |     1
++ 1 | 1 |   | 30 |     1
++ 1 | 1 |   | 31 |     1
++ 1 | 1 |   | 32 |     1
++ 1 | 1 |   | 33 |     1
++ 1 | 1 |   | 34 |     1
++ 1 | 1 |   | 35 |     1
++ 1 | 1 |   | 36 |     1
++ 1 | 1 |   | 37 |     1
++ 1 | 1 |   | 38 |     1
++ 1 | 1 |   | 39 |     1
++ 1 | 1 |   | 40 |     1
++ 1 | 1 |   |    |    40
++ 2 | 2 | 0 |  1 |     1
++ 2 | 2 | 0 |  2 |     1
++ 2 | 2 | 0 |  3 |     1
++ 2 | 2 | 0 |  4 |     1
++ 2 | 2 | 0 |  5 |     1
++ 2 | 2 | 0 |  6 |     1
++ 2 | 2 | 0 |  7 |     1
++ 2 | 2 | 0 |  8 |     1
++ 2 | 2 | 0 |  9 |     1
++ 2 | 2 | 0 |    |     9
++ 2 | 2 | 1 | 10 |     1
++ 2 | 2 | 1 | 11 |     1
++ 2 | 2 | 1 | 12 |     1
++ 2 | 2 | 1 | 13 |     1
++ 2 | 2 | 1 | 14 |     1
++ 2 | 2 | 1 | 15 |     1
++ 2 | 2 | 1 | 16 |     1
++ 2 | 2 | 1 | 17 |     1
++ 2 | 2 | 1 | 18 |     1
++ 2 | 2 | 1 | 19 |     1
++ 2 | 2 | 1 |    |    10
++ 2 | 2 | 2 | 20 |     1
++ 2 | 2 | 2 | 21 |     1
++ 2 | 2 | 2 | 22 |     1
++ 2 | 2 | 2 | 23 |     1
++ 2 | 2 | 2 | 24 |     1
++ 2 | 2 | 2 | 25 |     1
++ 2 | 2 | 2 | 26 |     1
++ 2 | 2 | 2 | 27 |     1
++ 2 | 2 | 2 | 28 |     1
++ 2 | 2 | 2 | 29 |     1
++ 2 | 2 | 2 |    |    10
++ 2 | 2 | 3 | 30 |     1
++ 2 | 2 | 3 | 31 |     1
++ 2 | 2 | 3 | 32 |     1
++ 2 | 2 | 3 | 33 |     1
++ 2 | 2 | 3 | 34 |     1
++ 2 | 2 | 3 | 35 |     1
++ 2 | 2 | 3 | 36 |     1
++ 2 | 2 | 3 | 37 |     1
++ 2 | 2 | 3 | 38 |     1
++ 2 | 2 | 3 | 39 |     1
++ 2 | 2 | 3 |    |    10
++ 2 | 2 | 4 | 40 |     1
++ 2 | 2 | 4 |    |     1
++ 2 | 2 |   |  1 |     1
++ 2 | 2 |   |  2 |     1
++ 2 | 2 |   |  3 |     1
++ 2 | 2 |   |  4 |     1
++ 2 | 2 |   |  5 |     1
++ 2 | 2 |   |  6 |     1
++ 2 | 2 |   |  7 |     1
++ 2 | 2 |   |  8 |     1
++ 2 | 2 |   |  9 |     1
++ 2 | 2 |   | 10 |     1
++ 2 | 2 |   | 11 |     1
++ 2 | 2 |   | 12 |     1
++ 2 | 2 |   | 13 |     1
++ 2 | 2 |   | 14 |     1
++ 2 | 2 |   | 15 |     1
++ 2 | 2 |   | 16 |     1
++ 2 | 2 |   | 17 |     1
++ 2 | 2 |   | 18 |     1
++ 2 | 2 |   | 19 |     1
++ 2 | 2 |   | 20 |     1
++ 2 | 2 |   | 21 |     1
++ 2 | 2 |   | 22 |     1
++ 2 | 2 |   | 23 |     1
++ 2 | 2 |   | 24 |     1
++ 2 | 2 |   | 25 |     1
++ 2 | 2 |   | 26 |     1
++ 2 | 2 |   | 27 |     1
++ 2 | 2 |   | 28 |     1
++ 2 | 2 |   | 29 |     1
++ 2 | 2 |   | 30 |     1
++ 2 | 2 |   | 31 |     1
++ 2 | 2 |   | 32 |     1
++ 2 | 2 |   | 33 |     1
++ 2 | 2 |   | 34 |     1
++ 2 | 2 |   | 35 |     1
++ 2 | 2 |   | 36 |     1
++ 2 | 2 |   | 37 |     1
++ 2 | 2 |   | 38 |     1
++ 2 | 2 |   | 39 |     1
++ 2 | 2 |   | 40 |     1
++ 2 | 2 |   |    |    40
++(172 rows)
++
+ --
+ -- Compare results between plans using sorting and plans using hash
+ -- aggregation. Force spilling in both cases by setting work_mem low
+diff --git a/src/test/regress/sql/groupingsets.sql b/src/test/regress/sql/groupingsets.sql
+index d4e5628eba8d..93b33c65d172 100644
+--- a/src/test/regress/sql/groupingsets.sql
++++ b/src/test/regress/sql/groupingsets.sql
+@@ -457,6 +457,27 @@ select v||'a', case when grouping(v||'a') = 1 then 1 else 0 end, count(*)
+   from unnest(array[1,1], array['a','b']) u(i,v)
+  group by rollup(i, v||'a') order by 1,3;
+ 
++-- Bug #16784
++CREATE TABLE bug_16784(i INT, j INT);
++ANALYZE bug_16784;
++ALTER TABLE bug_16784 SET (autovacuum_enabled = 'false');
++UPDATE pg_class SET reltuples = 10 WHERE relname='bug_16784';
++
++INSERT INTO bug_16784 SELECT g/10, g FROM generate_series(1,40) g;
++
++SET work_mem='64kB';
++
++explain (costs off) select * from
++  (values (1),(2)) v(a),
++  lateral (select v.a, i, j, count(*) from
++             bug_16784 group by cube(i,j)) s
++  order by v.a, i, j;
++select * from
++  (values (1),(2)) v(a),
++  lateral (select a, i, j, count(*) from
++             bug_16784 group by cube(i,j)) s
++  order by v.a, i, j;
++
+ --
+ -- Compare results between plans using sorting and plans using hash
+ -- aggregation. Force spilling in both cases by setting work_mem low

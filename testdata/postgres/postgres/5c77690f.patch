@@ -1,0 +1,152 @@
+From 5c77690f6f419c504b7d8248db30c2280217e72e Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 26 Jun 2017 14:39:55 -0400
+Subject: [PATCH] Improve wait logic in TAP tests for streaming replication.
+
+Remove hard-wired sleep(2) delays in 001_stream_rep.pl in favor of using
+poll_query_until to check for the desired state to appear.  In addition,
+add such a wait before the last test in the script, as it's possible
+to demonstrate failures there after upcoming improvements in pg_ctl.
+
+(We might end up adding polling before each of the get_slot_xmins calls in
+this script, but I feel no great need to do that until shown necessary.)
+
+In passing, clarify the description strings for some of the test cases.
+
+Michael Paquier and Craig Ringer, pursuant to a complaint from me
+
+Discussion: https://postgr.es/m/8962.1498425057@sss.pgh.pa.us
+---
+ src/test/recovery/t/001_stream_rep.pl | 65 ++++++++++++++++++---------
+ 1 file changed, 45 insertions(+), 20 deletions(-)
+
+diff --git a/src/test/recovery/t/001_stream_rep.pl b/src/test/recovery/t/001_stream_rep.pl
+index 266d27c8a2a5..750e40c3dafa 100644
+--- a/src/test/recovery/t/001_stream_rep.pl
++++ b/src/test/recovery/t/001_stream_rep.pl
+@@ -146,6 +146,20 @@ sub test_target_session_attrs
+ 	"wal_receiver_status_interval = 1");
+ $node_standby_2->restart;
+ 
++# Wait for given condition on slot's pg_replication_slots row --- useful for
++# ensuring we've reached a quiescent condition for reading slot xmins
++sub wait_slot_xmins
++{
++	my ($node, $slot_name, $check_expr) = @_;
++
++	$node->poll_query_until('postgres', qq[
++		SELECT $check_expr
++		FROM pg_catalog.pg_replication_slots
++		WHERE slot_name = '$slot_name';
++	]);
++}
++
++# Fetch xmin columns from slot's pg_replication_slots row
+ sub get_slot_xmins
+ {
+ 	my ($node, $slotname) = @_;
+@@ -156,12 +170,12 @@ sub get_slot_xmins
+ # There's no hot standby feedback and there are no logical slots on either peer
+ # so xmin and catalog_xmin should be null on both slots.
+ my ($xmin, $catalog_xmin) = get_slot_xmins($node_master, $slotname_1);
+-is($xmin,         '', 'non-cascaded slot xmin null with no hs_feedback');
+-is($catalog_xmin, '', 'non-cascaded slot xmin null with no hs_feedback');
++is($xmin,         '', 'xmin of non-cascaded slot null with no hs_feedback');
++is($catalog_xmin, '', 'catalog xmin of non-cascaded slot null with no hs_feedback');
+ 
+ ($xmin, $catalog_xmin) = get_slot_xmins($node_standby_1, $slotname_2);
+-is($xmin,         '', 'cascaded slot xmin null with no hs_feedback');
+-is($catalog_xmin, '', 'cascaded slot xmin null with no hs_feedback');
++is($xmin,         '', 'xmin of cascaded slot null with no hs_feedback');
++is($catalog_xmin, '', 'catalog xmin of cascaded slot null with no hs_feedback');
+ 
+ # Replication still works?
+ $node_master->safe_psql('postgres', 'CREATE TABLE replayed(val integer);');
+@@ -196,15 +210,18 @@ sub replay_check
+ 	'ALTER SYSTEM SET hot_standby_feedback = on;');
+ $node_standby_2->reload;
+ replay_check();
+-sleep(2);
++
++wait_slot_xmins($node_master, $slotname_1,
++				"xmin IS NOT NULL AND catalog_xmin IS NULL");
+ 
+ ($xmin, $catalog_xmin) = get_slot_xmins($node_master, $slotname_1);
+-isnt($xmin, '', 'non-cascaded slot xmin non-null with hs feedback');
+-is($catalog_xmin, '', 'non-cascaded slot xmin still null with hs_feedback');
++isnt($xmin, '', 'xmin of non-cascaded slot non-null with hs feedback');
++is($catalog_xmin, '',
++	'catalog xmin of non-cascaded slot still null with hs_feedback');
+ 
+ ($xmin, $catalog_xmin) = get_slot_xmins($node_standby_1, $slotname_2);
+-isnt($xmin, '', 'cascaded slot xmin non-null with hs feedback');
+-is($catalog_xmin, '', 'cascaded slot xmin still null with hs_feedback');
++isnt($xmin, '', 'xmin of cascaded slot non-null with hs feedback');
++is($catalog_xmin, '', 'catalog xmin of cascaded slot still null with hs_feedback');
+ 
+ note "doing some work to advance xmin";
+ for my $i (10000 .. 11000)
+@@ -216,15 +233,15 @@ sub replay_check
+ 
+ my ($xmin2, $catalog_xmin2) = get_slot_xmins($node_master, $slotname_1);
+ note "new xmin $xmin2, old xmin $xmin";
+-isnt($xmin2, $xmin, 'non-cascaded slot xmin with hs feedback has changed');
++isnt($xmin2, $xmin, 'xmin of non-cascaded slot with hs feedback has changed');
+ is($catalog_xmin2, '',
+-	'non-cascaded slot xmin still null with hs_feedback unchanged');
++	'catalog xmin of non-cascaded slot still null with hs_feedback unchanged');
+ 
+ ($xmin2, $catalog_xmin2) = get_slot_xmins($node_standby_1, $slotname_2);
+ note "new xmin $xmin2, old xmin $xmin";
+-isnt($xmin2, $xmin, 'cascaded slot xmin with hs feedback has changed');
++isnt($xmin2, $xmin, 'xmin of cascaded slot with hs feedback has changed');
+ is($catalog_xmin2, '',
+-	'cascaded slot xmin still null with hs_feedback unchanged');
++	'catalog xmin of cascaded slot still null with hs_feedback unchanged');
+ 
+ note "disabling hot_standby_feedback";
+ 
+@@ -236,16 +253,22 @@ sub replay_check
+ 	'ALTER SYSTEM SET hot_standby_feedback = off;');
+ $node_standby_2->reload;
+ replay_check();
+-sleep(2);
++
++wait_slot_xmins($node_master, $slotname_1,
++					   "xmin IS NULL AND catalog_xmin IS NULL");
+ 
+ ($xmin, $catalog_xmin) = get_slot_xmins($node_master, $slotname_1);
+-is($xmin, '', 'non-cascaded slot xmin null with hs feedback reset');
++is($xmin, '', 'xmin of non-cascaded slot null with hs feedback reset');
+ is($catalog_xmin, '',
+-	'non-cascaded slot xmin still null with hs_feedback reset');
++   'catalog xmin of non-cascaded slot still null with hs_feedback reset');
++
++wait_slot_xmins($node_standby_1, $slotname_2,
++					   "xmin IS NULL AND catalog_xmin IS NULL");
+ 
+ ($xmin, $catalog_xmin) = get_slot_xmins($node_standby_1, $slotname_2);
+-is($xmin,         '', 'cascaded slot xmin null with hs feedback reset');
+-is($catalog_xmin, '', 'cascaded slot xmin still null with hs_feedback reset');
++is($xmin,         '', 'xmin of cascaded slot null with hs feedback reset');
++is($catalog_xmin, '',
++	'catalog xmin of cascaded slot still null with hs_feedback reset');
+ 
+ note "re-enabling hot_standby_feedback and disabling while stopped";
+ $node_standby_2->safe_psql('postgres',
+@@ -260,11 +283,13 @@ sub replay_check
+ $node_standby_2->stop;
+ 
+ ($xmin, $catalog_xmin) = get_slot_xmins($node_standby_1, $slotname_2);
+-isnt($xmin, '', 'cascaded slot xmin non-null with postgres shut down');
++isnt($xmin, '', 'xmin of cascaded slot non-null with postgres shut down');
+ 
+ # Xmin from a previous run should be cleared on startup.
+ $node_standby_2->start;
+ 
++wait_slot_xmins($node_standby_1, $slotname_2, "xmin IS NULL");
++
+ ($xmin, $catalog_xmin) = get_slot_xmins($node_standby_1, $slotname_2);
+ is($xmin, '',
+-	'cascaded slot xmin reset after startup with hs feedback reset');
++	'xmin of cascaded slot reset after startup with hs feedback reset');

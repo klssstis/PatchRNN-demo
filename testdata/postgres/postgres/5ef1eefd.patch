@@ -1,0 +1,1523 @@
+From 5ef1eefd76f404ddc59b885d50340e602b70f05f Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Thu, 3 Feb 2022 13:57:27 -0500
+Subject: [PATCH] Allow archiving via loadable modules.
+
+Running a shell command for each file to be archived has a lot of
+overhead and may not offer as much error checking as you want, or the
+exact semantics that you want. So, offer the option to call a loadable
+module for each file to be archived, rather than running a shell command.
+
+Also, add a 'basic_archive' contrib module as an example implementation
+that archives to a local directory.
+
+Nathan Bossart, with a little bit of kibitzing by me.
+
+Discussion: http://postgr.es/m/20220202224433.GA1036711@nathanxps13
+---
+ contrib/Makefile                              |   1 +
+ contrib/basic_archive/.gitignore              |   4 +
+ contrib/basic_archive/Makefile                |  20 +
+ contrib/basic_archive/basic_archive.c         | 371 ++++++++++++++++++
+ contrib/basic_archive/basic_archive.conf      |   3 +
+ .../basic_archive/expected/basic_archive.out  |  29 ++
+ contrib/basic_archive/sql/basic_archive.sql   |  22 ++
+ doc/src/sgml/archive-modules.sgml             | 136 +++++++
+ doc/src/sgml/backup.sgml                      |  85 ++--
+ doc/src/sgml/basic-archive.sgml               |  81 ++++
+ doc/src/sgml/config.sgml                      |  37 +-
+ doc/src/sgml/contrib.sgml                     |   1 +
+ doc/src/sgml/filelist.sgml                    |   2 +
+ doc/src/sgml/high-availability.sgml           |   6 +-
+ doc/src/sgml/postgres.sgml                    |   1 +
+ doc/src/sgml/ref/pg_basebackup.sgml           |   4 +-
+ doc/src/sgml/ref/pg_receivewal.sgml           |   6 +-
+ doc/src/sgml/wal.sgml                         |   2 +-
+ src/backend/access/transam/xlog.c             |   2 +-
+ src/backend/postmaster/pgarch.c               | 110 +++++-
+ src/backend/postmaster/shell_archive.c        |  24 +-
+ src/backend/utils/init/miscinit.c             |   1 +
+ src/backend/utils/misc/guc.c                  |  12 +-
+ src/backend/utils/misc/postgresql.conf.sample |   3 +
+ src/include/access/xlog.h                     |   1 -
+ src/include/postmaster/pgarch.h               |  38 +-
+ 26 files changed, 938 insertions(+), 64 deletions(-)
+ create mode 100644 contrib/basic_archive/.gitignore
+ create mode 100644 contrib/basic_archive/Makefile
+ create mode 100644 contrib/basic_archive/basic_archive.c
+ create mode 100644 contrib/basic_archive/basic_archive.conf
+ create mode 100644 contrib/basic_archive/expected/basic_archive.out
+ create mode 100644 contrib/basic_archive/sql/basic_archive.sql
+ create mode 100644 doc/src/sgml/archive-modules.sgml
+ create mode 100644 doc/src/sgml/basic-archive.sgml
+
+diff --git a/contrib/Makefile b/contrib/Makefile
+index 87bf87ab90f8..e3e221308bbe 100644
+--- a/contrib/Makefile
++++ b/contrib/Makefile
+@@ -9,6 +9,7 @@ SUBDIRS = \
+ 		amcheck		\
+ 		auth_delay	\
+ 		auto_explain	\
++		basic_archive	\
+ 		bloom		\
+ 		btree_gin	\
+ 		btree_gist	\
+diff --git a/contrib/basic_archive/.gitignore b/contrib/basic_archive/.gitignore
+new file mode 100644
+index 000000000000..5dcb3ff97235
+--- /dev/null
++++ b/contrib/basic_archive/.gitignore
+@@ -0,0 +1,4 @@
++# Generated subdirectories
++/log/
++/results/
++/tmp_check/
+diff --git a/contrib/basic_archive/Makefile b/contrib/basic_archive/Makefile
+new file mode 100644
+index 000000000000..14d036e1c421
+--- /dev/null
++++ b/contrib/basic_archive/Makefile
+@@ -0,0 +1,20 @@
++# contrib/basic_archive/Makefile
++
++MODULES = basic_archive
++PGFILEDESC = "basic_archive - basic archive module"
++
++REGRESS = basic_archive
++REGRESS_OPTS = --temp-config $(top_srcdir)/contrib/basic_archive/basic_archive.conf
++
++NO_INSTALLCHECK = 1
++
++ifdef USE_PGXS
++PG_CONFIG = pg_config
++PGXS := $(shell $(PG_CONFIG) --pgxs)
++include $(PGXS)
++else
++subdir = contrib/basic_archive
++top_builddir = ../..
++include $(top_builddir)/src/Makefile.global
++include $(top_srcdir)/contrib/contrib-global.mk
++endif
+diff --git a/contrib/basic_archive/basic_archive.c b/contrib/basic_archive/basic_archive.c
+new file mode 100644
+index 000000000000..16ddddccbbc4
+--- /dev/null
++++ b/contrib/basic_archive/basic_archive.c
+@@ -0,0 +1,371 @@
++/*-------------------------------------------------------------------------
++ *
++ * basic_archive.c
++ *
++ * This file demonstrates a basic archive library implementation that is
++ * roughly equivalent to the following shell command:
++ *
++ * 		test ! -f /path/to/dest && cp /path/to/src /path/to/dest
++ *
++ * One notable difference between this module and the shell command above
++ * is that this module first copies the file to a temporary destination,
++ * syncs it to disk, and then durably moves it to the final destination.
++ *
++ * Another notable difference is that if /path/to/dest already exists
++ * but has contents identical to /path/to/src, archiving will succeed,
++ * whereas the command shown above would fail. This prevents problems if
++ * a file is successfully archived and then the system crashes before
++ * a durable record of the success has been made.
++ *
++ * Copyright (c) 2022, PostgreSQL Global Development Group
++ *
++ * IDENTIFICATION
++ *	  contrib/basic_archive/basic_archive.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include <sys/stat.h>
++#include <sys/time.h>
++#include <unistd.h>
++
++#include "common/int.h"
++#include "miscadmin.h"
++#include "postmaster/pgarch.h"
++#include "storage/copydir.h"
++#include "storage/fd.h"
++#include "utils/guc.h"
++#include "utils/memutils.h"
++
++PG_MODULE_MAGIC;
++
++void _PG_init(void);
++void _PG_archive_module_init(ArchiveModuleCallbacks *cb);
++
++static char *archive_directory = NULL;
++static MemoryContext basic_archive_context;
++
++static bool basic_archive_configured(void);
++static bool basic_archive_file(const char *file, const char *path);
++static void basic_archive_file_internal(const char *file, const char *path);
++static bool check_archive_directory(char **newval, void **extra, GucSource source);
++static bool compare_files(const char *file1, const char *file2);
++
++/*
++ * _PG_init
++ *
++ * Defines the module's GUC.
++ */
++void
++_PG_init(void)
++{
++	DefineCustomStringVariable("basic_archive.archive_directory",
++							   gettext_noop("Archive file destination directory."),
++							   NULL,
++							   &archive_directory,
++							   "",
++							   PGC_SIGHUP,
++							   0,
++							   check_archive_directory, NULL, NULL);
++
++	EmitWarningsOnPlaceholders("basic_archive");
++
++	basic_archive_context = AllocSetContextCreate(TopMemoryContext,
++												  "basic_archive",
++												  ALLOCSET_DEFAULT_SIZES);
++}
++
++/*
++ * _PG_archive_module_init
++ *
++ * Returns the module's archiving callbacks.
++ */
++void
++_PG_archive_module_init(ArchiveModuleCallbacks *cb)
++{
++	AssertVariableIsOfType(&_PG_archive_module_init, ArchiveModuleInit);
++
++	cb->check_configured_cb = basic_archive_configured;
++	cb->archive_file_cb = basic_archive_file;
++}
++
++/*
++ * check_archive_directory
++ *
++ * Checks that the provided archive directory exists.
++ */
++static bool
++check_archive_directory(char **newval, void **extra, GucSource source)
++{
++	struct stat st;
++
++	/*
++	 * The default value is an empty string, so we have to accept that value.
++	 * Our check_configured callback also checks for this and prevents archiving
++	 * from proceeding if it is still empty.
++	 */
++	if (*newval == NULL || *newval[0] == '\0')
++		return true;
++
++	/*
++	 * Make sure the file paths won't be too long.  The docs indicate that the
++	 * file names to be archived can be up to 64 characters long.
++	 */
++	if (strlen(*newval) + 64 + 2 >= MAXPGPATH)
++	{
++		GUC_check_errdetail("archive directory too long");
++		return false;
++	}
++
++	/*
++	 * Do a basic sanity check that the specified archive directory exists.  It
++	 * could be removed at some point in the future, so we still need to be
++	 * prepared for it not to exist in the actual archiving logic.
++	 */
++	if (stat(*newval, &st) != 0 || !S_ISDIR(st.st_mode))
++	{
++		GUC_check_errdetail("specified archive directory does not exist");
++		return false;
++	}
++
++	return true;
++}
++
++/*
++ * basic_archive_configured
++ *
++ * Checks that archive_directory is not blank.
++ */
++static bool
++basic_archive_configured(void)
++{
++	return archive_directory != NULL && archive_directory[0] != '\0';
++}
++
++/*
++ * basic_archive_file
++ *
++ * Archives one file.
++ */
++static bool
++basic_archive_file(const char *file, const char *path)
++{
++	sigjmp_buf	local_sigjmp_buf;
++	MemoryContext oldcontext;
++
++	/*
++	 * We run basic_archive_file_internal() in our own memory context so that we
++	 * can easily reset it during error recovery (thus avoiding memory leaks).
++	 */
++	oldcontext = MemoryContextSwitchTo(basic_archive_context);
++
++	/*
++	 * Since the archiver operates at the bottom of the exception stack, ERRORs
++	 * turn into FATALs and cause the archiver process to restart.  However,
++	 * using ereport(ERROR, ...) when there are problems is easy to code and
++	 * maintain.  Therefore, we create our own exception handler to catch ERRORs
++	 * and return false instead of restarting the archiver whenever there is a
++	 * failure.
++	 */
++	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
++	{
++		/* Since not using PG_TRY, must reset error stack by hand */
++		error_context_stack = NULL;
++
++		/* Prevent interrupts while cleaning up */
++		HOLD_INTERRUPTS();
++
++		/* Report the error and clear ErrorContext for next time */
++		EmitErrorReport();
++		FlushErrorState();
++
++		/* Close any files left open by copy_file() or compare_files() */
++		AtEOSubXact_Files(false, InvalidSubTransactionId, InvalidSubTransactionId);
++
++		/* Reset our memory context and switch back to the original one */
++		MemoryContextSwitchTo(oldcontext);
++		MemoryContextReset(basic_archive_context);
++
++		/* Remove our exception handler */
++		PG_exception_stack = NULL;
++
++		/* Now we can allow interrupts again */
++		RESUME_INTERRUPTS();
++
++		/* Report failure so that the archiver retries this file */
++		return false;
++	}
++
++	/* Enable our exception handler */
++	PG_exception_stack = &local_sigjmp_buf;
++
++	/* Archive the file! */
++	basic_archive_file_internal(file, path);
++
++	/* Remove our exception handler */
++	PG_exception_stack = NULL;
++
++	/* Reset our memory context and switch back to the original one */
++	MemoryContextSwitchTo(oldcontext);
++	MemoryContextReset(basic_archive_context);
++
++	return true;
++}
++
++static void
++basic_archive_file_internal(const char *file, const char *path)
++{
++	char		destination[MAXPGPATH];
++	char		temp[MAXPGPATH + 256];
++	struct stat st;
++	struct timeval tv;
++	uint64		epoch;
++
++	ereport(DEBUG3,
++			(errmsg("archiving \"%s\" via basic_archive", file)));
++
++	snprintf(destination, MAXPGPATH, "%s/%s", archive_directory, file);
++
++	/*
++	 * First, check if the file has already been archived.  If it already exists
++	 * and has the same contents as the file we're trying to archive, we can
++	 * return success (after ensuring the file is persisted to disk). This
++	 * scenario is possible if the server crashed after archiving the file but
++	 * before renaming its .ready file to .done.
++	 *
++	 * If the archive file already exists but has different contents, something
++	 * might be wrong, so we just fail.
++	 */
++	if (stat(destination, &st) == 0)
++	{
++		if (compare_files(path, destination))
++		{
++			ereport(DEBUG3,
++					(errmsg("archive file \"%s\" already exists with identical contents",
++							destination)));
++
++			fsync_fname(destination, false);
++			fsync_fname(archive_directory, true);
++
++			return;
++		}
++
++		ereport(ERROR,
++				(errmsg("archive file \"%s\" already exists", destination)));
++	}
++	else if (errno != ENOENT)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not stat file \"%s\": %m", destination)));
++
++	/*
++	 * Pick a sufficiently unique name for the temporary file so that a
++	 * collision is unlikely.  This helps avoid problems in case a temporary
++	 * file was left around after a crash or another server happens to be
++	 * archiving to the same directory.
++	 */
++	gettimeofday(&tv, NULL);
++	if (pg_mul_u64_overflow((uint64) 1000, (uint64) tv.tv_sec, &epoch) ||
++		pg_add_u64_overflow(epoch, (uint64) tv.tv_usec, &epoch))
++		elog(ERROR, "could not generate temporary file name for archiving");
++
++	snprintf(temp, sizeof(temp), "%s/%s.%s.%d." UINT64_FORMAT,
++			 archive_directory, "archtemp", file, MyProcPid, epoch);
++
++	/*
++	 * Copy the file to its temporary destination.  Note that this will fail if
++	 * temp already exists.
++	 */
++	copy_file(unconstify(char *, path), temp);
++
++	/*
++	 * Sync the temporary file to disk and move it to its final destination.
++	 * This will fail if destination already exists.
++	 */
++	(void) durable_rename_excl(temp, destination, ERROR);
++
++	ereport(DEBUG1,
++			(errmsg("archived \"%s\" via basic_archive", file)));
++}
++
++/*
++ * compare_files
++ *
++ * Returns whether the contents of the files are the same.
++ */
++static bool
++compare_files(const char *file1, const char *file2)
++{
++#define CMP_BUF_SIZE (4096)
++	char		buf1[CMP_BUF_SIZE];
++	char		buf2[CMP_BUF_SIZE];
++	int			fd1;
++	int			fd2;
++	bool		ret = true;
++
++	fd1 = OpenTransientFile(file1, O_RDONLY | PG_BINARY);
++	if (fd1 < 0)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not open file \"%s\": %m", file1)));
++
++	fd2 = OpenTransientFile(file2, O_RDONLY | PG_BINARY);
++	if (fd2 < 0)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not open file \"%s\": %m", file2)));
++
++	for (;;)
++	{
++		int		nbytes = 0;
++		int		buf1_len = 0;
++		int		buf2_len = 0;
++
++		while (buf1_len < CMP_BUF_SIZE)
++		{
++			nbytes = read(fd1, buf1 + buf1_len, CMP_BUF_SIZE - buf1_len);
++			if (nbytes < 0)
++				ereport(ERROR,
++						(errcode_for_file_access(),
++						 errmsg("could not read file \"%s\": %m", file1)));
++			else if (nbytes == 0)
++				break;
++
++			buf1_len += nbytes;
++		}
++
++		while (buf2_len < CMP_BUF_SIZE)
++		{
++			nbytes = read(fd2, buf2 + buf2_len, CMP_BUF_SIZE - buf2_len);
++			if (nbytes < 0)
++				ereport(ERROR,
++						(errcode_for_file_access(),
++						 errmsg("could not read file \"%s\": %m", file2)));
++			else if (nbytes == 0)
++				break;
++
++			buf2_len += nbytes;
++		}
++
++		if (buf1_len != buf2_len || memcmp(buf1, buf2, buf1_len) != 0)
++		{
++			ret = false;
++			break;
++		}
++		else if (buf1_len == 0)
++			break;
++	}
++
++	if (CloseTransientFile(fd1) != 0)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not close file \"%s\": %m", file1)));
++
++	if (CloseTransientFile(fd2) != 0)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not close file \"%s\": %m", file2)));
++
++	return ret;
++}
+diff --git a/contrib/basic_archive/basic_archive.conf b/contrib/basic_archive/basic_archive.conf
+new file mode 100644
+index 000000000000..b26b2d414450
+--- /dev/null
++++ b/contrib/basic_archive/basic_archive.conf
+@@ -0,0 +1,3 @@
++archive_mode = 'on'
++archive_library = 'basic_archive'
++basic_archive.archive_directory = '.'
+diff --git a/contrib/basic_archive/expected/basic_archive.out b/contrib/basic_archive/expected/basic_archive.out
+new file mode 100644
+index 000000000000..0015053e0f29
+--- /dev/null
++++ b/contrib/basic_archive/expected/basic_archive.out
+@@ -0,0 +1,29 @@
++CREATE TABLE test (a INT);
++SELECT 1 FROM pg_switch_wal();
++ ?column? 
++----------
++        1
++(1 row)
++
++DO $$
++DECLARE
++	archived bool;
++	loops int := 0;
++BEGIN
++	LOOP
++		archived := count(*) > 0 FROM pg_ls_dir('.', false, false) a
++			WHERE a ~ '^[0-9A-F]{24}$';
++		IF archived OR loops > 120 * 10 THEN EXIT; END IF;
++		PERFORM pg_sleep(0.1);
++		loops := loops + 1;
++	END LOOP;
++END
++$$;
++SELECT count(*) > 0 FROM pg_ls_dir('.', false, false) a
++	WHERE a ~ '^[0-9A-F]{24}$';
++ ?column? 
++----------
++ t
++(1 row)
++
++DROP TABLE test;
+diff --git a/contrib/basic_archive/sql/basic_archive.sql b/contrib/basic_archive/sql/basic_archive.sql
+new file mode 100644
+index 000000000000..14e236d57ab5
+--- /dev/null
++++ b/contrib/basic_archive/sql/basic_archive.sql
+@@ -0,0 +1,22 @@
++CREATE TABLE test (a INT);
++SELECT 1 FROM pg_switch_wal();
++
++DO $$
++DECLARE
++	archived bool;
++	loops int := 0;
++BEGIN
++	LOOP
++		archived := count(*) > 0 FROM pg_ls_dir('.', false, false) a
++			WHERE a ~ '^[0-9A-F]{24}$';
++		IF archived OR loops > 120 * 10 THEN EXIT; END IF;
++		PERFORM pg_sleep(0.1);
++		loops := loops + 1;
++	END LOOP;
++END
++$$;
++
++SELECT count(*) > 0 FROM pg_ls_dir('.', false, false) a
++	WHERE a ~ '^[0-9A-F]{24}$';
++
++DROP TABLE test;
+diff --git a/doc/src/sgml/archive-modules.sgml b/doc/src/sgml/archive-modules.sgml
+new file mode 100644
+index 000000000000..f1189ddcd5bf
+--- /dev/null
++++ b/doc/src/sgml/archive-modules.sgml
+@@ -0,0 +1,136 @@
++<!-- doc/src/sgml/archive-modules.sgml -->
++
++<chapter id="archive-modules">
++ <title>Archive Modules</title>
++ <indexterm zone="archive-modules">
++  <primary>Archive Modules</primary>
++ </indexterm>
++
++ <para>
++  PostgreSQL provides infrastructure to create custom modules for continuous
++  archiving (see <xref linkend="continuous-archiving"/>).  While archiving via
++  a shell command (i.e., <xref linkend="guc-archive-command"/>) is much
++  simpler, a custom archive module will often be considerably more robust and
++  performant.
++ </para>
++
++ <para>
++  When a custom <xref linkend="guc-archive-library"/> is configured, PostgreSQL
++  will submit completed WAL files to the module, and the server will avoid
++  recyling or removing these WAL files until the module indicates that the files
++  were successfully archived.  It is ultimately up to the module to decide what
++  to do with each WAL file, but many recommendations are listed at
++  <xref linkend="backup-archiving-wal"/>.
++ </para>
++
++ <para>
++  Archiving modules must at least consist of an initialization function (see
++  <xref linkend="archive-module-init"/>) and the required callbacks (see
++  <xref linkend="archive-module-callbacks"/>).  However, archive modules are
++  also permitted to do much more (e.g., declare GUCs and register background
++  workers).
++ </para>
++
++ <para>
++  The <filename>contrib/basic_archive</filename> module contains a working
++  example, which demonstrates some useful techniques.
++ </para>
++
++ <sect1 id="archive-module-init">
++  <title>Initialization Functions</title>
++  <indexterm zone="archive-module-init">
++   <primary>_PG_archive_module_init</primary>
++  </indexterm>
++  <para>
++   An archive library is loaded by dynamically loading a shared library with the
++   <xref linkend="guc-archive-library"/>'s name as the library base name.  The
++   normal library search path is used to locate the library.  To provide the
++   required archive module callbacks and to indicate that the library is
++   actually an archive module, it needs to provide a function named
++   <function>_PG_archive_module_init</function>.  This function is passed a
++   struct that needs to be filled with the callback function pointers for
++   individual actions.
++
++<programlisting>
++typedef struct ArchiveModuleCallbacks
++{
++    ArchiveCheckConfiguredCB check_configured_cb;
++    ArchiveFileCB archive_file_cb;
++    ArchiveShutdownCB shutdown_cb;
++} ArchiveModuleCallbacks;
++typedef void (*ArchiveModuleInit) (struct ArchiveModuleCallbacks *cb);
++</programlisting>
++
++   Only the <function>archive_file_cb</function> callback is required.  The
++   others are optional.
++  </para>
++ </sect1>
++
++ <sect1 id="archive-module-callbacks">
++  <title>Archive Module Callbacks</title>
++  <para>
++   The archive callbacks define the actual archiving behavior of the module.
++   The server will call them as required to process each individual WAL file.
++  </para>
++
++  <sect2 id="archive-module-check">
++   <title>Check Callback</title>
++   <para>
++    The <function>check_configured_cb</function> callback is called to determine
++    whether the module is fully configured and ready to accept WAL files (e.g.,
++    its configuration parameters are set to valid values).  If no
++    <function>check_configured_cb</function> is defined, the server always
++    assumes the module is configured.
++
++<programlisting>
++typedef bool (*ArchiveCheckConfiguredCB) (void);
++</programlisting>
++
++    If <literal>true</literal> is returned, the server will proceed with
++    archiving the file by calling the <function>archive_file_cb</function>
++    callback.  If <literal>false</literal> is returned, archiving will not
++    proceed, and the archiver will emit the following message to the server log:
++<screen>
++WARNING:  archive_mode enabled, yet archiving is not configured
++</screen>
++    In the latter case, the server will periodically call this function, and
++    archiving will proceed only when it returns <literal>true</literal>.
++   </para>
++  </sect2>
++
++  <sect2 id="archive-module-archive">
++   <title>Archive Callback</title>
++   <para>
++    The <function>archive_file_cb</function> callback is called to archive a
++    single WAL file.
++
++<programlisting>
++typedef bool (*ArchiveFileCB) (const char *file, const char *path);
++</programlisting>
++
++    If <literal>true</literal> is returned, the server proceeds as if the file
++    was successfully archived, which may include recycling or removing the
++    original WAL file.  If <literal>false</literal> is returned, the server will
++    keep the original WAL file and retry archiving later.
++    <literal>file</literal> will contain just the file name of the WAL file to
++    archive, while <literal>path</literal> contains the full path of the WAL
++    file (including the file name).
++   </para>
++  </sect2>
++
++  <sect2 id="archive-module-shutdown">
++   <title>Shutdown Callback</title>
++   <para>
++    The <function>shutdown_cb</function> callback is called when the archiver
++    process exits (e.g., after an error) or the value of
++    <xref linkend="guc-archive-library"/> changes.  If no
++    <function>shutdown_cb</function> is defined, no special action is taken in
++    these situations.
++
++<programlisting>
++typedef void (*ArchiveShutdownCB) (void);
++</programlisting>
++   </para>
++  </sect2>
++ </sect1>
++</chapter>
+diff --git a/doc/src/sgml/backup.sgml b/doc/src/sgml/backup.sgml
+index cba32b6eb3e5..0d69851bb1c8 100644
+--- a/doc/src/sgml/backup.sgml
++++ b/doc/src/sgml/backup.sgml
+@@ -593,20 +593,23 @@ tar -cf backup.tar /usr/local/pgsql/data
+     provide the database administrator with flexibility,
+     <productname>PostgreSQL</productname> tries not to make any assumptions about how
+     the archiving will be done.  Instead, <productname>PostgreSQL</productname> lets
+-    the administrator specify a shell command to be executed to copy a
+-    completed segment file to wherever it needs to go.  The command could be
+-    as simple as a <literal>cp</literal>, or it could invoke a complex shell
+-    script &mdash; it's all up to you.
++    the administrator specify an archive library to be executed to copy a
++    completed segment file to wherever it needs to go.  This could be as simple
++    as a shell command that uses <literal>cp</literal>, or it could invoke a
++    complex C function &mdash; it's all up to you.
+    </para>
+ 
+    <para>
+     To enable WAL archiving, set the <xref linkend="guc-wal-level"/>
+     configuration parameter to <literal>replica</literal> or higher,
+     <xref linkend="guc-archive-mode"/> to <literal>on</literal>,
+-    and specify the shell command to use in the <xref
+-    linkend="guc-archive-command"/> configuration parameter.  In practice
++    and specify the library to use in the <xref
++    linkend="guc-archive-library"/> configuration parameter.  In practice
+     these settings will always be placed in the
+     <filename>postgresql.conf</filename> file.
++    One simple way to archive is to set <varname>archive_library</varname> to
++    an empty string and to specify a shell command in
++    <xref linkend="guc-archive-command"/>.
+     In <varname>archive_command</varname>,
+     <literal>%p</literal> is replaced by the path name of the file to
+     archive, while <literal>%f</literal> is replaced by only the file name.
+@@ -631,7 +634,17 @@ test ! -f /mnt/server/archivedir/00000001000000A900000065 &amp;&amp; cp pg_wal/0
+    </para>
+ 
+    <para>
+-    The archive command will be executed under the ownership of the same
++    Another way to archive is to use a custom archive module as the
++    <varname>archive_library</varname>.  Since such modules are written in
++    <literal>C</literal>, creating your own may require considerably more effort
++    than writing a shell command.  However, archive modules can be more
++    performant than archiving via shell, and they will have access to many
++    useful server resources.  For more information about archive modules, see
++    <xref linkend="archive-modules"/>.
++   </para>
++
++   <para>
++    The archive library will be executed under the ownership of the same
+     user that the <productname>PostgreSQL</productname> server is running as.  Since
+     the series of WAL files being archived contains effectively everything
+     in your database, you will want to be sure that the archived data is
+@@ -640,25 +653,31 @@ test ! -f /mnt/server/archivedir/00000001000000A900000065 &amp;&amp; cp pg_wal/0
+    </para>
+ 
+    <para>
+-    It is important that the archive command return zero exit status if and
+-    only if it succeeds.  Upon getting a zero result,
++    It is important that the archive function return <literal>true</literal> if
++    and only if it succeeds.  If <literal>true</literal> is returned,
+     <productname>PostgreSQL</productname> will assume that the file has been
+-    successfully archived, and will remove or recycle it.  However, a nonzero
+-    status tells <productname>PostgreSQL</productname> that the file was not archived;
+-    it will try again periodically until it succeeds.
++    successfully archived, and will remove or recycle it.  However, a return
++    value of <literal>false</literal> tells
++    <productname>PostgreSQL</productname> that the file was not archived; it
++    will try again periodically until it succeeds.  If you are archiving via a
++    shell command, the appropriate return values can be achieved by returning
++    <literal>0</literal> if the command succeeds and a nonzero value if it
++    fails.
+    </para>
+ 
+    <para>
+-    When the archive command is terminated by a signal (other than
+-    <systemitem>SIGTERM</systemitem> that is used as part of a server
+-    shutdown) or an error by the shell with an exit status greater than
+-    125 (such as command not found), the archiver process aborts and gets
+-    restarted by the postmaster. In such cases, the failure is
+-    not reported in <xref linkend="pg-stat-archiver-view"/>.
++    If the archive function emits an <literal>ERROR</literal> or
++    <literal>FATAL</literal>, the archiver process aborts and gets restarted by
++    the postmaster.  If you are archiving via shell command, FATAL is emitted if
++    the command is terminated by a signal (other than
++    <systemitem>SIGTERM</systemitem> that is used as part of a server shutdown)
++    or an error by the shell with an exit status greater than 125 (such as
++    command not found).  In such cases, the failure is not reported in
++    <xref linkend="pg-stat-archiver-view"/>.
+    </para>
+ 
+    <para>
+-    The archive command should generally be designed to refuse to overwrite
++    The archive library should generally be designed to refuse to overwrite
+     any pre-existing archive file.  This is an important safety feature to
+     preserve the integrity of your archive in case of administrator error
+     (such as sending the output of two different servers to the same archive
+@@ -666,9 +685,9 @@ test ! -f /mnt/server/archivedir/00000001000000A900000065 &amp;&amp; cp pg_wal/0
+    </para>
+ 
+    <para>
+-    It is advisable to test your proposed archive command to ensure that it
++    It is advisable to test your proposed archive library to ensure that it
+     indeed does not overwrite an existing file, <emphasis>and that it returns
+-    nonzero status in this case</emphasis>.
++    <literal>false</literal> in this case</emphasis>.
+     The example command above for Unix ensures this by including a separate
+     <command>test</command> step.  On some Unix platforms, <command>cp</command> has
+     switches such as <option>-i</option> that can be used to do the same thing
+@@ -680,7 +699,7 @@ test ! -f /mnt/server/archivedir/00000001000000A900000065 &amp;&amp; cp pg_wal/0
+ 
+    <para>
+     While designing your archiving setup, consider what will happen if
+-    the archive command fails repeatedly because some aspect requires
++    the archive library fails repeatedly because some aspect requires
+     operator intervention or the archive runs out of space. For example, this
+     could occur if you write to tape without an autochanger; when the tape
+     fills, nothing further can be archived until the tape is swapped.
+@@ -695,7 +714,7 @@ test ! -f /mnt/server/archivedir/00000001000000A900000065 &amp;&amp; cp pg_wal/0
+    </para>
+ 
+    <para>
+-    The speed of the archiving command is unimportant as long as it can keep up
++    The speed of the archive library is unimportant as long as it can keep up
+     with the average rate at which your server generates WAL data.  Normal
+     operation continues even if the archiving process falls a little behind.
+     If archiving falls significantly behind, this will increase the amount of
+@@ -707,11 +726,11 @@ test ! -f /mnt/server/archivedir/00000001000000A900000065 &amp;&amp; cp pg_wal/0
+    </para>
+ 
+    <para>
+-    In writing your archive command, you should assume that the file names to
++    In writing your archive library, you should assume that the file names to
+     be archived can be up to 64 characters long and can contain any
+     combination of ASCII letters, digits, and dots.  It is not necessary to
+-    preserve the original relative path (<literal>%p</literal>) but it is necessary to
+-    preserve the file name (<literal>%f</literal>).
++    preserve the original relative path but it is necessary to preserve the file
++    name.
+    </para>
+ 
+    <para>
+@@ -728,7 +747,7 @@ test ! -f /mnt/server/archivedir/00000001000000A900000065 &amp;&amp; cp pg_wal/0
+    </para>
+ 
+    <para>
+-    The archive command is only invoked on completed WAL segments.  Hence,
++    The archive function is only invoked on completed WAL segments.  Hence,
+     if your server generates only little WAL traffic (or has slack periods
+     where it does so), there could be a long delay between the completion
+     of a transaction and its safe recording in archive storage.  To put
+@@ -757,8 +776,9 @@ test ! -f /mnt/server/archivedir/00000001000000A900000065 &amp;&amp; cp pg_wal/0
+     turned on during execution of one of these statements, WAL would not
+     contain enough information for archive recovery.  (Crash recovery is
+     unaffected.)  For this reason, <varname>wal_level</varname> can only be changed at
+-    server start.  However, <varname>archive_command</varname> can be changed with a
+-    configuration file reload.  If you wish to temporarily stop archiving,
++    server start.  However, <varname>archive_library</varname> can be changed with a
++    configuration file reload.  If you are archiving via shell and wish to
++    temporarily stop archiving,
+     one way to do it is to set <varname>archive_command</varname> to the empty
+     string (<literal>''</literal>).
+     This will cause WAL files to accumulate in <filename>pg_wal/</filename> until a
+@@ -938,11 +958,11 @@ SELECT * FROM pg_stop_backup(false, true);
+      On a standby, <varname>archive_mode</varname> must be <literal>always</literal> in order
+      for <function>pg_stop_backup</function> to wait.
+      Archiving of these files happens automatically since you have
+-     already configured <varname>archive_command</varname>. In most cases this
++     already configured <varname>archive_library</varname>. In most cases this
+      happens quickly, but you are advised to monitor your archive
+      system to ensure there are no delays.
+      If the archive process has fallen behind
+-     because of failures of the archive command, it will keep retrying
++     because of failures of the archive library, it will keep retrying
+      until the archive succeeds and the backup is complete.
+      If you wish to place a time limit on the execution of
+      <function>pg_stop_backup</function>, set an appropriate
+@@ -1500,9 +1520,10 @@ restore_command = 'cp /mnt/server/archivedir/%f %p'
+       To prepare for low level standalone hot backups, make sure
+       <varname>wal_level</varname> is set to
+       <literal>replica</literal> or higher, <varname>archive_mode</varname> to
+-      <literal>on</literal>, and set up an <varname>archive_command</varname> that performs
++      <literal>on</literal>, and set up an <varname>archive_library</varname> that performs
+       archiving only when a <emphasis>switch file</emphasis> exists.  For example:
+ <programlisting>
++archive_library = ''  # use shell command
+ archive_command = 'test ! -f /var/lib/pgsql/backup_in_progress || (test ! -f /var/lib/pgsql/archive/%f &amp;&amp; cp %p /var/lib/pgsql/archive/%f)'
+ </programlisting>
+       This command will perform archiving when
+diff --git a/doc/src/sgml/basic-archive.sgml b/doc/src/sgml/basic-archive.sgml
+new file mode 100644
+index 000000000000..0b650f17a823
+--- /dev/null
++++ b/doc/src/sgml/basic-archive.sgml
+@@ -0,0 +1,81 @@
++<!-- doc/src/sgml/basic-archive.sgml -->
++
++<sect1 id="basic-archive" xreflabel="basic_archive">
++ <title>basic_archive</title>
++
++ <indexterm zone="basic-archive">
++  <primary>basic_archive</primary>
++ </indexterm>
++
++ <para>
++  <filename>basic_archive</filename> is an example of an archive module.  This
++  module copies completed WAL segment files to the specified directory.  This
++  may not be especially useful, but it can serve as a starting point for
++  developing your own archive module.  For more information about archive
++  modules, see <xref linkend="archive-modules"/>.
++ </para>
++
++ <para>
++  In order to function, this module must be loaded via
++  <xref linkend="guc-archive-library"/>, and <xref linkend="guc-archive-mode"/>
++  must be enabled.
++ </para>
++
++ <sect2>
++  <title>Configuration Parameters</title>
++
++  <variablelist>
++   <varlistentry>
++    <term>
++     <varname>basic_archive.archive_directory</varname> (<type>string</type>)
++     <indexterm>
++      <primary><varname>basic_archive.archive_directory</varname> configuration parameter</primary>
++     </indexterm>
++    </term>
++    <listitem>
++     <para>
++      The directory where the server should copy WAL segment files.  This
++      directory must already exist.  The default is an empty string, which
++      effectively halts WAL archiving, but if <xref linkend="guc-archive-mode"/>
++      is enabled, the server will accumulate WAL segment files in the
++      expectation that a value will soon be provided.
++     </para>
++    </listitem>
++   </varlistentry>
++  </variablelist>
++
++  <para>
++   These parameters must be set in <filename>postgresql.conf</filename>.
++   Typical usage might be:
++  </para>
++
++<programlisting>
++# postgresql.conf
++archive_mode = 'on'
++archive_library = 'basic_archive'
++basic_archive.archive_directory = '/path/to/archive/directory'
++</programlisting>
++ </sect2>
++
++ <sect2>
++  <title>Notes</title>
++
++  <para>
++   Server crashes may leave temporary files with the prefix
++   <filename>archtemp</filename> in the archive directory.  It is recommended to
++   delete such files before restarting the server after a crash.  It is safe to
++   remove such files while the server is running as long as they are unrelated
++   to any archiving still in progress, but users should use extra caution when
++   doing so.
++  </para>
++ </sect2>
++
++ <sect2>
++  <title>Author</title>
++
++  <para>
++   Nathan Bossart
++  </para>
++ </sect2>
++
++</sect1>
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index 692d8a2a1782..fc63172efde3 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -3479,7 +3479,7 @@ include_dir 'conf.d'
+         Maximum size to let the WAL grow during automatic
+         checkpoints. This is a soft limit; WAL size can exceed
+         <varname>max_wal_size</varname> under special circumstances, such as
+-        heavy load, a failing <varname>archive_command</varname>, or a high
++        heavy load, a failing <varname>archive_library</varname>, or a high
+         <varname>wal_keep_size</varname> setting.
+         If this value is specified without units, it is taken as megabytes.
+         The default is 1 GB.
+@@ -3528,7 +3528,7 @@ include_dir 'conf.d'
+        <para>
+         When <varname>archive_mode</varname> is enabled, completed WAL segments
+         are sent to archive storage by setting
+-        <xref linkend="guc-archive-command"/>. In addition to <literal>off</literal>,
++        <xref linkend="guc-archive-library"/>. In addition to <literal>off</literal>,
+         to disable, there are two modes: <literal>on</literal>, and
+         <literal>always</literal>. During normal operation, there is no
+         difference between the two modes, but when set to <literal>always</literal>
+@@ -3538,9 +3538,6 @@ include_dir 'conf.d'
+         <xref linkend="continuous-archiving-in-standby"/> for details.
+        </para>
+        <para>
+-        <varname>archive_mode</varname> and <varname>archive_command</varname> are
+-        separate variables so that <varname>archive_command</varname> can be
+-        changed without leaving archiving mode.
+         This parameter can only be set at server start.
+         <varname>archive_mode</varname> cannot be enabled when
+         <varname>wal_level</varname> is set to <literal>minimal</literal>.
+@@ -3548,6 +3545,28 @@ include_dir 'conf.d'
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry id="guc-archive-library" xreflabel="archive_library">
++      <term><varname>archive_library</varname> (<type>string</type>)
++      <indexterm>
++       <primary><varname>archive_library</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        The library to use for archiving completed WAL file segments.  If set to
++        an empty string (the default), archiving via shell is enabled, and
++        <xref linkend="guc-archive-command"/> is used.  Otherwise, the specified
++        shared library is used for archiving.  For more information, see
++        <xref linkend="backup-archiving-wal"/> and
++        <xref linkend="archive-modules"/>.
++       </para>
++       <para>
++        This parameter can only be set in the
++        <filename>postgresql.conf</filename> file or on the server command line.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry id="guc-archive-command" xreflabel="archive_command">
+       <term><varname>archive_command</varname> (<type>string</type>)
+       <indexterm>
+@@ -3570,9 +3589,11 @@ include_dir 'conf.d'
+        <para>
+         This parameter can only be set in the <filename>postgresql.conf</filename>
+         file or on the server command line.  It is ignored unless
+-        <varname>archive_mode</varname> was enabled at server start.
++        <varname>archive_mode</varname> was enabled at server start and
++        <varname>archive_library</varname> specifies to archive via shell command.
+         If <varname>archive_command</varname> is an empty string (the default) while
+-        <varname>archive_mode</varname> is enabled, WAL archiving is temporarily
++        <varname>archive_mode</varname> is enabled and <varname>archive_library</varname>
++        specifies archiving via shell, WAL archiving is temporarily
+         disabled, but the server continues to accumulate WAL segment files in
+         the expectation that a command will soon be provided.  Setting
+         <varname>archive_command</varname> to a command that does nothing but
+@@ -3592,7 +3613,7 @@ include_dir 'conf.d'
+       </term>
+       <listitem>
+        <para>
+-        The <xref linkend="guc-archive-command"/> is only invoked for
++        The <xref linkend="guc-archive-library"/> is only invoked for
+         completed WAL segments. Hence, if your server generates little WAL
+         traffic (or has slack periods where it does so), there could be a
+         long delay between the completion of a transaction and its safe
+diff --git a/doc/src/sgml/contrib.sgml b/doc/src/sgml/contrib.sgml
+index d3ca4b693200..be9711c6f2ce 100644
+--- a/doc/src/sgml/contrib.sgml
++++ b/doc/src/sgml/contrib.sgml
+@@ -99,6 +99,7 @@ CREATE EXTENSION <replaceable>module_name</replaceable>;
+  &amcheck;
+  &auth-delay;
+  &auto-explain;
++ &basic-archive;
+  &bloom;
+  &btree-gin;
+  &btree-gist;
+diff --git a/doc/src/sgml/filelist.sgml b/doc/src/sgml/filelist.sgml
+index 89454e99b981..328cd1f378c7 100644
+--- a/doc/src/sgml/filelist.sgml
++++ b/doc/src/sgml/filelist.sgml
+@@ -99,6 +99,7 @@
+ <!ENTITY custom-scan SYSTEM "custom-scan.sgml">
+ <!ENTITY logicaldecoding SYSTEM "logicaldecoding.sgml">
+ <!ENTITY replication-origins SYSTEM "replication-origins.sgml">
++<!ENTITY archive-modules SYSTEM "archive-modules.sgml">
+ <!ENTITY protocol   SYSTEM "protocol.sgml">
+ <!ENTITY sources    SYSTEM "sources.sgml">
+ <!ENTITY storage    SYSTEM "storage.sgml">
+@@ -112,6 +113,7 @@
+ <!ENTITY amcheck         SYSTEM "amcheck.sgml">
+ <!ENTITY auth-delay      SYSTEM "auth-delay.sgml">
+ <!ENTITY auto-explain    SYSTEM "auto-explain.sgml">
++<!ENTITY basic-archive   SYSTEM "basic-archive.sgml">
+ <!ENTITY bloom           SYSTEM "bloom.sgml">
+ <!ENTITY btree-gin       SYSTEM "btree-gin.sgml">
+ <!ENTITY btree-gist      SYSTEM "btree-gist.sgml">
+diff --git a/doc/src/sgml/high-availability.sgml b/doc/src/sgml/high-availability.sgml
+index a265409f0251..437712762ae8 100644
+--- a/doc/src/sgml/high-availability.sgml
++++ b/doc/src/sgml/high-availability.sgml
+@@ -935,7 +935,7 @@ primary_conninfo = 'host=192.168.1.50 port=5432 user=foo password=foopass'
+     In lieu of using replication slots, it is possible to prevent the removal
+     of old WAL segments using <xref linkend="guc-wal-keep-size"/>, or by
+     storing the segments in an archive using
+-    <xref linkend="guc-archive-command"/>.
++    <xref linkend="guc-archive-library"/>.
+     However, these methods often result in retaining more WAL segments than
+     required, whereas replication slots retain only the number of segments
+     known to be needed.  On the other hand, replication slots can retain so
+@@ -1386,10 +1386,10 @@ synchronous_standby_names = 'ANY 2 (s1, s2, s3)'
+      to <literal>always</literal>, and the standby will call the archive
+      command for every WAL segment it receives, whether it's by restoring
+      from the archive or by streaming replication. The shared archive can
+-     be handled similarly, but the <varname>archive_command</varname> must
++     be handled similarly, but the <varname>archive_library</varname> must
+      test if the file being archived exists already, and if the existing file
+      has identical contents. This requires more care in the
+-     <varname>archive_command</varname>, as it must
++     <varname>archive_library</varname>, as it must
+      be careful to not overwrite an existing file with different contents,
+      but return success if the exactly same file is archived twice. And
+      all that must be done free of race conditions, if two servers attempt
+diff --git a/doc/src/sgml/postgres.sgml b/doc/src/sgml/postgres.sgml
+index dba9cf413f90..3db6d2160b10 100644
+--- a/doc/src/sgml/postgres.sgml
++++ b/doc/src/sgml/postgres.sgml
+@@ -233,6 +233,7 @@ break is not needed in a wider output rendering.
+   &bgworker;
+   &logicaldecoding;
+   &replication-origins;
++  &archive-modules;
+ 
+  </part>
+ 
+diff --git a/doc/src/sgml/ref/pg_basebackup.sgml b/doc/src/sgml/ref/pg_basebackup.sgml
+index 1546f10c0d9e..e7ae29ec3d36 100644
+--- a/doc/src/sgml/ref/pg_basebackup.sgml
++++ b/doc/src/sgml/ref/pg_basebackup.sgml
+@@ -102,8 +102,8 @@ PostgreSQL documentation
+      <para>
+       All WAL records required for the backup must contain sufficient full-page writes,
+       which requires you to enable <varname>full_page_writes</varname> on the primary and
+-      not to use a tool like <application>pg_compresslog</application> as
+-      <varname>archive_command</varname> to remove full-page writes from WAL files.
++      not to use a tool in your <varname>archive_library</varname> to remove
++      full-page writes from WAL files.
+      </para>
+     </listitem>
+    </itemizedlist>
+diff --git a/doc/src/sgml/ref/pg_receivewal.sgml b/doc/src/sgml/ref/pg_receivewal.sgml
+index b2e41ea814c7..b846213fb7bf 100644
+--- a/doc/src/sgml/ref/pg_receivewal.sgml
++++ b/doc/src/sgml/ref/pg_receivewal.sgml
+@@ -40,7 +40,7 @@ PostgreSQL documentation
+   <para>
+    <application>pg_receivewal</application> streams the write-ahead
+    log in real time as it's being generated on the server, and does not wait
+-   for segments to complete like <xref linkend="guc-archive-command"/> does.
++   for segments to complete like <xref linkend="guc-archive-library"/> does.
+    For this reason, it is not necessary to set
+    <xref linkend="guc-archive-timeout"/> when using
+     <application>pg_receivewal</application>.
+@@ -487,11 +487,11 @@ PostgreSQL documentation
+ 
+   <para>
+    When using <application>pg_receivewal</application> instead of
+-   <xref linkend="guc-archive-command"/> as the main WAL backup method, it is
++   <xref linkend="guc-archive-library"/> as the main WAL backup method, it is
+    strongly recommended to use replication slots.  Otherwise, the server is
+    free to recycle or remove write-ahead log files before they are backed up,
+    because it does not have any information, either
+-   from <xref linkend="guc-archive-command"/> or the replication slots, about
++   from <xref linkend="guc-archive-library"/> or the replication slots, about
+    how far the WAL stream has been archived.  Note, however, that a
+    replication slot will fill up the server's disk space if the receiver does
+    not keep up with fetching the WAL data.
+diff --git a/doc/src/sgml/wal.sgml b/doc/src/sgml/wal.sgml
+index 24e1c89503cb..2bb27a846828 100644
+--- a/doc/src/sgml/wal.sgml
++++ b/doc/src/sgml/wal.sgml
+@@ -636,7 +636,7 @@
+    WAL files plus one additional WAL file are
+    kept at all times. Also, if WAL archiving is used, old segments cannot be
+    removed or recycled until they are archived. If WAL archiving cannot keep up
+-   with the pace that WAL is generated, or if <varname>archive_command</varname>
++   with the pace that WAL is generated, or if <varname>archive_library</varname>
+    fails repeatedly, old WAL files will accumulate in <filename>pg_wal</filename>
+    until the situation is resolved. A slow or failed standby server that
+    uses a replication slot will have the same effect (see
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index dfe2a0bcce98..958220c495bf 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -8831,7 +8831,7 @@ ShutdownXLOG(int code, Datum arg)
+ 		 * process one more time at the end of shutdown). The checkpoint
+ 		 * record will go to the next XLOG file and won't be archived (yet).
+ 		 */
+-		if (XLogArchivingActive() && XLogArchiveCommandSet())
++		if (XLogArchivingActive())
+ 			RequestXLogSwitch(false);
+ 
+ 		CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
+diff --git a/src/backend/postmaster/pgarch.c b/src/backend/postmaster/pgarch.c
+index 6e3fcedc9788..d916ed39a8c4 100644
+--- a/src/backend/postmaster/pgarch.c
++++ b/src/backend/postmaster/pgarch.c
+@@ -89,6 +89,8 @@ typedef struct PgArchData
+ 	slock_t		arch_lck;
+ } PgArchData;
+ 
++char *XLogArchiveLibrary = "";
++
+ 
+ /* ----------
+  * Local data
+@@ -96,6 +98,8 @@ typedef struct PgArchData
+  */
+ static time_t last_sigterm_time = 0;
+ static PgArchData *PgArch = NULL;
++static ArchiveModuleCallbacks ArchiveContext;
++
+ 
+ /*
+  * Stuff for tracking multiple files to archive from each scan of
+@@ -140,6 +144,8 @@ static void pgarch_archiveDone(char *xlog);
+ static void pgarch_die(int code, Datum arg);
+ static void HandlePgArchInterrupts(void);
+ static int ready_file_comparator(Datum a, Datum b, void *arg);
++static void LoadArchiveLibrary(void);
++static void call_archive_module_shutdown_callback(int code, Datum arg);
+ 
+ /* Report shared memory space needed by PgArchShmemInit */
+ Size
+@@ -244,7 +250,16 @@ PgArchiverMain(void)
+ 	arch_files->arch_heap = binaryheap_allocate(NUM_FILES_PER_DIRECTORY_SCAN,
+ 												ready_file_comparator, NULL);
+ 
+-	pgarch_MainLoop();
++	/* Load the archive_library. */
++	LoadArchiveLibrary();
++
++	PG_ENSURE_ERROR_CLEANUP(call_archive_module_shutdown_callback, 0);
++	{
++		pgarch_MainLoop();
++	}
++	PG_END_ENSURE_ERROR_CLEANUP(call_archive_module_shutdown_callback, 0);
++
++	call_archive_module_shutdown_callback(0, 0);
+ 
+ 	proc_exit(0);
+ }
+@@ -407,11 +422,12 @@ pgarch_ArchiverCopyLoop(void)
+ 			 */
+ 			HandlePgArchInterrupts();
+ 
+-			/* can't do anything if no command ... */
+-			if (!XLogArchiveCommandSet())
++			/* can't do anything if not configured ... */
++			if (ArchiveContext.check_configured_cb != NULL &&
++				!ArchiveContext.check_configured_cb())
+ 			{
+ 				ereport(WARNING,
+-						(errmsg("archive_mode enabled, yet archive_command is not set")));
++						(errmsg("archive_mode enabled, yet archiving is not configured")));
+ 				return;
+ 			}
+ 
+@@ -492,7 +508,7 @@ pgarch_ArchiverCopyLoop(void)
+ /*
+  * pgarch_archiveXlog
+  *
+- * Invokes system(3) to copy one archive file to wherever it should go
++ * Invokes archive_file_cb to copy one archive file to wherever it should go
+  *
+  * Returns true if successful
+  */
+@@ -509,7 +525,7 @@ pgarch_archiveXlog(char *xlog)
+ 	snprintf(activitymsg, sizeof(activitymsg), "archiving %s", xlog);
+ 	set_ps_display(activitymsg);
+ 
+-	ret = shell_archive_file(xlog, pathname);
++	ret = ArchiveContext.archive_file_cb(xlog, pathname);
+ 	if (ret)
+ 		snprintf(activitymsg, sizeof(activitymsg), "last was %s", xlog);
+ 	else
+@@ -759,13 +775,89 @@ HandlePgArchInterrupts(void)
+ 	if (ProcSignalBarrierPending)
+ 		ProcessProcSignalBarrier();
+ 
++	/* Perform logging of memory contexts of this process */
++	if (LogMemoryContextPending)
++		ProcessLogMemoryContextInterrupt();
++
+ 	if (ConfigReloadPending)
+ 	{
++		char	   *archiveLib = pstrdup(XLogArchiveLibrary);
++		bool		archiveLibChanged;
++
+ 		ConfigReloadPending = false;
+ 		ProcessConfigFile(PGC_SIGHUP);
++
++		archiveLibChanged = strcmp(XLogArchiveLibrary, archiveLib) != 0;
++		pfree(archiveLib);
++
++		if (archiveLibChanged)
++		{
++			/*
++			 * Call the currently loaded archive module's shutdown callback, if
++			 * one is defined.
++			 */
++			call_archive_module_shutdown_callback(0, 0);
++
++			/*
++			 * Ideally, we would simply unload the previous archive module and
++			 * load the new one, but there is presently no mechanism for
++			 * unloading a library (see the comment above
++			 * internal_unload_library()).  To deal with this, we simply restart
++			 * the archiver.  The new archive module will be loaded when the new
++			 * archiver process starts up.
++			 */
++			ereport(LOG,
++					(errmsg("restarting archiver process because value of "
++							"\"archive_library\" was changed")));
++
++			proc_exit(0);
++		}
+ 	}
++}
+ 
+-	/* Perform logging of memory contexts of this process */
+-	if (LogMemoryContextPending)
+-		ProcessLogMemoryContextInterrupt();
++/*
++ * LoadArchiveLibrary
++ *
++ * Loads the archiving callbacks into our local ArchiveContext.
++ */
++static void
++LoadArchiveLibrary(void)
++{
++	ArchiveModuleInit archive_init;
++
++	memset(&ArchiveContext, 0, sizeof(ArchiveModuleCallbacks));
++
++	/*
++	 * If shell archiving is enabled, use our special initialization
++	 * function.  Otherwise, load the library and call its
++	 * _PG_archive_module_init().
++	 */
++	if (XLogArchiveLibrary[0] == '\0')
++		archive_init = shell_archive_init;
++	else
++		archive_init = (ArchiveModuleInit)
++			load_external_function(XLogArchiveLibrary,
++								   "_PG_archive_module_init", false, NULL);
++
++	if (archive_init == NULL)
++		ereport(ERROR,
++				(errmsg("archive modules have to declare the _PG_archive_module_init symbol")));
++
++	(*archive_init) (&ArchiveContext);
++
++	if (ArchiveContext.archive_file_cb == NULL)
++		ereport(ERROR,
++				(errmsg("archive modules must register an archive callback")));
++}
++
++/*
++ * call_archive_module_shutdown_callback
++ *
++ * Calls the loaded archive module's shutdown callback, if one is defined.
++ */
++static void
++call_archive_module_shutdown_callback(int code, Datum arg)
++{
++	if (ArchiveContext.shutdown_cb != NULL)
++		ArchiveContext.shutdown_cb();
+ }
+diff --git a/src/backend/postmaster/shell_archive.c b/src/backend/postmaster/shell_archive.c
+index b54e701da4d5..19e240c2053b 100644
+--- a/src/backend/postmaster/shell_archive.c
++++ b/src/backend/postmaster/shell_archive.c
+@@ -2,6 +2,10 @@
+  *
+  * shell_archive.c
+  *
++ * This archiving function uses a user-specified shell command (the
++ * archive_command GUC) to copy write-ahead log files.  It is used as the
++ * default, but other modules may define their own custom archiving logic.
++ *
+  * Copyright (c) 2022, PostgreSQL Global Development Group
+  *
+  * IDENTIFICATION
+@@ -17,7 +21,25 @@
+ #include "pgstat.h"
+ #include "postmaster/pgarch.h"
+ 
+-bool
++static bool shell_archive_configured(void);
++static bool shell_archive_file(const char *file, const char *path);
++
++void
++shell_archive_init(ArchiveModuleCallbacks *cb)
++{
++	AssertVariableIsOfType(&shell_archive_init, ArchiveModuleInit);
++
++	cb->check_configured_cb = shell_archive_configured;
++	cb->archive_file_cb = shell_archive_file;
++}
++
++static bool
++shell_archive_configured(void)
++{
++	return XLogArchiveCommand[0] != '\0';
++}
++
++static bool
+ shell_archive_file(const char *file, const char *path)
+ {
+ 	char		xlogarchcmd[MAXPGPATH];
+diff --git a/src/backend/utils/init/miscinit.c b/src/backend/utils/init/miscinit.c
+index 0f2570d62647..0868e5a24f64 100644
+--- a/src/backend/utils/init/miscinit.c
++++ b/src/backend/utils/init/miscinit.c
+@@ -38,6 +38,7 @@
+ #include "pgstat.h"
+ #include "postmaster/autovacuum.h"
+ #include "postmaster/interrupt.h"
++#include "postmaster/pgarch.h"
+ #include "postmaster/postmaster.h"
+ #include "storage/fd.h"
+ #include "storage/ipc.h"
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index b3fd42e0f185..f505413a7f96 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -3881,13 +3881,23 @@ static struct config_string ConfigureNamesString[] =
+ 	{
+ 		{"archive_command", PGC_SIGHUP, WAL_ARCHIVING,
+ 			gettext_noop("Sets the shell command that will be called to archive a WAL file."),
+-			NULL
++			gettext_noop("This is used only if \"archive_library\" is not set.")
+ 		},
+ 		&XLogArchiveCommand,
+ 		"",
+ 		NULL, NULL, show_archive_command
+ 	},
+ 
++	{
++		{"archive_library", PGC_SIGHUP, WAL_ARCHIVING,
++			gettext_noop("Sets the library that will be called to archive a WAL file."),
++			gettext_noop("An empty string indicates that \"archive_command\" should be used.")
++		},
++		&XLogArchiveLibrary,
++		"",
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"restore_command", PGC_SIGHUP, WAL_ARCHIVE_RECOVERY,
+ 			gettext_noop("Sets the shell command that will be called to retrieve an archived WAL file."),
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index 817d5f532467..56d0bee6d9be 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -245,6 +245,9 @@
+ 
+ #archive_mode = off		# enables archiving; off, on, or always
+ 				# (change requires restart)
++#archive_library = ''		# library to use to archive a logfile segment
++				# (empty string indicates archive_command should
++				# be used)
+ #archive_command = ''		# command to use to archive a logfile segment
+ 				# placeholders: %p = path of file to archive
+ 				#               %f = file name only
+diff --git a/src/include/access/xlog.h b/src/include/access/xlog.h
+index 5f934dd65ae3..a4b1c1286f2b 100644
+--- a/src/include/access/xlog.h
++++ b/src/include/access/xlog.h
+@@ -154,7 +154,6 @@ extern PGDLLIMPORT int wal_level;
+ /* Is WAL archiving enabled always (even during recovery)? */
+ #define XLogArchivingAlways() \
+ 	(AssertMacro(XLogArchiveMode == ARCHIVE_MODE_OFF || wal_level >= WAL_LEVEL_REPLICA), XLogArchiveMode == ARCHIVE_MODE_ALWAYS)
+-#define XLogArchiveCommandSet() (XLogArchiveCommand[0] != '\0')
+ 
+ /*
+  * Is WAL-logging necessary for archival or log-shipping, or can we skip
+diff --git a/src/include/postmaster/pgarch.h b/src/include/postmaster/pgarch.h
+index 991a6d061608..9bc7593a2df0 100644
+--- a/src/include/postmaster/pgarch.h
++++ b/src/include/postmaster/pgarch.h
+@@ -33,7 +33,41 @@ extern void PgArchiverMain(void) pg_attribute_noreturn();
+ extern void PgArchWakeup(void);
+ extern void PgArchForceDirScan(void);
+ 
+-/* in shell_archive.c */
+-extern bool shell_archive_file(const char *file, const char *path);
++/*
++ * The value of the archive_library GUC.
++ */
++extern char *XLogArchiveLibrary;
++
++/*
++ * Archive module callbacks
++ *
++ * These callback functions should be defined by archive libraries and returned
++ * via _PG_archive_module_init().  ArchiveFileCB is the only required callback.
++ * For more information about the purpose of each callback, refer to the
++ * archive modules documentation.
++ */
++typedef bool (*ArchiveCheckConfiguredCB) (void);
++typedef bool (*ArchiveFileCB) (const char *file, const char *path);
++typedef void (*ArchiveShutdownCB) (void);
++
++typedef struct ArchiveModuleCallbacks
++{
++	ArchiveCheckConfiguredCB check_configured_cb;
++	ArchiveFileCB archive_file_cb;
++	ArchiveShutdownCB shutdown_cb;
++} ArchiveModuleCallbacks;
++
++/*
++ * Type of the shared library symbol _PG_archive_module_init that is looked
++ * up when loading an archive library.
++ */
++typedef void (*ArchiveModuleInit) (ArchiveModuleCallbacks *cb);
++
++/*
++ * Since the logic for archiving via a shell command is in the core server
++ * and does not need to be loaded via a shared library, it has a special
++ * initialization function.
++ */
++extern void shell_archive_init(ArchiveModuleCallbacks *cb);
+ 
+ #endif							/* _PGARCH_H */

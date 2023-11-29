@@ -1,0 +1,157 @@
+From 5c056b0c2519e602c2e98bace5b16d2ecde6454b Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 6 Aug 2021 17:32:54 -0400
+Subject: [PATCH] Don't elide casting to typmod -1.
+
+Casting a value that's already of a type with a specific typmod
+to an unspecified typmod doesn't do anything so far as run-time
+behavior is concerned.  However, it really ought to change the
+exposed type of the expression to match.  Up to now,
+coerce_type_typmod hasn't bothered with that, which creates gotchas
+in contexts such as recursive unions.  If for example one side of
+the union is numeric(18,3), but it needs to be plain numeric to
+match the other side, there's no direct way to express that.
+
+This is easy enough to fix, by inserting a RelabelType to update the
+exposed type of the expression.  However, it's a bit nervous-making
+to change this behavior, because it's stood for a really long time.
+(I strongly suspect that it's like this in part because the logic
+pre-dates the introduction of RelabelType in 7.0.  The commit log
+message for 57b30e8e2 is interesting reading here.)  As a compromise,
+we'll sneak the change into 14beta3, and consider back-patching to
+stable branches if no complaints emerge in the next three months.
+
+Discussion: https://postgr.es/m/CABNQVagu3bZGqiTjb31a8D5Od3fUMs7Oh3gmZMQZVHZ=uWWWfQ@mail.gmail.com
+---
+ src/backend/parser/parse_coerce.c         | 26 ++++++++++------
+ src/test/regress/expected/expressions.out | 37 +++++++++++++++++++++++
+ src/test/regress/sql/expressions.sql      | 21 +++++++++++++
+ 3 files changed, 75 insertions(+), 9 deletions(-)
+
+diff --git a/src/backend/parser/parse_coerce.c b/src/backend/parser/parse_coerce.c
+index 5da72a4c36d6..78194afedfbc 100644
+--- a/src/backend/parser/parse_coerce.c
++++ b/src/backend/parser/parse_coerce.c
+@@ -758,25 +758,33 @@ coerce_type_typmod(Node *node, Oid targetTypeId, int32 targetTypMod,
+ 	CoercionPathType pathtype;
+ 	Oid			funcId;
+ 
+-	/*
+-	 * A negative typmod is assumed to mean that no coercion is wanted. Also,
+-	 * skip coercion if already done.
+-	 */
+-	if (targetTypMod < 0 || targetTypMod == exprTypmod(node))
++	/* Skip coercion if already done */
++	if (targetTypMod == exprTypmod(node))
+ 		return node;
+ 
++	/* Suppress display of nested coercion steps */
++	if (hideInputCoercion)
++		hide_coercion_node(node);
++
+ 	pathtype = find_typmod_coercion_function(targetTypeId, &funcId);
+ 
+ 	if (pathtype != COERCION_PATH_NONE)
+ 	{
+-		/* Suppress display of nested coercion steps */
+-		if (hideInputCoercion)
+-			hide_coercion_node(node);
+-
+ 		node = build_coercion_expression(node, pathtype, funcId,
+ 										 targetTypeId, targetTypMod,
+ 										 ccontext, cformat, location);
+ 	}
++	else
++	{
++		/*
++		 * We don't need to perform any actual coercion step, but we should
++		 * apply a RelabelType to ensure that the expression exposes the
++		 * intended typmod.
++		 */
++		node = applyRelabelType(node, targetTypeId, targetTypMod,
++								exprCollation(node),
++								cformat, location, false);
++	}
+ 
+ 	return node;
+ }
+diff --git a/src/test/regress/expected/expressions.out b/src/test/regress/expected/expressions.out
+index 84159cb21fc9..7b6b0bb4f99d 100644
+--- a/src/test/regress/expected/expressions.out
++++ b/src/test/regress/expected/expressions.out
+@@ -158,6 +158,43 @@ select count(*) from date_tbl
+     13
+ (1 row)
+ 
++--
++-- Test parsing of a no-op cast to a type with unspecified typmod
++--
++begin;
++create table numeric_tbl (f1 numeric(18,3), f2 numeric);
++create view numeric_view as
++  select
++    f1, f1::numeric(16,4) as f1164, f1::numeric as f1n,
++    f2, f2::numeric(16,4) as f2164, f2::numeric as f2n
++  from numeric_tbl;
++\d+ numeric_view
++                           View "public.numeric_view"
++ Column |     Type      | Collation | Nullable | Default | Storage | Description 
++--------+---------------+-----------+----------+---------+---------+-------------
++ f1     | numeric(18,3) |           |          |         | main    | 
++ f1164  | numeric(16,4) |           |          |         | main    | 
++ f1n    | numeric       |           |          |         | main    | 
++ f2     | numeric       |           |          |         | main    | 
++ f2164  | numeric(16,4) |           |          |         | main    | 
++ f2n    | numeric       |           |          |         | main    | 
++View definition:
++ SELECT numeric_tbl.f1,
++    numeric_tbl.f1::numeric(16,4) AS f1164,
++    numeric_tbl.f1::numeric AS f1n,
++    numeric_tbl.f2,
++    numeric_tbl.f2::numeric(16,4) AS f2164,
++    numeric_tbl.f2 AS f2n
++   FROM numeric_tbl;
++
++explain (verbose, costs off) select * from numeric_view;
++                                                                      QUERY PLAN                                                                       
++-------------------------------------------------------------------------------------------------------------------------------------------------------
++ Seq Scan on public.numeric_tbl
++   Output: numeric_tbl.f1, (numeric_tbl.f1)::numeric(16,4), (numeric_tbl.f1)::numeric, numeric_tbl.f2, (numeric_tbl.f2)::numeric(16,4), numeric_tbl.f2
++(2 rows)
++
++rollback;
+ --
+ -- Tests for ScalarArrayOpExpr with a hashfn
+ --
+diff --git a/src/test/regress/sql/expressions.sql b/src/test/regress/sql/expressions.sql
+index bf30f4150569..e9aa1a0b2896 100644
+--- a/src/test/regress/sql/expressions.sql
++++ b/src/test/regress/sql/expressions.sql
+@@ -66,6 +66,27 @@ select count(*) from date_tbl
+ select count(*) from date_tbl
+   where f1 not between symmetric '1997-01-01' and '1998-01-01';
+ 
++
++--
++-- Test parsing of a no-op cast to a type with unspecified typmod
++--
++begin;
++
++create table numeric_tbl (f1 numeric(18,3), f2 numeric);
++
++create view numeric_view as
++  select
++    f1, f1::numeric(16,4) as f1164, f1::numeric as f1n,
++    f2, f2::numeric(16,4) as f2164, f2::numeric as f2n
++  from numeric_tbl;
++
++\d+ numeric_view
++
++explain (verbose, costs off) select * from numeric_view;
++
++rollback;
++
++
+ --
+ -- Tests for ScalarArrayOpExpr with a hashfn
+ --

@@ -1,0 +1,1063 @@
+From 5e09280057a4c3f5db297348ea3e044c9c5f4ef8 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 14 Dec 2018 12:52:49 -0500
+Subject: [PATCH] Make pg_statistic and related code account more honestly for
+ collations.
+
+When we first put in collations support, we basically punted on teaching
+pg_statistic, ANALYZE, and the planner selectivity functions about that.
+They've just used DEFAULT_COLLATION_OID independently of the actual
+collation of the data.  It's time to improve that, so:
+
+* Add columns to pg_statistic that record the specific collation associated
+with each statistics slot.
+
+* Teach ANALYZE to use the column's actual collation when comparing values
+for statistical purposes, and record this in the appropriate slot.  (Note
+that type-specific typanalyze functions are now expected to fill
+stats->stacoll with the appropriate collation, too.)
+
+* Teach assorted selectivity functions to use the actual collation of
+the stats they are looking at, instead of just assuming it's
+DEFAULT_COLLATION_OID.
+
+This should give noticeably better results in selectivity estimates for
+columns with nondefault collations, at least for query clauses that use
+that same collation (which would be the default behavior in most cases).
+It's still true that comparisons with explicit COLLATE clauses different
+from the stored data's collation won't be well-estimated, but that's no
+worse than before.  Also, this patch does make the first step towards
+doing better with that, which is that it's now theoretically possible to
+collect stats for a collation other than the column's own collation.
+
+Patch by me; thanks to Peter Eisentraut for review.
+
+Discussion: https://postgr.es/m/14706.1544630227@sss.pgh.pa.us
+---
+ doc/src/sgml/catalogs.sgml                    | 12 ++++
+ src/backend/commands/analyze.c                | 26 ++++++--
+ src/backend/statistics/dependencies.c         |  5 +-
+ src/backend/statistics/extended_stats.c       |  8 +--
+ src/backend/statistics/mvdistinct.c           |  5 +-
+ src/backend/tsearch/ts_typanalyze.c           |  2 +
+ src/backend/utils/adt/array_selfuncs.c        | 59 ++++++++---------
+ src/backend/utils/adt/array_typanalyze.c      | 17 +++--
+ src/backend/utils/adt/rangetypes_typanalyze.c |  1 +
+ src/backend/utils/adt/selfuncs.c              | 64 +++++++++++--------
+ src/backend/utils/cache/lsyscache.c           | 19 ++++++
+ src/backend/utils/cache/typcache.c            |  1 +
+ src/include/catalog/catversion.h              |  2 +-
+ src/include/catalog/pg_statistic.h            | 43 ++++++++-----
+ src/include/commands/vacuum.h                 | 11 +++-
+ .../statistics/extended_stats_internal.h      |  2 +-
+ src/include/utils/lsyscache.h                 |  1 +
+ src/include/utils/typcache.h                  |  1 +
+ 18 files changed, 189 insertions(+), 90 deletions(-)
+
+diff --git a/doc/src/sgml/catalogs.sgml b/doc/src/sgml/catalogs.sgml
+index 18c38e42de6e..8d0cab5da69a 100644
+--- a/doc/src/sgml/catalogs.sgml
++++ b/doc/src/sgml/catalogs.sgml
+@@ -6394,6 +6394,18 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
+       </entry>
+      </row>
+ 
++     <row>
++      <entry><structfield>stacoll<replaceable>N</replaceable></structfield></entry>
++      <entry><type>oid</type></entry>
++      <entry><literal><link linkend="catalog-pg-collation"><structname>pg_collation</structname></link>.oid</literal></entry>
++      <entry>
++       The collation used to derive the statistics stored in the
++       <replaceable>N</replaceable>th <quote>slot</quote>.  For example, a
++       histogram slot for a collatable column would show the collation that
++       defines the sort order of the data.  Zero for noncollatable data.
++      </entry>
++     </row>
++
+      <row>
+       <entry><structfield>stanumbers<replaceable>N</replaceable></structfield></entry>
+       <entry><type>float4[]</type></entry>
+diff --git a/src/backend/commands/analyze.c b/src/backend/commands/analyze.c
+index b8445dc37288..b5a7475db9ad 100644
+--- a/src/backend/commands/analyze.c
++++ b/src/backend/commands/analyze.c
+@@ -904,11 +904,22 @@ examine_attribute(Relation onerel, int attnum, Node *index_expr)
+ 	{
+ 		stats->attrtypid = exprType(index_expr);
+ 		stats->attrtypmod = exprTypmod(index_expr);
++
++		/*
++		 * If a collation has been specified for the index column, use that in
++		 * preference to anything else; but if not, fall back to whatever we
++		 * can get from the expression.
++		 */
++		if (OidIsValid(onerel->rd_indcollation[attnum - 1]))
++			stats->attrcollid = onerel->rd_indcollation[attnum - 1];
++		else
++			stats->attrcollid = exprCollation(index_expr);
+ 	}
+ 	else
+ 	{
+ 		stats->attrtypid = attr->atttypid;
+ 		stats->attrtypmod = attr->atttypmod;
++		stats->attrcollid = attr->attcollation;
+ 	}
+ 
+ 	typtuple = SearchSysCacheCopy1(TYPEOID,
+@@ -1553,6 +1564,11 @@ update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
+ 		{
+ 			values[i++] = ObjectIdGetDatum(stats->staop[k]);	/* staopN */
+ 		}
++		i = Anum_pg_statistic_stacoll1 - 1;
++		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
++		{
++			values[i++] = ObjectIdGetDatum(stats->stacoll[k]);	/* stacollN */
++		}
+ 		i = Anum_pg_statistic_stanumbers1 - 1;
+ 		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+ 		{
+@@ -1993,9 +2009,8 @@ compute_distinct_stats(VacAttrStatsP stats,
+ 		firstcount1 = track_cnt;
+ 		for (j = 0; j < track_cnt; j++)
+ 		{
+-			/* We always use the default collation for statistics */
+ 			if (DatumGetBool(FunctionCall2Coll(&f_cmpeq,
+-											   DEFAULT_COLLATION_OID,
++											   stats->attrcollid,
+ 											   value, track[j].value)))
+ 			{
+ 				match = true;
+@@ -2202,6 +2217,7 @@ compute_distinct_stats(VacAttrStatsP stats,
+ 
+ 			stats->stakind[0] = STATISTIC_KIND_MCV;
+ 			stats->staop[0] = mystats->eqopr;
++			stats->stacoll[0] = stats->attrcollid;
+ 			stats->stanumbers[0] = mcv_freqs;
+ 			stats->numnumbers[0] = num_mcv;
+ 			stats->stavalues[0] = mcv_values;
+@@ -2273,8 +2289,7 @@ compute_scalar_stats(VacAttrStatsP stats,
+ 
+ 	memset(&ssup, 0, sizeof(ssup));
+ 	ssup.ssup_cxt = CurrentMemoryContext;
+-	/* We always use the default collation for statistics */
+-	ssup.ssup_collation = DEFAULT_COLLATION_OID;
++	ssup.ssup_collation = stats->attrcollid;
+ 	ssup.ssup_nulls_first = false;
+ 
+ 	/*
+@@ -2567,6 +2582,7 @@ compute_scalar_stats(VacAttrStatsP stats,
+ 
+ 			stats->stakind[slot_idx] = STATISTIC_KIND_MCV;
+ 			stats->staop[slot_idx] = mystats->eqopr;
++			stats->stacoll[slot_idx] = stats->attrcollid;
+ 			stats->stanumbers[slot_idx] = mcv_freqs;
+ 			stats->numnumbers[slot_idx] = num_mcv;
+ 			stats->stavalues[slot_idx] = mcv_values;
+@@ -2682,6 +2698,7 @@ compute_scalar_stats(VacAttrStatsP stats,
+ 
+ 			stats->stakind[slot_idx] = STATISTIC_KIND_HISTOGRAM;
+ 			stats->staop[slot_idx] = mystats->ltopr;
++			stats->stacoll[slot_idx] = stats->attrcollid;
+ 			stats->stavalues[slot_idx] = hist_values;
+ 			stats->numvalues[slot_idx] = num_hist;
+ 
+@@ -2725,6 +2742,7 @@ compute_scalar_stats(VacAttrStatsP stats,
+ 
+ 			stats->stakind[slot_idx] = STATISTIC_KIND_CORRELATION;
+ 			stats->staop[slot_idx] = mystats->ltopr;
++			stats->stacoll[slot_idx] = stats->attrcollid;
+ 			stats->stanumbers[slot_idx] = corrs;
+ 			stats->numnumbers[slot_idx] = 1;
+ 			slot_idx++;
+diff --git a/src/backend/statistics/dependencies.c b/src/backend/statistics/dependencies.c
+index 140783cfb3a9..58d0df20f697 100644
+--- a/src/backend/statistics/dependencies.c
++++ b/src/backend/statistics/dependencies.c
+@@ -252,6 +252,9 @@ dependency_degree(int numrows, HeapTuple *rows, int k, AttrNumber *dependency,
+ 	 * (b) split the data into groups by first (k-1) columns
+ 	 *
+ 	 * (c) for each group count different values in the last column
++	 *
++	 * We use the column data types' default sort operators and collations;
++	 * perhaps at some point it'd be worth using column-specific collations?
+ 	 */
+ 
+ 	/* prepare the sort function for the first dimension, and SortItem array */
+@@ -266,7 +269,7 @@ dependency_degree(int numrows, HeapTuple *rows, int k, AttrNumber *dependency,
+ 				 colstat->attrtypid);
+ 
+ 		/* prepare the sort function for this dimension */
+-		multi_sort_add_dimension(mss, i, type->lt_opr);
++		multi_sort_add_dimension(mss, i, type->lt_opr, type->typcollation);
+ 
+ 		/* accumulate all the data for both columns into an array and sort it */
+ 		for (j = 0; j < numrows; j++)
+diff --git a/src/backend/statistics/extended_stats.c b/src/backend/statistics/extended_stats.c
+index 5dcee95250a4..082f0506da04 100644
+--- a/src/backend/statistics/extended_stats.c
++++ b/src/backend/statistics/extended_stats.c
+@@ -363,18 +363,18 @@ multi_sort_init(int ndims)
+ }
+ 
+ /*
+- * Prepare sort support info using the given sort operator
++ * Prepare sort support info using the given sort operator and collation
+  * at the position 'sortdim'
+  */
+ void
+-multi_sort_add_dimension(MultiSortSupport mss, int sortdim, Oid oper)
++multi_sort_add_dimension(MultiSortSupport mss, int sortdim,
++						 Oid oper, Oid collation)
+ {
+ 	SortSupport ssup = &mss->ssup[sortdim];
+ 
+ 	ssup->ssup_cxt = CurrentMemoryContext;
+-	ssup->ssup_collation = DEFAULT_COLLATION_OID;
++	ssup->ssup_collation = collation;
+ 	ssup->ssup_nulls_first = false;
+-	ssup->ssup_cxt = CurrentMemoryContext;
+ 
+ 	PrepareSortSupportFromOrderingOp(oper, ssup);
+ }
+diff --git a/src/backend/statistics/mvdistinct.c b/src/backend/statistics/mvdistinct.c
+index 593c21983960..3071e42d8643 100644
+--- a/src/backend/statistics/mvdistinct.c
++++ b/src/backend/statistics/mvdistinct.c
+@@ -454,6 +454,9 @@ ndistinct_for_combination(double totalrows, int numrows, HeapTuple *rows,
+ 	/*
+ 	 * For each dimension, set up sort-support and fill in the values from the
+ 	 * sample data.
++	 *
++	 * We use the column data types' default sort operators and collations;
++	 * perhaps at some point it'd be worth using column-specific collations?
+ 	 */
+ 	for (i = 0; i < k; i++)
+ 	{
+@@ -466,7 +469,7 @@ ndistinct_for_combination(double totalrows, int numrows, HeapTuple *rows,
+ 				 colstat->attrtypid);
+ 
+ 		/* prepare the sort function for this dimension */
+-		multi_sort_add_dimension(mss, i, type->lt_opr);
++		multi_sort_add_dimension(mss, i, type->lt_opr, type->typcollation);
+ 
+ 		/* accumulate all the data for this dimension into the arrays */
+ 		for (j = 0; j < numrows; j++)
+diff --git a/src/backend/tsearch/ts_typanalyze.c b/src/backend/tsearch/ts_typanalyze.c
+index 1f93963c6664..bd34711f685e 100644
+--- a/src/backend/tsearch/ts_typanalyze.c
++++ b/src/backend/tsearch/ts_typanalyze.c
+@@ -14,6 +14,7 @@
+ #include "postgres.h"
+ 
+ #include "access/hash.h"
++#include "catalog/pg_collation.h"
+ #include "catalog/pg_operator.h"
+ #include "commands/vacuum.h"
+ #include "tsearch/ts_type.h"
+@@ -415,6 +416,7 @@ compute_tsvector_stats(VacAttrStats *stats,
+ 
+ 			stats->stakind[0] = STATISTIC_KIND_MCELEM;
+ 			stats->staop[0] = TextEqualOperator;
++			stats->stacoll[0] = DEFAULT_COLLATION_OID;
+ 			stats->stanumbers[0] = mcelem_freqs;
+ 			/* See above comment about two extra frequency fields */
+ 			stats->numnumbers[0] = num_mcelem + 2;
+diff --git a/src/backend/utils/adt/array_selfuncs.c b/src/backend/utils/adt/array_selfuncs.c
+index 339525b53b5b..00b69bd1e3f5 100644
+--- a/src/backend/utils/adt/array_selfuncs.c
++++ b/src/backend/utils/adt/array_selfuncs.c
+@@ -46,21 +46,21 @@ static Selectivity mcelem_array_selec(ArrayType *array,
+ 				   Datum *mcelem, int nmcelem,
+ 				   float4 *numbers, int nnumbers,
+ 				   float4 *hist, int nhist,
+-				   Oid operator, FmgrInfo *cmpfunc);
++				   Oid operator);
+ static Selectivity mcelem_array_contain_overlap_selec(Datum *mcelem, int nmcelem,
+ 								   float4 *numbers, int nnumbers,
+ 								   Datum *array_data, int nitems,
+-								   Oid operator, FmgrInfo *cmpfunc);
++								   Oid operator, TypeCacheEntry *typentry);
+ static Selectivity mcelem_array_contained_selec(Datum *mcelem, int nmcelem,
+ 							 float4 *numbers, int nnumbers,
+ 							 Datum *array_data, int nitems,
+ 							 float4 *hist, int nhist,
+-							 Oid operator, FmgrInfo *cmpfunc);
++							 Oid operator, TypeCacheEntry *typentry);
+ static float *calc_hist(const float4 *hist, int nhist, int n);
+ static float *calc_distr(const float *p, int n, int m, float rest);
+ static int	floor_log2(uint32 n);
+ static bool find_next_mcelem(Datum *mcelem, int nmcelem, Datum value,
+-				 int *index, FmgrInfo *cmpfunc);
++				 int *index, TypeCacheEntry *typentry);
+ static int	element_compare(const void *key1, const void *key2, void *arg);
+ static int	float_compare_desc(const void *key1, const void *key2);
+ 
+@@ -166,7 +166,7 @@ scalararraysel_containment(PlannerInfo *root,
+ 														   sslot.nnumbers,
+ 														   &constval, 1,
+ 														   OID_ARRAY_CONTAINS_OP,
+-														   cmpfunc);
++														   typentry);
+ 			else
+ 				selec = mcelem_array_contained_selec(sslot.values,
+ 													 sslot.nvalues,
+@@ -176,7 +176,7 @@ scalararraysel_containment(PlannerInfo *root,
+ 													 hslot.numbers,
+ 													 hslot.nnumbers,
+ 													 OID_ARRAY_CONTAINED_OP,
+-													 cmpfunc);
++													 typentry);
+ 
+ 			free_attstatsslot(&hslot);
+ 			free_attstatsslot(&sslot);
+@@ -189,14 +189,14 @@ scalararraysel_containment(PlannerInfo *root,
+ 														   NULL, 0,
+ 														   &constval, 1,
+ 														   OID_ARRAY_CONTAINS_OP,
+-														   cmpfunc);
++														   typentry);
+ 			else
+ 				selec = mcelem_array_contained_selec(NULL, 0,
+ 													 NULL, 0,
+ 													 &constval, 1,
+ 													 NULL, 0,
+ 													 OID_ARRAY_CONTAINED_OP,
+-													 cmpfunc);
++													 typentry);
+ 		}
+ 
+ 		/*
+@@ -212,14 +212,14 @@ scalararraysel_containment(PlannerInfo *root,
+ 													   NULL, 0,
+ 													   &constval, 1,
+ 													   OID_ARRAY_CONTAINS_OP,
+-													   cmpfunc);
++													   typentry);
+ 		else
+ 			selec = mcelem_array_contained_selec(NULL, 0,
+ 												 NULL, 0,
+ 												 &constval, 1,
+ 												 NULL, 0,
+ 												 OID_ARRAY_CONTAINED_OP,
+-												 cmpfunc);
++												 typentry);
+ 		/* we assume no nulls here, so no stanullfrac correction */
+ 	}
+ 
+@@ -385,7 +385,7 @@ calc_arraycontsel(VariableStatData *vardata, Datum constval,
+ 									   sslot.values, sslot.nvalues,
+ 									   sslot.numbers, sslot.nnumbers,
+ 									   hslot.numbers, hslot.nnumbers,
+-									   operator, cmpfunc);
++									   operator);
+ 
+ 			free_attstatsslot(&hslot);
+ 			free_attstatsslot(&sslot);
+@@ -395,7 +395,7 @@ calc_arraycontsel(VariableStatData *vardata, Datum constval,
+ 			/* No most-common-elements info, so do without */
+ 			selec = mcelem_array_selec(array, typentry,
+ 									   NULL, 0, NULL, 0, NULL, 0,
+-									   operator, cmpfunc);
++									   operator);
+ 		}
+ 
+ 		/*
+@@ -408,7 +408,7 @@ calc_arraycontsel(VariableStatData *vardata, Datum constval,
+ 		/* No stats at all, so do without */
+ 		selec = mcelem_array_selec(array, typentry,
+ 								   NULL, 0, NULL, 0, NULL, 0,
+-								   operator, cmpfunc);
++								   operator);
+ 		/* we assume no nulls here, so no stanullfrac correction */
+ 	}
+ 
+@@ -431,7 +431,7 @@ mcelem_array_selec(ArrayType *array, TypeCacheEntry *typentry,
+ 				   Datum *mcelem, int nmcelem,
+ 				   float4 *numbers, int nnumbers,
+ 				   float4 *hist, int nhist,
+-				   Oid operator, FmgrInfo *cmpfunc)
++				   Oid operator)
+ {
+ 	Selectivity selec;
+ 	int			num_elems;
+@@ -476,20 +476,20 @@ mcelem_array_selec(ArrayType *array, TypeCacheEntry *typentry,
+ 
+ 	/* Sort extracted elements using their default comparison function. */
+ 	qsort_arg(elem_values, nonnull_nitems, sizeof(Datum),
+-			  element_compare, cmpfunc);
++			  element_compare, typentry);
+ 
+ 	/* Separate cases according to operator */
+ 	if (operator == OID_ARRAY_CONTAINS_OP || operator == OID_ARRAY_OVERLAP_OP)
+ 		selec = mcelem_array_contain_overlap_selec(mcelem, nmcelem,
+ 												   numbers, nnumbers,
+ 												   elem_values, nonnull_nitems,
+-												   operator, cmpfunc);
++												   operator, typentry);
+ 	else if (operator == OID_ARRAY_CONTAINED_OP)
+ 		selec = mcelem_array_contained_selec(mcelem, nmcelem,
+ 											 numbers, nnumbers,
+ 											 elem_values, nonnull_nitems,
+ 											 hist, nhist,
+-											 operator, cmpfunc);
++											 operator, typentry);
+ 	else
+ 	{
+ 		elog(ERROR, "arraycontsel called for unrecognized operator %u",
+@@ -523,7 +523,7 @@ static Selectivity
+ mcelem_array_contain_overlap_selec(Datum *mcelem, int nmcelem,
+ 								   float4 *numbers, int nnumbers,
+ 								   Datum *array_data, int nitems,
+-								   Oid operator, FmgrInfo *cmpfunc)
++								   Oid operator, TypeCacheEntry *typentry)
+ {
+ 	Selectivity selec,
+ 				elem_selec;
+@@ -586,14 +586,14 @@ mcelem_array_contain_overlap_selec(Datum *mcelem, int nmcelem,
+ 
+ 		/* Ignore any duplicates in the array data. */
+ 		if (i > 0 &&
+-			element_compare(&array_data[i - 1], &array_data[i], cmpfunc) == 0)
++			element_compare(&array_data[i - 1], &array_data[i], typentry) == 0)
+ 			continue;
+ 
+ 		/* Find the smallest MCELEM >= this array item. */
+ 		if (use_bsearch)
+ 		{
+ 			match = find_next_mcelem(mcelem, nmcelem, array_data[i],
+-									 &mcelem_index, cmpfunc);
++									 &mcelem_index, typentry);
+ 		}
+ 		else
+ 		{
+@@ -601,7 +601,7 @@ mcelem_array_contain_overlap_selec(Datum *mcelem, int nmcelem,
+ 			{
+ 				int			cmp = element_compare(&mcelem[mcelem_index],
+ 												  &array_data[i],
+-												  cmpfunc);
++												  typentry);
+ 
+ 				if (cmp < 0)
+ 					mcelem_index++;
+@@ -699,7 +699,7 @@ mcelem_array_contained_selec(Datum *mcelem, int nmcelem,
+ 							 float4 *numbers, int nnumbers,
+ 							 Datum *array_data, int nitems,
+ 							 float4 *hist, int nhist,
+-							 Oid operator, FmgrInfo *cmpfunc)
++							 Oid operator, TypeCacheEntry *typentry)
+ {
+ 	int			mcelem_index,
+ 				i,
+@@ -765,7 +765,7 @@ mcelem_array_contained_selec(Datum *mcelem, int nmcelem,
+ 
+ 		/* Ignore any duplicates in the array data. */
+ 		if (i > 0 &&
+-			element_compare(&array_data[i - 1], &array_data[i], cmpfunc) == 0)
++			element_compare(&array_data[i - 1], &array_data[i], typentry) == 0)
+ 			continue;
+ 
+ 		/*
+@@ -777,7 +777,7 @@ mcelem_array_contained_selec(Datum *mcelem, int nmcelem,
+ 		{
+ 			int			cmp = element_compare(&mcelem[mcelem_index],
+ 											  &array_data[i],
+-											  cmpfunc);
++											  typentry);
+ 
+ 			if (cmp < 0)
+ 			{
+@@ -1130,7 +1130,7 @@ floor_log2(uint32 n)
+  */
+ static bool
+ find_next_mcelem(Datum *mcelem, int nmcelem, Datum value, int *index,
+-				 FmgrInfo *cmpfunc)
++				 TypeCacheEntry *typentry)
+ {
+ 	int			l = *index,
+ 				r = nmcelem - 1,
+@@ -1140,7 +1140,7 @@ find_next_mcelem(Datum *mcelem, int nmcelem, Datum value, int *index,
+ 	while (l <= r)
+ 	{
+ 		i = (l + r) / 2;
+-		res = element_compare(&mcelem[i], &value, cmpfunc);
++		res = element_compare(&mcelem[i], &value, typentry);
+ 		if (res == 0)
+ 		{
+ 			*index = i;
+@@ -1158,7 +1158,7 @@ find_next_mcelem(Datum *mcelem, int nmcelem, Datum value, int *index,
+ /*
+  * Comparison function for elements.
+  *
+- * We use the element type's default btree opclass, and the default collation
++ * We use the element type's default btree opclass, and its default collation
+  * if the type is collation-sensitive.
+  *
+  * XXX consider using SortSupport infrastructure
+@@ -1168,10 +1168,11 @@ element_compare(const void *key1, const void *key2, void *arg)
+ {
+ 	Datum		d1 = *((const Datum *) key1);
+ 	Datum		d2 = *((const Datum *) key2);
+-	FmgrInfo   *cmpfunc = (FmgrInfo *) arg;
++	TypeCacheEntry *typentry = (TypeCacheEntry *) arg;
++	FmgrInfo   *cmpfunc = &typentry->cmp_proc_finfo;
+ 	Datum		c;
+ 
+-	c = FunctionCall2Coll(cmpfunc, DEFAULT_COLLATION_OID, d1, d2);
++	c = FunctionCall2Coll(cmpfunc, typentry->typcollation, d1, d2);
+ 	return DatumGetInt32(c);
+ }
+ 
+diff --git a/src/backend/utils/adt/array_typanalyze.c b/src/backend/utils/adt/array_typanalyze.c
+index 92e38b870f51..c4a1fef3a2f3 100644
+--- a/src/backend/utils/adt/array_typanalyze.c
++++ b/src/backend/utils/adt/array_typanalyze.c
+@@ -15,7 +15,6 @@
+ #include "postgres.h"
+ 
+ #include "access/tuptoaster.h"
+-#include "catalog/pg_collation.h"
+ #include "commands/vacuum.h"
+ #include "utils/array.h"
+ #include "utils/builtins.h"
+@@ -39,6 +38,7 @@ typedef struct
+ 	/* Information about array element type */
+ 	Oid			type_id;		/* element type's OID */
+ 	Oid			eq_opr;			/* default equality operator's OID */
++	Oid			coll_id;		/* collation to use */
+ 	bool		typbyval;		/* physical properties of element type */
+ 	int16		typlen;
+ 	char		typalign;
+@@ -135,6 +135,7 @@ array_typanalyze(PG_FUNCTION_ARGS)
+ 	extra_data = (ArrayAnalyzeExtraData *) palloc(sizeof(ArrayAnalyzeExtraData));
+ 	extra_data->type_id = typentry->type_id;
+ 	extra_data->eq_opr = typentry->eq_opr;
++	extra_data->coll_id = stats->attrcollid;	/* collation we should use */
+ 	extra_data->typbyval = typentry->typbyval;
+ 	extra_data->typlen = typentry->typlen;
+ 	extra_data->typalign = typentry->typalign;
+@@ -560,6 +561,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
+ 
+ 			stats->stakind[slot_idx] = STATISTIC_KIND_MCELEM;
+ 			stats->staop[slot_idx] = extra_data->eq_opr;
++			stats->stacoll[slot_idx] = extra_data->coll_id;
+ 			stats->stanumbers[slot_idx] = mcelem_freqs;
+ 			/* See above comment about extra stanumber entries */
+ 			stats->numnumbers[slot_idx] = num_mcelem + 3;
+@@ -661,6 +663,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
+ 
+ 			stats->stakind[slot_idx] = STATISTIC_KIND_DECHIST;
+ 			stats->staop[slot_idx] = extra_data->eq_opr;
++			stats->stacoll[slot_idx] = extra_data->coll_id;
+ 			stats->stanumbers[slot_idx] = hist;
+ 			stats->numnumbers[slot_idx] = num_hist + 1;
+ 			slot_idx++;
+@@ -703,7 +706,7 @@ prune_element_hashtable(HTAB *elements_tab, int b_current)
+ /*
+  * Hash function for elements.
+  *
+- * We use the element type's default hash opclass, and the default collation
++ * We use the element type's default hash opclass, and the column collation
+  * if the type is collation-sensitive.
+  */
+ static uint32
+@@ -712,7 +715,9 @@ element_hash(const void *key, Size keysize)
+ 	Datum		d = *((const Datum *) key);
+ 	Datum		h;
+ 
+-	h = FunctionCall1Coll(array_extra_data->hash, DEFAULT_COLLATION_OID, d);
++	h = FunctionCall1Coll(array_extra_data->hash,
++						  array_extra_data->coll_id,
++						  d);
+ 	return DatumGetUInt32(h);
+ }
+ 
+@@ -729,7 +734,7 @@ element_match(const void *key1, const void *key2, Size keysize)
+ /*
+  * Comparison function for elements.
+  *
+- * We use the element type's default btree opclass, and the default collation
++ * We use the element type's default btree opclass, and the column collation
+  * if the type is collation-sensitive.
+  *
+  * XXX consider using SortSupport infrastructure
+@@ -741,7 +746,9 @@ element_compare(const void *key1, const void *key2)
+ 	Datum		d2 = *((const Datum *) key2);
+ 	Datum		c;
+ 
+-	c = FunctionCall2Coll(array_extra_data->cmp, DEFAULT_COLLATION_OID, d1, d2);
++	c = FunctionCall2Coll(array_extra_data->cmp,
++						  array_extra_data->coll_id,
++						  d1, d2);
+ 	return DatumGetInt32(c);
+ }
+ 
+diff --git a/src/backend/utils/adt/rangetypes_typanalyze.c b/src/backend/utils/adt/rangetypes_typanalyze.c
+index 9c50e4c1be12..98cf5f8964bd 100644
+--- a/src/backend/utils/adt/rangetypes_typanalyze.c
++++ b/src/backend/utils/adt/rangetypes_typanalyze.c
+@@ -320,6 +320,7 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
+ 			num_hist = 0;
+ 		}
+ 		stats->staop[slot_idx] = Float8LessOperator;
++		stats->stacoll[slot_idx] = InvalidOid;
+ 		stats->stavalues[slot_idx] = length_hist_values;
+ 		stats->numvalues[slot_idx] = num_hist;
+ 		stats->statypid[slot_idx] = FLOAT8OID;
+diff --git a/src/backend/utils/adt/selfuncs.c b/src/backend/utils/adt/selfuncs.c
+index ffca0fe5bb8e..c3db9ea070b3 100644
+--- a/src/backend/utils/adt/selfuncs.c
++++ b/src/backend/utils/adt/selfuncs.c
+@@ -87,11 +87,12 @@
+  * For both oprrest and oprjoin functions, the operator's input collation OID
+  * (if any) is passed using the standard fmgr mechanism, so that the estimator
+  * function can fetch it with PG_GET_COLLATION().  Note, however, that all
+- * statistics in pg_statistic are currently built using the database's default
++ * statistics in pg_statistic are currently built using the relevant column's
+  * collation.  Thus, in most cases where we are looking at statistics, we
+- * should ignore the actual operator collation and use DEFAULT_COLLATION_OID.
++ * should ignore the operator collation and use the stats entry's collation.
+  * We expect that the error induced by doing this is usually not large enough
+- * to justify complicating matters.
++ * to justify complicating matters.  In any case, doing otherwise would yield
++ * entirely garbage results for ordered stats data such as histograms.
+  *----------
+  */
+ 
+@@ -181,7 +182,8 @@ static double eqjoinsel_semi(Oid opfuncoid,
+ 			   RelOptInfo *inner_rel);
+ static bool estimate_multivariate_ndistinct(PlannerInfo *root,
+ 								RelOptInfo *rel, List **varinfos, double *ndistinct);
+-static bool convert_to_scalar(Datum value, Oid valuetypid, double *scaledvalue,
++static bool convert_to_scalar(Datum value, Oid valuetypid, Oid collid,
++				  double *scaledvalue,
+ 				  Datum lobound, Datum hibound, Oid boundstypid,
+ 				  double *scaledlobound, double *scaledhibound);
+ static double convert_numeric_to_scalar(Datum value, Oid typid, bool *failure);
+@@ -201,7 +203,8 @@ static double convert_one_string_to_scalar(char *value,
+ 							 int rangelo, int rangehi);
+ static double convert_one_bytea_to_scalar(unsigned char *value, int valuelen,
+ 							int rangelo, int rangehi);
+-static char *convert_string_datum(Datum value, Oid typid, bool *failure);
++static char *convert_string_datum(Datum value, Oid typid, Oid collid,
++					 bool *failure);
+ static double convert_timevalue_to_scalar(Datum value, Oid typid,
+ 							bool *failure);
+ static void examine_simple_variable(PlannerInfo *root, Var *var,
+@@ -370,12 +373,12 @@ var_eq_const(VariableStatData *vardata, Oid operator,
+ 				/* be careful to apply operator right way 'round */
+ 				if (varonleft)
+ 					match = DatumGetBool(FunctionCall2Coll(&eqproc,
+-														   DEFAULT_COLLATION_OID,
++														   sslot.stacoll,
+ 														   sslot.values[i],
+ 														   constval));
+ 				else
+ 					match = DatumGetBool(FunctionCall2Coll(&eqproc,
+-														   DEFAULT_COLLATION_OID,
++														   sslot.stacoll,
+ 														   constval,
+ 														   sslot.values[i]));
+ 				if (match)
+@@ -666,11 +669,11 @@ mcv_selectivity(VariableStatData *vardata, FmgrInfo *opproc,
+ 		{
+ 			if (varonleft ?
+ 				DatumGetBool(FunctionCall2Coll(opproc,
+-											   DEFAULT_COLLATION_OID,
++											   sslot.stacoll,
+ 											   sslot.values[i],
+ 											   constval)) :
+ 				DatumGetBool(FunctionCall2Coll(opproc,
+-											   DEFAULT_COLLATION_OID,
++											   sslot.stacoll,
+ 											   constval,
+ 											   sslot.values[i])))
+ 				mcv_selec += sslot.numbers[i];
+@@ -744,11 +747,11 @@ histogram_selectivity(VariableStatData *vardata, FmgrInfo *opproc,
+ 			{
+ 				if (varonleft ?
+ 					DatumGetBool(FunctionCall2Coll(opproc,
+-												   DEFAULT_COLLATION_OID,
++												   sslot.stacoll,
+ 												   sslot.values[i],
+ 												   constval)) :
+ 					DatumGetBool(FunctionCall2Coll(opproc,
+-												   DEFAULT_COLLATION_OID,
++												   sslot.stacoll,
+ 												   constval,
+ 												   sslot.values[i])))
+ 					nmatch++;
+@@ -873,7 +876,7 @@ ineq_histogram_selectivity(PlannerInfo *root,
+ 														 &sslot.values[probe]);
+ 
+ 				ltcmp = DatumGetBool(FunctionCall2Coll(opproc,
+-													   DEFAULT_COLLATION_OID,
++													   sslot.stacoll,
+ 													   sslot.values[probe],
+ 													   constval));
+ 				if (isgt)
+@@ -958,7 +961,8 @@ ineq_histogram_selectivity(PlannerInfo *root,
+ 				 * values to a uniform comparison scale, and do a linear
+ 				 * interpolation within this bin.
+ 				 */
+-				if (convert_to_scalar(constval, consttype, &val,
++				if (convert_to_scalar(constval, consttype, sslot.stacoll,
++									  &val,
+ 									  sslot.values[i - 1], sslot.values[i],
+ 									  vardata->vartype,
+ 									  &low, &high))
+@@ -2499,7 +2503,7 @@ eqjoinsel_inner(Oid opfuncoid,
+ 				if (hasmatch2[j])
+ 					continue;
+ 				if (DatumGetBool(FunctionCall2Coll(&eqproc,
+-												   DEFAULT_COLLATION_OID,
++												   sslot1->stacoll,
+ 												   sslot1->values[i],
+ 												   sslot2->values[j])))
+ 				{
+@@ -2711,7 +2715,7 @@ eqjoinsel_semi(Oid opfuncoid,
+ 				if (hasmatch2[j])
+ 					continue;
+ 				if (DatumGetBool(FunctionCall2Coll(&eqproc,
+-												   DEFAULT_COLLATION_OID,
++												   sslot1->stacoll,
+ 												   sslot1->values[i],
+ 												   sslot2->values[j])))
+ 				{
+@@ -4066,7 +4070,7 @@ estimate_multivariate_ndistinct(PlannerInfo *root, RelOptInfo *rel,
+  * converted to measurements expressed in seconds.
+  */
+ static bool
+-convert_to_scalar(Datum value, Oid valuetypid, double *scaledvalue,
++convert_to_scalar(Datum value, Oid valuetypid, Oid collid, double *scaledvalue,
+ 				  Datum lobound, Datum hibound, Oid boundstypid,
+ 				  double *scaledlobound, double *scaledhibound)
+ {
+@@ -4131,11 +4135,11 @@ convert_to_scalar(Datum value, Oid valuetypid, double *scaledvalue,
+ 		case NAMEOID:
+ 			{
+ 				char	   *valstr = convert_string_datum(value, valuetypid,
+-														  &failure);
++														  collid, &failure);
+ 				char	   *lostr = convert_string_datum(lobound, boundstypid,
+-														 &failure);
++														 collid, &failure);
+ 				char	   *histr = convert_string_datum(hibound, boundstypid,
+-														 &failure);
++														 collid, &failure);
+ 
+ 				/*
+ 				 * Bail out if any of the values is not of string type.  We
+@@ -4404,7 +4408,7 @@ convert_one_string_to_scalar(char *value, int rangelo, int rangehi)
+  * before continuing, so as to generate correct locale-specific results.
+  */
+ static char *
+-convert_string_datum(Datum value, Oid typid, bool *failure)
++convert_string_datum(Datum value, Oid typid, Oid collid, bool *failure)
+ {
+ 	char	   *val;
+ 
+@@ -4432,7 +4436,7 @@ convert_string_datum(Datum value, Oid typid, bool *failure)
+ 			return NULL;
+ 	}
+ 
+-	if (!lc_collate_is_c(DEFAULT_COLLATION_OID))
++	if (!lc_collate_is_c(collid))
+ 	{
+ 		char	   *xfrmstr;
+ 		size_t		xfrmlen;
+@@ -5407,14 +5411,14 @@ get_variable_range(PlannerInfo *root, VariableStatData *vardata, Oid sortop,
+ 				continue;
+ 			}
+ 			if (DatumGetBool(FunctionCall2Coll(&opproc,
+-											   DEFAULT_COLLATION_OID,
++											   sslot.stacoll,
+ 											   sslot.values[i], tmin)))
+ 			{
+ 				tmin = sslot.values[i];
+ 				tmin_is_mcv = true;
+ 			}
+ 			if (DatumGetBool(FunctionCall2Coll(&opproc,
+-											   DEFAULT_COLLATION_OID,
++											   sslot.stacoll,
+ 											   tmax, sslot.values[i])))
+ 			{
+ 				tmax = sslot.values[i];
+@@ -6014,6 +6018,7 @@ prefix_selectivity(PlannerInfo *root, VariableStatData *vardata,
+ 	Selectivity prefixsel;
+ 	Oid			cmpopr;
+ 	FmgrInfo	opproc;
++	AttStatsSlot sslot;
+ 	Const	   *greaterstrcon;
+ 	Selectivity eq_sel;
+ 
+@@ -6036,16 +6041,23 @@ prefix_selectivity(PlannerInfo *root, VariableStatData *vardata,
+ 
+ 	/*-------
+ 	 * If we can create a string larger than the prefix, say
+-	 *	"x < greaterstr".
++	 * "x < greaterstr".  We try to generate the string referencing the
++	 * collation of the var's statistics, but if that's not available,
++	 * use DEFAULT_COLLATION_OID.
+ 	 *-------
+ 	 */
++	if (HeapTupleIsValid(vardata->statsTuple) &&
++		get_attstatsslot(&sslot, vardata->statsTuple,
++						 STATISTIC_KIND_HISTOGRAM, InvalidOid, 0))
++		 /* sslot.stacoll is set up */ ;
++	else
++		sslot.stacoll = DEFAULT_COLLATION_OID;
+ 	cmpopr = get_opfamily_member(opfamily, vartype, vartype,
+ 								 BTLessStrategyNumber);
+ 	if (cmpopr == InvalidOid)
+ 		elog(ERROR, "no < operator for opfamily %u", opfamily);
+ 	fmgr_info(get_opcode(cmpopr), &opproc);
+-	greaterstrcon = make_greater_string(prefixcon, &opproc,
+-										DEFAULT_COLLATION_OID);
++	greaterstrcon = make_greater_string(prefixcon, &opproc, sslot.stacoll);
+ 	if (greaterstrcon)
+ 	{
+ 		Selectivity topsel;
+diff --git a/src/backend/utils/cache/lsyscache.c b/src/backend/utils/cache/lsyscache.c
+index 7a263cc1fdc4..33b5b1649c27 100644
+--- a/src/backend/utils/cache/lsyscache.c
++++ b/src/backend/utils/cache/lsyscache.c
+@@ -2881,6 +2881,7 @@ get_attavgwidth(Oid relid, AttrNumber attnum)
+  *
+  * If a matching slot is found, true is returned, and *sslot is filled thus:
+  * staop: receives the actual STAOP value.
++ * stacoll: receives the actual STACOLL value.
+  * valuetype: receives actual datatype of the elements of stavalues.
+  * values: receives pointer to an array of the slot's stavalues.
+  * nvalues: receives number of stavalues.
+@@ -2893,6 +2894,10 @@ get_attavgwidth(Oid relid, AttrNumber attnum)
+  *
+  * If no matching slot is found, false is returned, and *sslot is zeroed.
+  *
++ * Note that the current API doesn't allow for searching for a slot with
++ * a particular collation.  If we ever actually support recording more than
++ * one collation, we'll have to extend the API, but for now simple is good.
++ *
+  * The data referred to by the fields of sslot is locally palloc'd and
+  * is independent of the original pg_statistic tuple.  When the caller
+  * is done with it, call free_attstatsslot to release the palloc'd data.
+@@ -2927,6 +2932,20 @@ get_attstatsslot(AttStatsSlot *sslot, HeapTuple statstuple,
+ 		return false;			/* not there */
+ 
+ 	sslot->staop = (&stats->staop1)[i];
++	sslot->stacoll = (&stats->stacoll1)[i];
++
++	/*
++	 * XXX Hopefully-temporary hack: if stacoll isn't set, inject the default
++	 * collation.  This won't matter for non-collation-aware datatypes.  For
++	 * those that are, this covers cases where stacoll has not been set.  In
++	 * the short term we need this because some code paths involving type NAME
++	 * do not pass any collation to prefix_selectivity and related functions.
++	 * Even when that's been fixed, it's likely that some add-on typanalyze
++	 * functions won't get the word right away about filling stacoll during
++	 * ANALYZE, so we'll probably need this for awhile.
++	 */
++	if (sslot->stacoll == InvalidOid)
++		sslot->stacoll = DEFAULT_COLLATION_OID;
+ 
+ 	if (flags & ATTSTATSSLOT_VALUES)
+ 	{
+diff --git a/src/backend/utils/cache/typcache.c b/src/backend/utils/cache/typcache.c
+index 1a96cc9b98fd..c540a39c15dd 100644
+--- a/src/backend/utils/cache/typcache.c
++++ b/src/backend/utils/cache/typcache.c
+@@ -388,6 +388,7 @@ lookup_type_cache(Oid type_id, int flags)
+ 		typentry->typtype = typtup->typtype;
+ 		typentry->typrelid = typtup->typrelid;
+ 		typentry->typelem = typtup->typelem;
++		typentry->typcollation = typtup->typcollation;
+ 
+ 		/* If it's a domain, immediately thread it into the domain cache list */
+ 		if (typentry->typtype == TYPTYPE_DOMAIN)
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index e16ec9dd7786..838e927547f3 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	201812091
++#define CATALOG_VERSION_NO	201812141
+ 
+ #endif
+diff --git a/src/include/catalog/pg_statistic.h b/src/include/catalog/pg_statistic.h
+index 49223aab4fce..2155f51a5b1e 100644
+--- a/src/include/catalog/pg_statistic.h
++++ b/src/include/catalog/pg_statistic.h
+@@ -74,12 +74,13 @@ CATALOG(pg_statistic,2619,StatisticRelationId)
+ 	 * statistical data can be placed.  Each slot includes:
+ 	 *		kind			integer code identifying kind of data (see below)
+ 	 *		op				OID of associated operator, if needed
++	 *		coll			OID of relevant collation, or 0 if none
+ 	 *		numbers			float4 array (for statistical values)
+ 	 *		values			anyarray (for representations of data values)
+-	 * The ID and operator fields are never NULL; they are zeroes in an
+-	 * unused slot.  The numbers and values fields are NULL in an unused
+-	 * slot, and might also be NULL in a used slot if the slot kind has
+-	 * no need for one or the other.
++	 * The ID, operator, and collation fields are never NULL; they are zeroes
++	 * in an unused slot.  The numbers and values fields are NULL in an
++	 * unused slot, and might also be NULL in a used slot if the slot kind
++	 * has no need for one or the other.
+ 	 * ----------------
+ 	 */
+ 
+@@ -95,6 +96,12 @@ CATALOG(pg_statistic,2619,StatisticRelationId)
+ 	Oid			staop4;
+ 	Oid			staop5;
+ 
++	Oid			stacoll1;
++	Oid			stacoll2;
++	Oid			stacoll3;
++	Oid			stacoll4;
++	Oid			stacoll5;
++
+ #ifdef CATALOG_VARLEN			/* variable-length fields start here */
+ 	float4		stanumbers1[1];
+ 	float4		stanumbers2[1];
+@@ -159,7 +166,8 @@ typedef FormData_pg_statistic *Form_pg_statistic;
+ 
+ /*
+  * In a "most common values" slot, staop is the OID of the "=" operator
+- * used to decide whether values are the same or not.  stavalues contains
++ * used to decide whether values are the same or not, and stacoll is the
++ * collation used (same as column's collation).  stavalues contains
+  * the K most common non-null values appearing in the column, and stanumbers
+  * contains their frequencies (fractions of total row count).  The values
+  * shall be ordered in decreasing frequency.  Note that since the arrays are
+@@ -171,9 +179,11 @@ typedef FormData_pg_statistic *Form_pg_statistic;
+ 
+ /*
+  * A "histogram" slot describes the distribution of scalar data.  staop is
+- * the OID of the "<" operator that describes the sort ordering.  (In theory,
+- * more than one histogram could appear, if a datatype has more than one
+- * useful sort operator.)  stavalues contains M (>=2) non-null values that
++ * the OID of the "<" operator that describes the sort ordering, and stacoll
++ * is the relevant collation.  (In theory more than one histogram could appear,
++ * if a datatype has more than one useful sort operator or we care about more
++ * than one collation.  Currently the collation will always be that of the
++ * underlying column.)  stavalues contains M (>=2) non-null values that
+  * divide the non-null column data values into M-1 bins of approximately equal
+  * population.  The first stavalues item is the MIN and the last is the MAX.
+  * stanumbers is not used and should be NULL.  IMPORTANT POINT: if an MCV
+@@ -190,11 +200,12 @@ typedef FormData_pg_statistic *Form_pg_statistic;
+ /*
+  * A "correlation" slot describes the correlation between the physical order
+  * of table tuples and the ordering of data values of this column, as seen
+- * by the "<" operator identified by staop.  (As with the histogram, more
+- * than one entry could theoretically appear.)	stavalues is not used and
+- * should be NULL.  stanumbers contains a single entry, the correlation
+- * coefficient between the sequence of data values and the sequence of
+- * their actual tuple positions.  The coefficient ranges from +1 to -1.
++ * by the "<" operator identified by staop with the collation identified by
++ * stacoll.  (As with the histogram, more than one entry could theoretically
++ * appear.)  stavalues is not used and should be NULL.  stanumbers contains
++ * a single entry, the correlation coefficient between the sequence of data
++ * values and the sequence of their actual tuple positions.  The coefficient
++ * ranges from +1 to -1.
+  */
+ #define STATISTIC_KIND_CORRELATION	3
+ 
+@@ -203,7 +214,8 @@ typedef FormData_pg_statistic *Form_pg_statistic;
+  * except that it stores the most common non-null *elements* of the column
+  * values.  This is useful when the column datatype is an array or some other
+  * type with identifiable elements (for instance, tsvector).  staop contains
+- * the equality operator appropriate to the element type.  stavalues contains
++ * the equality operator appropriate to the element type, and stacoll
++ * contains the collation to use with it.  stavalues contains
+  * the most common element values, and stanumbers their frequencies.  Unlike
+  * MCV slots, frequencies are measured as the fraction of non-null rows the
+  * element value appears in, not the frequency of all rows.  Also unlike
+@@ -226,7 +238,8 @@ typedef FormData_pg_statistic *Form_pg_statistic;
+  * A "distinct elements count histogram" slot describes the distribution of
+  * the number of distinct element values present in each row of an array-type
+  * column.  Only non-null rows are considered, and only non-null elements.
+- * staop contains the equality operator appropriate to the element type.
++ * staop contains the equality operator appropriate to the element type,
++ * and stacoll contains the collation to use with it.
+  * stavalues is not used and should be NULL.  The last member of stanumbers is
+  * the average count of distinct element values over all non-null rows.  The
+  * preceding M (>=2) members form a histogram that divides the population of
+diff --git a/src/include/commands/vacuum.h b/src/include/commands/vacuum.h
+index 2f4303e40d83..dfff23ac55b3 100644
+--- a/src/include/commands/vacuum.h
++++ b/src/include/commands/vacuum.h
+@@ -52,9 +52,11 @@
+  * careful to allocate any pointed-to data in anl_context, which will NOT
+  * be CurrentMemoryContext when compute_stats is called.
+  *
+- * Note: for the moment, all comparisons done for statistical purposes
+- * should use the database's default collation (DEFAULT_COLLATION_OID).
+- * This might change in some future release.
++ * Note: all comparisons done for statistical purposes should use the
++ * underlying column's collation (attcollation), except in situations
++ * where a noncollatable container type contains a collatable type;
++ * in that case use the type's default collation.  Be sure to record
++ * the appropriate collation in stacoll.
+  *----------
+  */
+ typedef struct VacAttrStats *VacAttrStatsP;
+@@ -78,11 +80,13 @@ typedef struct VacAttrStats
+ 	 * because some index opclasses store a different type than the underlying
+ 	 * column/expression.  Instead use attrtypid, attrtypmod, and attrtype for
+ 	 * information about the datatype being fed to the typanalyze function.
++	 * Likewise, use attrcollid not attr->attcollation.
+ 	 */
+ 	Form_pg_attribute attr;		/* copy of pg_attribute row for column */
+ 	Oid			attrtypid;		/* type of data being analyzed */
+ 	int32		attrtypmod;		/* typmod of data being analyzed */
+ 	Form_pg_type attrtype;		/* copy of pg_type row for attrtypid */
++	Oid			attrcollid;		/* collation of data being analyzed */
+ 	MemoryContext anl_context;	/* where to save long-lived data */
+ 
+ 	/*
+@@ -103,6 +107,7 @@ typedef struct VacAttrStats
+ 	float4		stadistinct;	/* # distinct values */
+ 	int16		stakind[STATISTIC_NUM_SLOTS];
+ 	Oid			staop[STATISTIC_NUM_SLOTS];
++	Oid			stacoll[STATISTIC_NUM_SLOTS];
+ 	int			numnumbers[STATISTIC_NUM_SLOTS];
+ 	float4	   *stanumbers[STATISTIC_NUM_SLOTS];
+ 	int			numvalues[STATISTIC_NUM_SLOTS];
+diff --git a/src/include/statistics/extended_stats_internal.h b/src/include/statistics/extended_stats_internal.h
+index b3ca0c1229fa..fff6bc67991f 100644
+--- a/src/include/statistics/extended_stats_internal.h
++++ b/src/include/statistics/extended_stats_internal.h
+@@ -59,7 +59,7 @@ extern MVDependencies *statext_dependencies_deserialize(bytea *data);
+ 
+ extern MultiSortSupport multi_sort_init(int ndims);
+ extern void multi_sort_add_dimension(MultiSortSupport mss, int sortdim,
+-						 Oid oper);
++						 Oid oper, Oid collation);
+ extern int	multi_sort_compare(const void *a, const void *b, void *arg);
+ extern int multi_sort_compare_dim(int dim, const SortItem *a,
+ 					   const SortItem *b, MultiSortSupport mss);
+diff --git a/src/include/utils/lsyscache.h b/src/include/utils/lsyscache.h
+index ff1705ad2b87..64089930019c 100644
+--- a/src/include/utils/lsyscache.h
++++ b/src/include/utils/lsyscache.h
+@@ -44,6 +44,7 @@ typedef struct AttStatsSlot
+ {
+ 	/* Always filled: */
+ 	Oid			staop;			/* Actual staop for the found slot */
++	Oid			stacoll;		/* Actual collation for the found slot */
+ 	/* Filled if ATTSTATSSLOT_VALUES is specified: */
+ 	Oid			valuetype;		/* Actual datatype of the values */
+ 	Datum	   *values;			/* slot's "values" array, or NULL if none */
+diff --git a/src/include/utils/typcache.h b/src/include/utils/typcache.h
+index 217d064da523..2b299608cfc7 100644
+--- a/src/include/utils/typcache.h
++++ b/src/include/utils/typcache.h
+@@ -41,6 +41,7 @@ typedef struct TypeCacheEntry
+ 	char		typtype;
+ 	Oid			typrelid;
+ 	Oid			typelem;
++	Oid			typcollation;
+ 
+ 	/*
+ 	 * Information obtained from opfamily entries

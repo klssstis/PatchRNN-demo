@@ -1,0 +1,158 @@
+From 5ed6fff6b729c3cce55d4abc8f695da93aa40a0d Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 14 Mar 2017 12:47:46 -0400
+Subject: [PATCH] Make logging about multixact wraparound protection less
+ chatty.
+
+The original messaging design, introduced in commit 068cfadf9, seems too
+chatty now that some time has elapsed since the bug fix; most installations
+will be in good shape and don't really need a reminder about this on every
+postmaster start.
+
+Hence, arrange to suppress the "wraparound protections are now enabled"
+message during startup (specifically, during the TrimMultiXact() call).
+The message will still appear if protection becomes effective at some
+later point.
+
+Discussion: https://postgr.es/m/17211.1489189214@sss.pgh.pa.us
+---
+ src/backend/access/transam/multixact.c | 21 +++++++++++++--------
+ src/backend/access/transam/xlog.c      |  4 ++--
+ src/backend/commands/vacuum.c          |  2 +-
+ src/include/access/multixact.h         |  3 ++-
+ 4 files changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/src/backend/access/transam/multixact.c b/src/backend/access/transam/multixact.c
+index 59d1252ddc99..c350dfa17fe5 100644
+--- a/src/backend/access/transam/multixact.c
++++ b/src/backend/access/transam/multixact.c
+@@ -363,7 +363,7 @@ static void ExtendMultiXactOffset(MultiXactId multi);
+ static void ExtendMultiXactMember(MultiXactOffset offset, int nmembers);
+ static bool MultiXactOffsetWouldWrap(MultiXactOffset boundary,
+ 						 MultiXactOffset start, uint32 distance);
+-static bool SetOffsetVacuumLimit(void);
++static bool SetOffsetVacuumLimit(bool is_startup);
+ static bool find_multixact_start(MultiXactId multi, MultiXactOffset *result);
+ static void WriteMZeroPageXlogRec(int pageno, uint8 info);
+ static void WriteMTruncateXlogRec(Oid oldestMultiDB,
+@@ -2095,7 +2095,7 @@ TrimMultiXact(void)
+ 	LWLockRelease(MultiXactGenLock);
+ 
+ 	/* Now compute how far away the next members wraparound is. */
+-	SetMultiXactIdLimit(oldestMXact, oldestMXactDB);
++	SetMultiXactIdLimit(oldestMXact, oldestMXactDB, true);
+ }
+ 
+ /*
+@@ -2186,9 +2186,13 @@ MultiXactSetNextMXact(MultiXactId nextMulti,
+  * Determine the last safe MultiXactId to allocate given the currently oldest
+  * datminmxid (ie, the oldest MultiXactId that might exist in any database
+  * of our cluster), and the OID of the (or a) database with that value.
++ *
++ * is_startup is true when we are just starting the cluster, false when we
++ * are updating state in a running cluster.  This only affects log messages.
+  */
+ void
+-SetMultiXactIdLimit(MultiXactId oldest_datminmxid, Oid oldest_datoid)
++SetMultiXactIdLimit(MultiXactId oldest_datminmxid, Oid oldest_datoid,
++					bool is_startup)
+ {
+ 	MultiXactId multiVacLimit;
+ 	MultiXactId multiWarnLimit;
+@@ -2277,7 +2281,7 @@ SetMultiXactIdLimit(MultiXactId oldest_datminmxid, Oid oldest_datoid)
+ 	Assert(!InRecovery);
+ 
+ 	/* Set limits for offset vacuum. */
+-	needs_offset_vacuum = SetOffsetVacuumLimit();
++	needs_offset_vacuum = SetOffsetVacuumLimit(is_startup);
+ 
+ 	/*
+ 	 * If past the autovacuum force point, immediately signal an autovac
+@@ -2370,7 +2374,7 @@ MultiXactAdvanceOldest(MultiXactId oldestMulti, Oid oldestMultiDB)
+ 	Assert(InRecovery);
+ 
+ 	if (MultiXactIdPrecedes(MultiXactState->oldestMultiXactId, oldestMulti))
+-		SetMultiXactIdLimit(oldestMulti, oldestMultiDB);
++		SetMultiXactIdLimit(oldestMulti, oldestMultiDB, false);
+ }
+ 
+ /*
+@@ -2537,7 +2541,7 @@ GetOldestMultiXactId(void)
+  * otherwise.
+  */
+ static bool
+-SetOffsetVacuumLimit(void)
++SetOffsetVacuumLimit(bool is_startup)
+ {
+ 	MultiXactId oldestMultiXactId;
+ 	MultiXactId nextMXact;
+@@ -2619,9 +2623,10 @@ SetOffsetVacuumLimit(void)
+ 		/* always leave one segment before the wraparound point */
+ 		offsetStopLimit -= (MULTIXACT_MEMBERS_PER_PAGE * SLRU_PAGES_PER_SEGMENT);
+ 
+-		if (!prevOldestOffsetKnown && IsUnderPostmaster)
++		if (!prevOldestOffsetKnown && !is_startup)
+ 			ereport(LOG,
+ 					(errmsg("MultiXact member wraparound protections are now enabled")));
++
+ 		ereport(DEBUG1,
+ 		(errmsg("MultiXact member stop limit is now %u based on MultiXact %u",
+ 				offsetStopLimit, oldestMultiXactId)));
+@@ -3312,7 +3317,7 @@ multixact_redo(XLogReaderState *record)
+ 		 * Advance the horizon values, so they're current at the end of
+ 		 * recovery.
+ 		 */
+-		SetMultiXactIdLimit(xlrec.endTruncOff, xlrec.oldestMultiDB);
++		SetMultiXactIdLimit(xlrec.endTruncOff, xlrec.oldestMultiDB, false);
+ 
+ 		PerformMembersTruncation(xlrec.startTruncMemb, xlrec.endTruncMemb);
+ 
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index c0e5362928ee..c8c2dd8ccaac 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -4995,7 +4995,7 @@ BootStrapXLOG(void)
+ 	ShmemVariableCache->oidCount = 0;
+ 	MultiXactSetNextMXact(checkPoint.nextMulti, checkPoint.nextMultiOffset);
+ 	SetTransactionIdLimit(checkPoint.oldestXid, checkPoint.oldestXidDB);
+-	SetMultiXactIdLimit(checkPoint.oldestMulti, checkPoint.oldestMultiDB);
++	SetMultiXactIdLimit(checkPoint.oldestMulti, checkPoint.oldestMultiDB, true);
+ 	SetCommitTsLimit(InvalidTransactionId, InvalidTransactionId);
+ 
+ 	/* Set up the XLOG page header */
+@@ -6597,7 +6597,7 @@ StartupXLOG(void)
+ 	ShmemVariableCache->oidCount = 0;
+ 	MultiXactSetNextMXact(checkPoint.nextMulti, checkPoint.nextMultiOffset);
+ 	SetTransactionIdLimit(checkPoint.oldestXid, checkPoint.oldestXidDB);
+-	SetMultiXactIdLimit(checkPoint.oldestMulti, checkPoint.oldestMultiDB);
++	SetMultiXactIdLimit(checkPoint.oldestMulti, checkPoint.oldestMultiDB, true);
+ 	SetCommitTsLimit(checkPoint.oldestCommitTsXid,
+ 					 checkPoint.newestCommitTsXid);
+ 	XLogCtl->ckptXidEpoch = checkPoint.nextXidEpoch;
+diff --git a/src/backend/commands/vacuum.c b/src/backend/commands/vacuum.c
+index 3a9b965266fc..3b3dfeead4f9 100644
+--- a/src/backend/commands/vacuum.c
++++ b/src/backend/commands/vacuum.c
+@@ -1205,7 +1205,7 @@ vac_truncate_clog(TransactionId frozenXID,
+ 	 * signalling twice?
+ 	 */
+ 	SetTransactionIdLimit(frozenXID, oldestxid_datoid);
+-	SetMultiXactIdLimit(minMulti, minmulti_datoid);
++	SetMultiXactIdLimit(minMulti, minmulti_datoid, false);
+ }
+ 
+ 
+diff --git a/src/include/access/multixact.h b/src/include/access/multixact.h
+index 1d01988bb825..85997a41fa31 100644
+--- a/src/include/access/multixact.h
++++ b/src/include/access/multixact.h
+@@ -127,7 +127,8 @@ extern void StartupMultiXact(void);
+ extern void TrimMultiXact(void);
+ extern void ShutdownMultiXact(void);
+ extern void SetMultiXactIdLimit(MultiXactId oldest_datminmxid,
+-					Oid oldest_datoid);
++					Oid oldest_datoid,
++					bool is_startup);
+ extern void MultiXactGetCheckptMulti(bool is_shutdown,
+ 						 MultiXactId *nextMulti,
+ 						 MultiXactOffset *nextMultiOffset,

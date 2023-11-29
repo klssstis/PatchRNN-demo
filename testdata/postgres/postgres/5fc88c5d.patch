@@ -1,0 +1,299 @@
+From 5fc88c5d53e43fa7dcea93499d230a0bf70f4f77 Mon Sep 17 00:00:00 2001
+From: Thomas Munro <tmunro@postgresql.org>
+Date: Sat, 6 Aug 2022 12:02:43 +1200
+Subject: [PATCH] Replace pgwin32_is_junction() with lstat().
+
+Now that lstat() reports junction points with S_IFLNK/S_ISLINK(), and
+unlink() can unlink them, there is no need for conditional code for
+Windows in a few places.  That was expressed by testing for WIN32 or
+S_ISLNK, which we can now constant-fold.
+
+The coding around pgwin32_is_junction() was a bit suspect anyway, as we
+never checked for errors, and we also know that errors can be spuriously
+reported because of transient sharing violations on this OS.  The
+lstat()-based code has handling for that.
+
+This also reverts 4fc6b6ee on master only.  That was done because
+lstat() didn't previously work for symlinks (junction points), but now
+it does.
+
+Tested-by: Andrew Dunstan <andrew@dunslane.net>
+Discussion: https://postgr.es/m/CA%2BhUKGLfOOeyZpm5ByVcAt7x5Pn-%3DxGRNCvgiUPVVzjFLtnY0w%40mail.gmail.com
+---
+ src/backend/commands/tablespace.c    |  7 +------
+ src/backend/replication/basebackup.c | 12 +-----------
+ src/backend/storage/file/fd.c        |  5 -----
+ src/backend/utils/adt/misc.c         |  7 -------
+ src/bin/pg_checksums/pg_checksums.c  |  4 ----
+ src/bin/pg_rewind/file_ops.c         |  4 ----
+ src/common/file_utils.c              | 23 -----------------------
+ src/include/port.h                   |  1 -
+ src/include/port/win32_port.h        |  1 -
+ src/port/dirmod.c                    | 16 ----------------
+ 10 files changed, 2 insertions(+), 78 deletions(-)
+
+diff --git a/src/backend/commands/tablespace.c b/src/backend/commands/tablespace.c
+index 526e82e388b2..f260b484fc49 100644
+--- a/src/backend/commands/tablespace.c
++++ b/src/backend/commands/tablespace.c
+@@ -792,8 +792,7 @@ destroy_tablespace_directories(Oid tablespaceoid, bool redo)
+ 	/*
+ 	 * Try to remove the symlink.  We must however deal with the possibility
+ 	 * that it's a directory instead of a symlink --- this could happen during
+-	 * WAL replay (see TablespaceCreateDbspace), and it is also the case on
+-	 * Windows where junction points lstat() as directories.
++	 * WAL replay (see TablespaceCreateDbspace).
+ 	 *
+ 	 * Note: in the redo case, we'll return true if this final step fails;
+ 	 * there's no point in retrying it.  Also, ENOENT should provoke no more
+@@ -823,7 +822,6 @@ destroy_tablespace_directories(Oid tablespaceoid, bool redo)
+ 							linkloc)));
+ 		}
+ 	}
+-#ifdef S_ISLNK
+ 	else if (S_ISLNK(st.st_mode))
+ 	{
+ 		if (unlink(linkloc) < 0)
+@@ -836,7 +834,6 @@ destroy_tablespace_directories(Oid tablespaceoid, bool redo)
+ 							linkloc)));
+ 		}
+ 	}
+-#endif
+ 	else
+ 	{
+ 		/* Refuse to remove anything that's not a directory or symlink */
+@@ -914,7 +911,6 @@ remove_tablespace_symlink(const char *linkloc)
+ 					 errmsg("could not remove directory \"%s\": %m",
+ 							linkloc)));
+ 	}
+-#ifdef S_ISLNK
+ 	else if (S_ISLNK(st.st_mode))
+ 	{
+ 		if (unlink(linkloc) < 0 && errno != ENOENT)
+@@ -923,7 +919,6 @@ remove_tablespace_symlink(const char *linkloc)
+ 					 errmsg("could not remove symbolic link \"%s\": %m",
+ 							linkloc)));
+ 	}
+-#endif
+ 	else
+ 	{
+ 		/* Refuse to remove anything that's not a directory or symlink */
+diff --git a/src/backend/replication/basebackup.c b/src/backend/replication/basebackup.c
+index 5e457f9be990..deeddd09a9c5 100644
+--- a/src/backend/replication/basebackup.c
++++ b/src/backend/replication/basebackup.c
+@@ -1322,13 +1322,7 @@ sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeonly,
+ 		}
+ 
+ 		/* Allow symbolic links in pg_tblspc only */
+-		if (strcmp(path, "./pg_tblspc") == 0 &&
+-#ifndef WIN32
+-			S_ISLNK(statbuf.st_mode)
+-#else
+-			pgwin32_is_junction(pathbuf)
+-#endif
+-			)
++		if (strcmp(path, "./pg_tblspc") == 0 && S_ISLNK(statbuf.st_mode))
+ 		{
+ 			char		linkpath[MAXPGPATH];
+ 			int			rllen;
+@@ -1798,11 +1792,7 @@ static void
+ convert_link_to_directory(const char *pathbuf, struct stat *statbuf)
+ {
+ 	/* If symlink, write it as a directory anyway */
+-#ifndef WIN32
+ 	if (S_ISLNK(statbuf->st_mode))
+-#else
+-	if (pgwin32_is_junction(pathbuf))
+-#endif
+ 		statbuf->st_mode = S_IFDIR | pg_dir_create_mode;
+ }
+ 
+diff --git a/src/backend/storage/file/fd.c b/src/backend/storage/file/fd.c
+index ccb540d6178b..efb34d4dcbcf 100644
+--- a/src/backend/storage/file/fd.c
++++ b/src/backend/storage/file/fd.c
+@@ -3365,7 +3365,6 @@ SyncDataDirectory(void)
+ 	 */
+ 	xlog_is_symlink = false;
+ 
+-#ifndef WIN32
+ 	{
+ 		struct stat st;
+ 
+@@ -3377,10 +3376,6 @@ SyncDataDirectory(void)
+ 		else if (S_ISLNK(st.st_mode))
+ 			xlog_is_symlink = true;
+ 	}
+-#else
+-	if (pgwin32_is_junction("pg_wal"))
+-		xlog_is_symlink = true;
+-#endif
+ 
+ #ifdef HAVE_SYNCFS
+ 	if (recovery_init_sync_method == RECOVERY_INIT_SYNC_METHOD_SYNCFS)
+diff --git a/src/backend/utils/adt/misc.c b/src/backend/utils/adt/misc.c
+index af0d924459e4..d35b5d1f4fac 100644
+--- a/src/backend/utils/adt/misc.c
++++ b/src/backend/utils/adt/misc.c
+@@ -283,9 +283,7 @@ pg_tablespace_location(PG_FUNCTION_ARGS)
+ 	char		sourcepath[MAXPGPATH];
+ 	char		targetpath[MAXPGPATH];
+ 	int			rllen;
+-#ifndef WIN32
+ 	struct stat st;
+-#endif
+ 
+ 	/*
+ 	 * It's useful to apply this function to pg_class.reltablespace, wherein
+@@ -314,10 +312,6 @@ pg_tablespace_location(PG_FUNCTION_ARGS)
+ 	 * created with allow_in_place_tablespaces enabled.  If a directory is
+ 	 * found, a relative path to the data directory is returned.
+ 	 */
+-#ifdef WIN32
+-	if (!pgwin32_is_junction(sourcepath))
+-		PG_RETURN_TEXT_P(cstring_to_text(sourcepath));
+-#else
+ 	if (lstat(sourcepath, &st) < 0)
+ 	{
+ 		ereport(ERROR,
+@@ -328,7 +322,6 @@ pg_tablespace_location(PG_FUNCTION_ARGS)
+ 
+ 	if (!S_ISLNK(st.st_mode))
+ 		PG_RETURN_TEXT_P(cstring_to_text(sourcepath));
+-#endif
+ 
+ 	/*
+ 	 * In presence of a link or a junction point, return the path pointing to.
+diff --git a/src/bin/pg_checksums/pg_checksums.c b/src/bin/pg_checksums/pg_checksums.c
+index dc20122c8940..324ccf77834e 100644
+--- a/src/bin/pg_checksums/pg_checksums.c
++++ b/src/bin/pg_checksums/pg_checksums.c
+@@ -384,11 +384,7 @@ scan_directory(const char *basedir, const char *subdir, bool sizeonly)
+ 			if (!sizeonly)
+ 				scan_file(fn, segmentno);
+ 		}
+-#ifndef WIN32
+ 		else if (S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode))
+-#else
+-		else if (S_ISDIR(st.st_mode) || pgwin32_is_junction(fn))
+-#endif
+ 		{
+ 			/*
+ 			 * If going through the entries of pg_tblspc, we assume to operate
+diff --git a/src/bin/pg_rewind/file_ops.c b/src/bin/pg_rewind/file_ops.c
+index 5e6d8b89c49c..db190bcba715 100644
+--- a/src/bin/pg_rewind/file_ops.c
++++ b/src/bin/pg_rewind/file_ops.c
+@@ -431,11 +431,7 @@ recurse_dir(const char *datadir, const char *parentpath,
+ 			/* recurse to handle subdirectories */
+ 			recurse_dir(datadir, path, callback);
+ 		}
+-#ifndef WIN32
+ 		else if (S_ISLNK(fst.st_mode))
+-#else
+-		else if (pgwin32_is_junction(fullpath))
+-#endif
+ 		{
+ 			char		link_target[MAXPGPATH];
+ 			int			len;
+diff --git a/src/common/file_utils.c b/src/common/file_utils.c
+index 966b987d6487..df4d6d240c06 100644
+--- a/src/common/file_utils.c
++++ b/src/common/file_utils.c
+@@ -79,7 +79,6 @@ fsync_pgdata(const char *pg_data,
+ 	 */
+ 	xlog_is_symlink = false;
+ 
+-#ifndef WIN32
+ 	{
+ 		struct stat st;
+ 
+@@ -88,10 +87,6 @@ fsync_pgdata(const char *pg_data,
+ 		else if (S_ISLNK(st.st_mode))
+ 			xlog_is_symlink = true;
+ 	}
+-#else
+-	if (pgwin32_is_junction(pg_wal))
+-		xlog_is_symlink = true;
+-#endif
+ 
+ 	/*
+ 	 * If possible, hint to the kernel that we're soon going to fsync the data
+@@ -459,27 +454,9 @@ get_dirent_type(const char *path,
+ 			result = PGFILETYPE_REG;
+ 		else if (S_ISDIR(fst.st_mode))
+ 			result = PGFILETYPE_DIR;
+-#ifdef S_ISLNK
+ 		else if (S_ISLNK(fst.st_mode))
+ 			result = PGFILETYPE_LNK;
+-#endif
+ 	}
+ 
+-#if defined(WIN32) && !defined(_MSC_VER)
+-
+-	/*
+-	 * If we're on native Windows (not Cygwin, which has its own POSIX
+-	 * symlinks), but not using the MSVC compiler, then we're using a
+-	 * readdir() emulation provided by the MinGW runtime that has no d_type.
+-	 * Since the lstat() fallback code reports junction points as directories,
+-	 * we need an extra system call to check if we should report them as
+-	 * symlinks instead, following our convention.
+-	 */
+-	if (result == PGFILETYPE_DIR &&
+-		!look_through_symlinks &&
+-		pgwin32_is_junction(path))
+-		result = PGFILETYPE_LNK;
+-#endif
+-
+ 	return result;
+ }
+diff --git a/src/include/port.h b/src/include/port.h
+index 14b640fe33e3..feb2ae840dd7 100644
+--- a/src/include/port.h
++++ b/src/include/port.h
+@@ -284,7 +284,6 @@ extern int	pgunlink(const char *path);
+ #if defined(WIN32) && !defined(__CYGWIN__)
+ extern int	pgsymlink(const char *oldpath, const char *newpath);
+ extern int	pgreadlink(const char *path, char *buf, size_t size);
+-extern bool pgwin32_is_junction(const char *path);
+ 
+ #define symlink(oldpath, newpath)	pgsymlink(oldpath, newpath)
+ #define readlink(path, buf, size)	pgreadlink(path, buf, size)
+diff --git a/src/include/port/win32_port.h b/src/include/port/win32_port.h
+index c27b34de5bf5..a65996cce51e 100644
+--- a/src/include/port/win32_port.h
++++ b/src/include/port/win32_port.h
+@@ -230,7 +230,6 @@ int			setitimer(int which, const struct itimerval *value, struct itimerval *oval
+  */
+ extern int	pgsymlink(const char *oldpath, const char *newpath);
+ extern int	pgreadlink(const char *path, char *buf, size_t size);
+-extern bool pgwin32_is_junction(const char *path);
+ 
+ #define symlink(oldpath, newpath)	pgsymlink(oldpath, newpath)
+ #define readlink(path, buf, size)	pgreadlink(path, buf, size)
+diff --git a/src/port/dirmod.c b/src/port/dirmod.c
+index ea191e99c65e..2818bfd2e95f 100644
+--- a/src/port/dirmod.c
++++ b/src/port/dirmod.c
+@@ -362,20 +362,4 @@ pgreadlink(const char *path, char *buf, size_t size)
+ 	return r;
+ }
+ 
+-/*
+- * Assumes the file exists, so will return false if it doesn't
+- * (since a nonexistent file is not a junction)
+- */
+-bool
+-pgwin32_is_junction(const char *path)
+-{
+-	DWORD		attr = GetFileAttributes(path);
+-
+-	if (attr == INVALID_FILE_ATTRIBUTES)
+-	{
+-		_dosmaperr(GetLastError());
+-		return false;
+-	}
+-	return ((attr & FILE_ATTRIBUTE_REPARSE_POINT) == FILE_ATTRIBUTE_REPARSE_POINT);
+-}
+ #endif							/* defined(WIN32) && !defined(__CYGWIN__) */

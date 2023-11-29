@@ -1,0 +1,204 @@
+From 5c854e7a2c8a6cd26040e0f9949e7a4a007f6366 Mon Sep 17 00:00:00 2001
+From: Etsuro Fujita <efujita@postgresql.org>
+Date: Thu, 28 Apr 2022 15:15:00 +0900
+Subject: [PATCH] Disable asynchronous execution if using gating Result nodes.
+
+mark_async_capable_plan(), which is called from create_append_plan() to
+determine whether subplans are async-capable, failed to take into
+account that the given subplan created from a given subpath might
+include a gating Result node if the subpath is a SubqueryScanPath or
+ForeignPath, causing a segmentation fault there when the subplan created
+from a SubqueryScanPath includes the Result node, or causing
+ExecAsyncRequest() to throw an error about an unrecognized node type
+when the subplan created from a ForeignPath includes the Result node,
+because in the latter case the Result node was unintentionally
+considered as async-capable, but we don't currently support executing
+Result nodes asynchronously.  Fix by modifying mark_async_capable_plan()
+to disable asynchronous execution in such cases.  Also, adjust code in
+the ProjectionPath case in mark_async_capable_plan(), for consistency
+with other cases, and adjust/improve comments there.
+
+is_async_capable_path() added in commit 27e1f1456, which was rewritten
+to mark_async_capable_plan() in a later commit, has the same issue,
+causing the error at execution mentioned above, so back-patch to v14
+where the aforesaid commit went in.
+
+Per report from Justin Pryzby.
+
+Etsuro Fujita, reviewed by Zhihong Yu and Justin Pryzby.
+
+Discussion: https://postgr.es/m/20220408124338.GK24419%40telsasoft.com
+---
+ .../postgres_fdw/expected/postgres_fdw.out    | 66 +++++++++++++++++++
+ contrib/postgres_fdw/sql/postgres_fdw.sql     | 13 ++++
+ src/backend/optimizer/plan/createplan.c       | 34 ++++++++--
+ 3 files changed, 106 insertions(+), 7 deletions(-)
+
+diff --git a/contrib/postgres_fdw/expected/postgres_fdw.out b/contrib/postgres_fdw/expected/postgres_fdw.out
+index 477de09a876f..44457f930c26 100644
+--- a/contrib/postgres_fdw/expected/postgres_fdw.out
++++ b/contrib/postgres_fdw/expected/postgres_fdw.out
+@@ -10734,6 +10734,72 @@ SELECT * FROM result_tbl ORDER BY a;
+ (12 rows)
+ 
+ DELETE FROM result_tbl;
++-- Disable async execution if we use gating Result nodes for pseudoconstant
++-- quals
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT * FROM async_pt WHERE CURRENT_USER = SESSION_USER;
++                           QUERY PLAN                           
++----------------------------------------------------------------
++ Append
++   ->  Result
++         Output: async_pt_1.a, async_pt_1.b, async_pt_1.c
++         One-Time Filter: (CURRENT_USER = SESSION_USER)
++         ->  Foreign Scan on public.async_p1 async_pt_1
++               Output: async_pt_1.a, async_pt_1.b, async_pt_1.c
++               Remote SQL: SELECT a, b, c FROM public.base_tbl1
++   ->  Result
++         Output: async_pt_2.a, async_pt_2.b, async_pt_2.c
++         One-Time Filter: (CURRENT_USER = SESSION_USER)
++         ->  Foreign Scan on public.async_p2 async_pt_2
++               Output: async_pt_2.a, async_pt_2.b, async_pt_2.c
++               Remote SQL: SELECT a, b, c FROM public.base_tbl2
++   ->  Result
++         Output: async_pt_3.a, async_pt_3.b, async_pt_3.c
++         One-Time Filter: (CURRENT_USER = SESSION_USER)
++         ->  Seq Scan on public.async_p3 async_pt_3
++               Output: async_pt_3.a, async_pt_3.b, async_pt_3.c
++(18 rows)
++
++EXPLAIN (VERBOSE, COSTS OFF)
++(SELECT * FROM async_p1 WHERE CURRENT_USER = SESSION_USER)
++UNION ALL
++(SELECT * FROM async_p2 WHERE CURRENT_USER = SESSION_USER);
++                           QUERY PLAN                           
++----------------------------------------------------------------
++ Append
++   ->  Result
++         Output: async_p1.a, async_p1.b, async_p1.c
++         One-Time Filter: (CURRENT_USER = SESSION_USER)
++         ->  Foreign Scan on public.async_p1
++               Output: async_p1.a, async_p1.b, async_p1.c
++               Remote SQL: SELECT a, b, c FROM public.base_tbl1
++   ->  Result
++         Output: async_p2.a, async_p2.b, async_p2.c
++         One-Time Filter: (CURRENT_USER = SESSION_USER)
++         ->  Foreign Scan on public.async_p2
++               Output: async_p2.a, async_p2.b, async_p2.c
++               Remote SQL: SELECT a, b, c FROM public.base_tbl2
++(13 rows)
++
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT * FROM ((SELECT * FROM async_p1 WHERE b < 10) UNION ALL (SELECT * FROM async_p2 WHERE b < 10)) s WHERE CURRENT_USER = SESSION_USER;
++                                   QUERY PLAN                                    
++---------------------------------------------------------------------------------
++ Append
++   ->  Result
++         Output: async_p1.a, async_p1.b, async_p1.c
++         One-Time Filter: (CURRENT_USER = SESSION_USER)
++         ->  Foreign Scan on public.async_p1
++               Output: async_p1.a, async_p1.b, async_p1.c
++               Remote SQL: SELECT a, b, c FROM public.base_tbl1 WHERE ((b < 10))
++   ->  Result
++         Output: async_p2.a, async_p2.b, async_p2.c
++         One-Time Filter: (CURRENT_USER = SESSION_USER)
++         ->  Foreign Scan on public.async_p2
++               Output: async_p2.a, async_p2.b, async_p2.c
++               Remote SQL: SELECT a, b, c FROM public.base_tbl2 WHERE ((b < 10))
++(13 rows)
++
+ -- Test that pending requests are processed properly
+ SET enable_mergejoin TO false;
+ SET enable_hashjoin TO false;
+diff --git a/contrib/postgres_fdw/sql/postgres_fdw.sql b/contrib/postgres_fdw/sql/postgres_fdw.sql
+index ed181dedff56..92d12120272b 100644
+--- a/contrib/postgres_fdw/sql/postgres_fdw.sql
++++ b/contrib/postgres_fdw/sql/postgres_fdw.sql
+@@ -3410,6 +3410,19 @@ UNION ALL
+ SELECT * FROM result_tbl ORDER BY a;
+ DELETE FROM result_tbl;
+ 
++-- Disable async execution if we use gating Result nodes for pseudoconstant
++-- quals
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT * FROM async_pt WHERE CURRENT_USER = SESSION_USER;
++
++EXPLAIN (VERBOSE, COSTS OFF)
++(SELECT * FROM async_p1 WHERE CURRENT_USER = SESSION_USER)
++UNION ALL
++(SELECT * FROM async_p2 WHERE CURRENT_USER = SESSION_USER);
++
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT * FROM ((SELECT * FROM async_p1 WHERE b < 10) UNION ALL (SELECT * FROM async_p2 WHERE b < 10)) s WHERE CURRENT_USER = SESSION_USER;
++
+ -- Test that pending requests are processed properly
+ SET enable_mergejoin TO false;
+ SET enable_hashjoin TO false;
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index 7905bc46548c..db11936efefb 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -1112,9 +1112,9 @@ create_join_plan(PlannerInfo *root, JoinPath *best_path)
+ 
+ /*
+  * mark_async_capable_plan
+- *		Check whether a given Path node is async-capable, and if so, mark the
+- *		Plan node created from it as such and return true, otherwise return
+- *		false.
++ *		Check whether the Plan node created from a Path node is async-capable,
++ *		and if so, mark the Plan node as such and return true, otherwise
++ *		return false.
+  */
+ static bool
+ mark_async_capable_plan(Plan *plan, Path *path)
+@@ -1125,6 +1125,13 @@ mark_async_capable_plan(Plan *plan, Path *path)
+ 			{
+ 				SubqueryScan *scan_plan = (SubqueryScan *) plan;
+ 
++				/*
++				 * If the generated plan node includes a gating Result node,
++				 * we can't execute it asynchronously.
++				 */
++				if (IsA(plan, Result))
++					return false;
++
+ 				/*
+ 				 * If a SubqueryScan node atop of an async-capable plan node
+ 				 * is deletable, consider it as async-capable.
+@@ -1139,6 +1146,13 @@ mark_async_capable_plan(Plan *plan, Path *path)
+ 			{
+ 				FdwRoutine *fdwroutine = path->parent->fdwroutine;
+ 
++				/*
++				 * If the generated plan node includes a gating Result node,
++				 * we can't execute it asynchronously.
++				 */
++				if (IsA(plan, Result))
++					return false;
++
+ 				Assert(fdwroutine != NULL);
+ 				if (fdwroutine->IsForeignPathAsyncCapable != NULL &&
+ 					fdwroutine->IsForeignPathAsyncCapable((ForeignPath *) path))
+@@ -1148,11 +1162,17 @@ mark_async_capable_plan(Plan *plan, Path *path)
+ 		case T_ProjectionPath:
+ 
+ 			/*
+-			 * If the generated plan node doesn't include a Result node,
+-			 * consider it as async-capable if the subpath is async-capable.
++			 * If the generated plan node includes a Result node for
++			 * the projection, we can't execute it asynchronously.
++			 */
++			if (IsA(plan, Result))
++				return false;
++
++			/*
++			 * create_projection_plan() would have pulled up the subplan, so
++			 * check the capability using the subpath.
+ 			 */
+-			if (!IsA(plan, Result) &&
+-				mark_async_capable_plan(plan,
++			if (mark_async_capable_plan(plan,
+ 										((ProjectionPath *) path)->subpath))
+ 				return true;
+ 			return false;

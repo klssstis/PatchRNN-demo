@@ -1,0 +1,122 @@
+From 5f27b5f848a433ba54c521ccb889788b8f4d6ba7 Mon Sep 17 00:00:00 2001
+From: Noah Misch <noah@leadboat.com>
+Date: Sat, 14 Oct 2023 16:33:51 -0700
+Subject: [PATCH] Dissociate btequalimage() from interval_ops, ending its
+ deduplication.
+
+Under interval_ops, some equal values are distinguishable.  One such
+pair is '24:00:00' and '1 day'.  With that being so, btequalimage()
+breaches the documented contract for the "equalimage" btree support
+function.  This can cause incorrect results from index-only scans.
+Users should REINDEX any btree indexes having interval-type columns.
+After updating, pg_amcheck will report an error for almost all such
+indexes.  This fix makes interval_ops simply omit the support function,
+like numeric_ops does.  Back-pack to v13, where btequalimage() first
+appeared.  In back branches, for the benefit of old catalog content,
+btequalimage() code will return false for type "interval".  Going
+forward, back-branch initdb will include the catalog change.
+
+Reviewed by Peter Geoghegan.
+
+Discussion: https://postgr.es/m/20231011013317.22.nmisch@google.com
+---
+ contrib/amcheck/verify_nbtree.c          | 13 ++++++++++++-
+ src/include/catalog/catversion.h         |  2 +-
+ src/include/catalog/pg_amproc.dat        |  2 --
+ src/include/catalog/pg_opfamily.dat      |  2 +-
+ src/test/regress/expected/opr_sanity.out |  3 ++-
+ 5 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/contrib/amcheck/verify_nbtree.c b/contrib/amcheck/verify_nbtree.c
+index dbb83d80f81b..3e07a3e35f43 100644
+--- a/contrib/amcheck/verify_nbtree.c
++++ b/contrib/amcheck/verify_nbtree.c
+@@ -31,6 +31,7 @@
+ #include "access/xact.h"
+ #include "catalog/index.h"
+ #include "catalog/pg_am.h"
++#include "catalog/pg_opfamily_d.h"
+ #include "commands/tablecmds.h"
+ #include "common/pg_prng.h"
+ #include "lib/bloomfilter.h"
+@@ -338,10 +339,20 @@ bt_index_check_internal(Oid indrelid, bool parentcheck, bool heapallindexed,
+ 					 errmsg("index \"%s\" metapage has equalimage field set on unsupported nbtree version",
+ 							RelationGetRelationName(indrel))));
+ 		if (allequalimage && !_bt_allequalimage(indrel, false))
++		{
++			bool		has_interval_ops = false;
++
++			for (int i = 0; i < IndexRelationGetNumberOfKeyAttributes(indrel); i++)
++				if (indrel->rd_opfamily[i] == INTERVAL_BTREE_FAM_OID)
++					has_interval_ops = true;
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INDEX_CORRUPTED),
+ 					 errmsg("index \"%s\" metapage incorrectly indicates that deduplication is safe",
+-							RelationGetRelationName(indrel))));
++							RelationGetRelationName(indrel)),
++					 has_interval_ops
++					 ? errhint("This is known of \"interval\" indexes last built on a version predating 2023-11.")
++					 : 0));
++		}
+ 
+ 		/* Check index, possibly against table it is an index on */
+ 		bt_check_every_level(indrel, heaprel, heapkeyspace, parentcheck,
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 473687419c95..5efc14452070 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -57,6 +57,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202310131
++#define CATALOG_VERSION_NO	202310141
+ 
+ #endif
+diff --git a/src/include/catalog/pg_amproc.dat b/src/include/catalog/pg_amproc.dat
+index 5b950129de0a..4c70da41defd 100644
+--- a/src/include/catalog/pg_amproc.dat
++++ b/src/include/catalog/pg_amproc.dat
+@@ -172,8 +172,6 @@
+ { amprocfamily => 'btree/interval_ops', amproclefttype => 'interval',
+   amprocrighttype => 'interval', amprocnum => '3',
+   amproc => 'in_range(interval,interval,interval,bool,bool)' },
+-{ amprocfamily => 'btree/interval_ops', amproclefttype => 'interval',
+-  amprocrighttype => 'interval', amprocnum => '4', amproc => 'btequalimage' },
+ { amprocfamily => 'btree/macaddr_ops', amproclefttype => 'macaddr',
+   amprocrighttype => 'macaddr', amprocnum => '1', amproc => 'macaddr_cmp' },
+ { amprocfamily => 'btree/macaddr_ops', amproclefttype => 'macaddr',
+diff --git a/src/include/catalog/pg_opfamily.dat b/src/include/catalog/pg_opfamily.dat
+index 91587b99d097..81a8525c5d07 100644
+--- a/src/include/catalog/pg_opfamily.dat
++++ b/src/include/catalog/pg_opfamily.dat
+@@ -50,7 +50,7 @@
+   opfmethod => 'btree', opfname => 'integer_ops' },
+ { oid => '1977',
+   opfmethod => 'hash', opfname => 'integer_ops' },
+-{ oid => '1982',
++{ oid => '1982', oid_symbol => 'INTERVAL_BTREE_FAM_OID',
+   opfmethod => 'btree', opfname => 'interval_ops' },
+ { oid => '1983',
+   opfmethod => 'hash', opfname => 'interval_ops' },
+diff --git a/src/test/regress/expected/opr_sanity.out b/src/test/regress/expected/opr_sanity.out
+index a1bdf2c0b5f8..7a6f36a6a9a8 100644
+--- a/src/test/regress/expected/opr_sanity.out
++++ b/src/test/regress/expected/opr_sanity.out
+@@ -2208,6 +2208,7 @@ ORDER BY 1, 2, 3;
+                     | array_ops        | array_ops        | anyarray
+                     | float_ops        | float4_ops       | real
+                     | float_ops        | float8_ops       | double precision
++                    | interval_ops     | interval_ops     | interval
+                     | jsonb_ops        | jsonb_ops        | jsonb
+                     | multirange_ops   | multirange_ops   | anymultirange
+                     | numeric_ops      | numeric_ops      | numeric
+@@ -2216,7 +2217,7 @@ ORDER BY 1, 2, 3;
+                     | record_ops       | record_ops       | record
+                     | tsquery_ops      | tsquery_ops      | tsquery
+                     | tsvector_ops     | tsvector_ops     | tsvector
+-(15 rows)
++(16 rows)
+ 
+ -- **************** pg_index ****************
+ -- Look for illegal values in pg_index fields.

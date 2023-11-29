@@ -1,0 +1,153 @@
+From 5db1fd7823a1a12e2bdad98abc8e102fd71ffbda Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Thu, 25 Mar 2021 19:55:32 -0400
+Subject: [PATCH] Fix interaction of TOAST compression with expression indexes.
+
+Before, trying to compress a value for insertion into an expression
+index would crash.
+
+Dilip Kumar, with some editing by me. Report by Jaime Casanova.
+
+Discussion: http://postgr.es/m/CAJKUy5gcs0zGOp6JXU2mMVdthYhuQpFk=S3V8DOKT=LZC1L36Q@mail.gmail.com
+---
+ src/backend/access/brin/brin_tuple.c        |  8 +++++---
+ src/backend/access/common/indextuple.c      | 15 +++++++++++++--
+ src/backend/catalog/index.c                 | 10 ++++++++++
+ src/test/regress/expected/compression.out   |  6 ++++++
+ src/test/regress/expected/compression_1.out | 13 +++++++++++++
+ src/test/regress/sql/compression.sql        |  7 +++++++
+ 6 files changed, 54 insertions(+), 5 deletions(-)
+
+diff --git a/src/backend/access/brin/brin_tuple.c b/src/backend/access/brin/brin_tuple.c
+index 8d03e609a389..32ffd9f9fc24 100644
+--- a/src/backend/access/brin/brin_tuple.c
++++ b/src/backend/access/brin/brin_tuple.c
+@@ -220,10 +220,12 @@ brin_form_tuple(BrinDesc *brdesc, BlockNumber blkno, BrinMemTuple *tuple,
+ 
+ 				/*
+ 				 * If the BRIN summary and indexed attribute use the same data
+-				 * type, we can use the same compression method. Otherwise we
+-				 * have to use the default method.
++				 * type and it has a valid compression method, we can use the
++				 * same compression method. Otherwise we have to use the
++				 * default method.
+ 				 */
+-				if (att->atttypid == atttype->type_id)
++				if (att->atttypid == atttype->type_id &&
++					CompressionMethodIsValid(att->attcompression))
+ 					compression = att->attcompression;
+ 				else
+ 					compression = GetDefaultToastCompression();
+diff --git a/src/backend/access/common/indextuple.c b/src/backend/access/common/indextuple.c
+index 1f6b7b77d4e8..ae932691af84 100644
+--- a/src/backend/access/common/indextuple.c
++++ b/src/backend/access/common/indextuple.c
+@@ -103,8 +103,19 @@ index_form_tuple(TupleDesc tupleDescriptor,
+ 			(att->attstorage == TYPSTORAGE_EXTENDED ||
+ 			 att->attstorage == TYPSTORAGE_MAIN))
+ 		{
+-			Datum		cvalue = toast_compress_datum(untoasted_values[i],
+-													  att->attcompression);
++			Datum	cvalue;
++			char	compression = att->attcompression;
++
++			/*
++			 * If the compression method is not valid, use the default. We
++			 * don't expect this to happen for regular index columns, which
++			 * inherit the setting from the corresponding table column, but
++			 * we do expect it to happen whenever an expression is indexed.
++			 */
++			if (!CompressionMethodIsValid(compression))
++				compression = GetDefaultToastCompression();
++
++			cvalue = toast_compress_datum(untoasted_values[i], compression);
+ 
+ 			if (DatumGetPointer(cvalue) != NULL)
+ 			{
+diff --git a/src/backend/catalog/index.c b/src/backend/catalog/index.c
+index af30840c0447..a628b3281ce8 100644
+--- a/src/backend/catalog/index.c
++++ b/src/backend/catalog/index.c
+@@ -30,6 +30,7 @@
+ #include "access/relscan.h"
+ #include "access/sysattr.h"
+ #include "access/tableam.h"
++#include "access/toast_compression.h"
+ #include "access/transam.h"
+ #include "access/visibilitymap.h"
+ #include "access/xact.h"
+@@ -379,6 +380,15 @@ ConstructTupleDescriptor(Relation heapRelation,
+ 			to->attalign = typeTup->typalign;
+ 			to->atttypmod = exprTypmod(indexkey);
+ 
++			/*
++			 * For expression columns, set attcompression invalid, since
++			 * there's no table column from which to copy the value. Whenever
++			 * we actually need to compress a value, we'll use whatever the
++			 * current value of default_compression_method is at that point
++			 * in time.
++			 */
++			to->attcompression = InvalidCompressionMethod;
++
+ 			ReleaseSysCache(tuple);
+ 
+ 			/*
+diff --git a/src/test/regress/expected/compression.out b/src/test/regress/expected/compression.out
+index 566a1877eac6..61e97cb33cec 100644
+--- a/src/test/regress/expected/compression.out
++++ b/src/test/regress/expected/compression.out
+@@ -313,6 +313,12 @@ SELECT pg_column_compression(f1) FROM cmdata;
+  lz4
+ (2 rows)
+ 
++-- test expression index
++DROP TABLE cmdata2;
++CREATE TABLE cmdata2 (f1 TEXT COMPRESSION pglz, f2 TEXT COMPRESSION lz4);
++CREATE UNIQUE INDEX idx1 ON cmdata2 ((f1 || f2));
++INSERT INTO cmdata2 VALUES((SELECT array_agg(md5(g::TEXT))::TEXT FROM
++generate_series(1, 50) g), VERSION());
+ -- check data is ok
+ SELECT length(f1) FROM cmdata;
+  length 
+diff --git a/src/test/regress/expected/compression_1.out b/src/test/regress/expected/compression_1.out
+index 399093341548..d03d6255ae37 100644
+--- a/src/test/regress/expected/compression_1.out
++++ b/src/test/regress/expected/compression_1.out
+@@ -309,6 +309,19 @@ SELECT pg_column_compression(f1) FROM cmdata;
+  pglz
+ (2 rows)
+ 
++-- test expression index
++DROP TABLE cmdata2;
++CREATE TABLE cmdata2 (f1 TEXT COMPRESSION pglz, f2 TEXT COMPRESSION lz4);
++ERROR:  unsupported LZ4 compression method
++DETAIL:  This functionality requires the server to be built with lz4 support.
++HINT:  You need to rebuild PostgreSQL using --with-lz4.
++CREATE UNIQUE INDEX idx1 ON cmdata2 ((f1 || f2));
++ERROR:  relation "cmdata2" does not exist
++INSERT INTO cmdata2 VALUES((SELECT array_agg(md5(g::TEXT))::TEXT FROM
++generate_series(1, 50) g), VERSION());
++ERROR:  relation "cmdata2" does not exist
++LINE 1: INSERT INTO cmdata2 VALUES((SELECT array_agg(md5(g::TEXT))::...
++                    ^
+ -- check data is ok
+ SELECT length(f1) FROM cmdata;
+  length 
+diff --git a/src/test/regress/sql/compression.sql b/src/test/regress/sql/compression.sql
+index 5e178be04a2c..76d1776d8329 100644
+--- a/src/test/regress/sql/compression.sql
++++ b/src/test/regress/sql/compression.sql
+@@ -130,6 +130,13 @@ SELECT pg_column_compression(f1) FROM cmdata;
+ VACUUM FULL cmdata;
+ SELECT pg_column_compression(f1) FROM cmdata;
+ 
++-- test expression index
++DROP TABLE cmdata2;
++CREATE TABLE cmdata2 (f1 TEXT COMPRESSION pglz, f2 TEXT COMPRESSION lz4);
++CREATE UNIQUE INDEX idx1 ON cmdata2 ((f1 || f2));
++INSERT INTO cmdata2 VALUES((SELECT array_agg(md5(g::TEXT))::TEXT FROM
++generate_series(1, 50) g), VERSION());
++
+ -- check data is ok
+ SELECT length(f1) FROM cmdata;
+ SELECT length(f1) FROM cmdata1;

@@ -1,0 +1,220 @@
+From 5a20b0219e7684788a1b63e812dd44b31361b259 Mon Sep 17 00:00:00 2001
+From: Etsuro Fujita <efujita@postgresql.org>
+Date: Tue, 10 Dec 2019 18:00:30 +0900
+Subject: [PATCH] Fix handling of multiple AFTER ROW triggers on a foreign
+ table.
+
+AfterTriggerExecute() retrieves a fresh tuple or pair of tuples from a
+tuplestore and then stores the tuple(s) in the passed-in slot(s) if
+AFTER_TRIGGER_FDW_FETCH, while it uses the most-recently-retrieved
+tuple(s) stored in the slot(s) if AFTER_TRIGGER_FDW_REUSE.  This was
+done correctly before 12, but commit ff11e7f4b broke it by mistakenly
+clearing the tuple(s) stored in the slot(s) in that function, leading to
+an assertion failure as reported in bug #16139 from Alexander Lakhin.
+
+Also, fix some other issues with the aforementioned commit in passing:
+
+* For tg_newslot, which is a slot added to the TriggerData struct by the
+  commit to store new updated tuples, it didn't ensure the slot was NULL
+  if there was no such tuple.
+* The commit failed to update the documentation about the trigger
+  interface.
+
+Author: Etsuro Fujita
+Backpatch-through: 12
+Discussion: https://postgr.es/m/16139-94f9ccf0db6119ec%40postgresql.org
+---
+ .../postgres_fdw/expected/postgres_fdw.out    | 32 ++++++++++++++-
+ contrib/postgres_fdw/sql/postgres_fdw.sql     | 17 ++++++++
+ doc/src/sgml/trigger.sgml                     | 16 ++++----
+ src/backend/commands/trigger.c                | 40 ++++++++++++-------
+ 4 files changed, 81 insertions(+), 24 deletions(-)
+
+diff --git a/contrib/postgres_fdw/expected/postgres_fdw.out b/contrib/postgres_fdw/expected/postgres_fdw.out
+index 48282ab151e1..2927a9c7db37 100644
+--- a/contrib/postgres_fdw/expected/postgres_fdw.out
++++ b/contrib/postgres_fdw/expected/postgres_fdw.out
+@@ -6459,6 +6459,36 @@ DROP TRIGGER trig_row_after ON rem1;
+ DROP TRIGGER trig_stmt_before ON rem1;
+ DROP TRIGGER trig_stmt_after ON rem1;
+ DELETE from rem1;
++-- Test multiple AFTER ROW triggers on a foreign table
++CREATE TRIGGER trig_row_after1
++AFTER INSERT OR UPDATE OR DELETE ON rem1
++FOR EACH ROW EXECUTE PROCEDURE trigger_data(23,'skidoo');
++CREATE TRIGGER trig_row_after2
++AFTER INSERT OR UPDATE OR DELETE ON rem1
++FOR EACH ROW EXECUTE PROCEDURE trigger_data(23,'skidoo');
++insert into rem1 values(1,'insert');
++NOTICE:  trig_row_after1(23, skidoo) AFTER ROW INSERT ON rem1
++NOTICE:  NEW: (1,insert)
++NOTICE:  trig_row_after2(23, skidoo) AFTER ROW INSERT ON rem1
++NOTICE:  NEW: (1,insert)
++update rem1 set f2  = 'update' where f1 = 1;
++NOTICE:  trig_row_after1(23, skidoo) AFTER ROW UPDATE ON rem1
++NOTICE:  OLD: (1,insert),NEW: (1,update)
++NOTICE:  trig_row_after2(23, skidoo) AFTER ROW UPDATE ON rem1
++NOTICE:  OLD: (1,insert),NEW: (1,update)
++update rem1 set f2 = f2 || f2;
++NOTICE:  trig_row_after1(23, skidoo) AFTER ROW UPDATE ON rem1
++NOTICE:  OLD: (1,update),NEW: (1,updateupdate)
++NOTICE:  trig_row_after2(23, skidoo) AFTER ROW UPDATE ON rem1
++NOTICE:  OLD: (1,update),NEW: (1,updateupdate)
++delete from rem1;
++NOTICE:  trig_row_after1(23, skidoo) AFTER ROW DELETE ON rem1
++NOTICE:  OLD: (1,updateupdate)
++NOTICE:  trig_row_after2(23, skidoo) AFTER ROW DELETE ON rem1
++NOTICE:  OLD: (1,updateupdate)
++-- cleanup
++DROP TRIGGER trig_row_after1 ON rem1;
++DROP TRIGGER trig_row_after2 ON rem1;
+ -- Test WHEN conditions
+ CREATE TRIGGER trig_row_before_insupd
+ BEFORE INSERT OR UPDATE ON rem1
+@@ -6689,7 +6719,7 @@ NOTICE:  trig_row_after(23, skidoo) AFTER ROW INSERT ON rem1
+ NOTICE:  NEW: (13,"test triggered !")
+   ctid  
+ --------
+- (0,29)
++ (0,32)
+ (1 row)
+ 
+ -- cleanup
+diff --git a/contrib/postgres_fdw/sql/postgres_fdw.sql b/contrib/postgres_fdw/sql/postgres_fdw.sql
+index 1c5c37b783ee..ecfa43efc8fc 100644
+--- a/contrib/postgres_fdw/sql/postgres_fdw.sql
++++ b/contrib/postgres_fdw/sql/postgres_fdw.sql
+@@ -1485,6 +1485,23 @@ DROP TRIGGER trig_stmt_after ON rem1;
+ 
+ DELETE from rem1;
+ 
++-- Test multiple AFTER ROW triggers on a foreign table
++CREATE TRIGGER trig_row_after1
++AFTER INSERT OR UPDATE OR DELETE ON rem1
++FOR EACH ROW EXECUTE PROCEDURE trigger_data(23,'skidoo');
++
++CREATE TRIGGER trig_row_after2
++AFTER INSERT OR UPDATE OR DELETE ON rem1
++FOR EACH ROW EXECUTE PROCEDURE trigger_data(23,'skidoo');
++
++insert into rem1 values(1,'insert');
++update rem1 set f2  = 'update' where f1 = 1;
++update rem1 set f2 = f2 || f2;
++delete from rem1;
++
++-- cleanup
++DROP TRIGGER trig_row_after1 ON rem1;
++DROP TRIGGER trig_row_after2 ON rem1;
+ 
+ -- Test WHEN conditions
+ 
+diff --git a/doc/src/sgml/trigger.sgml b/doc/src/sgml/trigger.sgml
+index f62f420c1927..ba94acad696c 100644
+--- a/doc/src/sgml/trigger.sgml
++++ b/doc/src/sgml/trigger.sgml
+@@ -511,8 +511,8 @@ typedef struct TriggerData
+     HeapTuple        tg_trigtuple;
+     HeapTuple        tg_newtuple;
+     Trigger         *tg_trigger;
+-    Buffer           tg_trigtuplebuf;
+-    Buffer           tg_newtuplebuf;
++    TupleTableSlot  *tg_trigslot;
++    TupleTableSlot  *tg_newslot;
+     Tuplestorestate *tg_oldtable;
+     Tuplestorestate *tg_newtable;
+ } TriggerData;
+@@ -714,21 +714,21 @@ typedef struct Trigger
+      </varlistentry>
+ 
+      <varlistentry>
+-      <term><structfield>tg_trigtuplebuf</structfield></term>
++      <term><structfield>tg_trigslot</structfield></term>
+       <listitem>
+        <para>
+-        The buffer containing <structfield>tg_trigtuple</structfield>, or <symbol>InvalidBuffer</symbol> if there
+-        is no such tuple or it is not stored in a disk buffer.
++        The slot containing <structfield>tg_trigtuple</structfield>,
++        or a <symbol>NULL</symbol> pointer if there is no such tuple.
+        </para>
+       </listitem>
+      </varlistentry>
+ 
+      <varlistentry>
+-      <term><structfield>tg_newtuplebuf</structfield></term>
++      <term><structfield>tg_newslot</structfield></term>
+       <listitem>
+        <para>
+-        The buffer containing <structfield>tg_newtuple</structfield>, or <symbol>InvalidBuffer</symbol> if there
+-        is no such tuple or it is not stored in a disk buffer.
++        The slot containing <structfield>tg_newtuple</structfield>,
++        or a <symbol>NULL</symbol> pointer if there is no such tuple.
+        </para>
+       </listitem>
+      </varlistentry>
+diff --git a/src/backend/commands/trigger.c b/src/backend/commands/trigger.c
+index 8d22d43bc3a7..faeea16d21ae 100644
+--- a/src/backend/commands/trigger.c
++++ b/src/backend/commands/trigger.c
+@@ -4255,12 +4255,17 @@ AfterTriggerExecute(EState *estate,
+ 			LocTriggerData.tg_trigtuple =
+ 				ExecFetchSlotHeapTuple(trig_tuple_slot1, true, &should_free_trig);
+ 
+-			LocTriggerData.tg_newslot = trig_tuple_slot2;
+-			LocTriggerData.tg_newtuple =
+-				((evtshared->ats_event & TRIGGER_EVENT_OPMASK) ==
+-				 TRIGGER_EVENT_UPDATE) ?
+-				ExecFetchSlotHeapTuple(trig_tuple_slot2, true, &should_free_new) : NULL;
+-
++			if ((evtshared->ats_event & TRIGGER_EVENT_OPMASK) ==
++				TRIGGER_EVENT_UPDATE)
++			{
++				LocTriggerData.tg_newslot = trig_tuple_slot2;
++				LocTriggerData.tg_newtuple =
++					ExecFetchSlotHeapTuple(trig_tuple_slot2, true, &should_free_new);
++			}
++			else
++			{
++				LocTriggerData.tg_newtuple = NULL;
++			}
+ 			break;
+ 
+ 		default:
+@@ -4355,10 +4360,14 @@ AfterTriggerExecute(EState *estate,
+ 	if (should_free_new)
+ 		heap_freetuple(LocTriggerData.tg_newtuple);
+ 
+-	if (LocTriggerData.tg_trigslot)
+-		ExecClearTuple(LocTriggerData.tg_trigslot);
+-	if (LocTriggerData.tg_newslot)
+-		ExecClearTuple(LocTriggerData.tg_newslot);
++	/* don't clear slots' contents if foreign table */
++	if (trig_tuple_slot1 == NULL)
++	{
++		if (LocTriggerData.tg_trigslot)
++			ExecClearTuple(LocTriggerData.tg_trigslot);
++		if (LocTriggerData.tg_newslot)
++			ExecClearTuple(LocTriggerData.tg_newslot);
++	}
+ 
+ 	/*
+ 	 * If doing EXPLAIN ANALYZE, stop charging time to this trigger, and count
+@@ -4512,13 +4521,14 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
+ 					trigdesc = rInfo->ri_TrigDesc;
+ 					finfo = rInfo->ri_TrigFunctions;
+ 					instr = rInfo->ri_TrigInstrument;
++					if (slot1 != NULL)
++					{
++						ExecDropSingleTupleTableSlot(slot1);
++						ExecDropSingleTupleTableSlot(slot2);
++						slot1 = slot2 = NULL;
++					}
+ 					if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+ 					{
+-						if (slot1 != NULL)
+-						{
+-							ExecDropSingleTupleTableSlot(slot1);
+-							ExecDropSingleTupleTableSlot(slot2);
+-						}
+ 						slot1 = MakeSingleTupleTableSlot(rel->rd_att,
+ 														 &TTSOpsMinimalTuple);
+ 						slot2 = MakeSingleTupleTableSlot(rel->rd_att,

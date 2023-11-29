@@ -1,0 +1,385 @@
+From 5a3423ad8ee171fbf08317917981effe47d211eb Mon Sep 17 00:00:00 2001
+From: Daniel Gustafsson <dgustafsson@postgresql.org>
+Date: Fri, 8 Sep 2023 15:05:12 +0200
+Subject: [PATCH] Add JIT deform_counter
+
+generation_counter includes time spent on both JIT:ing expressions
+and tuple deforming which are configured independently via options
+jit_expressions and jit_tuple_deforming.  As they are  combined in
+the same counter it's not apparent what fraction of time the tuple
+deforming takes.
+
+This adds deform_counter dedicated to tuple deforming, which allows
+seeing more directly the influence jit_tuple_deforming is having on
+the query. The counter is exposed in EXPLAIN and pg_stat_statements
+bumpin pg_stat_statements to 1.11.
+
+Author: Dmitry Dolgov <9erthalion6@gmail.com>
+Reviewed-by: Pavel Stehule <pavel.stehule@gmail.com>
+Reviewed-by: Daniel Gustafsson <daniel@yesql.se>
+Discussion: https://postgr.es/m/20220612091253.eegstkufdsu4kfls@erthalion.local
+---
+ contrib/pg_stat_statements/Makefile           |  1 +
+ contrib/pg_stat_statements/meson.build        |  1 +
+ .../pg_stat_statements--1.10--1.11.sql        | 69 +++++++++++++++++++
+ .../pg_stat_statements/pg_stat_statements.c   | 35 +++++++++-
+ .../pg_stat_statements.control                |  2 +-
+ doc/src/sgml/jit.sgml                         |  2 +-
+ doc/src/sgml/pgstatstatements.sgml            | 19 +++++
+ src/backend/commands/explain.c                | 12 +++-
+ src/backend/jit/jit.c                         |  1 +
+ src/backend/jit/llvm/llvmjit_expr.c           |  6 ++
+ src/include/jit/jit.h                         |  3 +
+ 11 files changed, 145 insertions(+), 6 deletions(-)
+ create mode 100644 contrib/pg_stat_statements/pg_stat_statements--1.10--1.11.sql
+
+diff --git a/contrib/pg_stat_statements/Makefile b/contrib/pg_stat_statements/Makefile
+index 5578a9dd4e35..eba4a95d91ac 100644
+--- a/contrib/pg_stat_statements/Makefile
++++ b/contrib/pg_stat_statements/Makefile
+@@ -7,6 +7,7 @@ OBJS = \
+ 
+ EXTENSION = pg_stat_statements
+ DATA = pg_stat_statements--1.4.sql \
++	pg_stat_statements--1.10--1.11.sql \
+ 	pg_stat_statements--1.9--1.10.sql pg_stat_statements--1.8--1.9.sql \
+ 	pg_stat_statements--1.7--1.8.sql pg_stat_statements--1.6--1.7.sql \
+ 	pg_stat_statements--1.5--1.6.sql pg_stat_statements--1.4--1.5.sql \
+diff --git a/contrib/pg_stat_statements/meson.build b/contrib/pg_stat_statements/meson.build
+index 3e3062ada9cb..15b7c7f2b020 100644
+--- a/contrib/pg_stat_statements/meson.build
++++ b/contrib/pg_stat_statements/meson.build
+@@ -21,6 +21,7 @@ contrib_targets += pg_stat_statements
+ install_data(
+   'pg_stat_statements.control',
+   'pg_stat_statements--1.4.sql',
++  'pg_stat_statements--1.10--1.11.sql',
+   'pg_stat_statements--1.9--1.10.sql',
+   'pg_stat_statements--1.8--1.9.sql',
+   'pg_stat_statements--1.7--1.8.sql',
+diff --git a/contrib/pg_stat_statements/pg_stat_statements--1.10--1.11.sql b/contrib/pg_stat_statements/pg_stat_statements--1.10--1.11.sql
+new file mode 100644
+index 000000000000..20bae804582e
+--- /dev/null
++++ b/contrib/pg_stat_statements/pg_stat_statements--1.10--1.11.sql
+@@ -0,0 +1,69 @@
++/* contrib/pg_stat_statements/pg_stat_statements--1.10--1.11.sql */
++
++-- complain if script is sourced in psql, rather than via ALTER EXTENSION
++\echo Use "ALTER EXTENSION pg_stat_statements UPDATE TO '1.11'" to load this file. \quit
++
++/* First we have to remove them from the extension */
++ALTER EXTENSION pg_stat_statements DROP VIEW pg_stat_statements;
++ALTER EXTENSION pg_stat_statements DROP FUNCTION pg_stat_statements(boolean);
++
++/* Then we can drop them */
++DROP VIEW pg_stat_statements;
++DROP FUNCTION pg_stat_statements(boolean);
++
++/* Now redefine */
++CREATE FUNCTION pg_stat_statements(IN showtext boolean,
++    OUT userid oid,
++    OUT dbid oid,
++    OUT toplevel bool,
++    OUT queryid bigint,
++    OUT query text,
++    OUT plans int8,
++    OUT total_plan_time float8,
++    OUT min_plan_time float8,
++    OUT max_plan_time float8,
++    OUT mean_plan_time float8,
++    OUT stddev_plan_time float8,
++    OUT calls int8,
++    OUT total_exec_time float8,
++    OUT min_exec_time float8,
++    OUT max_exec_time float8,
++    OUT mean_exec_time float8,
++    OUT stddev_exec_time float8,
++    OUT rows int8,
++    OUT shared_blks_hit int8,
++    OUT shared_blks_read int8,
++    OUT shared_blks_dirtied int8,
++    OUT shared_blks_written int8,
++    OUT local_blks_hit int8,
++    OUT local_blks_read int8,
++    OUT local_blks_dirtied int8,
++    OUT local_blks_written int8,
++    OUT temp_blks_read int8,
++    OUT temp_blks_written int8,
++    OUT blk_read_time float8,
++    OUT blk_write_time float8,
++    OUT temp_blk_read_time float8,
++    OUT temp_blk_write_time float8,
++    OUT wal_records int8,
++    OUT wal_fpi int8,
++    OUT wal_bytes numeric,
++    OUT jit_functions int8,
++    OUT jit_generation_time float8,
++    OUT jit_inlining_count int8,
++    OUT jit_inlining_time float8,
++    OUT jit_optimization_count int8,
++    OUT jit_optimization_time float8,
++    OUT jit_emission_count int8,
++    OUT jit_emission_time float8,
++    OUT jit_deform_count int8,
++    OUT jit_deform_time float8
++)
++RETURNS SETOF record
++AS 'MODULE_PATHNAME', 'pg_stat_statements_1_11'
++LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
++
++CREATE VIEW pg_stat_statements AS
++  SELECT * FROM pg_stat_statements(true);
++
++GRANT SELECT ON pg_stat_statements TO PUBLIC;
+diff --git a/contrib/pg_stat_statements/pg_stat_statements.c b/contrib/pg_stat_statements/pg_stat_statements.c
+index 06b65aeef5ca..a46f2db352b8 100644
+--- a/contrib/pg_stat_statements/pg_stat_statements.c
++++ b/contrib/pg_stat_statements/pg_stat_statements.c
+@@ -117,7 +117,8 @@ typedef enum pgssVersion
+ 	PGSS_V1_3,
+ 	PGSS_V1_8,
+ 	PGSS_V1_9,
+-	PGSS_V1_10
++	PGSS_V1_10,
++	PGSS_V1_11
+ } pgssVersion;
+ 
+ typedef enum pgssStoreKind
+@@ -192,6 +193,10 @@ typedef struct Counters
+ 	double		jit_generation_time;	/* total time to generate jit code */
+ 	int64		jit_inlining_count; /* number of times inlining time has been
+ 									 * > 0 */
++	double		jit_deform_time;	/* total time to deform tuples in jit code */
++	int64		jit_deform_count;	/* number of times deform time has been >
++									 * 0 */
++
+ 	double		jit_inlining_time;	/* total time to inline jit code */
+ 	int64		jit_optimization_count; /* number of times optimization time
+ 										 * has been > 0 */
+@@ -312,6 +317,7 @@ PG_FUNCTION_INFO_V1(pg_stat_statements_1_3);
+ PG_FUNCTION_INFO_V1(pg_stat_statements_1_8);
+ PG_FUNCTION_INFO_V1(pg_stat_statements_1_9);
+ PG_FUNCTION_INFO_V1(pg_stat_statements_1_10);
++PG_FUNCTION_INFO_V1(pg_stat_statements_1_11);
+ PG_FUNCTION_INFO_V1(pg_stat_statements);
+ PG_FUNCTION_INFO_V1(pg_stat_statements_info);
+ 
+@@ -1398,6 +1404,10 @@ pgss_store(const char *query, uint64 queryId,
+ 			e->counters.jit_functions += jitusage->created_functions;
+ 			e->counters.jit_generation_time += INSTR_TIME_GET_MILLISEC(jitusage->generation_counter);
+ 
++			if (INSTR_TIME_GET_MILLISEC(jitusage->deform_counter))
++				e->counters.jit_deform_count++;
++			e->counters.jit_deform_time += INSTR_TIME_GET_MILLISEC(jitusage->deform_counter);
++
+ 			if (INSTR_TIME_GET_MILLISEC(jitusage->inlining_counter))
+ 				e->counters.jit_inlining_count++;
+ 			e->counters.jit_inlining_time += INSTR_TIME_GET_MILLISEC(jitusage->inlining_counter);
+@@ -1460,7 +1470,8 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
+ #define PG_STAT_STATEMENTS_COLS_V1_8	32
+ #define PG_STAT_STATEMENTS_COLS_V1_9	33
+ #define PG_STAT_STATEMENTS_COLS_V1_10	43
+-#define PG_STAT_STATEMENTS_COLS			43	/* maximum of above */
++#define PG_STAT_STATEMENTS_COLS_V1_11	45
++#define PG_STAT_STATEMENTS_COLS			45	/* maximum of above */
+ 
+ /*
+  * Retrieve statement statistics.
+@@ -1472,6 +1483,16 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
+  * expected API version is identified by embedding it in the C name of the
+  * function.  Unfortunately we weren't bright enough to do that for 1.1.
+  */
++Datum
++pg_stat_statements_1_11(PG_FUNCTION_ARGS)
++{
++	bool		showtext = PG_GETARG_BOOL(0);
++
++	pg_stat_statements_internal(fcinfo, PGSS_V1_11, showtext);
++
++	return (Datum) 0;
++}
++
+ Datum
+ pg_stat_statements_1_10(PG_FUNCTION_ARGS)
+ {
+@@ -1602,6 +1623,10 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
+ 			if (api_version != PGSS_V1_10)
+ 				elog(ERROR, "incorrect number of output arguments");
+ 			break;
++		case PG_STAT_STATEMENTS_COLS_V1_11:
++			if (api_version != PGSS_V1_11)
++				elog(ERROR, "incorrect number of output arguments");
++			break;
+ 		default:
+ 			elog(ERROR, "incorrect number of output arguments");
+ 	}
+@@ -1834,6 +1859,11 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
+ 			values[i++] = Int64GetDatumFast(tmp.jit_emission_count);
+ 			values[i++] = Float8GetDatumFast(tmp.jit_emission_time);
+ 		}
++		if (api_version >= PGSS_V1_11)
++		{
++			values[i++] = Int64GetDatumFast(tmp.jit_deform_count);
++			values[i++] = Float8GetDatumFast(tmp.jit_deform_time);
++		}
+ 
+ 		Assert(i == (api_version == PGSS_V1_0 ? PG_STAT_STATEMENTS_COLS_V1_0 :
+ 					 api_version == PGSS_V1_1 ? PG_STAT_STATEMENTS_COLS_V1_1 :
+@@ -1842,6 +1872,7 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
+ 					 api_version == PGSS_V1_8 ? PG_STAT_STATEMENTS_COLS_V1_8 :
+ 					 api_version == PGSS_V1_9 ? PG_STAT_STATEMENTS_COLS_V1_9 :
+ 					 api_version == PGSS_V1_10 ? PG_STAT_STATEMENTS_COLS_V1_10 :
++					 api_version == PGSS_V1_11 ? PG_STAT_STATEMENTS_COLS_V1_11 :
+ 					 -1 /* fail if you forget to update this assert */ ));
+ 
+ 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+diff --git a/contrib/pg_stat_statements/pg_stat_statements.control b/contrib/pg_stat_statements/pg_stat_statements.control
+index 0747e4813837..8a76106ec676 100644
+--- a/contrib/pg_stat_statements/pg_stat_statements.control
++++ b/contrib/pg_stat_statements/pg_stat_statements.control
+@@ -1,5 +1,5 @@
+ # pg_stat_statements extension
+ comment = 'track planning and execution statistics of all SQL statements executed'
+-default_version = '1.10'
++default_version = '1.11'
+ module_pathname = '$libdir/pg_stat_statements'
+ relocatable = true
+diff --git a/doc/src/sgml/jit.sgml b/doc/src/sgml/jit.sgml
+index 998c972e8ba0..1921557cb826 100644
+--- a/doc/src/sgml/jit.sgml
++++ b/doc/src/sgml/jit.sgml
+@@ -170,7 +170,7 @@ SET
+  JIT:
+    Functions: 3
+    Options: Inlining false, Optimization false, Expressions true, Deforming true
+-   Timing: Generation 1.259 ms, Inlining 0.000 ms, Optimization 0.797 ms, Emission 5.048 ms, Total 7.104 ms
++   Timing: Generation 1.259 ms (Deform 0.000 ms), Inlining 0.000 ms, Optimization 0.797 ms, Emission 5.048 ms, Total 7.104 ms
+  Execution Time: 7.416 ms
+ </screen>
+    As visible here, <acronym>JIT</acronym> was used, but inlining and
+diff --git a/doc/src/sgml/pgstatstatements.sgml b/doc/src/sgml/pgstatstatements.sgml
+index b1214ee6453c..7e7c5c9ff826 100644
+--- a/doc/src/sgml/pgstatstatements.sgml
++++ b/doc/src/sgml/pgstatstatements.sgml
+@@ -420,6 +420,25 @@
+       </para></entry>
+      </row>
+ 
++     <row>
++      <entry role="catalog_table_entry"><para role="column_definition">
++       <structfield>jit_deform_count</structfield> <type>bigint</type>
++      </para>
++      <para>
++       Total number of tuple deform functions JIT-compiled by the statement
++      </para></entry>
++     </row>
++
++     <row>
++      <entry role="catalog_table_entry"><para role="column_definition">
++       <structfield>jit_deform_time</structfield> <type>double precision</type>
++      </para>
++      <para>
++        Total time spent by the statement on JIT-compiling tuple deform
++        functions, in milliseconds
++      </para></entry>
++     </row>
++
+      <row>
+       <entry role="catalog_table_entry"><para role="column_definition">
+        <structfield>jit_inlining_count</structfield> <type>bigint</type>
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index 8570b14f6217..13217807eed7 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -893,6 +893,7 @@ ExplainPrintJIT(ExplainState *es, int jit_flags, JitInstrumentation *ji)
+ 
+ 	/* calculate total time */
+ 	INSTR_TIME_SET_ZERO(total_time);
++	/* don't add deform_counter, it's included in generation_counter */
+ 	INSTR_TIME_ADD(total_time, ji->generation_counter);
+ 	INSTR_TIME_ADD(total_time, ji->inlining_counter);
+ 	INSTR_TIME_ADD(total_time, ji->optimization_counter);
+@@ -920,8 +921,9 @@ ExplainPrintJIT(ExplainState *es, int jit_flags, JitInstrumentation *ji)
+ 		{
+ 			ExplainIndentText(es);
+ 			appendStringInfo(es->str,
+-							 "Timing: %s %.3f ms, %s %.3f ms, %s %.3f ms, %s %.3f ms, %s %.3f ms\n",
++							 "Timing: %s %.3f ms (%s %.3f ms), %s %.3f ms, %s %.3f ms, %s %.3f ms, %s %.3f ms\n",
+ 							 "Generation", 1000.0 * INSTR_TIME_GET_DOUBLE(ji->generation_counter),
++							 "Deform", 1000.0 * INSTR_TIME_GET_DOUBLE(ji->deform_counter),
+ 							 "Inlining", 1000.0 * INSTR_TIME_GET_DOUBLE(ji->inlining_counter),
+ 							 "Optimization", 1000.0 * INSTR_TIME_GET_DOUBLE(ji->optimization_counter),
+ 							 "Emission", 1000.0 * INSTR_TIME_GET_DOUBLE(ji->emission_counter),
+@@ -945,9 +947,15 @@ ExplainPrintJIT(ExplainState *es, int jit_flags, JitInstrumentation *ji)
+ 		{
+ 			ExplainOpenGroup("Timing", "Timing", true, es);
+ 
+-			ExplainPropertyFloat("Generation", "ms",
++			ExplainOpenGroup("Generation", "Generation", true, es);
++			ExplainPropertyFloat("Deform", "ms",
++								 1000.0 * INSTR_TIME_GET_DOUBLE(ji->deform_counter),
++								 3, es);
++			ExplainPropertyFloat("Total", "ms",
+ 								 1000.0 * INSTR_TIME_GET_DOUBLE(ji->generation_counter),
+ 								 3, es);
++			ExplainCloseGroup("Generation", "Generation", true, es);
++
+ 			ExplainPropertyFloat("Inlining", "ms",
+ 								 1000.0 * INSTR_TIME_GET_DOUBLE(ji->inlining_counter),
+ 								 3, es);
+diff --git a/src/backend/jit/jit.c b/src/backend/jit/jit.c
+index fd1cf184c8e5..4da8fee20b4a 100644
+--- a/src/backend/jit/jit.c
++++ b/src/backend/jit/jit.c
+@@ -185,6 +185,7 @@ InstrJitAgg(JitInstrumentation *dst, JitInstrumentation *add)
+ {
+ 	dst->created_functions += add->created_functions;
+ 	INSTR_TIME_ADD(dst->generation_counter, add->generation_counter);
++	INSTR_TIME_ADD(dst->deform_counter, add->deform_counter);
+ 	INSTR_TIME_ADD(dst->inlining_counter, add->inlining_counter);
+ 	INSTR_TIME_ADD(dst->optimization_counter, add->optimization_counter);
+ 	INSTR_TIME_ADD(dst->emission_counter, add->emission_counter);
+diff --git a/src/backend/jit/llvm/llvmjit_expr.c b/src/backend/jit/llvm/llvmjit_expr.c
+index 00d7b8110b9e..2ac335e23899 100644
+--- a/src/backend/jit/llvm/llvmjit_expr.c
++++ b/src/backend/jit/llvm/llvmjit_expr.c
+@@ -121,7 +121,9 @@ llvm_compile_expr(ExprState *state)
+ 	LLVMValueRef v_aggnulls;
+ 
+ 	instr_time	starttime;
++	instr_time	deform_starttime;
+ 	instr_time	endtime;
++	instr_time	deform_endtime;
+ 
+ 	llvm_enter_fatal_on_oom();
+ 
+@@ -315,10 +317,14 @@ llvm_compile_expr(ExprState *state)
+ 					 */
+ 					if (tts_ops && desc && (context->base.flags & PGJIT_DEFORM))
+ 					{
++						INSTR_TIME_SET_CURRENT(deform_starttime);
+ 						l_jit_deform =
+ 							slot_compile_deform(context, desc,
+ 												tts_ops,
+ 												op->d.fetch.last_var);
++						INSTR_TIME_SET_CURRENT(deform_endtime);
++						INSTR_TIME_ACCUM_DIFF(context->base.instr.deform_counter,
++											  deform_endtime, deform_starttime);
+ 					}
+ 
+ 					if (l_jit_deform)
+diff --git a/src/include/jit/jit.h b/src/include/jit/jit.h
+index 14f2e36b3711..ed381d8a1c8f 100644
+--- a/src/include/jit/jit.h
++++ b/src/include/jit/jit.h
+@@ -32,6 +32,9 @@ typedef struct JitInstrumentation
+ 	/* accumulated time to generate code */
+ 	instr_time	generation_counter;
+ 
++	/* accumulated time to deform tuples, included into generation_counter */
++	instr_time	deform_counter;
++
+ 	/* accumulated time for inlining */
+ 	instr_time	inlining_counter;
+ 

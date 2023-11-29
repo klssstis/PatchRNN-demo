@@ -1,0 +1,146 @@
+From 5be594caf818e0b5e33f8dec191f2707394a6d95 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Wed, 6 May 2020 12:29:41 -0400
+Subject: [PATCH] Heed lock protocol in DROP OWNED BY
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We were acquiring object locks then deleting objects one by one, instead
+of acquiring all object locks first, ignoring those that did not exist,
+and then deleting all objects together.   The latter is the correct
+protocol to use, and what this commits changes to code to do.  Failing
+to follow that leads to "cache lookup failed for relation XYZ" error
+reports when DROP OWNED runs concurrently with other DDL -- for example,
+a session termination that removes some temp tables.
+
+Author: Álvaro Herrera
+Reported-by: Mithun Chicklore Yogendra (Mithun CY)
+Reviewed-by: Ahsan Hadi, Tom Lane
+Discussion: https://postgr.es/m/CADq3xVZTbzK4ZLKq+dn_vB4QafXXbmMgDP3trY-GuLnib2Ai1w@mail.gmail.com
+---
+ src/backend/catalog/dependency.c        | 15 +++++++++------
+ src/backend/catalog/pg_shdepend.c       | 24 +++++++++++++++++++++++-
+ src/backend/commands/subscriptioncmds.c |  1 -
+ src/include/catalog/dependency.h        |  4 ++++
+ 4 files changed, 36 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/catalog/dependency.c b/src/backend/catalog/dependency.c
+index ffd52c11533e..5565e6fc197d 100644
+--- a/src/backend/catalog/dependency.c
++++ b/src/backend/catalog/dependency.c
+@@ -200,8 +200,6 @@ static void reportDependentObjects(const ObjectAddresses *targetObjects,
+ static void deleteOneObject(const ObjectAddress *object,
+ 							Relation *depRel, int32 flags);
+ static void doDeletion(const ObjectAddress *object, int flags);
+-static void AcquireDeletionLock(const ObjectAddress *object, int flags);
+-static void ReleaseDeletionLock(const ObjectAddress *object);
+ static bool find_expr_references_walker(Node *node,
+ 										find_expr_references_context *context);
+ static void eliminate_duplicate_dependencies(ObjectAddresses *addrs);
+@@ -1527,11 +1525,14 @@ doDeletion(const ObjectAddress *object, int flags)
+ /*
+  * AcquireDeletionLock - acquire a suitable lock for deleting an object
+  *
++ * Accepts the same flags as performDeletion (though currently only
++ * PERFORM_DELETION_CONCURRENTLY does anything).
++ *
+  * We use LockRelation for relations, LockDatabaseObject for everything
+- * else.  Note that dependency.c is not concerned with deleting any kind of
+- * shared-across-databases object, so we have no need for LockSharedObject.
++ * else.  Shared-across-databases objects are not currently supported
++ * because no caller cares, but could be modified to use LockSharedObject.
+  */
+-static void
++void
+ AcquireDeletionLock(const ObjectAddress *object, int flags)
+ {
+ 	if (object->classId == RelationRelationId)
+@@ -1557,8 +1558,10 @@ AcquireDeletionLock(const ObjectAddress *object, int flags)
+ 
+ /*
+  * ReleaseDeletionLock - release an object deletion lock
++ *
++ * Companion to AcquireDeletionLock.
+  */
+-static void
++void
+ ReleaseDeletionLock(const ObjectAddress *object)
+ {
+ 	if (object->classId == RelationRelationId)
+diff --git a/src/backend/catalog/pg_shdepend.c b/src/backend/catalog/pg_shdepend.c
+index 2ef792dbd768..61447f33a699 100644
+--- a/src/backend/catalog/pg_shdepend.c
++++ b/src/backend/catalog/pg_shdepend.c
+@@ -1324,7 +1324,10 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
+ 											sdepForm->objid);
+ 					break;
+ 				case SHARED_DEPENDENCY_POLICY:
+-					/* If unable to remove role from policy, remove policy. */
++					/*
++					 * Try to remove role from policy; if unable to, remove
++					 * policy.
++					 */
+ 					if (!RemoveRoleFromObjectPolicy(roleid,
+ 													sdepForm->classid,
+ 													sdepForm->objid))
+@@ -1332,6 +1335,18 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
+ 						obj.classId = sdepForm->classid;
+ 						obj.objectId = sdepForm->objid;
+ 						obj.objectSubId = sdepForm->objsubid;
++						/*
++						 * Acquire lock on object, then verify this dependency
++						 * is still relevant.  If not, the object might have
++						 * been dropped or the policy modified.  Ignore the
++						 * object in that case.
++						 */
++						AcquireDeletionLock(&obj, 0);
++						if (!systable_recheck_tuple(scan, tuple))
++						{
++							ReleaseDeletionLock(&obj);
++							break;
++						}
+ 						add_exact_object_address(&obj, deleteobjs);
+ 					}
+ 					break;
+@@ -1342,6 +1357,13 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
+ 						obj.classId = sdepForm->classid;
+ 						obj.objectId = sdepForm->objid;
+ 						obj.objectSubId = sdepForm->objsubid;
++						/* as above */
++						AcquireDeletionLock(&obj, 0);
++						if (!systable_recheck_tuple(scan, tuple))
++						{
++							ReleaseDeletionLock(&obj);
++							break;
++						}
+ 						add_exact_object_address(&obj, deleteobjs);
+ 					}
+ 					break;
+diff --git a/src/backend/commands/subscriptioncmds.c b/src/backend/commands/subscriptioncmds.c
+index 7f156673f7d7..9ebb026187f7 100644
+--- a/src/backend/commands/subscriptioncmds.c
++++ b/src/backend/commands/subscriptioncmds.c
+@@ -915,7 +915,6 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
+ 	if (slotname)
+ 		PreventInTransactionBlock(isTopLevel, "DROP SUBSCRIPTION");
+ 
+-
+ 	ObjectAddressSet(myself, SubscriptionRelationId, subid);
+ 	EventTriggerSQLDropAddObject(&myself, true, true);
+ 
+diff --git a/src/include/catalog/dependency.h b/src/include/catalog/dependency.h
+index 2c6abe26a5ab..a8f7e9965b7c 100644
+--- a/src/include/catalog/dependency.h
++++ b/src/include/catalog/dependency.h
+@@ -142,6 +142,10 @@ typedef enum ObjectClass
+ 
+ /* in dependency.c */
+ 
++extern void AcquireDeletionLock(const ObjectAddress *object, int flags);
++
++extern void ReleaseDeletionLock(const ObjectAddress *object);
++
+ extern void performDeletion(const ObjectAddress *object,
+ 							DropBehavior behavior, int flags);
+ 
