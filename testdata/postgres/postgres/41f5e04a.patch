@@ -1,0 +1,322 @@
+From 41f5e04aec6cf63ba8392adf70e9289e9c3706d6 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Sun, 7 Apr 2019 22:14:47 -0700
+Subject: [PATCH] Fix a number of issues around modifying a previously updated
+ row.
+
+This commit fixes three, unfortunately related, issues:
+
+1) Since 5db6df0c01, the introduction of DML via tableam, it was
+   possible to trigger "ERROR: unexpected table_lock_tuple status: 1"
+   when updating a row that was previously updated in the same
+   transaction - but only when the previously updated row was before
+   updated in a concurrent transaction (and READ COMMITTED was
+   used). The reason for that was that that case simply wasn't
+   expected. Fixing that lead to:
+
+2) Even before the above commit, there were error checks (introduced
+   in 6868ed7491b7) preventing a row being updated by different
+   commands within the same statement (say in a function called by an
+   UPDATE) - but that check wasn't performed when the row was first
+   updated in a concurrent transaction - instead the second update was
+   silently skipped in that case. After this change we throw the same
+   error as we'd without the concurrent transaction.
+
+3) The error messages (introduced in 6868ed7491b7) preventing such
+   updates emitted the same error message for both DELETE and
+   UPDATE ("tuple to be updated was already modified by an operation
+   triggered by the current command"). While that could be changed
+   separately, it made it hard to write tests that verify the correct
+   correct behavior of the code.
+
+This commit changes heap's implementation of table_lock_tuple() to
+return TM_SelfModified instead of TM_Invisible (previously loosely
+modeled after EvalPlanQualFetch), and teaches nodeModifyTable.c to
+handle that in response to table_lock_tuple() and not just in response
+to table_(delete|update).
+
+Additionally it fixes the wrong error message (see 3 above). The
+comment for table_lock_tuple() is also adjusted to state that
+TM_Deleted won't return information in TM_FailureData - it'll not
+always be available.
+
+This also adds tests to ensure that DELETE/UPDATE correctly error out
+when affecting a row that concurrently was modified by another
+transaction.
+
+Author: Andres Freund
+Reported-By: Tom Lane, when investigating a bug bug fix to another bug
+    by Amit Langote
+Discussion: https://postgr.es/m/19321.1554567786@sss.pgh.pa.us
+---
+ src/backend/access/heap/heapam_handler.c      |  8 ++-
+ src/backend/executor/nodeModifyTable.c        | 44 ++++++++++--
+ src/include/access/tableam.h                  |  6 +-
+ .../isolation/expected/eval-plan-qual.out     | 67 +++++++++++++++++++
+ src/test/isolation/specs/eval-plan-qual.spec  | 27 ++++++++
+ src/test/regress/expected/triggers.out        |  2 +-
+ 6 files changed, 144 insertions(+), 10 deletions(-)
+
+diff --git a/src/backend/access/heap/heapam_handler.c b/src/backend/access/heap/heapam_handler.c
+index add0d65f8165..1d8ca2429f91 100644
+--- a/src/backend/access/heap/heapam_handler.c
++++ b/src/backend/access/heap/heapam_handler.c
+@@ -463,8 +463,14 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
+ 					if (TransactionIdIsCurrentTransactionId(priorXmax) &&
+ 						HeapTupleHeaderGetCmin(tuple->t_data) >= cid)
+ 					{
++						tmfd->xmax = priorXmax;
++						/*
++						 * Cmin is the problematic value, so store that. See
++						 * above.
++						 */
++						tmfd->cmax = HeapTupleHeaderGetCmin(tuple->t_data);
+ 						ReleaseBuffer(buffer);
+-						return TM_Invisible;
++						return TM_SelfModified;
+ 					}
+ 
+ 					/*
+diff --git a/src/backend/executor/nodeModifyTable.c b/src/backend/executor/nodeModifyTable.c
+index 61c4459f676d..8c0a2c4bac53 100644
+--- a/src/backend/executor/nodeModifyTable.c
++++ b/src/backend/executor/nodeModifyTable.c
+@@ -799,7 +799,7 @@ ldelete:;
+ 				if (tmfd.cmax != estate->es_output_cid)
+ 					ereport(ERROR,
+ 							(errcode(ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION),
+-							 errmsg("tuple to be updated was already modified by an operation triggered by the current command"),
++							 errmsg("tuple to be deleted was already modified by an operation triggered by the current command"),
+ 							 errhint("Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.")));
+ 
+ 				/* Else, already deleted by self; nothing to do */
+@@ -858,6 +858,25 @@ ldelete:;
+ 							else
+ 								goto ldelete;
+ 
++						case TM_SelfModified:
++							/*
++							 * This can be reached when following an update
++							 * chain from a tuple updated by another session,
++							 * reaching a tuple that was already updated in
++							 * this transaction. If previously updated by this
++							 * command, ignore the delete, otherwise error
++							 * out.
++							 *
++							 * See also TM_SelfModified response to
++							 * table_delete() above.
++							 */
++							if (tmfd.cmax != estate->es_output_cid)
++								ereport(ERROR,
++										(errcode(ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION),
++										 errmsg("tuple to be deleted was already modified by an operation triggered by the current command"),
++										 errhint("Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.")));
++							return NULL;
++
+ 						case TM_Deleted:
+ 							/* tuple already deleted; nothing to do */
+ 							return NULL;
+@@ -870,10 +889,6 @@ ldelete:;
+ 							 * already have errored out if the first version
+ 							 * is invisible.
+ 							 *
+-							 * TM_SelfModified should be impossible, as we'd
+-							 * otherwise should have hit the TM_SelfModified
+-							 * case in response to table_delete above.
+-							 *
+ 							 * TM_Updated should be impossible, because we're
+ 							 * locking the latest version via
+ 							 * TUPLE_LOCK_FLAG_FIND_LAST_VERSION.
+@@ -1379,6 +1394,25 @@ lreplace:;
+ 							/* tuple already deleted; nothing to do */
+ 							return NULL;
+ 
++						case TM_SelfModified:
++							/*
++							 * This can be reached when following an update
++							 * chain from a tuple updated by another session,
++							 * reaching a tuple that was already updated in
++							 * this transaction. If previously modified by
++							 * this command, ignore the redundant update,
++							 * otherwise error out.
++							 *
++							 * See also TM_SelfModified response to
++							 * table_update() above.
++							 */
++							if (tmfd.cmax != estate->es_output_cid)
++								ereport(ERROR,
++										(errcode(ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION),
++										 errmsg("tuple to be updated was already modified by an operation triggered by the current command"),
++										 errhint("Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.")));
++							return NULL;
++
+ 						default:
+ 							/* see table_lock_tuple call in ExecDelete() */
+ 							elog(ERROR, "unexpected table_lock_tuple status: %u",
+diff --git a/src/include/access/tableam.h b/src/include/access/tableam.h
+index a647e7db3251..51398f35c01d 100644
+--- a/src/include/access/tableam.h
++++ b/src/include/access/tableam.h
+@@ -1216,9 +1216,9 @@ table_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
+  *	TM_Deleted: lock failed because tuple deleted by other xact
+  *	TM_WouldBlock: lock couldn't be acquired and wait_policy is skip
+  *
+- * In the failure cases other than TM_Invisible, the routine fills *tmfd with
+- * the tuple's t_ctid, t_xmax, and, if possible, t_cmax.  See comments for
+- * struct TM_FailureData for additional info.
++ * In the failure cases other than TM_Invisible and TM_Deleted, the routine
++ * fills *tmfd with the tuple's t_ctid, t_xmax, and, if possible, t_cmax.  See
++ * comments for struct TM_FailureData for additional info.
+  */
+ static inline TM_Result
+ table_lock_tuple(Relation rel, ItemPointer tid, Snapshot snapshot,
+diff --git a/src/test/isolation/expected/eval-plan-qual.out b/src/test/isolation/expected/eval-plan-qual.out
+index c09e97faf823..0308f2d72979 100644
+--- a/src/test/isolation/expected/eval-plan-qual.out
++++ b/src/test/isolation/expected/eval-plan-qual.out
+@@ -258,6 +258,73 @@ accountid      balance
+ checking       1050           
+ savings        600            
+ 
++starting permutation: wx1 updwcte c1 c2 read
++step wx1: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'checking' RETURNING balance;
++balance        
++
++400            
++step updwcte: WITH doup AS (UPDATE accounts SET balance = balance + 1100 WHERE accountid = 'checking' RETURNING *) UPDATE accounts a SET balance = doup.balance + 100 FROM doup RETURNING *; <waiting ...>
++step c1: COMMIT;
++step updwcte: <... completed>
++accountid      balance        accountid      balance        
++
++savings        1600           checking       1500           
++step c2: COMMIT;
++step read: SELECT * FROM accounts ORDER BY accountid;
++accountid      balance        
++
++checking       1500           
++savings        1600           
++
++starting permutation: wx1 updwctefail c1 c2 read
++step wx1: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'checking' RETURNING balance;
++balance        
++
++400            
++step updwctefail: WITH doup AS (UPDATE accounts SET balance = balance + 1100 WHERE accountid = 'checking' RETURNING *, update_checking(999)) UPDATE accounts a SET balance = doup.balance + 100 FROM doup RETURNING *; <waiting ...>
++step c1: COMMIT;
++step updwctefail: <... completed>
++error in steps c1 updwctefail: ERROR:  tuple to be updated was already modified by an operation triggered by the current command
++step c2: COMMIT;
++step read: SELECT * FROM accounts ORDER BY accountid;
++accountid      balance        
++
++checking       400            
++savings        600            
++
++starting permutation: wx1 delwcte c1 c2 read
++step wx1: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'checking' RETURNING balance;
++balance        
++
++400            
++step delwcte: WITH doup AS (UPDATE accounts SET balance = balance + 1100 WHERE accountid = 'checking' RETURNING *) DELETE FROM accounts a USING doup RETURNING *; <waiting ...>
++step c1: COMMIT;
++step delwcte: <... completed>
++accountid      balance        accountid      balance        
++
++savings        600            checking       1500           
++step c2: COMMIT;
++step read: SELECT * FROM accounts ORDER BY accountid;
++accountid      balance        
++
++checking       1500           
++
++starting permutation: wx1 delwctefail c1 c2 read
++step wx1: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'checking' RETURNING balance;
++balance        
++
++400            
++step delwctefail: WITH doup AS (UPDATE accounts SET balance = balance + 1100 WHERE accountid = 'checking' RETURNING *, update_checking(999)) DELETE FROM accounts a USING doup RETURNING *; <waiting ...>
++step c1: COMMIT;
++step delwctefail: <... completed>
++error in steps c1 delwctefail: ERROR:  tuple to be deleted was already modified by an operation triggered by the current command
++step c2: COMMIT;
++step read: SELECT * FROM accounts ORDER BY accountid;
++accountid      balance        
++
++checking       400            
++savings        600            
++
+ starting permutation: upsert1 upsert2 c1 c2 read
+ step upsert1: 
+ 	WITH upsert AS
+diff --git a/src/test/isolation/specs/eval-plan-qual.spec b/src/test/isolation/specs/eval-plan-qual.spec
+index 41c8d564409d..5a4d1c170598 100644
+--- a/src/test/isolation/specs/eval-plan-qual.spec
++++ b/src/test/isolation/specs/eval-plan-qual.spec
+@@ -9,6 +9,9 @@ setup
+  CREATE TABLE accounts (accountid text PRIMARY KEY, balance numeric not null);
+  INSERT INTO accounts VALUES ('checking', 600), ('savings', 600);
+ 
++ CREATE FUNCTION update_checking(int) RETURNS bool LANGUAGE sql AS $$
++     UPDATE accounts SET balance = balance + 1 WHERE accountid = 'checking'; SELECT true;$$;
++
+  CREATE TABLE accounts_ext (accountid text PRIMARY KEY, balance numeric not null, other text);
+  INSERT INTO accounts_ext VALUES ('checking', 600, 'other'), ('savings', 700, null);
+  ALTER TABLE accounts_ext ADD COLUMN newcol int DEFAULT 42;
+@@ -34,6 +37,7 @@ setup
+ teardown
+ {
+  DROP TABLE accounts;
++ DROP FUNCTION update_checking(int);
+  DROP TABLE accounts_ext;
+  DROP TABLE p CASCADE;
+  DROP TABLE table_a, table_b, jointest;
+@@ -170,6 +174,16 @@ step "updateforcip3"	{
+ }
+ step "wrtwcte"	{ UPDATE table_a SET value = 'tableAValue2' WHERE id = 1; }
+ step "wrjt"	{ UPDATE jointest SET data = 42 WHERE id = 7; }
++
++# Use writable CTEs to create self-updated rows, that then are
++# (updated|deleted). The *fail versions of the tests additionally
++# perform an update, via a function, in a different command, to test
++# behaviour relating to that.
++step "updwcte"  { WITH doup AS (UPDATE accounts SET balance = balance + 1100 WHERE accountid = 'checking' RETURNING *) UPDATE accounts a SET balance = doup.balance + 100 FROM doup RETURNING *; }
++step "updwctefail"  { WITH doup AS (UPDATE accounts SET balance = balance + 1100 WHERE accountid = 'checking' RETURNING *, update_checking(999)) UPDATE accounts a SET balance = doup.balance + 100 FROM doup RETURNING *; }
++step "delwcte"  { WITH doup AS (UPDATE accounts SET balance = balance + 1100 WHERE accountid = 'checking' RETURNING *) DELETE FROM accounts a USING doup RETURNING *; }
++step "delwctefail"  { WITH doup AS (UPDATE accounts SET balance = balance + 1100 WHERE accountid = 'checking' RETURNING *, update_checking(999)) DELETE FROM accounts a USING doup RETURNING *; }
++
+ step "c2"	{ COMMIT; }
+ step "r2"	{ ROLLBACK; }
+ 
+@@ -221,6 +235,19 @@ permutation "wx2" "d2" "d1" "r2" "c1" "read"
+ permutation "d1" "wx2" "c1" "c2" "read"
+ permutation "d1" "wx2" "r1" "c2" "read"
+ 
++# test that an update to a self-modified row is ignored when
++# previously updated by the same cid
++permutation "wx1" "updwcte" "c1" "c2" "read"
++# test that an update to a self-modified row throws error when
++# previously updated by a different cid
++permutation "wx1" "updwctefail" "c1" "c2" "read"
++# test that a delete to a self-modified row is ignored when
++# previously updated by the same cid
++permutation "wx1" "delwcte" "c1" "c2" "read"
++# test that a delete to a self-modified row throws error when
++# previously updated by a different cid
++permutation "wx1" "delwctefail" "c1" "c2" "read"
++
+ permutation "upsert1" "upsert2" "c1" "c2" "read"
+ permutation "readp1" "writep1" "readp2" "c1" "c2"
+ permutation "writep2" "returningp1" "c1" "c2"
+diff --git a/src/test/regress/expected/triggers.out b/src/test/regress/expected/triggers.out
+index d153225b0db1..cd2b550c14e5 100644
+--- a/src/test/regress/expected/triggers.out
++++ b/src/test/regress/expected/triggers.out
+@@ -1607,7 +1607,7 @@ select * from parent; select * from child;
+ (1 row)
+ 
+ delete from parent where aid = 1; -- should fail
+-ERROR:  tuple to be updated was already modified by an operation triggered by the current command
++ERROR:  tuple to be deleted was already modified by an operation triggered by the current command
+ HINT:  Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.
+ select * from parent; select * from child;
+  aid | val1 | val2 | val3 | val4 | bcnt 

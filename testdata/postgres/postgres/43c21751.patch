@@ -1,0 +1,186 @@
+From 43c2175121c829c8591fc5117b725f1f22bfb670 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 13 Jan 2022 17:49:25 -0500
+Subject: [PATCH] Fix ruleutils.c's dumping of whole-row Vars in more contexts.
+
+Commit 7745bc352 intended to ensure that whole-row Vars would be
+printed with "::type" decoration in all contexts where plain
+"var.*" notation would result in star-expansion, notably in
+ROW() and VALUES() constructs.  However, it missed the case of
+INSERT with a single-row VALUES, as reported by Timur Khanjanov.
+
+Nosing around ruleutils.c, I found a second oversight: the
+code for RowCompareExpr generates ROW() notation without benefit
+of an actual RowExpr, and naturally it wasn't in sync :-(.
+(The code for FieldStore also does this, but we don't expect that
+to generate strictly parsable SQL anyway, so I left it alone.)
+
+Back-patch to all supported branches.
+
+Discussion: https://postgr.es/m/efaba6f9-4190-56be-8ff2-7a1674f9194f@intrans.baku.az
+---
+ src/backend/utils/adt/ruleutils.c         | 56 ++++++++++++++---------
+ src/test/regress/expected/create_view.out | 19 +++++++-
+ src/test/regress/sql/create_view.sql      |  5 ++
+ 3 files changed, 57 insertions(+), 23 deletions(-)
+
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index 63b85566822f..039b1d2b9514 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -438,6 +438,8 @@ static void get_rule_expr(Node *node, deparse_context *context,
+ 						  bool showimplicit);
+ static void get_rule_expr_toplevel(Node *node, deparse_context *context,
+ 								   bool showimplicit);
++static void get_rule_list_toplevel(List *lst, deparse_context *context,
++								   bool showimplicit);
+ static void get_rule_expr_funccall(Node *node, deparse_context *context,
+ 								   bool showimplicit);
+ static bool looks_like_function(Node *node);
+@@ -6632,7 +6634,7 @@ get_insert_query_def(Query *query, deparse_context *context)
+ 		/* Add the single-VALUES expression list */
+ 		appendContextKeyword(context, "VALUES (",
+ 							 -PRETTYINDENT_STD, PRETTYINDENT_STD, 2);
+-		get_rule_expr((Node *) strippedexprs, context, false);
++		get_rule_list_toplevel(strippedexprs, context, false);
+ 		appendStringInfoChar(buf, ')');
+ 	}
+ 	else
+@@ -8996,23 +8998,15 @@ get_rule_expr(Node *node, deparse_context *context,
+ 		case T_RowCompareExpr:
+ 			{
+ 				RowCompareExpr *rcexpr = (RowCompareExpr *) node;
+-				ListCell   *arg;
+-				char	   *sep;
+ 
+ 				/*
+ 				 * SQL99 allows "ROW" to be omitted when there is more than
+-				 * one column, but for simplicity we always print it.
++				 * one column, but for simplicity we always print it.  Within
++				 * a ROW expression, whole-row Vars need special treatment, so
++				 * use get_rule_list_toplevel.
+ 				 */
+ 				appendStringInfoString(buf, "(ROW(");
+-				sep = "";
+-				foreach(arg, rcexpr->largs)
+-				{
+-					Node	   *e = (Node *) lfirst(arg);
+-
+-					appendStringInfoString(buf, sep);
+-					get_rule_expr(e, context, true);
+-					sep = ", ";
+-				}
++				get_rule_list_toplevel(rcexpr->largs, context, true);
+ 
+ 				/*
+ 				 * We assume that the name of the first-column operator will
+@@ -9025,15 +9019,7 @@ get_rule_expr(Node *node, deparse_context *context,
+ 								 generate_operator_name(linitial_oid(rcexpr->opnos),
+ 														exprType(linitial(rcexpr->largs)),
+ 														exprType(linitial(rcexpr->rargs))));
+-				sep = "";
+-				foreach(arg, rcexpr->rargs)
+-				{
+-					Node	   *e = (Node *) lfirst(arg);
+-
+-					appendStringInfoString(buf, sep);
+-					get_rule_expr(e, context, true);
+-					sep = ", ";
+-				}
++				get_rule_list_toplevel(rcexpr->rargs, context, true);
+ 				appendStringInfoString(buf, "))");
+ 			}
+ 			break;
+@@ -9578,6 +9564,32 @@ get_rule_expr_toplevel(Node *node, deparse_context *context,
+ 		get_rule_expr(node, context, showimplicit);
+ }
+ 
++/*
++ * get_rule_list_toplevel		- Parse back a list of toplevel expressions
++ *
++ * Apply get_rule_expr_toplevel() to each element of a List.
++ *
++ * This adds commas between the expressions, but caller is responsible
++ * for printing surrounding decoration.
++ */
++static void
++get_rule_list_toplevel(List *lst, deparse_context *context,
++					   bool showimplicit)
++{
++	const char *sep;
++	ListCell   *lc;
++
++	sep = "";
++	foreach(lc, lst)
++	{
++		Node	   *e = (Node *) lfirst(lc);
++
++		appendStringInfoString(context->buf, sep);
++		get_rule_expr_toplevel(e, context, showimplicit);
++		sep = ", ";
++	}
++}
++
+ /*
+  * get_rule_expr_funccall		- Parse back a function-call expression
+  *
+diff --git a/src/test/regress/expected/create_view.out b/src/test/regress/expected/create_view.out
+index f50ef7668574..509e930fc775 100644
+--- a/src/test/regress/expected/create_view.out
++++ b/src/test/regress/expected/create_view.out
+@@ -1681,6 +1681,22 @@ select * from int8_tbl i where i.* in (values(i.*::int8_tbl));
+  4567890123456789 | -4567890123456789
+ (5 rows)
+ 
++create table tt15v_log(o tt15v, n tt15v, incr bool);
++create rule updlog as on update to tt15v do also
++  insert into tt15v_log values(old, new, row(old,old) < row(new,new));
++\d+ tt15v
++                             View "testviewschm2.tt15v"
++ Column |      Type       | Collation | Nullable | Default | Storage  | Description 
++--------+-----------------+-----------+----------+---------+----------+-------------
++ row    | nestedcomposite |           |          |         | extended | 
++View definition:
++ SELECT ROW(i.*::int8_tbl)::nestedcomposite AS "row"
++   FROM int8_tbl i;
++Rules:
++ updlog AS
++    ON UPDATE TO tt15v DO  INSERT INTO tt15v_log (o, n, incr)
++  VALUES (old.*::tt15v, new.*::tt15v, (ROW(old.*::tt15v, old.*::tt15v) < ROW(new.*::tt15v, new.*::tt15v)))
++
+ -- check unique-ification of overlength names
+ create view tt18v as
+   select * from int8_tbl xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxy
+@@ -1994,7 +2010,7 @@ drop cascades to view aliased_view_2
+ drop cascades to view aliased_view_3
+ drop cascades to view aliased_view_4
+ DROP SCHEMA testviewschm2 CASCADE;
+-NOTICE:  drop cascades to 73 other objects
++NOTICE:  drop cascades to 74 other objects
+ DETAIL:  drop cascades to table t1
+ drop cascades to view temporal1
+ drop cascades to view temporal2
+@@ -2058,6 +2074,7 @@ drop cascades to type nestedcomposite
+ drop cascades to view tt15v
+ drop cascades to view tt16v
+ drop cascades to view tt17v
++drop cascades to table tt15v_log
+ drop cascades to view tt18v
+ drop cascades to view tt19v
+ drop cascades to view tt20v
+diff --git a/src/test/regress/sql/create_view.sql b/src/test/regress/sql/create_view.sql
+index bdda56e8de73..82df4b7caca7 100644
+--- a/src/test/regress/sql/create_view.sql
++++ b/src/test/regress/sql/create_view.sql
+@@ -565,6 +565,11 @@ select * from tt17v;
+ select pg_get_viewdef('tt17v', true);
+ select * from int8_tbl i where i.* in (values(i.*::int8_tbl));
+ 
++create table tt15v_log(o tt15v, n tt15v, incr bool);
++create rule updlog as on update to tt15v do also
++  insert into tt15v_log values(old, new, row(old,old) < row(new,new));
++\d+ tt15v
++
+ -- check unique-ification of overlength names
+ 
+ create view tt18v as

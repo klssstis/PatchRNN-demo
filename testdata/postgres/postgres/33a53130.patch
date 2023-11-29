@@ -1,0 +1,450 @@
+From 33a53130a89447e171a8268ae0b221bb48af6468 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Mon, 10 Jun 2019 18:56:23 -0400
+Subject: [PATCH] Make pg_dump emit ATTACH PARTITION instead of PARTITION OF
+ (reprise)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Using PARTITION OF can result in column ordering being changed from the
+database being dumped, if the partition uses a column layout different
+from the parent's.  It's not pg_dump's job to editorialize on table
+definitions, so this is not acceptable; back-patch all the way back to
+pg10, where partitioned tables where introduced.
+
+This change also ensures that partitions end up in the correct
+tablespace, if different from the parent's; this is an oversight in
+ca4103025dfe (in pg12 only).  Partitioned indexes (in pg11) don't have
+this problem, because they're already created as independent indexes and
+attached to their parents afterwards.
+
+This change also has the advantage that the partition is restorable from
+the dump (as a standalone table) even if its parent table isn't
+restored.
+
+The original commits (3b23552ad8bb in branch master) failed to cover
+subsidiary column elements correctly, such as NOT NULL constraint and
+CHECK constraints, as reported by Rushabh Lathia (initially as a failure
+to restore serial columns).  They were reverted.  This recapitulation
+commit fixes those problems.
+
+Add some pg_dump tests to verify these things more exhaustively,
+including constraints with legacy-inheritance tables, which were not
+tested originally.  In branches 10 and 11, add a local constraint to the
+pg_dump test partition that was added by commit 2d7eeb1b1492 to master.
+
+Author: Álvaro Herrera, David Rowley
+Reviewed-by: Álvaro Herrera
+Discussion: https://postgr.es/m/CAKJS1f_1c260nOt_vBJ067AZ3JXptXVRohDVMLEBmudX1YEx-A@mail.gmail.com
+Discussion: https://postgr.es/m/20190423185007.GA27954@alvherre.pgsql
+Discussion: https://postgr.es/m/CAGPqQf0iQV=PPOv2Btog9J9AwOQp6HmuVd6SbGTR_v3Zp2XT1w@mail.gmail.com
+---
+ src/bin/pg_dump/pg_dump.c        | 158 +++++++++++++++----------------
+ src/bin/pg_dump/t/002_pg_dump.pl |  72 +++++++++++---
+ 2 files changed, 138 insertions(+), 92 deletions(-)
+
+diff --git a/src/bin/pg_dump/pg_dump.c b/src/bin/pg_dump/pg_dump.c
+index 9f59cc74ee25..36e8d27edd86 100644
+--- a/src/bin/pg_dump/pg_dump.c
++++ b/src/bin/pg_dump/pg_dump.c
+@@ -8631,9 +8631,12 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
+  * Normally this is always true, but it's false for dropped columns, as well
+  * as those that were inherited without any local definition.  (If we print
+  * such a column it will mistakenly get pg_attribute.attislocal set to true.)
+- * However, in binary_upgrade mode, we must print all such columns anyway and
+- * fix the attislocal/attisdropped state later, so as to keep control of the
+- * physical column order.
++ * For partitions, it's always true, because we want the partitions to be
++ * created independently and ATTACH PARTITION used afterwards.
++ *
++ * In binary_upgrade mode, we must print all columns and fix the attislocal/
++ * attisdropped state later, so as to keep control of the physical column
++ * order.
+  *
+  * This function exists because there are scattered nonobvious places that
+  * must be kept in sync with this decision.
+@@ -8643,7 +8646,9 @@ shouldPrintColumn(DumpOptions *dopt, TableInfo *tbinfo, int colno)
+ {
+ 	if (dopt->binary_upgrade)
+ 		return true;
+-	return (tbinfo->attislocal[colno] && !tbinfo->attisdropped[colno]);
++	if (tbinfo->attisdropped[colno])
++		return false;
++	return (tbinfo->attislocal[colno] || tbinfo->ispartition);
+ }
+ 
+ 
+@@ -15594,27 +15599,6 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 		if (tbinfo->reloftype && !dopt->binary_upgrade)
+ 			appendPQExpBuffer(q, " OF %s", tbinfo->reloftype);
+ 
+-		/*
+-		 * If the table is a partition, dump it as such; except in the case of
+-		 * a binary upgrade, we dump the table normally and attach it to the
+-		 * parent afterward.
+-		 */
+-		if (tbinfo->ispartition && !dopt->binary_upgrade)
+-		{
+-			TableInfo  *parentRel = tbinfo->parents[0];
+-
+-			/*
+-			 * With partitions, unlike inheritance, there can only be one
+-			 * parent.
+-			 */
+-			if (tbinfo->numParents != 1)
+-				fatal("invalid number of parents %d for table \"%s\"",
+-					  tbinfo->numParents, tbinfo->dobj.name);
+-
+-			appendPQExpBuffer(q, " PARTITION OF %s",
+-							  fmtQualifiedDumpable(parentRel));
+-		}
+-
+ 		if (tbinfo->relkind != RELKIND_MATVIEW)
+ 		{
+ 			/* Dump the attributes */
+@@ -15629,26 +15613,30 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 				 */
+ 				if (shouldPrintColumn(dopt, tbinfo, j))
+ 				{
++					bool		print_default;
++					bool		print_notnull;
++
+ 					/*
+ 					 * Default value --- suppress if to be printed separately.
+ 					 */
+-					bool		has_default = (tbinfo->attrdefs[j] != NULL &&
+-											   !tbinfo->attrdefs[j]->separate);
++					print_default = (tbinfo->attrdefs[j] != NULL &&
++									 !tbinfo->attrdefs[j]->separate);
+ 
+ 					/*
+ 					 * Not Null constraint --- suppress if inherited, except
+-					 * in binary-upgrade case where that won't work.
++					 * if partition, or in binary-upgrade case where that
++					 * won't work.
+ 					 */
+-					bool		has_notnull = (tbinfo->notnull[j] &&
+-											   (!tbinfo->inhNotNull[j] ||
+-												dopt->binary_upgrade));
++					print_notnull = (tbinfo->notnull[j] &&
++									 (!tbinfo->inhNotNull[j] ||
++									  tbinfo->ispartition || dopt->binary_upgrade));
+ 
+ 					/*
+-					 * Skip column if fully defined by reloftype or the
+-					 * partition parent.
++					 * Skip column if fully defined by reloftype, except in
++					 * binary upgrade
+ 					 */
+-					if ((tbinfo->reloftype || tbinfo->ispartition) &&
+-						!has_default && !has_notnull && !dopt->binary_upgrade)
++					if (tbinfo->reloftype && !print_default && !print_notnull &&
++						!dopt->binary_upgrade)
+ 						continue;
+ 
+ 					/* Format properly if not first attr */
+@@ -15671,26 +15659,22 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 						 * clean things up later.
+ 						 */
+ 						appendPQExpBufferStr(q, " INTEGER /* dummy */");
+-						/* Skip all the rest, too */
++						/* and skip to the next column */
+ 						continue;
+ 					}
+ 
+ 					/*
+-					 * Attribute type
+-					 *
+-					 * In binary-upgrade mode, we always include the type. If
+-					 * we aren't in binary-upgrade mode, then we skip the type
+-					 * when creating a typed table ('OF type_name') or a
+-					 * partition ('PARTITION OF'), since the type comes from
+-					 * the parent/partitioned table.
++					 * Attribute type; print it except when creating a typed
++					 * table ('OF type_name'), but in binary-upgrade mode,
++					 * print it in that case too.
+ 					 */
+-					if (dopt->binary_upgrade || (!tbinfo->reloftype && !tbinfo->ispartition))
++					if (dopt->binary_upgrade || !tbinfo->reloftype)
+ 					{
+ 						appendPQExpBuffer(q, " %s",
+ 										  tbinfo->atttypnames[j]);
+ 					}
+ 
+-					if (has_default)
++					if (print_default)
+ 					{
+ 						if (tbinfo->attgenerated[j] == ATTRIBUTE_GENERATED_STORED)
+ 							appendPQExpBuffer(q, " GENERATED ALWAYS AS (%s) STORED",
+@@ -15701,7 +15685,7 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 					}
+ 
+ 
+-					if (has_notnull)
++					if (print_notnull)
+ 						appendPQExpBufferStr(q, " NOT NULL");
+ 
+ 					/* Add collation if not default for the type */
+@@ -15719,12 +15703,18 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 
+ 			/*
+ 			 * Add non-inherited CHECK constraints, if any.
++			 *
++			 * For partitions, we need to include check constraints even if
++			 * they're not defined locally, because the ALTER TABLE ATTACH
++			 * PARTITION that we'll emit later expects the constraint to be
++			 * there.  (No need to fix conislocal: ATTACH PARTITION does that)
+ 			 */
+ 			for (j = 0; j < tbinfo->ncheck; j++)
+ 			{
+ 				ConstraintInfo *constr = &(tbinfo->checkexprs[j]);
+ 
+-				if (constr->separate || !constr->conislocal)
++				if (constr->separate ||
++					(!constr->conislocal && !tbinfo->ispartition))
+ 					continue;
+ 
+ 				if (actual_atts == 0)
+@@ -15741,25 +15731,20 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 
+ 			if (actual_atts)
+ 				appendPQExpBufferStr(q, "\n)");
+-			else if (!((tbinfo->reloftype || tbinfo->ispartition) &&
+-					   !dopt->binary_upgrade))
++			else if (!(tbinfo->reloftype && !dopt->binary_upgrade))
+ 			{
+ 				/*
+-				 * We must have a parenthesized attribute list, even though
+-				 * empty, when not using the OF TYPE or PARTITION OF syntax.
++				 * No attributes? we must have a parenthesized attribute list,
++				 * even though empty, when not using the OF TYPE syntax.
+ 				 */
+ 				appendPQExpBufferStr(q, " (\n)");
+ 			}
+ 
+-			if (tbinfo->ispartition && !dopt->binary_upgrade)
+-			{
+-				appendPQExpBufferChar(q, '\n');
+-				appendPQExpBufferStr(q, tbinfo->partbound);
+-			}
+-
+-			/* Emit the INHERITS clause, except if this is a partition. */
+-			if (numParents > 0 &&
+-				!tbinfo->ispartition &&
++			/*
++			 * Emit the INHERITS clause (not for partitions), except in
++			 * binary-upgrade mode.
++			 */
++			if (numParents > 0 && !tbinfo->ispartition &&
+ 				!dopt->binary_upgrade)
+ 			{
+ 				appendPQExpBufferStr(q, "\nINHERITS (");
+@@ -15910,11 +15895,17 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 				}
+ 			}
+ 
++			/*
++			 * Add inherited CHECK constraints, if any.
++			 *
++			 * For partitions, they were already dumped, and conislocal
++			 * doesn't need fixing.
++			 */
+ 			for (k = 0; k < tbinfo->ncheck; k++)
+ 			{
+ 				ConstraintInfo *constr = &(tbinfo->checkexprs[k]);
+ 
+-				if (constr->separate || constr->conislocal)
++				if (constr->separate || constr->conislocal || tbinfo->ispartition)
+ 					continue;
+ 
+ 				appendPQExpBufferStr(q, "\n-- For binary upgrade, set up inherited constraint.\n");
+@@ -15932,30 +15923,16 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 				appendPQExpBufferStr(q, "::pg_catalog.regclass;\n");
+ 			}
+ 
+-			if (numParents > 0)
++			if (numParents > 0 && !tbinfo->ispartition)
+ 			{
+-				appendPQExpBufferStr(q, "\n-- For binary upgrade, set up inheritance and partitioning this way.\n");
++				appendPQExpBufferStr(q, "\n-- For binary upgrade, set up inheritance this way.\n");
+ 				for (k = 0; k < numParents; k++)
+ 				{
+ 					TableInfo  *parentRel = parents[k];
+ 
+-					/* In the partitioning case, we alter the parent */
+-					if (tbinfo->ispartition)
+-						appendPQExpBuffer(q,
+-										  "ALTER TABLE ONLY %s ATTACH PARTITION ",
+-										  fmtQualifiedDumpable(parentRel));
+-					else
+-						appendPQExpBuffer(q, "ALTER TABLE ONLY %s INHERIT ",
+-										  qualrelname);
+-
+-					/* Partition needs specifying the bounds */
+-					if (tbinfo->ispartition)
+-						appendPQExpBuffer(q, "%s %s;\n",
+-										  qualrelname,
+-										  tbinfo->partbound);
+-					else
+-						appendPQExpBuffer(q, "%s;\n",
+-										  fmtQualifiedDumpable(parentRel));
++					appendPQExpBuffer(q, "ALTER TABLE ONLY %s INHERIT %s;\n",
++									  qualrelname,
++									  fmtQualifiedDumpable(parentRel));
+ 				}
+ 			}
+ 
+@@ -15968,6 +15945,27 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 			}
+ 		}
+ 
++		/*
++		 * For partitioned tables, emit the ATTACH PARTITION clause.  Note
++		 * that we always want to create partitions this way instead of using
++		 * CREATE TABLE .. PARTITION OF, mainly to preserve a possible column
++		 * layout discrepancy with the parent, but also to ensure it gets the
++		 * correct tablespace setting if it differs from the parent's.
++		 */
++		if (tbinfo->ispartition)
++		{
++			/* With partitions there can only be one parent */
++			if (tbinfo->numParents != 1)
++				fatal("invalid number of parents %d for table \"%s\"",
++					  tbinfo->numParents, tbinfo->dobj.name);
++
++			/* Perform ALTER TABLE on the parent */
++			appendPQExpBuffer(q,
++							  "ALTER TABLE ONLY %s ATTACH PARTITION %s %s;\n",
++							  fmtQualifiedDumpable(parents[0]),
++							  qualrelname, tbinfo->partbound);
++		}
++
+ 		/*
+ 		 * In binary_upgrade mode, arrange to restore the old relfrozenxid and
+ 		 * relminmxid of all vacuumable relations.  (While vacuum.c processes
+diff --git a/src/bin/pg_dump/t/002_pg_dump.pl b/src/bin/pg_dump/t/002_pg_dump.pl
+index 5afbc51ed710..c56bf00e4b40 100644
+--- a/src/bin/pg_dump/t/002_pg_dump.pl
++++ b/src/bin/pg_dump/t/002_pg_dump.pl
+@@ -733,7 +733,12 @@
+ 			\QALTER TABLE ONLY dump_test.measurement ATTACH PARTITION dump_test_second_schema.measurement_y2006m2 \E
+ 			\QFOR VALUES FROM ('2006-02-01') TO ('2006-03-01');\E\n
+ 			/xm,
+-		like => { binary_upgrade => 1, },
++		like => {
++			%full_runs,
++			role             => 1,
++			section_pre_data => 1,
++			binary_upgrade   => 1,
++		},
+ 	  },
+ 
+ 	'ALTER TABLE test_table CLUSTER ON test_table_pkey' => {
+@@ -2283,9 +2288,9 @@
+ 	'CREATE TABLE measurement PARTITIONED BY' => {
+ 		create_order => 90,
+ 		create_sql   => 'CREATE TABLE dump_test.measurement (
+-						city_id int not null,
++						city_id serial not null,
+ 						logdate date not null,
+-						peaktemp int,
++						peaktemp int CHECK (peaktemp >= -460),
+ 						unitsales int
+ 					   ) PARTITION BY RANGE (logdate);',
+ 		regexp => qr/^
+@@ -2295,7 +2300,8 @@
+ 			\s+\Qcity_id integer NOT NULL,\E\n
+ 			\s+\Qlogdate date NOT NULL,\E\n
+ 			\s+\Qpeaktemp integer,\E\n
+-			\s+\Qunitsales integer\E\n
++			\s+\Qunitsales integer,\E\n
++			\s+\QCONSTRAINT measurement_peaktemp_check CHECK ((peaktemp >= '-460'::integer))\E\n
+ 			\)\n
+ 			\QPARTITION BY RANGE (logdate);\E\n
+ 			/xm,
+@@ -2307,7 +2313,7 @@
+ 		},
+ 	},
+ 
+-	'CREATE TABLE measurement_y2006m2 PARTITION OF' => {
++	'Partition measurement_y2006m2 creation' => {
+ 		create_order => 91,
+ 		create_sql =>
+ 		  'CREATE TABLE dump_test_second_schema.measurement_y2006m2
+@@ -2316,19 +2322,21 @@
+ 						)
+ 						FOR VALUES FROM (\'2006-02-01\') TO (\'2006-03-01\');',
+ 		regexp => qr/^
+-			\Q-- Name: measurement_y2006m2;\E.*\n
+-			\Q--\E\n\n
+-			\QCREATE TABLE dump_test_second_schema.measurement_y2006m2 PARTITION OF dump_test.measurement (\E\n
++			\QCREATE TABLE dump_test_second_schema.measurement_y2006m2 (\E\n
++			\s+\Qcity_id integer DEFAULT nextval('dump_test.measurement_city_id_seq'::regclass) NOT NULL,\E\n
++			\s+\Qlogdate date NOT NULL,\E\n
++			\s+\Qpeaktemp integer,\E\n
++			\s+\Qunitsales integer DEFAULT 0,\E\n
++			\s+\QCONSTRAINT measurement_peaktemp_check CHECK ((peaktemp >= '-460'::integer)),\E\n
+ 			\s+\QCONSTRAINT measurement_y2006m2_unitsales_check CHECK ((unitsales >= 0))\E\n
+-			\)\n
+-			\QFOR VALUES FROM ('2006-02-01') TO ('2006-03-01');\E\n
++			\);\n
+ 			/xm,
+ 		like => {
+ 			%full_runs,
+-			role             => 1,
+ 			section_pre_data => 1,
++			role             => 1,
++			binary_upgrade   => 1,
+ 		},
+-		unlike => { binary_upgrade => 1, },
+ 	},
+ 
+ 	'CREATE TABLE test_fourth_table_zero_col' => {
+@@ -2432,6 +2440,46 @@
+ 		unlike => { exclude_dump_test_schema => 1, },
+ 	},
+ 
++	'CREATE TABLE test_inheritance_parent' => {
++		create_order => 90,
++		create_sql   => 'CREATE TABLE dump_test.test_inheritance_parent (
++						   col1 int NOT NULL,
++						   col2 int CHECK (col2 >= 42)
++						 );',
++		regexp => qr/^
++		\QCREATE TABLE dump_test.test_inheritance_parent (\E\n
++		\s+\Qcol1 integer NOT NULL,\E\n
++		\s+\Qcol2 integer,\E\n
++		\s+\QCONSTRAINT test_inheritance_parent_col2_check CHECK ((col2 >= 42))\E\n
++		\Q);\E\n
++		/xm,
++		like =>
++		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
++		unlike => { exclude_dump_test_schema => 1, },
++	},
++
++	'CREATE TABLE test_inheritance_child' => {
++		create_order => 91,
++		create_sql   => 'CREATE TABLE dump_test.test_inheritance_child (
++						    col1 int NOT NULL,
++						    CONSTRAINT test_inheritance_child CHECK (col2 >= 142857)
++						) INHERITS (dump_test.test_inheritance_parent);',
++		regexp => qr/^
++		\QCREATE TABLE dump_test.test_inheritance_child (\E\n
++		\s+\Qcol1 integer,\E\n
++		\s+\QCONSTRAINT test_inheritance_child CHECK ((col2 >= 142857))\E\n
++		\)\n
++		\QINHERITS (dump_test.test_inheritance_parent);\E\n
++		/xm,
++		like => {
++			%full_runs, %dump_test_schema_runs, section_pre_data => 1,
++		},
++		unlike => {
++			binary_upgrade           => 1,
++			exclude_dump_test_schema => 1,
++		},
++	},
++
+ 	'CREATE STATISTICS extended_stats_no_options' => {
+ 		create_order => 97,
+ 		create_sql   => 'CREATE STATISTICS dump_test.test_ext_stats_no_options

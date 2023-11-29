@@ -1,0 +1,1451 @@
+From 43d1ed60fdd96027f044e152176c0d45cd6bf443 Mon Sep 17 00:00:00 2001
+From: Teodor Sigaev <teodor@sigaev.ru>
+Date: Fri, 30 Mar 2018 14:23:17 +0300
+Subject: [PATCH] Predicate locking in GIN index
+
+Predicate locks are used on per page basis only if fastupdate = off, in
+opposite case predicate lock on pending list will effectively lock whole index,
+to reduce locking overhead, just lock a relation. Entry and posting trees are
+essentially B-tree, so locks are acquired on leaf pages only.
+
+Author: Shubham Barai with some editorization by me and Dmitry Ivanov
+Review by: Alexander Korotkov, Dmitry Ivanov, Fedor Sigaev
+Discussion: https://www.postgresql.org/message-id/flat/CALxAEPt5sWW+EwTaKUGFL5_XFcZ0MuGBcyJ70oqbWqr42YKR8Q@mail.gmail.com
+---
+ src/backend/access/gin/ginbtree.c             |  22 +
+ src/backend/access/gin/gindatapage.c          |  10 +-
+ src/backend/access/gin/ginget.c               |  76 +-
+ src/backend/access/gin/gininsert.c            |  38 +-
+ src/backend/access/gin/ginutil.c              |  10 +-
+ src/backend/access/gin/ginvacuum.c            |  12 +-
+ src/backend/storage/lmgr/README-SSI           |   9 +
+ src/include/access/gin_private.h              |   4 +-
+ src/test/isolation/expected/predicate-gin.out | 756 ++++++++++++++++++
+ src/test/isolation/isolation_schedule         |   1 +
+ src/test/isolation/specs/predicate-gin.spec   | 134 ++++
+ 11 files changed, 1054 insertions(+), 18 deletions(-)
+ create mode 100644 src/test/isolation/expected/predicate-gin.out
+ create mode 100644 src/test/isolation/specs/predicate-gin.spec
+
+diff --git a/src/backend/access/gin/ginbtree.c b/src/backend/access/gin/ginbtree.c
+index 37070b3b7297..095b1192cb44 100644
+--- a/src/backend/access/gin/ginbtree.c
++++ b/src/backend/access/gin/ginbtree.c
+@@ -17,6 +17,7 @@
+ #include "access/gin_private.h"
+ #include "access/ginxlog.h"
+ #include "access/xloginsert.h"
++#include "storage/predicate.h"
+ #include "miscadmin.h"
+ #include "utils/memutils.h"
+ #include "utils/rel.h"
+@@ -515,6 +516,19 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
+ 			btree->fillRoot(btree, newrootpg,
+ 							BufferGetBlockNumber(lbuffer), newlpage,
+ 							BufferGetBlockNumber(rbuffer), newrpage);
++
++			if (GinPageIsLeaf(BufferGetPage(stack->buffer)))
++			{
++
++				PredicateLockPageSplit(btree->index,
++						BufferGetBlockNumber(stack->buffer),
++						BufferGetBlockNumber(lbuffer));
++
++				PredicateLockPageSplit(btree->index,
++						BufferGetBlockNumber(stack->buffer),
++						BufferGetBlockNumber(rbuffer));
++			}
++
+ 		}
+ 		else
+ 		{
+@@ -524,6 +538,14 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
+ 			GinPageGetOpaque(newrpage)->rightlink = savedRightLink;
+ 			GinPageGetOpaque(newlpage)->flags |= GIN_INCOMPLETE_SPLIT;
+ 			GinPageGetOpaque(newlpage)->rightlink = BufferGetBlockNumber(rbuffer);
++
++			if (GinPageIsLeaf(BufferGetPage(stack->buffer)))
++			{
++
++				PredicateLockPageSplit(btree->index,
++						BufferGetBlockNumber(stack->buffer),
++						BufferGetBlockNumber(rbuffer));
++			}
+ 		}
+ 
+ 		/*
+diff --git a/src/backend/access/gin/gindatapage.c b/src/backend/access/gin/gindatapage.c
+index f9daaba52ebd..642ca1a2c732 100644
+--- a/src/backend/access/gin/gindatapage.c
++++ b/src/backend/access/gin/gindatapage.c
+@@ -19,6 +19,7 @@
+ #include "access/xloginsert.h"
+ #include "lib/ilist.h"
+ #include "miscadmin.h"
++#include "storage/predicate.h"
+ #include "utils/rel.h"
+ 
+ /*
+@@ -1759,7 +1760,7 @@ leafRepackItems(disassembledLeaf *leaf, ItemPointer remaining)
+  */
+ BlockNumber
+ createPostingTree(Relation index, ItemPointerData *items, uint32 nitems,
+-				  GinStatsData *buildStats)
++				  GinStatsData *buildStats, Buffer entrybuffer)
+ {
+ 	BlockNumber blkno;
+ 	Buffer		buffer;
+@@ -1810,6 +1811,12 @@ createPostingTree(Relation index, ItemPointerData *items, uint32 nitems,
+ 	page = BufferGetPage(buffer);
+ 	blkno = BufferGetBlockNumber(buffer);
+ 
++	/*
++	 * Copy a predicate lock from entry tree leaf (containing posting list)
++	 * to  posting tree.
++	 */
++	PredicateLockPageSplit(index, BufferGetBlockNumber(entrybuffer), blkno);
++
+ 	START_CRIT_SECTION();
+ 
+ 	PageRestoreTempPage(tmppage, page);
+@@ -1904,6 +1911,7 @@ ginInsertItemPointers(Relation index, BlockNumber rootBlkno,
+ 		btree.itemptr = insertdata.items[insertdata.curitem];
+ 		stack = ginFindLeafPage(&btree, false, NULL);
+ 
++		GinCheckForSerializableConflictIn(btree.index, NULL, stack->buffer);
+ 		ginInsertValue(&btree, stack, &insertdata, buildStats);
+ 	}
+ }
+diff --git a/src/backend/access/gin/ginget.c b/src/backend/access/gin/ginget.c
+index 6fe67f346df7..0e984166fa84 100644
+--- a/src/backend/access/gin/ginget.c
++++ b/src/backend/access/gin/ginget.c
+@@ -17,8 +17,10 @@
+ #include "access/gin_private.h"
+ #include "access/relscan.h"
+ #include "miscadmin.h"
++#include "storage/predicate.h"
+ #include "utils/datum.h"
+ #include "utils/memutils.h"
++#include "utils/rel.h"
+ 
+ /* GUC parameter */
+ int			GinFuzzySearchLimit = 0;
+@@ -33,11 +35,25 @@ typedef struct pendingPosition
+ } pendingPosition;
+ 
+ 
++/*
++ * Place predicate lock on GIN page if needed.
++ */
++static void
++GinPredicateLockPage(Relation index, BlockNumber blkno, Snapshot snapshot)
++{
++	/*
++	 * When fast update is on then no need in locking pages, because we
++	 * anyway need to lock the whole index.
++	 */
++	if (!GinGetUseFastUpdate(index))
++			PredicateLockPage(index, blkno, snapshot);
++}
++
+ /*
+  * Goes to the next page if current offset is outside of bounds
+  */
+ static bool
+-moveRightIfItNeeded(GinBtreeData *btree, GinBtreeStack *stack)
++moveRightIfItNeeded(GinBtreeData *btree, GinBtreeStack *stack, Snapshot snapshot)
+ {
+ 	Page		page = BufferGetPage(stack->buffer);
+ 
+@@ -52,6 +68,7 @@ moveRightIfItNeeded(GinBtreeData *btree, GinBtreeStack *stack)
+ 		stack->buffer = ginStepRight(stack->buffer, btree->index, GIN_SHARE);
+ 		stack->blkno = BufferGetBlockNumber(stack->buffer);
+ 		stack->off = FirstOffsetNumber;
++		GinPredicateLockPage(btree->index, stack->blkno, snapshot);
+ 	}
+ 
+ 	return true;
+@@ -73,6 +90,7 @@ scanPostingTree(Relation index, GinScanEntry scanEntry,
+ 	/* Descend to the leftmost leaf page */
+ 	stack = ginScanBeginPostingTree(&btree, index, rootPostingTree, snapshot);
+ 	buffer = stack->buffer;
++
+ 	IncrBufferRefCount(buffer); /* prevent unpin in freeGinBtreeStack */
+ 
+ 	freeGinBtreeStack(stack);
+@@ -82,6 +100,11 @@ scanPostingTree(Relation index, GinScanEntry scanEntry,
+ 	 */
+ 	for (;;)
+ 	{
++		/*
++		 * Predicate lock each leaf page in posting tree
++		 */
++		GinPredicateLockPage(index, BufferGetBlockNumber(buffer), snapshot);
++
+ 		page = BufferGetPage(buffer);
+ 		if ((GinPageGetOpaque(page)->flags & GIN_DELETED) == 0)
+ 		{
+@@ -131,6 +154,12 @@ collectMatchBitmap(GinBtreeData *btree, GinBtreeStack *stack,
+ 	attnum = scanEntry->attnum;
+ 	attr = TupleDescAttr(btree->ginstate->origTupdesc, attnum - 1);
+ 
++	/*
++	 * Predicate lock entry leaf page, following pages will be locked by
++	 * moveRightIfItNeeded()
++	 */
++	GinPredicateLockPage(btree->index, stack->buffer, snapshot);
++
+ 	for (;;)
+ 	{
+ 		Page		page;
+@@ -141,7 +170,7 @@ collectMatchBitmap(GinBtreeData *btree, GinBtreeStack *stack,
+ 		/*
+ 		 * stack->off points to the interested entry, buffer is already locked
+ 		 */
+-		if (moveRightIfItNeeded(btree, stack) == false)
++		if (moveRightIfItNeeded(btree, stack, snapshot) == false)
+ 			return true;
+ 
+ 		page = BufferGetPage(stack->buffer);
+@@ -250,7 +279,7 @@ collectMatchBitmap(GinBtreeData *btree, GinBtreeStack *stack,
+ 				Datum		newDatum;
+ 				GinNullCategory newCategory;
+ 
+-				if (moveRightIfItNeeded(btree, stack) == false)
++				if (moveRightIfItNeeded(btree, stack, snapshot) == false)
+ 					elog(ERROR, "lost saved point in index");	/* must not happen !!! */
+ 
+ 				page = BufferGetPage(stack->buffer);
+@@ -323,6 +352,7 @@ startScanEntry(GinState *ginstate, GinScanEntry entry, Snapshot snapshot)
+ 						ginstate);
+ 	stackEntry = ginFindLeafPage(&btreeEntry, true, snapshot);
+ 	page = BufferGetPage(stackEntry->buffer);
++
+ 	/* ginFindLeafPage() will have already checked snapshot age. */
+ 	needUnlock = true;
+ 
+@@ -370,6 +400,10 @@ startScanEntry(GinState *ginstate, GinScanEntry entry, Snapshot snapshot)
+ 	{
+ 		IndexTuple	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, stackEntry->off));
+ 
++		/* Predicate lock visited entry leaf page */
++		GinPredicateLockPage(ginstate->index,
++							 BufferGetBlockNumber(stackEntry->buffer), snapshot);
++
+ 		if (GinIsPostingTree(itup))
+ 		{
+ 			BlockNumber rootPostingTree = GinGetPostingTree(itup);
+@@ -391,6 +425,12 @@ startScanEntry(GinState *ginstate, GinScanEntry entry, Snapshot snapshot)
+ 											rootPostingTree, snapshot);
+ 			entry->buffer = stack->buffer;
+ 
++			/*
++			 * Predicate lock visited posting tree page, following pages
++			 * will be locked by moveRightIfItNeeded or entryLoadMoreItems
++			 */
++			GinPredicateLockPage(ginstate->index, BufferGetBlockNumber(entry->buffer), snapshot);
++
+ 			/*
+ 			 * We keep buffer pinned because we need to prevent deletion of
+ 			 * page during scan. See GIN's vacuum implementation. RefCount is
+@@ -493,7 +533,7 @@ startScanKey(GinState *ginstate, GinScanOpaque so, GinScanKey key)
+ 
+ 		for (i = 0; i < key->nentries - 1; i++)
+ 		{
+-			/* Pass all entries <= i as FALSE, and the rest as MAYBE */
++			/* Pass all entries <= i as false, and the rest as MAYBE */
+ 			for (j = 0; j <= i; j++)
+ 				key->entryRes[entryIndexes[j]] = GIN_FALSE;
+ 			for (j = i + 1; j < key->nentries; j++)
+@@ -633,6 +673,8 @@ entryLoadMoreItems(GinState *ginstate, GinScanEntry entry,
+ 		entry->btree.fullScan = false;
+ 		stack = ginFindLeafPage(&entry->btree, true, snapshot);
+ 
++		GinPredicateLockPage(ginstate->index, BufferGetBlockNumber(stack->buffer), snapshot);
++
+ 		/* we don't need the stack, just the buffer. */
+ 		entry->buffer = stack->buffer;
+ 		IncrBufferRefCount(entry->buffer);
+@@ -677,6 +719,10 @@ entryLoadMoreItems(GinState *ginstate, GinScanEntry entry,
+ 			entry->buffer = ginStepRight(entry->buffer,
+ 										 ginstate->index,
+ 										 GIN_SHARE);
++
++			GinPredicateLockPage(ginstate->index, BufferGetBlockNumber(entry->buffer), snapshot);
++
++
+ 			page = BufferGetPage(entry->buffer);
+ 		}
+ 		stepright = true;
+@@ -1038,8 +1084,8 @@ keyGetItem(GinState *ginstate, MemoryContext tempCtx, GinScanKey key,
+ 	 * lossy page even when none of the other entries match.
+ 	 *
+ 	 * Our strategy is to call the tri-state consistent function, with the
+-	 * lossy-page entries set to MAYBE, and all the other entries FALSE. If it
+-	 * returns FALSE, none of the lossy items alone are enough for a match, so
++	 * lossy-page entries set to MAYBE, and all the other entries false. If it
++	 * returns false, none of the lossy items alone are enough for a match, so
+ 	 * we don't need to return a lossy-page pointer. Otherwise, return a
+ 	 * lossy-page pointer to indicate that the whole heap page must be
+ 	 * checked.  (On subsequent calls, we'll do nothing until minItem is past
+@@ -1700,7 +1746,8 @@ collectMatchesForHeapRow(IndexScanDesc scan, pendingPosition *pos)
+ }
+ 
+ /*
+- * Collect all matched rows from pending list into bitmap
++ * Collect all matched rows from pending list into bitmap. Also function
++ * takes PendingLockRelation if it's needed.
+  */
+ static void
+ scanPendingInsert(IndexScanDesc scan, TIDBitmap *tbm, int64 *ntids)
+@@ -1730,9 +1777,24 @@ scanPendingInsert(IndexScanDesc scan, TIDBitmap *tbm, int64 *ntids)
+ 	{
+ 		/* No pending list, so proceed with normal scan */
+ 		UnlockReleaseBuffer(metabuffer);
++
++		/*
++		 * If fast update is enabled, we acquire a predicate lock on the entire
++		 * relation as fast update postpones the insertion of tuples into index
++		 * structure due to which we can't detect rw conflicts.
++		 */
++		if (GinGetUseFastUpdate(scan->indexRelation))
++			PredicateLockRelation(scan->indexRelation, scan->xs_snapshot);
++
+ 		return;
+ 	}
+ 
++	/*
++	 * Pending list is not empty, we need to lock the index doesn't despite on
++	 * fastupdate state
++	 */
++	PredicateLockRelation(scan->indexRelation, scan->xs_snapshot);
++
+ 	pos.pendingBuffer = ReadBuffer(scan->indexRelation, blkno);
+ 	LockBuffer(pos.pendingBuffer, GIN_SHARE);
+ 	pos.firstOffset = FirstOffsetNumber;
+diff --git a/src/backend/access/gin/gininsert.c b/src/backend/access/gin/gininsert.c
+index 23f728554744..ec5eebb8484d 100644
+--- a/src/backend/access/gin/gininsert.c
++++ b/src/backend/access/gin/gininsert.c
+@@ -22,6 +22,7 @@
+ #include "storage/bufmgr.h"
+ #include "storage/smgr.h"
+ #include "storage/indexfsm.h"
++#include "storage/predicate.h"
+ #include "utils/memutils.h"
+ #include "utils/rel.h"
+ 
+@@ -48,7 +49,7 @@ static IndexTuple
+ addItemPointersToLeafTuple(GinState *ginstate,
+ 						   IndexTuple old,
+ 						   ItemPointerData *items, uint32 nitem,
+-						   GinStatsData *buildStats)
++						   GinStatsData *buildStats, Buffer buffer)
+ {
+ 	OffsetNumber attnum;
+ 	Datum		key;
+@@ -99,7 +100,8 @@ addItemPointersToLeafTuple(GinState *ginstate,
+ 		postingRoot = createPostingTree(ginstate->index,
+ 										oldItems,
+ 										oldNPosting,
+-										buildStats);
++										buildStats,
++										buffer);
+ 
+ 		/* Now insert the TIDs-to-be-added into the posting tree */
+ 		ginInsertItemPointers(ginstate->index, postingRoot,
+@@ -127,7 +129,7 @@ static IndexTuple
+ buildFreshLeafTuple(GinState *ginstate,
+ 					OffsetNumber attnum, Datum key, GinNullCategory category,
+ 					ItemPointerData *items, uint32 nitem,
+-					GinStatsData *buildStats)
++					GinStatsData *buildStats, Buffer buffer)
+ {
+ 	IndexTuple	res = NULL;
+ 	GinPostingList *compressedList;
+@@ -157,7 +159,7 @@ buildFreshLeafTuple(GinState *ginstate,
+ 		 * Initialize a new posting tree with the TIDs.
+ 		 */
+ 		postingRoot = createPostingTree(ginstate->index, items, nitem,
+-										buildStats);
++										buildStats, buffer);
+ 
+ 		/* And save the root link in the result tuple */
+ 		GinSetPostingTree(res, postingRoot);
+@@ -217,17 +219,19 @@ ginEntryInsert(GinState *ginstate,
+ 			return;
+ 		}
+ 
++		GinCheckForSerializableConflictIn(btree.index, NULL, stack->buffer);
+ 		/* modify an existing leaf entry */
+ 		itup = addItemPointersToLeafTuple(ginstate, itup,
+-										  items, nitem, buildStats);
++										  items, nitem, buildStats, stack->buffer);
+ 
+ 		insertdata.isDelete = true;
+ 	}
+ 	else
+ 	{
++		GinCheckForSerializableConflictIn(btree.index, NULL, stack->buffer);
+ 		/* no match, so construct a new leaf entry */
+ 		itup = buildFreshLeafTuple(ginstate, attnum, key, category,
+-								   items, nitem, buildStats);
++								   items, nitem, buildStats, stack->buffer);
+ 	}
+ 
+ 	/* Insert the new or modified leaf tuple */
+@@ -513,6 +517,18 @@ gininsert(Relation index, Datum *values, bool *isnull,
+ 
+ 		memset(&collector, 0, sizeof(GinTupleCollector));
+ 
++		/*
++		 * With fastupdate on each scan and each insert begin with access to
++		 * pending list, so it effectively lock entire index. In this case
++		 * we aquire predicate lock and check for conflicts over index relation,
++		 * and hope that it will reduce locking overhead.
++		 *
++		 * Do not use GinCheckForSerializableConflictIn() here, because
++		 * it will do nothing (it does actual work only with fastupdate off).
++		 * Check for conflicts for entire index.
++		 */
++		CheckForSerializableConflictIn(index, NULL, InvalidBuffer);
++
+ 		for (i = 0; i < ginstate->origTupdesc->natts; i++)
+ 			ginHeapTupleFastCollect(ginstate, &collector,
+ 									(OffsetNumber) (i + 1),
+@@ -523,6 +539,16 @@ gininsert(Relation index, Datum *values, bool *isnull,
+ 	}
+ 	else
+ 	{
++		GinStatsData	stats;
++
++		/*
++		 * Fastupdate is off but if pending list isn't empty then we need to
++		 * check conflicts with PredicateLockRelation in scanPendingInsert().
++		 */
++		ginGetStats(index, &stats);
++		if (stats.nPendingPages > 0)
++			CheckForSerializableConflictIn(index, NULL, InvalidBuffer);
++
+ 		for (i = 0; i < ginstate->origTupdesc->natts; i++)
+ 			ginHeapTupleInsert(ginstate, (OffsetNumber) (i + 1),
+ 							   values[i], isnull[i],
+diff --git a/src/backend/access/gin/ginutil.c b/src/backend/access/gin/ginutil.c
+index 7bac7a125215..5632cc5a773f 100644
+--- a/src/backend/access/gin/ginutil.c
++++ b/src/backend/access/gin/ginutil.c
+@@ -23,6 +23,7 @@
+ #include "miscadmin.h"
+ #include "storage/indexfsm.h"
+ #include "storage/lmgr.h"
++#include "storage/predicate.h"
+ #include "utils/builtins.h"
+ #include "utils/index_selfuncs.h"
+ #include "utils/typcache.h"
+@@ -49,7 +50,7 @@ ginhandler(PG_FUNCTION_ARGS)
+ 	amroutine->amsearchnulls = false;
+ 	amroutine->amstorage = true;
+ 	amroutine->amclusterable = false;
+-	amroutine->ampredlocks = false;
++	amroutine->ampredlocks = true;
+ 	amroutine->amcanparallel = false;
+ 	amroutine->amkeytype = InvalidOid;
+ 
+@@ -716,3 +717,10 @@ ginUpdateStats(Relation index, const GinStatsData *stats)
+ 
+ 	END_CRIT_SECTION();
+ }
++
++void
++GinCheckForSerializableConflictIn(Relation relation, HeapTuple tuple, Buffer buffer)
++{
++	if (!GinGetUseFastUpdate(relation))
++		CheckForSerializableConflictIn(relation, tuple, buffer);
++}
+diff --git a/src/backend/access/gin/ginvacuum.c b/src/backend/access/gin/ginvacuum.c
+index 630d6a7788c2..dd8e31b87211 100644
+--- a/src/backend/access/gin/ginvacuum.c
++++ b/src/backend/access/gin/ginvacuum.c
+@@ -22,6 +22,7 @@
+ #include "postmaster/autovacuum.h"
+ #include "storage/indexfsm.h"
+ #include "storage/lmgr.h"
++#include "storage/predicate.h"
+ #include "utils/memutils.h"
+ 
+ struct GinVacuumState
+@@ -153,11 +154,18 @@ ginDeletePage(GinVacuumState *gvs, BlockNumber deleteBlkno, BlockNumber leftBlkn
+ 
+ 	LockBuffer(lBuffer, GIN_EXCLUSIVE);
+ 
++	page = BufferGetPage(dBuffer);
++	rightlink = GinPageGetOpaque(page)->rightlink;
++
++	/*
++	 * Any insert which would have gone on the leaf block will now go to its
++	 * right sibling.
++	 */
++	PredicateLockPageCombine(gvs->index, deleteBlkno, rightlink);
++
+ 	START_CRIT_SECTION();
+ 
+ 	/* Unlink the page by changing left sibling's rightlink */
+-	page = BufferGetPage(dBuffer);
+-	rightlink = GinPageGetOpaque(page)->rightlink;
+ 
+ 	page = BufferGetPage(lBuffer);
+ 	GinPageGetOpaque(page)->rightlink = rightlink;
+diff --git a/src/backend/storage/lmgr/README-SSI b/src/backend/storage/lmgr/README-SSI
+index e221241f9657..9e98af23c837 100644
+--- a/src/backend/storage/lmgr/README-SSI
++++ b/src/backend/storage/lmgr/README-SSI
+@@ -380,6 +380,15 @@ then be trusted to ripple up to all levels and locations where
+ conflicting predicate locks may exist. In case there is a page split,
+ we need to copy predicate lock from an original page to all new pages.
+ 
++    * GIN searches acquire predicate locks only on the leaf pages
++of entry tree and posting tree. During a page split, a predicate locks are
++copied from the original page to the new page. In the same way predicate locks
++are copied from entry tree leaf page to freshly created posting tree root.
++However, when fast update is enabled, a predicate lock on the whole index
++relation is required. Fast update postpones the insertion of tuples into index
++structure by temporarily storing them into pending list. That makes us unable
++to detect r-w conflicts using page-level locks.
++
+     * The effects of page splits, overflows, consolidations, and
+ removals must be carefully reviewed to ensure that predicate locks
+ aren't "lost" during those operations, or kept with pages which could
+diff --git a/src/include/access/gin_private.h b/src/include/access/gin_private.h
+index a709596a7ae5..d1df3033a6d1 100644
+--- a/src/include/access/gin_private.h
++++ b/src/include/access/gin_private.h
+@@ -103,6 +103,8 @@ extern Datum *ginExtractEntries(GinState *ginstate, OffsetNumber attnum,
+ extern OffsetNumber gintuple_get_attrnum(GinState *ginstate, IndexTuple tuple);
+ extern Datum gintuple_get_key(GinState *ginstate, IndexTuple tuple,
+ 				 GinNullCategory *category);
++extern void GinCheckForSerializableConflictIn(Relation relation,
++				 HeapTuple tuple, Buffer buffer);
+ 
+ /* gininsert.c */
+ extern IndexBuildResult *ginbuild(Relation heap, Relation index,
+@@ -217,7 +219,7 @@ extern ItemPointer GinDataLeafPageGetItems(Page page, int *nitems, ItemPointerDa
+ extern int	GinDataLeafPageGetItemsToTbm(Page page, TIDBitmap *tbm);
+ extern BlockNumber createPostingTree(Relation index,
+ 				  ItemPointerData *items, uint32 nitems,
+-				  GinStatsData *buildStats);
++				  GinStatsData *buildStats, Buffer entrybuffer);
+ extern void GinDataPageAddPostingItem(Page page, PostingItem *data, OffsetNumber offset);
+ extern void GinPageDeletePostingItem(Page page, OffsetNumber offset);
+ extern void ginInsertItemPointers(Relation index, BlockNumber rootBlkno,
+diff --git a/src/test/isolation/expected/predicate-gin.out b/src/test/isolation/expected/predicate-gin.out
+new file mode 100644
+index 000000000000..4f5501f6f01b
+--- /dev/null
++++ b/src/test/isolation/expected/predicate-gin.out
+@@ -0,0 +1,756 @@
++Parsed test spec with 2 sessions
++
++starting permutation: rxy1 wx1 c1 rxy2 wy2 c2
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c1: commit;
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10050          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step c2: commit;
++
++starting permutation: rxy2 wy2 c2 rxy1 wx1 c1
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step c2: commit;
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10050          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c1: commit;
++
++starting permutation: rxy3 wx3 c1 rxy4 wy4 c2
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c1: commit;
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c2: commit;
++
++starting permutation: rxy4 wy4 c2 rxy3 wx3 c1
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c2: commit;
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c1: commit;
++
++starting permutation: rxy1 wx1 rxy2 c1 wy2 c2
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step c1: commit;
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c2: commit;
++
++starting permutation: rxy1 wx1 rxy2 wy2 c1 c2
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 wx1 rxy2 wy2 c2 c1
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 rxy2 wx1 c1 wy2 c2
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c1: commit;
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c2: commit;
++
++starting permutation: rxy1 rxy2 wx1 wy2 c1 c2
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 rxy2 wx1 wy2 c2 c1
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 rxy2 wy2 wx1 c1 c2
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 rxy2 wy2 wx1 c2 c1
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy1 rxy2 wy2 c2 wx1 c1
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step c2: commit;
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c1: commit;
++
++starting permutation: rxy2 rxy1 wx1 c1 wy2 c2
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c1: commit;
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c2: commit;
++
++starting permutation: rxy2 rxy1 wx1 wy2 c1 c2
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 rxy1 wx1 wy2 c2 c1
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 rxy1 wy2 wx1 c1 c2
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 rxy1 wy2 wx1 c2 c1
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 rxy1 wy2 c2 wx1 c1
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step c2: commit;
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c1: commit;
++
++starting permutation: rxy2 wy2 rxy1 wx1 c1 c2
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c1: commit;
++step c2: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 wy2 rxy1 wx1 c2 c1
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c2: commit;
++step c1: commit;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++
++starting permutation: rxy2 wy2 rxy1 c2 wx1 c1
++step rxy2: select count(*) from gin_tbl where p @> array[5,6];
++count          
++
++10000          
++step wy2: insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g;
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step c2: commit;
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c1: commit;
++
++starting permutation: rxy3 wx3 rxy4 c1 wy4 c2
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step c1: commit;
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c2: commit;
++
++starting permutation: rxy3 wx3 rxy4 wy4 c1 c2
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy3 wx3 rxy4 wy4 c2 c1
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy3 rxy4 wx3 c1 wy4 c2
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c1: commit;
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c2: commit;
++
++starting permutation: rxy3 rxy4 wx3 wy4 c1 c2
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy3 rxy4 wx3 wy4 c2 c1
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy3 rxy4 wy4 wx3 c1 c2
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy3 rxy4 wy4 wx3 c2 c1
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy3 rxy4 wy4 c2 wx3 c1
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c2: commit;
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c1: commit;
++
++starting permutation: rxy4 rxy3 wx3 c1 wy4 c2
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c1: commit;
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c2: commit;
++
++starting permutation: rxy4 rxy3 wx3 wy4 c1 c2
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy4 rxy3 wx3 wy4 c2 c1
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy4 rxy3 wy4 wx3 c1 c2
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy4 rxy3 wy4 wx3 c2 c1
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy4 rxy3 wy4 c2 wx3 c1
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step c2: commit;
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c1: commit;
++
++starting permutation: rxy4 wy4 rxy3 wx3 c1 c2
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c1: commit;
++step c2: commit;
++
++starting permutation: rxy4 wy4 rxy3 wx3 c2 c1
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c2: commit;
++step c1: commit;
++
++starting permutation: rxy4 wy4 rxy3 c2 wx3 c1
++step rxy4: select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000];
++count          
++
++4              
++step wy4: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g;
++step rxy3: select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000];
++count          
++
++4              
++step c2: commit;
++step wx3: insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g;
++step c1: commit;
++
++starting permutation: rxy1 rxy2fu wx1 c1 wy2fu c2
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step rxy2fu: select count(*) from gin_tbl where p @> array[10000,10005];
++count          
++
++0              
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c1: commit;
++step wy2fu: insert into gin_tbl select g, array[10000,10005] from
++              generate_series(20051, 20100) g;
++step c2: commit;
++
++starting permutation: fu1 rxy1 rxy2fu wx1 c1 wy2fu c2
++step fu1: alter index ginidx set (fastupdate = on);
++			  commit;
++			  begin isolation level serializable; 
++  			  set enable_seqscan=off;
++step rxy1: select count(*) from gin_tbl where p @> array[4,5];
++count          
++
++10000          
++step rxy2fu: select count(*) from gin_tbl where p @> array[10000,10005];
++count          
++
++0              
++step wx1: insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g;
++step c1: commit;
++step wy2fu: insert into gin_tbl select g, array[10000,10005] from
++              generate_series(20051, 20100) g;
++ERROR:  could not serialize access due to read/write dependencies among transactions
++step c2: commit;
+diff --git a/src/test/isolation/isolation_schedule b/src/test/isolation/isolation_schedule
+index 53e1f192b0bb..d3965fe73f7b 100644
+--- a/src/test/isolation/isolation_schedule
++++ b/src/test/isolation/isolation_schedule
+@@ -67,3 +67,4 @@ test: vacuum-reltuples
+ test: timeouts
+ test: vacuum-concurrent-drop
+ test: predicate-gist
++test: predicate-gin
+diff --git a/src/test/isolation/specs/predicate-gin.spec b/src/test/isolation/specs/predicate-gin.spec
+new file mode 100644
+index 000000000000..9f0cda805734
+--- /dev/null
++++ b/src/test/isolation/specs/predicate-gin.spec
+@@ -0,0 +1,134 @@
++# Test for page level predicate locking in gin index
++#
++# Test to verify serialization failures and to check reduced false positives
++#
++# To verify serialization failures, queries and permutations are written in such
++# a way that an index scan  (from one transaction) and an index insert (from
++# another transaction) will try to access the same part (sub-tree) of the index
++# whereas to check reduced false positives, they will try to access different
++# parts (sub-tree) of the index.
++
++
++setup
++{
++  create table gin_tbl(id int4, p int4[]);
++  insert into gin_tbl select g, array[g, g*2,g*3] from generate_series(1, 10000) g;
++  insert into gin_tbl select g, array[4,5,6] from generate_series(10001, 20000) g;
++  create index ginidx on gin_tbl using gin(p) with (fastupdate = off);
++}
++
++teardown
++{
++  drop table gin_tbl;
++}
++
++session "s1"
++setup
++{
++  begin isolation level serializable;
++  set enable_seqscan=off;
++}
++
++# enable pending list for a small subset of tests
++step "fu1"	{ alter index ginidx set (fastupdate = on);
++			  commit;
++			  begin isolation level serializable; 
++  			  set enable_seqscan=off; }
++
++step "rxy1"	{ select count(*) from gin_tbl where p @> array[4,5]; }
++step "wx1"	{ insert into gin_tbl select g, array[5,6] from generate_series
++              (20001, 20050) g; }
++step "rxy3"	{ select count(*) from gin_tbl where p @> array[1,2] or
++              p @> array[100,200] or p @> array[500,1000] or p @> array[1000,2000]; }
++step "wx3"	{ insert into gin_tbl select g, array[g,g*2] from generate_series
++              (1, 50) g; }
++step "c1"  { commit; }
++
++session "s2"
++setup
++{
++  begin isolation level serializable;
++  set enable_seqscan=off;
++}
++
++step "rxy2"	{ select count(*) from gin_tbl where p @> array[5,6]; }
++step "rxy2fu"	{ select count(*) from gin_tbl where p @> array[10000,10005]; }
++step "wy2"	{ insert into gin_tbl select g, array[4,5] from
++              generate_series(20051, 20100) g; }
++step "wy2fu"	{ insert into gin_tbl select g, array[10000,10005] from
++              generate_series(20051, 20100) g; }
++step "rxy4"	{ select count(*) from gin_tbl where p @> array[4000,8000] or
++              p @> array[5000,10000] or p @> array[6000,12000] or
++              p @> array[8000,16000]; }
++step "wy4"	{ insert into gin_tbl select g, array[g,g*2] from generate_series
++              (10000, 10050) g; }
++step "c2"	{ commit; }
++
++
++# An index scan (from one transaction) and an index insert (from another transaction)
++# try to access the same part of the index but one transaction commits before other
++# transaction begins so no r-w conflict.
++
++permutation "rxy1" "wx1" "c1" "rxy2" "wy2" "c2"
++permutation "rxy2" "wy2" "c2" "rxy1" "wx1" "c1"
++
++# An index scan (from one transaction) and an index insert (from another transaction)
++# try to access different parts of the index and also one transaction commits before
++# other transaction begins, so no r-w conflict.
++
++permutation "rxy3" "wx3" "c1" "rxy4" "wy4" "c2"
++permutation "rxy4" "wy4" "c2" "rxy3" "wx3" "c1"
++
++
++# An index scan (from one transaction) and an index insert (from another transaction)
++# try to access the same part of the index and one transaction begins before other
++# transaction commits so there is a r-w conflict.
++
++permutation "rxy1" "wx1" "rxy2" "c1" "wy2" "c2"
++permutation "rxy1" "wx1" "rxy2" "wy2" "c1" "c2"
++permutation "rxy1" "wx1" "rxy2" "wy2" "c2" "c1"
++permutation "rxy1" "rxy2" "wx1" "c1" "wy2" "c2"
++permutation "rxy1" "rxy2" "wx1" "wy2" "c1" "c2"
++permutation "rxy1" "rxy2" "wx1" "wy2" "c2" "c1"
++permutation "rxy1" "rxy2" "wy2" "wx1" "c1" "c2"
++permutation "rxy1" "rxy2" "wy2" "wx1" "c2" "c1"
++permutation "rxy1" "rxy2" "wy2" "c2" "wx1" "c1"
++permutation "rxy2" "rxy1" "wx1" "c1" "wy2" "c2"
++permutation "rxy2" "rxy1" "wx1" "wy2" "c1" "c2"
++permutation "rxy2" "rxy1" "wx1" "wy2" "c2" "c1"
++permutation "rxy2" "rxy1" "wy2" "wx1" "c1" "c2"
++permutation "rxy2" "rxy1" "wy2" "wx1" "c2" "c1"
++permutation "rxy2" "rxy1" "wy2" "c2" "wx1" "c1"
++permutation "rxy2" "wy2" "rxy1" "wx1" "c1" "c2"
++permutation "rxy2" "wy2" "rxy1" "wx1" "c2" "c1"
++permutation "rxy2" "wy2" "rxy1" "c2" "wx1" "c1"
++
++# An index scan (from one transaction) and an index insert (from another transaction)
++# try to access different parts of the index so no r-w conflict.
++
++permutation "rxy3" "wx3" "rxy4" "c1" "wy4" "c2"
++permutation "rxy3" "wx3" "rxy4" "wy4" "c1" "c2"
++permutation "rxy3" "wx3" "rxy4" "wy4" "c2" "c1"
++permutation "rxy3" "rxy4" "wx3" "c1" "wy4" "c2"
++permutation "rxy3" "rxy4" "wx3" "wy4" "c1" "c2"
++permutation "rxy3" "rxy4" "wx3" "wy4" "c2" "c1"
++permutation "rxy3" "rxy4" "wy4" "wx3" "c1" "c2"
++permutation "rxy3" "rxy4" "wy4" "wx3" "c2" "c1"
++permutation "rxy3" "rxy4" "wy4" "c2" "wx3" "c1"
++permutation "rxy4" "rxy3" "wx3" "c1" "wy4" "c2"
++permutation "rxy4" "rxy3" "wx3" "wy4" "c1" "c2"
++permutation "rxy4" "rxy3" "wx3" "wy4" "c2" "c1"
++permutation "rxy4" "rxy3" "wy4" "wx3" "c1" "c2"
++permutation "rxy4" "rxy3" "wy4" "wx3" "c2" "c1"
++permutation "rxy4" "rxy3" "wy4" "c2" "wx3" "c1"
++permutation "rxy4" "wy4" "rxy3" "wx3" "c1" "c2"
++permutation "rxy4" "wy4" "rxy3" "wx3" "c2" "c1"
++permutation "rxy4" "wy4" "rxy3" "c2" "wx3" "c1"
++
++# Test fastupdate = on. First test should pass because fastupdate is off and
++# sessions touches different parts of index, second should fail because
++# with fastupdate on, then whole index should be under predicate lock.
++
++permutation       "rxy1" "rxy2fu" "wx1" "c1" "wy2fu" "c2"
++permutation "fu1" "rxy1" "rxy2fu" "wx1" "c1" "wy2fu" "c2"
++

@@ -1,0 +1,347 @@
+From 36e4419d1f1ef06bba58a28a870aaaa8de73bb46 Mon Sep 17 00:00:00 2001
+From: Peter Eisentraut <peter@eisentraut.org>
+Date: Mon, 28 Aug 2023 15:15:20 +0200
+Subject: [PATCH] Make error messages about WAL segment size more consistent
+
+Make the primary messages more compact and make the detail messages
+uniform.  In initdb.c and pg_resetwal.c, use the newish
+option_parse_int() to simplify some of the option parsing.  For the
+backend GUC wal_segment_size, add a GUC check hook to do the
+verification instead of coding it in bootstrap.c.  This might be
+overkill, but that way the check is in the right place and it becomes
+more self-documenting.
+
+In passing, make pg_controldata use the logging API for warning
+messages.
+
+Reviewed-by: Aleksander Alekseev <aleksander@timescale.com>
+Discussion: https://www.postgresql.org/message-id/flat/9939aa8a-d7be-da2c-7715-0a0b5535a1f7@eisentraut.org
+---
+ src/backend/access/transam/xlog.c             | 19 +++++++++++---
+ src/backend/bootstrap/bootstrap.c             | 11 +-------
+ src/backend/utils/misc/guc_tables.c           |  2 +-
+ src/bin/initdb/initdb.c                       | 25 +++++--------------
+ src/bin/pg_basebackup/streamutil.c            |  5 ++--
+ src/bin/pg_controldata/pg_controldata.c       | 23 ++++++++---------
+ .../pg_controldata/t/001_pg_controldata.pl    |  6 ++---
+ src/bin/pg_resetwal/Makefile                  |  2 ++
+ src/bin/pg_resetwal/pg_resetwal.c             | 18 +++++++------
+ src/bin/pg_rewind/pg_rewind.c                 | 12 ++++++---
+ src/bin/pg_waldump/pg_waldump.c               | 12 ++++++---
+ src/include/utils/guc_hooks.h                 |  1 +
+ 12 files changed, 71 insertions(+), 65 deletions(-)
+
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 60c0b7ec3af1..f6f8adc72a6d 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -1995,6 +1995,18 @@ assign_checkpoint_completion_target(double newval, void *extra)
+ 	CalculateCheckpointSegments();
+ }
+ 
++bool
++check_wal_segment_size(int *newval, void **extra, GucSource source)
++{
++	if (!IsValidWalSegSize(*newval))
++	{
++		GUC_check_errdetail("The WAL segment size must be a power of two between 1 MB and 1 GB.");
++		return false;
++	}
++
++	return true;
++}
++
+ /*
+  * At a checkpoint, how many WAL segments to recycle as preallocated future
+  * XLOG segments? Returns the highest segment that should be preallocated.
+@@ -4145,10 +4157,11 @@ ReadControlFile(void)
+ 
+ 	if (!IsValidWalSegSize(wal_segment_size))
+ 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-						errmsg_plural("WAL segment size must be a power of two between 1 MB and 1 GB, but the control file specifies %d byte",
+-									  "WAL segment size must be a power of two between 1 MB and 1 GB, but the control file specifies %d bytes",
++						errmsg_plural("invalid WAL segment size in control file (%d byte)",
++									  "invalid WAL segment size in control file (%d bytes)",
+ 									  wal_segment_size,
+-									  wal_segment_size)));
++									  wal_segment_size),
++						errdetail("The WAL segment size must be a power of two between 1 MB and 1 GB.")));
+ 
+ 	snprintf(wal_segsz_str, sizeof(wal_segsz_str), "%d", wal_segment_size);
+ 	SetConfigOption("wal_segment_size", wal_segsz_str, PGC_INTERNAL,
+diff --git a/src/backend/bootstrap/bootstrap.c b/src/backend/bootstrap/bootstrap.c
+index 4cc2efa95c48..5810f8825e9e 100644
+--- a/src/backend/bootstrap/bootstrap.c
++++ b/src/backend/bootstrap/bootstrap.c
+@@ -280,16 +280,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
+ 				strlcpy(OutputFileName, optarg, MAXPGPATH);
+ 				break;
+ 			case 'X':
+-				{
+-					int			WalSegSz = strtoul(optarg, NULL, 0);
+-
+-					if (!IsValidWalSegSize(WalSegSz))
+-						ereport(ERROR,
+-								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-								 errmsg("-X requires a power of two value between 1 MB and 1 GB")));
+-					SetConfigOption("wal_segment_size", optarg, PGC_INTERNAL,
+-									PGC_S_DYNAMIC_DEFAULT);
+-				}
++				SetConfigOption("wal_segment_size", optarg, PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+ 				break;
+ 			default:
+ 				write_stderr("Try \"%s --help\" for more information.\n",
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index 7e00dccb210c..e0ca48a27d41 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -3166,7 +3166,7 @@ struct config_int ConfigureNamesInt[] =
+ 		DEFAULT_XLOG_SEG_SIZE,
+ 		WalSegMinSize,
+ 		WalSegMaxSize,
+-		NULL, NULL, NULL
++		check_wal_segment_size, NULL, NULL
+ 	},
+ 
+ 	{
+diff --git a/src/bin/initdb/initdb.c b/src/bin/initdb/initdb.c
+index 3f4167682aba..c66467eb9510 100644
+--- a/src/bin/initdb/initdb.c
++++ b/src/bin/initdb/initdb.c
+@@ -76,6 +76,7 @@
+ #include "common/restricted_token.h"
+ #include "common/string.h"
+ #include "common/username.h"
++#include "fe_utils/option_utils.h"
+ #include "fe_utils/string_utils.h"
+ #include "getopt_long.h"
+ #include "mb/pg_wchar.h"
+@@ -163,8 +164,7 @@ static bool sync_only = false;
+ static bool show_setting = false;
+ static bool data_checksums = false;
+ static char *xlog_dir = NULL;
+-static char *str_wal_segment_size_mb = NULL;
+-static int	wal_segment_size_mb;
++static int	wal_segment_size_mb = (DEFAULT_XLOG_SEG_SIZE) / (1024 * 1024);
+ 
+ 
+ /* internal vars */
+@@ -3258,7 +3258,8 @@ main(int argc, char *argv[])
+ 				xlog_dir = pg_strdup(optarg);
+ 				break;
+ 			case 12:
+-				str_wal_segment_size_mb = pg_strdup(optarg);
++				if (!option_parse_int(optarg, "--wal-segsize", 1, 1024, &wal_segment_size_mb))
++					exit(1);
+ 				break;
+ 			case 13:
+ 				noinstructions = true;
+@@ -3348,22 +3349,8 @@ main(int argc, char *argv[])
+ 
+ 	check_need_password(authmethodlocal, authmethodhost);
+ 
+-	/* set wal segment size */
+-	if (str_wal_segment_size_mb == NULL)
+-		wal_segment_size_mb = (DEFAULT_XLOG_SEG_SIZE) / (1024 * 1024);
+-	else
+-	{
+-		char	   *endptr;
+-
+-		/* check that the argument is a number */
+-		wal_segment_size_mb = strtol(str_wal_segment_size_mb, &endptr, 10);
+-
+-		/* verify that wal segment size is valid */
+-		if (endptr == str_wal_segment_size_mb || *endptr != '\0')
+-			pg_fatal("argument of --wal-segsize must be a number");
+-		if (!IsValidWalSegSize(wal_segment_size_mb * 1024 * 1024))
+-			pg_fatal("argument of --wal-segsize must be a power of 2 between 1 and 1024");
+-	}
++	if (!IsValidWalSegSize(wal_segment_size_mb * 1024 * 1024))
++		pg_fatal("argument of %s must be a power of 2 between 1 and 1024", "--wal-segsize");
+ 
+ 	get_restricted_token();
+ 
+diff --git a/src/bin/pg_basebackup/streamutil.c b/src/bin/pg_basebackup/streamutil.c
+index 15514599c4ef..75ab9e56f3e5 100644
+--- a/src/bin/pg_basebackup/streamutil.c
++++ b/src/bin/pg_basebackup/streamutil.c
+@@ -321,10 +321,11 @@ RetrieveWalSegSize(PGconn *conn)
+ 
+ 	if (!IsValidWalSegSize(WalSegSz))
+ 	{
+-		pg_log_error(ngettext("WAL segment size must be a power of two between 1 MB and 1 GB, but the remote server reported a value of %d byte",
+-							  "WAL segment size must be a power of two between 1 MB and 1 GB, but the remote server reported a value of %d bytes",
++		pg_log_error(ngettext("remote server reported invalid WAL segment size (%d byte)",
++							  "remote server reported invalid WAL segment size (%d bytes)",
+ 							  WalSegSz),
+ 					 WalSegSz);
++		pg_log_error_detail("The WAL segment size must be a power of two between 1 MB and 1 GB.");
+ 		return false;
+ 	}
+ 
+diff --git a/src/bin/pg_controldata/pg_controldata.c b/src/bin/pg_controldata/pg_controldata.c
+index c390ec51ce9b..93e0837947cf 100644
+--- a/src/bin/pg_controldata/pg_controldata.c
++++ b/src/bin/pg_controldata/pg_controldata.c
+@@ -167,24 +167,23 @@ main(int argc, char *argv[])
+ 	/* get a copy of the control file */
+ 	ControlFile = get_controlfile(DataDir, &crc_ok);
+ 	if (!crc_ok)
+-		printf(_("WARNING: Calculated CRC checksum does not match value stored in file.\n"
+-				 "Either the file is corrupt, or it has a different layout than this program\n"
+-				 "is expecting.  The results below are untrustworthy.\n\n"));
++	{
++		pg_log_warning("calculated CRC checksum does not match value stored in control file");
++		pg_log_warning_detail("Either the control file is corrupt, or it has a different layout than this program "
++							  "is expecting.  The results below are untrustworthy.");
++	}
+ 
+ 	/* set wal segment size */
+ 	WalSegSz = ControlFile->xlog_seg_size;
+ 
+ 	if (!IsValidWalSegSize(WalSegSz))
+ 	{
+-		printf(_("WARNING: invalid WAL segment size\n"));
+-		printf(ngettext("The WAL segment size stored in the file, %d byte, is not a power of two\n"
+-						"between 1 MB and 1 GB.  The file is corrupt and the results below are\n"
+-						"untrustworthy.\n\n",
+-						"The WAL segment size stored in the file, %d bytes, is not a power of two\n"
+-						"between 1 MB and 1 GB.  The file is corrupt and the results below are\n"
+-						"untrustworthy.\n\n",
+-						WalSegSz),
+-			   WalSegSz);
++		pg_log_warning(ngettext("invalid WAL segment size in control file (%d byte)",
++								"invalid WAL segment size in control file (%d bytes)",
++								WalSegSz),
++					   WalSegSz);
++		pg_log_warning_detail("The WAL segment size must be a power of two between 1 MB and 1 GB.");
++		pg_log_warning_detail("The file is corrupt and the results below are untrustworthy.");
+ 	}
+ 
+ 	/*
+diff --git a/src/bin/pg_controldata/t/001_pg_controldata.pl b/src/bin/pg_controldata/t/001_pg_controldata.pl
+index 0c641036e9c5..4918ea89446e 100644
+--- a/src/bin/pg_controldata/t/001_pg_controldata.pl
++++ b/src/bin/pg_controldata/t/001_pg_controldata.pl
+@@ -36,11 +36,11 @@
+ command_checks_all(
+ 	[ 'pg_controldata', $node->data_dir ],
+ 	0,
++	[qr/./],
+ 	[
+-		qr/WARNING: Calculated CRC checksum does not match value stored in file/,
+-		qr/WARNING: invalid WAL segment size/
++		qr/warning: calculated CRC checksum does not match value stored in control file/,
++		qr/warning: invalid WAL segment size/
+ 	],
+-	[qr/^$/],
+ 	'pg_controldata with corrupted pg_control');
+ 
+ done_testing();
+diff --git a/src/bin/pg_resetwal/Makefile b/src/bin/pg_resetwal/Makefile
+index a363b948b53c..5c86435e22bc 100644
+--- a/src/bin/pg_resetwal/Makefile
++++ b/src/bin/pg_resetwal/Makefile
+@@ -15,6 +15,8 @@ subdir = src/bin/pg_resetwal
+ top_builddir = ../../..
+ include $(top_builddir)/src/Makefile.global
+ 
++LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils
++
+ OBJS = \
+ 	$(WIN32RES) \
+ 	pg_resetwal.o
+diff --git a/src/bin/pg_resetwal/pg_resetwal.c b/src/bin/pg_resetwal/pg_resetwal.c
+index e7ef2b8bd0c8..9bebc2a9958b 100644
+--- a/src/bin/pg_resetwal/pg_resetwal.c
++++ b/src/bin/pg_resetwal/pg_resetwal.c
+@@ -55,6 +55,7 @@
+ #include "common/logging.h"
+ #include "common/restricted_token.h"
+ #include "common/string.h"
++#include "fe_utils/option_utils.h"
+ #include "getopt_long.h"
+ #include "pg_getopt.h"
+ #include "storage/large_object.h"
+@@ -290,13 +291,16 @@ main(int argc, char *argv[])
+ 				break;
+ 
+ 			case 1:
+-				errno = 0;
+-				set_wal_segsize = strtol(optarg, &endptr, 10) * 1024 * 1024;
+-				if (endptr == optarg || *endptr != '\0' || errno != 0)
+-					pg_fatal("argument of --wal-segsize must be a number");
+-				if (!IsValidWalSegSize(set_wal_segsize))
+-					pg_fatal("argument of --wal-segsize must be a power of 2 between 1 and 1024");
+-				break;
++				{
++					int			wal_segsize_mb;
++
++					if (!option_parse_int(optarg, "--wal-segsize", 1, 1024, &wal_segsize_mb))
++						exit(1);
++					set_wal_segsize = wal_segsize_mb * 1024 * 1024;
++					if (!IsValidWalSegSize(set_wal_segsize))
++						pg_fatal("argument of %s must be a power of 2 between 1 and 1024", "--wal-segsize");
++					break;
++				}
+ 
+ 			default:
+ 				/* getopt_long already emitted a complaint */
+diff --git a/src/bin/pg_rewind/pg_rewind.c b/src/bin/pg_rewind/pg_rewind.c
+index f7f3b8227fd6..7f69f024412f 100644
+--- a/src/bin/pg_rewind/pg_rewind.c
++++ b/src/bin/pg_rewind/pg_rewind.c
+@@ -1023,10 +1023,14 @@ digestControlFile(ControlFileData *ControlFile, const char *content,
+ 	WalSegSz = ControlFile->xlog_seg_size;
+ 
+ 	if (!IsValidWalSegSize(WalSegSz))
+-		pg_fatal(ngettext("WAL segment size must be a power of two between 1 MB and 1 GB, but the control file specifies %d byte",
+-						  "WAL segment size must be a power of two between 1 MB and 1 GB, but the control file specifies %d bytes",
+-						  WalSegSz),
+-				 WalSegSz);
++	{
++		pg_log_error(ngettext("invalid WAL segment size in control file (%d byte)",
++							  "invalid WAL segment size in control file (%d bytes)",
++							  WalSegSz),
++					 WalSegSz);
++		pg_log_error_detail("The WAL segment size must be a power of two between 1 MB and 1 GB.");
++		exit(1);
++	}
+ 
+ 	/* Additional checks on control file */
+ 	checkControlFile(ControlFile);
+diff --git a/src/bin/pg_waldump/pg_waldump.c b/src/bin/pg_waldump/pg_waldump.c
+index e8b5a6cd6175..b9acfed3b7af 100644
+--- a/src/bin/pg_waldump/pg_waldump.c
++++ b/src/bin/pg_waldump/pg_waldump.c
+@@ -252,10 +252,14 @@ search_directory(const char *directory, const char *fname)
+ 			WalSegSz = longhdr->xlp_seg_size;
+ 
+ 			if (!IsValidWalSegSize(WalSegSz))
+-				pg_fatal(ngettext("WAL segment size must be a power of two between 1 MB and 1 GB, but the WAL file \"%s\" header specifies %d byte",
+-								  "WAL segment size must be a power of two between 1 MB and 1 GB, but the WAL file \"%s\" header specifies %d bytes",
+-								  WalSegSz),
+-						 fname, WalSegSz);
++			{
++				pg_log_error(ngettext("invalid WAL segment size in WAL file \"%s\" (%d byte)",
++									  "invalid WAL segment size in WAL file \"%s\" (%d bytes)",
++									  WalSegSz),
++							 fname, WalSegSz);
++				pg_log_error_detail("The WAL segment size must be a power of two between 1 MB and 1 GB.");
++				exit(1);
++			}
+ 		}
+ 		else if (r < 0)
+ 			pg_fatal("could not read file \"%s\": %m",
+diff --git a/src/include/utils/guc_hooks.h b/src/include/utils/guc_hooks.h
+index 952293a1c305..f04b99e3b955 100644
+--- a/src/include/utils/guc_hooks.h
++++ b/src/include/utils/guc_hooks.h
+@@ -158,6 +158,7 @@ extern bool check_wal_buffers(int *newval, void **extra, GucSource source);
+ extern bool check_wal_consistency_checking(char **newval, void **extra,
+ 										   GucSource source);
+ extern void assign_wal_consistency_checking(const char *newval, void *extra);
++extern bool check_wal_segment_size(int *newval, void **extra, GucSource source);
+ extern void assign_xlog_sync_method(int new_sync_method, void *extra);
+ 
+ #endif							/* GUC_HOOKS_H */

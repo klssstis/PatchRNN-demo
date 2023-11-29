@@ -1,0 +1,68 @@
+From 49a3360209ba07d385f1a9e619854bbbe1b7005f Mon Sep 17 00:00:00 2001
+From: Heikki Linnakangas <heikki.linnakangas@iki.fi>
+Date: Wed, 12 Jul 2017 15:30:52 +0300
+Subject: [PATCH] Fix ordering of operations in SyncRepWakeQueue to avoid
+ assertion failure.
+
+Commit 14e8803f1 removed the locking in SyncRepWaitForLSN, but that
+introduced a race condition, where SyncRepWaitForLSN might see
+syncRepState already set to SYNC_REP_WAIT_COMPLETE, but the process was
+not yet removed from the queue. That tripped the assertion, that the
+process should no longer be in the uqeue. Reorder the operations in
+SyncRepWakeQueue to remove the process from the queue first, and update
+syncRepState only after that, and add a memory barrier in between to make
+sure the operations are made visible to other processes in that order.
+
+Fixes bug #14721 reported by Const Zhang. Analysis and fix by Thomas Munro.
+Backpatch down to 9.5, where the locking was removed.
+
+Discussion: https://www.postgresql.org/message-id/20170629023623.1480.26508%40wrigleys.postgresql.org
+---
+ src/backend/replication/syncrep.c | 22 ++++++++++++++++------
+ 1 file changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/src/backend/replication/syncrep.c b/src/backend/replication/syncrep.c
+index 6a28becdad57..77e80f161233 100644
+--- a/src/backend/replication/syncrep.c
++++ b/src/backend/replication/syncrep.c
+@@ -293,8 +293,11 @@ SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
+ 	 * WalSender has checked our LSN and has removed us from queue. Clean up
+ 	 * state and leave.  It's OK to reset these shared memory fields without
+ 	 * holding SyncRepLock, because any walsenders will ignore us anyway when
+-	 * we're not on the queue.
++	 * we're not on the queue.  We need a read barrier to make sure we see
++	 * the changes to the queue link (this might be unnecessary without
++	 * assertions, but better safe than sorry).
+ 	 */
++	pg_read_barrier();
+ 	Assert(SHMQueueIsDetached(&(MyProc->syncRepLinks)));
+ 	MyProc->syncRepState = SYNC_REP_NOT_WAITING;
+ 	MyProc->waitLSN = 0;
+@@ -1022,15 +1025,22 @@ SyncRepWakeQueue(bool all, int mode)
+ 									   offsetof(PGPROC, syncRepLinks));
+ 
+ 		/*
+-		 * Set state to complete; see SyncRepWaitForLSN() for discussion of
+-		 * the various states.
++		 * Remove thisproc from queue.
+ 		 */
+-		thisproc->syncRepState = SYNC_REP_WAIT_COMPLETE;
++		SHMQueueDelete(&(thisproc->syncRepLinks));
+ 
+ 		/*
+-		 * Remove thisproc from queue.
++		 * SyncRepWaitForLSN() reads syncRepState without holding the lock, so
++		 * make sure that it sees the queue link being removed before the
++		 * syncRepState change.
+ 		 */
+-		SHMQueueDelete(&(thisproc->syncRepLinks));
++		pg_write_barrier();
++
++		/*
++		 * Set state to complete; see SyncRepWaitForLSN() for discussion of
++		 * the various states.
++		 */
++		thisproc->syncRepState = SYNC_REP_WAIT_COMPLETE;
+ 
+ 		/*
+ 		 * Wake only when we have set state and removed from queue.

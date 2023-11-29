@@ -1,0 +1,223 @@
+From 36c4bc6e725fe3e9b5a6cc7f1f83010534f18e4b Mon Sep 17 00:00:00 2001
+From: Tomas Vondra <tomas.vondra@postgresql.org>
+Date: Sat, 15 Jan 2022 02:15:23 +0100
+Subject: [PATCH] Ignore extended statistics for inheritance trees
+
+Since commit 859b3003de we only build extended statistics for individual
+relations, ignoring the child relations. This resolved the issue with
+updating catalog tuple twice, but we still tried to use the statistics
+when calculating estimates for the whole inheritance tree. When the
+relations contain very distinct data, it may produce bogus estimates.
+
+This is roughly the same issue 427c6b5b9 addressed ~15 years ago, and we
+fix it the same way - by ignoring extended statistics when calculating
+estimates for the inheritance tree as a whole. We still consider
+extended statistics when calculating estimates for individual child
+relations, of course.
+
+This may result in plan changes due to different estimates, but if the
+old statistics were not describing the inheritance tree particularly
+well it's quite likely the new plans is actually better.
+
+Report and patch by Justin Pryzby, minor fixes and cleanup by me.
+Backpatch all the way back to PostgreSQL 10, where extended statistics
+were introduced (same as 859b3003de).
+
+Author: Justin Pryzby
+Reported-by: Justin Pryzby
+Backpatch-through: 10
+Discussion: https://postgr.es/m/20210923212624.GI831%40telsasoft.com
+---
+ src/backend/statistics/dependencies.c   |  9 ++++++
+ src/backend/statistics/extended_stats.c |  9 ++++++
+ src/backend/utils/adt/selfuncs.c        | 17 ++++++++++
+ src/test/regress/expected/stats_ext.out | 41 +++++++++++++++++++++++++
+ src/test/regress/sql/stats_ext.sql      | 22 +++++++++++++
+ 5 files changed, 98 insertions(+)
+
+diff --git a/src/backend/statistics/dependencies.c b/src/backend/statistics/dependencies.c
+index 82b549fdc2cd..f1602cd3a261 100644
+--- a/src/backend/statistics/dependencies.c
++++ b/src/backend/statistics/dependencies.c
+@@ -24,6 +24,7 @@
+ #include "nodes/pathnodes.h"
+ #include "optimizer/clauses.h"
+ #include "optimizer/optimizer.h"
++#include "parser/parsetree.h"
+ #include "statistics/extended_stats_internal.h"
+ #include "statistics/statistics.h"
+ #include "utils/bytea.h"
+@@ -1410,11 +1411,19 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
+ 	int			ndependencies;
+ 	int			i;
+ 	AttrNumber	attnum_offset;
++	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+ 
+ 	/* unique expressions */
+ 	Node	  **unique_exprs;
+ 	int			unique_exprs_cnt;
+ 
++	/*
++	 * When dealing with inheritance trees, ignore extended stats (which were
++	 * built without data from child rels, and thus do not represent them).
++	 */
++	if (rte->inh)
++		return 1.0;
++
+ 	/* check if there's any stats that might be useful for us. */
+ 	if (!has_stats_of_kind(rel->statlist, STATS_EXT_DEPENDENCIES))
+ 		return 1.0;
+diff --git a/src/backend/statistics/extended_stats.c b/src/backend/statistics/extended_stats.c
+index 4ab9aaa591c2..b23c15e9db4a 100644
+--- a/src/backend/statistics/extended_stats.c
++++ b/src/backend/statistics/extended_stats.c
+@@ -30,6 +30,7 @@
+ #include "nodes/nodeFuncs.h"
+ #include "optimizer/clauses.h"
+ #include "optimizer/optimizer.h"
++#include "parser/parsetree.h"
+ #include "pgstat.h"
+ #include "postmaster/autovacuum.h"
+ #include "statistics/extended_stats_internal.h"
+@@ -1694,6 +1695,14 @@ statext_mcv_clauselist_selectivity(PlannerInfo *root, List *clauses, int varReli
+ 	List	  **list_exprs;		/* expressions matched to any statistic */
+ 	int			listidx;
+ 	Selectivity sel = (is_or) ? 0.0 : 1.0;
++	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
++
++	/*
++	 * When dealing with inheritance trees, ignore extended stats (which were
++	 * built without data from child rels, and thus do not represent them).
++	 */
++	if (rte->inh)
++		return sel;
+ 
+ 	/* check if there's any stats that might be useful for us. */
+ 	if (!has_stats_of_kind(rel->statlist, STATS_EXT_MCV))
+diff --git a/src/backend/utils/adt/selfuncs.c b/src/backend/utils/adt/selfuncs.c
+index aff748d67ba5..9e39f9888e1f 100644
+--- a/src/backend/utils/adt/selfuncs.c
++++ b/src/backend/utils/adt/selfuncs.c
+@@ -3913,6 +3913,14 @@ estimate_multivariate_ndistinct(PlannerInfo *root, RelOptInfo *rel,
+ 	Oid			statOid = InvalidOid;
+ 	MVNDistinct *stats;
+ 	StatisticExtInfo *matched_info = NULL;
++	RangeTblEntry		*rte = planner_rt_fetch(rel->relid, root);
++
++	/*
++	 * When dealing with inheritance trees, ignore extended stats (which were
++	 * built without data from child rels, and thus do not represent them).
++	 */
++	if (rte->inh)
++		return false;
+ 
+ 	/* bail out immediately if the table has no extended statistics */
+ 	if (!rel->statlist)
+@@ -5222,6 +5230,7 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
+ 		foreach(slist, onerel->statlist)
+ 		{
+ 			StatisticExtInfo *info = (StatisticExtInfo *) lfirst(slist);
++			RangeTblEntry	 *rte = planner_rt_fetch(onerel->relid, root);
+ 			ListCell   *expr_item;
+ 			int			pos;
+ 
+@@ -5232,6 +5241,14 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
+ 			if (vardata->statsTuple)
+ 				break;
+ 
++			/*
++			 * When dealing with inheritance trees, ignore extended stats (which
++			 * were built without data from child rels, and so do not represent
++			 * them).
++			 */
++			if (rte->inh)
++				break;
++
+ 			/* skip stats without per-expression stats */
+ 			if (info->kind != STATS_EXT_EXPRESSIONS)
+ 				continue;
+diff --git a/src/test/regress/expected/stats_ext.out b/src/test/regress/expected/stats_ext.out
+index c60ba45aba82..abe1f89edd86 100644
+--- a/src/test/regress/expected/stats_ext.out
++++ b/src/test/regress/expected/stats_ext.out
+@@ -176,6 +176,47 @@ CREATE STATISTICS ab1_a_b_stats ON a, b FROM ab1;
+ ANALYZE ab1;
+ DROP TABLE ab1 CASCADE;
+ NOTICE:  drop cascades to table ab1c
++-- Tests for stats with inheritance
++CREATE TABLE stxdinh(a int, b int);
++CREATE TABLE stxdinh1() INHERITS(stxdinh);
++CREATE TABLE stxdinh2() INHERITS(stxdinh);
++INSERT INTO stxdinh SELECT mod(a,50), mod(a,100) FROM generate_series(0, 1999) a;
++INSERT INTO stxdinh1 SELECT mod(a,100), mod(a,100) FROM generate_series(0, 999) a;
++INSERT INTO stxdinh2 SELECT mod(a,100), mod(a,100) FROM generate_series(0, 999) a;
++VACUUM ANALYZE stxdinh, stxdinh1, stxdinh2;
++-- Ensure non-inherited stats are not applied to inherited query
++-- Without stats object, it looks like this
++SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* GROUP BY 1, 2');
++ estimated | actual 
++-----------+--------
++       400 |    150
++(1 row)
++
++SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* WHERE a = 0 AND b = 0');
++ estimated | actual 
++-----------+--------
++         3 |     40
++(1 row)
++
++CREATE STATISTICS stxdinh ON a, b FROM stxdinh;
++VACUUM ANALYZE stxdinh, stxdinh1, stxdinh2;
++-- Since the stats object does not include inherited stats, it should not
++-- affect the estimates
++SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* GROUP BY 1, 2');
++ estimated | actual 
++-----------+--------
++       400 |    150
++(1 row)
++
++-- Dependencies are applied at individual relations (within append), so
++-- this estimate changes a bit because we improve estimates for the parent
++SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* WHERE a = 0 AND b = 0');
++ estimated | actual 
++-----------+--------
++        22 |     40
++(1 row)
++
++DROP TABLE stxdinh, stxdinh1, stxdinh2;
+ -- basic test for statistics on expressions
+ CREATE TABLE ab1 (a INTEGER, b INTEGER, c TIMESTAMP, d TIMESTAMPTZ);
+ -- expression stats may be built on a single expression column
+diff --git a/src/test/regress/sql/stats_ext.sql b/src/test/regress/sql/stats_ext.sql
+index 6fb37962a720..69d7b71f0eb8 100644
+--- a/src/test/regress/sql/stats_ext.sql
++++ b/src/test/regress/sql/stats_ext.sql
+@@ -112,6 +112,28 @@ CREATE STATISTICS ab1_a_b_stats ON a, b FROM ab1;
+ ANALYZE ab1;
+ DROP TABLE ab1 CASCADE;
+ 
++-- Tests for stats with inheritance
++CREATE TABLE stxdinh(a int, b int);
++CREATE TABLE stxdinh1() INHERITS(stxdinh);
++CREATE TABLE stxdinh2() INHERITS(stxdinh);
++INSERT INTO stxdinh SELECT mod(a,50), mod(a,100) FROM generate_series(0, 1999) a;
++INSERT INTO stxdinh1 SELECT mod(a,100), mod(a,100) FROM generate_series(0, 999) a;
++INSERT INTO stxdinh2 SELECT mod(a,100), mod(a,100) FROM generate_series(0, 999) a;
++VACUUM ANALYZE stxdinh, stxdinh1, stxdinh2;
++-- Ensure non-inherited stats are not applied to inherited query
++-- Without stats object, it looks like this
++SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* GROUP BY 1, 2');
++SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* WHERE a = 0 AND b = 0');
++CREATE STATISTICS stxdinh ON a, b FROM stxdinh;
++VACUUM ANALYZE stxdinh, stxdinh1, stxdinh2;
++-- Since the stats object does not include inherited stats, it should not
++-- affect the estimates
++SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* GROUP BY 1, 2');
++-- Dependencies are applied at individual relations (within append), so
++-- this estimate changes a bit because we improve estimates for the parent
++SELECT * FROM check_estimated_rows('SELECT a, b FROM stxdinh* WHERE a = 0 AND b = 0');
++DROP TABLE stxdinh, stxdinh1, stxdinh2;
++
+ -- basic test for statistics on expressions
+ CREATE TABLE ab1 (a INTEGER, b INTEGER, c TIMESTAMP, d TIMESTAMPTZ);
+ 

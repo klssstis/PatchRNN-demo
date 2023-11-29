@@ -1,0 +1,611 @@
+From 49c9d9fcfa9ae3403617b1a292f2425374219131 Mon Sep 17 00:00:00 2001
+From: Peter Geoghegan <pg@bowt.ie>
+Date: Fri, 14 Jan 2022 16:50:34 -0800
+Subject: [PATCH] Unify VACUUM VERBOSE and autovacuum logging.
+
+The log_autovacuum_min_duration instrumentation used its own dedicated
+code for logging, which was not reused by VACUUM VERBOSE.  This was
+highly duplicative, and sometimes led to each code path using slightly
+different accounting for essentially the same information.
+
+Clean things up by making VACUUM VERBOSE reuse the same instrumentation
+code.  This code restructuring changes the structure of the VACUUM
+VERBOSE output itself, but that seems like an overall improvement.  The
+most noticeable change in VACUUM VERBOSE output is that it no longer
+outputs a distinct message per index per round of index vacuuming.  Most
+of the same information (about each index) is now shown in its new
+per-operation summary message.  This is far more legible.
+
+A few details are no longer displayed by VACUUM VERBOSE, but that's no
+real loss in practice, especially in the common case where we don't need
+multiple index scans/rounds of vacuuming.  This super fine-grained
+information is still available via DEBUG2 messages, which might still be
+useful in debugging scenarios.
+
+VACUUM VERBOSE now shows new instrumentation, which is typically very
+useful: all of the log_autovacuum_min_duration instrumentation that it
+missed out on before now.  This includes information about WAL overhead,
+buffers hit/missed/dirtied information, and I/O timing information.
+
+VACUUM VERBOSE still retains a few INFO messages of its own.  This is
+limited to output concerning the progress of heap rel truncation, as
+well as some basic information about parallel workers.  These details
+are still potentially quite useful.  They aren't a good fit for the log
+output, which must summarize the whole operation.
+
+Author: Peter Geoghegan <pg@bowt.ie>
+Reviewed-By: Masahiko Sawada <sawada.mshk@gmail.com>
+Reviewed-By: Andres Freund <andres@anarazel.de>
+Discussion: https://postgr.es/m/CAH2-WzmW4Me7_qR4X4ka7pxP-jGmn7=Npma_-Z-9Y1eD0MQRLw@mail.gmail.com
+---
+ doc/src/sgml/config.sgml              |  10 +-
+ src/backend/access/heap/vacuumlazy.c  | 221 +++++++++-----------------
+ src/backend/commands/vacuum.c         |  21 +--
+ src/backend/commands/vacuumparallel.c |   5 +-
+ src/include/commands/vacuum.h         |   6 +-
+ 5 files changed, 93 insertions(+), 170 deletions(-)
+
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index d098a33a17f6..c0fbf03dd3ce 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -7614,10 +7614,12 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
+         displayed in <link linkend="monitoring-pg-stat-database-view">
+         <structname>pg_stat_database</structname></link>, in the output of
+         <xref linkend="sql-explain"/> when the <literal>BUFFERS</literal> option
+-        is used, by autovacuum for auto-vacuums and auto-analyzes, when
+-        <xref linkend="guc-log-autovacuum-min-duration"/> is set and by
+-        <xref linkend="pgstatstatements"/>.  Only superusers can change this
+-        setting.
++        is used, in the output of <xref linkend="sql-vacuum"/> when
++        the <literal>VERBOSE</literal> option is used, by autovacuum
++        for auto-vacuums and auto-analyzes, when <xref
++         linkend="guc-log-autovacuum-min-duration"/> is set and by
++        <xref linkend="pgstatstatements"/>.  Only superusers can
++        change this setting.
+        </para>
+       </listitem>
+      </varlistentry>
+diff --git a/src/backend/access/heap/vacuumlazy.c b/src/backend/access/heap/vacuumlazy.c
+index f8c6c2580af2..1749cc2a4768 100644
+--- a/src/backend/access/heap/vacuumlazy.c
++++ b/src/backend/access/heap/vacuumlazy.c
+@@ -171,10 +171,11 @@ typedef struct LVRelState
+ 	/* Error reporting state */
+ 	char	   *relnamespace;
+ 	char	   *relname;
+-	char	   *indname;
++	char	   *indname;		/* Current index name */
+ 	BlockNumber blkno;			/* used only for heap operations */
+ 	OffsetNumber offnum;		/* used only for heap operations */
+ 	VacErrPhase phase;
++	bool		verbose;		/* VACUUM VERBOSE? */
+ 
+ 	/*
+ 	 * State managed by lazy_scan_heap() follows.
+@@ -237,9 +238,6 @@ typedef struct LVSavedErrInfo
+ 	VacErrPhase phase;
+ } LVSavedErrInfo;
+ 
+-/* elevel controls whole VACUUM's verbosity */
+-static int	elevel = -1;
+-
+ 
+ /* non-export function prototypes */
+ static void lazy_scan_heap(LVRelState *vacrel, VacuumParams *params,
+@@ -299,6 +297,8 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
+ 				BufferAccessStrategy bstrategy)
+ {
+ 	LVRelState *vacrel;
++	bool		verbose,
++				instrument;
+ 	PGRUsage	ru0;
+ 	TimestampTz starttime = 0;
+ 	WalUsage	walusage_start = pgWalUsage;
+@@ -324,8 +324,10 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
+ 	TransactionId FreezeLimit;
+ 	MultiXactId MultiXactCutoff;
+ 
+-	/* measure elapsed time iff autovacuum logging requires it */
+-	if (IsAutoVacuumWorkerProcess() && params->log_min_duration >= 0)
++	verbose = (params->options & VACOPT_VERBOSE) != 0;
++	instrument = (verbose || (IsAutoVacuumWorkerProcess() &&
++							  params->log_min_duration >= 0));
++	if (instrument)
+ 	{
+ 		pg_rusage_init(&ru0);
+ 		starttime = GetCurrentTimestamp();
+@@ -336,11 +338,6 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
+ 		}
+ 	}
+ 
+-	if (params->options & VACOPT_VERBOSE)
+-		elevel = INFO;
+-	else
+-		elevel = DEBUG2;
+-
+ 	pgstat_progress_start_command(PROGRESS_COMMAND_VACUUM,
+ 								  RelationGetRelid(rel));
+ 
+@@ -365,14 +362,54 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
+ 	if (params->options & VACOPT_DISABLE_PAGE_SKIPPING)
+ 		aggressive = true;
+ 
++	/*
++	 * Setup error traceback support for ereport() first.  The idea is to set
++	 * up an error context callback to display additional information on any
++	 * error during a vacuum.  During different phases of vacuum, we update
++	 * the state so that the error context callback always display current
++	 * information.
++	 *
++	 * Copy the names of heap rel into local memory for error reporting
++	 * purposes, too.  It isn't always safe to assume that we can get the name
++	 * of each rel.  It's convenient for code in lazy_scan_heap to always use
++	 * these temp copies.
++	 */
+ 	vacrel = (LVRelState *) palloc0(sizeof(LVRelState));
++	vacrel->relnamespace = get_namespace_name(RelationGetNamespace(rel));
++	vacrel->relname = pstrdup(RelationGetRelationName(rel));
++	vacrel->indname = NULL;
++	vacrel->phase = VACUUM_ERRCB_PHASE_UNKNOWN;
++	vacrel->verbose = verbose;
++	errcallback.callback = vacuum_error_callback;
++	errcallback.arg = vacrel;
++	errcallback.previous = error_context_stack;
++	error_context_stack = &errcallback;
++	if (verbose)
++	{
++		Assert(!IsAutoVacuumWorkerProcess());
++		if (aggressive)
++			ereport(INFO,
++					(errmsg("aggressively vacuuming \"%s.%s.%s\"",
++							get_database_name(MyDatabaseId),
++							vacrel->relnamespace, vacrel->relname)));
++		else
++			ereport(INFO,
++					(errmsg("vacuuming \"%s.%s.%s\"",
++							get_database_name(MyDatabaseId),
++							vacrel->relnamespace, vacrel->relname)));
++	}
+ 
+-	/* Set up high level stuff about rel */
++	/* Set up high level stuff about rel and its indexes */
+ 	vacrel->rel = rel;
+ 	vac_open_indexes(vacrel->rel, RowExclusiveLock, &vacrel->nindexes,
+ 					 &vacrel->indrels);
+-	vacrel->failsafe_active = false;
+-	vacrel->consider_bypass_optimization = true;
++	if (instrument && vacrel->nindexes > 0)
++	{
++		/* Copy index names used by instrumentation (not error reporting) */
++		indnames = palloc(sizeof(char *) * vacrel->nindexes);
++		for (int i = 0; i < vacrel->nindexes; i++)
++			indnames[i] = pstrdup(RelationGetRelationName(vacrel->indrels[i]));
++	}
+ 
+ 	/*
+ 	 * The index_cleanup param either disables index vacuuming and cleanup or
+@@ -386,6 +423,8 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
+ 	Assert(params->index_cleanup != VACOPTVALUE_UNSPECIFIED);
+ 	Assert(params->truncate != VACOPTVALUE_UNSPECIFIED &&
+ 		   params->truncate != VACOPTVALUE_AUTO);
++	vacrel->failsafe_active = false;
++	vacrel->consider_bypass_optimization = true;
+ 	vacrel->do_index_vacuuming = true;
+ 	vacrel->do_index_cleanup = true;
+ 	vacrel->do_rel_truncate = (params->truncate != VACOPTVALUE_DISABLED);
+@@ -416,37 +455,6 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
+ 	vacrel->FreezeLimit = FreezeLimit;
+ 	vacrel->MultiXactCutoff = MultiXactCutoff;
+ 
+-	vacrel->relnamespace = get_namespace_name(RelationGetNamespace(rel));
+-	vacrel->relname = pstrdup(RelationGetRelationName(rel));
+-	vacrel->indname = NULL;
+-	vacrel->phase = VACUUM_ERRCB_PHASE_UNKNOWN;
+-
+-	/* Save index names iff autovacuum logging requires it */
+-	if (IsAutoVacuumWorkerProcess() && params->log_min_duration >= 0 &&
+-		vacrel->nindexes > 0)
+-	{
+-		indnames = palloc(sizeof(char *) * vacrel->nindexes);
+-		for (int i = 0; i < vacrel->nindexes; i++)
+-			indnames[i] =
+-				pstrdup(RelationGetRelationName(vacrel->indrels[i]));
+-	}
+-
+-	/*
+-	 * Setup error traceback support for ereport().  The idea is to set up an
+-	 * error context callback to display additional information on any error
+-	 * during a vacuum.  During different phases of vacuum (heap scan, heap
+-	 * vacuum, index vacuum, index clean up, heap truncate), we update the
+-	 * error context callback to display appropriate information.
+-	 *
+-	 * Note that the index vacuum and heap vacuum phases may be called
+-	 * multiple times in the middle of the heap scan phase.  So the old phase
+-	 * information is restored at the end of those phases.
+-	 */
+-	errcallback.callback = vacuum_error_callback;
+-	errcallback.arg = vacrel;
+-	errcallback.previous = error_context_stack;
+-	error_context_stack = &errcallback;
+-
+ 	/*
+ 	 * Call lazy_scan_heap to perform all required heap pruning, index
+ 	 * vacuuming, and heap vacuuming (plus related processing)
+@@ -477,11 +485,6 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
+ 	 */
+ 	if (should_attempt_truncation(vacrel))
+ 	{
+-		/*
+-		 * Update error traceback information.  This is the last phase during
+-		 * which we add context information to errors, so we don't need to
+-		 * revert to the previous phase.
+-		 */
+ 		update_vacuum_error_info(vacrel, NULL, VACUUM_ERRCB_PHASE_TRUNCATE,
+ 								 vacrel->nonempty_pages,
+ 								 InvalidOffsetNumber);
+@@ -544,12 +547,11 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
+ 						 vacrel->new_dead_tuples);
+ 	pgstat_progress_end_command();
+ 
+-	/* and log the action if appropriate */
+-	if (IsAutoVacuumWorkerProcess() && params->log_min_duration >= 0)
++	if (instrument)
+ 	{
+ 		TimestampTz endtime = GetCurrentTimestamp();
+ 
+-		if (params->log_min_duration == 0 ||
++		if (verbose || params->log_min_duration == 0 ||
+ 			TimestampDifferenceExceeds(starttime, endtime,
+ 									   params->log_min_duration))
+ 		{
+@@ -572,12 +574,17 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
+ 					(secs + usecs / 1000000.0);
+ 			}
+ 
+-			/*
+-			 * This is pretty messy, but we split it up so that we can skip
+-			 * emitting individual parts of the message when not applicable.
+-			 */
+ 			initStringInfo(&buf);
+-			if (params->is_wraparound)
++			if (verbose)
++			{
++				/*
++				 * Aggressiveness already reported earlier, in dedicated
++				 * VACUUM VERBOSE ereport
++				 */
++				Assert(!params->is_wraparound);
++				msgfmt = _("finished vacuuming \"%s.%s.%s\": index scans: %d\n");
++			}
++			else if (params->is_wraparound)
+ 			{
+ 				/*
+ 				 * While it's possible for a VACUUM to be both is_wraparound
+@@ -676,7 +683,7 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
+ 							 (unsigned long long) walusage.wal_bytes);
+ 			appendStringInfo(&buf, _("system usage: %s"), pg_rusage_show(&ru0));
+ 
+-			ereport(LOG,
++			ereport(verbose ? INFO : LOG,
+ 					(errmsg_internal("%s", buf.data)));
+ 			pfree(buf.data);
+ 		}
+@@ -688,7 +695,7 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
+ 		if (vacrel->indstats[i])
+ 			pfree(vacrel->indstats[i]);
+ 
+-		if (indnames && indnames[i])
++		if (instrument)
+ 			pfree(indnames[i]);
+ 	}
+ }
+@@ -738,10 +745,8 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
+ 				next_unskippable_block,
+ 				next_failsafe_block,
+ 				next_fsm_block_to_vacuum;
+-	PGRUsage	ru0;
+ 	Buffer		vmbuffer = InvalidBuffer;
+ 	bool		skipping_blocks;
+-	StringInfoData buf;
+ 	const int	initprog_index[] = {
+ 		PROGRESS_VACUUM_PHASE,
+ 		PROGRESS_VACUUM_TOTAL_HEAP_BLKS,
+@@ -750,19 +755,6 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
+ 	int64		initprog_val[3];
+ 	GlobalVisState *vistest;
+ 
+-	pg_rusage_init(&ru0);
+-
+-	if (aggressive)
+-		ereport(elevel,
+-				(errmsg("aggressively vacuuming \"%s.%s\"",
+-						vacrel->relnamespace,
+-						vacrel->relname)));
+-	else
+-		ereport(elevel,
+-				(errmsg("vacuuming \"%s.%s\"",
+-						vacrel->relnamespace,
+-						vacrel->relname)));
+-
+ 	nblocks = RelationGetNumberOfBlocks(vacrel->rel);
+ 	next_unskippable_block = 0;
+ 	next_failsafe_block = 0;
+@@ -1453,52 +1445,6 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
+ 	/* Update index statistics */
+ 	if (vacrel->nindexes > 0 && vacrel->do_index_cleanup)
+ 		update_index_statistics(vacrel);
+-
+-	/*
+-	 * When the table has no indexes (i.e. in the one-pass strategy case),
+-	 * make log report that lazy_vacuum_heap_rel would've made had there been
+-	 * indexes.  (As in the two-pass strategy case, only make this report when
+-	 * there were LP_DEAD line pointers vacuumed in lazy_vacuum_heap_page.)
+-	 */
+-	if (vacrel->nindexes == 0 && vacrel->lpdead_item_pages > 0)
+-		ereport(elevel,
+-				(errmsg("table \"%s\": removed %lld dead item identifiers in %u pages",
+-						vacrel->relname, (long long) vacrel->lpdead_items,
+-						vacrel->lpdead_item_pages)));
+-
+-	/*
+-	 * Make a log report summarizing pruning and freezing.
+-	 *
+-	 * The autovacuum specific logging in heap_vacuum_rel summarizes an entire
+-	 * VACUUM operation, whereas each VACUUM VERBOSE log report generally
+-	 * summarizes a single round of index/heap vacuuming (or rel truncation).
+-	 * It wouldn't make sense to report on pruning or freezing while following
+-	 * that convention, though.  You can think of this log report as a summary
+-	 * of our first pass over the heap.
+-	 */
+-	initStringInfo(&buf);
+-	appendStringInfo(&buf,
+-					 _("%lld dead row versions cannot be removed yet, oldest xmin: %u\n"),
+-					 (long long) vacrel->new_dead_tuples, vacrel->OldestXmin);
+-	appendStringInfo(&buf, ngettext("Skipped %u page due to buffer pins, ",
+-									"Skipped %u pages due to buffer pins, ",
+-									vacrel->pinskipped_pages),
+-					 vacrel->pinskipped_pages);
+-	appendStringInfo(&buf, ngettext("%u frozen page.\n",
+-									"%u frozen pages.\n",
+-									vacrel->frozenskipped_pages),
+-					 vacrel->frozenskipped_pages);
+-	appendStringInfo(&buf, _("%s."), pg_rusage_show(&ru0));
+-
+-	ereport(elevel,
+-			(errmsg("table \"%s.%s\": found %lld removable, %lld nonremovable row versions in %u out of %u pages",
+-					vacrel->relnamespace,
+-					vacrel->relname,
+-					(long long) vacrel->tuples_deleted,
+-					(long long) vacrel->num_tuples, vacrel->scanned_pages,
+-					nblocks),
+-			 errdetail_internal("%s", buf.data)));
+-	pfree(buf.data);
+ }
+ 
+ /*
+@@ -1995,11 +1941,6 @@ lazy_vacuum(LVRelState *vacrel)
+ 		 * calls.)
+ 		 */
+ 		vacrel->do_index_vacuuming = false;
+-		ereport(elevel,
+-				(errmsg("table \"%s\": index scan bypassed: %u pages from table (%.2f%% of total) have %lld dead item identifiers",
+-						vacrel->relname, vacrel->lpdead_item_pages,
+-						100.0 * vacrel->lpdead_item_pages / vacrel->rel_pages,
+-						(long long) vacrel->lpdead_items)));
+ 	}
+ 	else if (lazy_vacuum_all_indexes(vacrel))
+ 	{
+@@ -2142,7 +2083,6 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
+ {
+ 	int			index;
+ 	BlockNumber vacuumed_pages;
+-	PGRUsage	ru0;
+ 	Buffer		vmbuffer = InvalidBuffer;
+ 	LVSavedErrInfo saved_err_info;
+ 
+@@ -2159,7 +2099,6 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
+ 							 VACUUM_ERRCB_PHASE_VACUUM_HEAP,
+ 							 InvalidBlockNumber, InvalidOffsetNumber);
+ 
+-	pg_rusage_init(&ru0);
+ 	vacuumed_pages = 0;
+ 
+ 	index = 0;
+@@ -2206,10 +2145,9 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
+ 		   (index == vacrel->lpdead_items &&
+ 			vacuumed_pages == vacrel->lpdead_item_pages));
+ 
+-	ereport(elevel,
++	ereport(DEBUG2,
+ 			(errmsg("table \"%s\": removed %lld dead item identifiers in %u pages",
+-					vacrel->relname, (long long) index, vacuumed_pages),
+-			 errdetail_internal("%s", pg_rusage_show(&ru0))));
++					vacrel->relname, (long long) index, vacuumed_pages)));
+ 
+ 	/* Revert to the previous phase information for error traceback */
+ 	restore_vacuum_error_info(vacrel, &saved_err_info);
+@@ -2519,7 +2457,7 @@ lazy_vacuum_one_index(Relation indrel, IndexBulkDeleteResult *istat,
+ 	ivinfo.analyze_only = false;
+ 	ivinfo.report_progress = false;
+ 	ivinfo.estimated_count = true;
+-	ivinfo.message_level = elevel;
++	ivinfo.message_level = DEBUG2;
+ 	ivinfo.num_heap_tuples = reltuples;
+ 	ivinfo.strategy = vacrel->bstrategy;
+ 
+@@ -2567,7 +2505,7 @@ lazy_cleanup_one_index(Relation indrel, IndexBulkDeleteResult *istat,
+ 	ivinfo.analyze_only = false;
+ 	ivinfo.report_progress = false;
+ 	ivinfo.estimated_count = estimated_count;
+-	ivinfo.message_level = elevel;
++	ivinfo.message_level = DEBUG2;
+ 
+ 	ivinfo.num_heap_tuples = reltuples;
+ 	ivinfo.strategy = vacrel->bstrategy;
+@@ -2653,10 +2591,6 @@ lazy_truncate_heap(LVRelState *vacrel)
+ 	 */
+ 	do
+ 	{
+-		PGRUsage	ru0;
+-
+-		pg_rusage_init(&ru0);
+-
+ 		/*
+ 		 * We need full exclusive lock on the relation in order to do
+ 		 * truncation. If we can't get it, give up rather than waiting --- we
+@@ -2684,7 +2618,7 @@ lazy_truncate_heap(LVRelState *vacrel)
+ 				 * We failed to establish the lock in the specified number of
+ 				 * retries. This means we give up truncating.
+ 				 */
+-				ereport(elevel,
++				ereport(vacrel->verbose ? INFO : DEBUG2,
+ 						(errmsg("\"%s\": stopping truncate due to conflicting lock request",
+ 								vacrel->relname)));
+ 				return;
+@@ -2754,12 +2688,10 @@ lazy_truncate_heap(LVRelState *vacrel)
+ 		vacrel->pages_removed += orig_rel_pages - new_rel_pages;
+ 		vacrel->rel_pages = new_rel_pages;
+ 
+-		ereport(elevel,
++		ereport(vacrel->verbose ? INFO : DEBUG2,
+ 				(errmsg("table \"%s\": truncated %u to %u pages",
+ 						vacrel->relname,
+-						orig_rel_pages, new_rel_pages),
+-				 errdetail_internal("%s",
+-									pg_rusage_show(&ru0))));
++						orig_rel_pages, new_rel_pages)));
+ 		orig_rel_pages = new_rel_pages;
+ 	} while (new_rel_pages > vacrel->nonempty_pages && lock_waiter_detected);
+ }
+@@ -2818,7 +2750,7 @@ count_nondeletable_pages(LVRelState *vacrel, bool *lock_waiter_detected)
+ 			{
+ 				if (LockHasWaitersRelation(vacrel->rel, AccessExclusiveLock))
+ 				{
+-					ereport(elevel,
++					ereport(vacrel->verbose ? INFO : DEBUG2,
+ 							(errmsg("table \"%s\": suspending truncate due to conflicting lock request",
+ 									vacrel->relname)));
+ 
+@@ -2985,7 +2917,8 @@ dead_items_alloc(LVRelState *vacrel, int nworkers)
+ 		else
+ 			vacrel->pvs = parallel_vacuum_init(vacrel->rel, vacrel->indrels,
+ 											   vacrel->nindexes, nworkers,
+-											   max_items, elevel,
++											   max_items,
++											   vacrel->verbose ? INFO : DEBUG2,
+ 											   vacrel->bstrategy);
+ 
+ 		/* If parallel mode started, dead_items space is allocated in DSM */
+diff --git a/src/backend/commands/vacuum.c b/src/backend/commands/vacuum.c
+index 287098e4d098..283ffaea77d8 100644
+--- a/src/backend/commands/vacuum.c
++++ b/src/backend/commands/vacuum.c
+@@ -268,7 +268,7 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
+ 	/* user-invoked vacuum is never "for wraparound" */
+ 	params.is_wraparound = false;
+ 
+-	/* user-invoked vacuum never uses this parameter */
++	/* user-invoked vacuum uses VACOPT_VERBOSE instead of log_min_duration */
+ 	params.log_min_duration = -1;
+ 
+ 	/* Now go through the common routine */
+@@ -2275,10 +2275,6 @@ IndexBulkDeleteResult *
+ vac_bulkdel_one_index(IndexVacuumInfo *ivinfo, IndexBulkDeleteResult *istat,
+ 					  VacDeadItems *dead_items)
+ {
+-	PGRUsage	ru0;
+-
+-	pg_rusage_init(&ru0);
+-
+ 	/* Do bulk deletion */
+ 	istat = index_bulk_delete(ivinfo, istat, vac_tid_reaped,
+ 							  (void *) dead_items);
+@@ -2286,8 +2282,7 @@ vac_bulkdel_one_index(IndexVacuumInfo *ivinfo, IndexBulkDeleteResult *istat,
+ 	ereport(ivinfo->message_level,
+ 			(errmsg("scanned index \"%s\" to remove %d row versions",
+ 					RelationGetRelationName(ivinfo->index),
+-					dead_items->num_items),
+-			 errdetail_internal("%s", pg_rusage_show(&ru0))));
++					dead_items->num_items)));
+ 
+ 	return istat;
+ }
+@@ -2300,14 +2295,9 @@ vac_bulkdel_one_index(IndexVacuumInfo *ivinfo, IndexBulkDeleteResult *istat,
+ IndexBulkDeleteResult *
+ vac_cleanup_one_index(IndexVacuumInfo *ivinfo, IndexBulkDeleteResult *istat)
+ {
+-	PGRUsage	ru0;
+-
+-	pg_rusage_init(&ru0);
+-
+ 	istat = index_vacuum_cleanup(ivinfo, istat);
+ 
+ 	if (istat)
+-	{
+ 		ereport(ivinfo->message_level,
+ 				(errmsg("index \"%s\" now contains %.0f row versions in %u pages",
+ 						RelationGetRelationName(ivinfo->index),
+@@ -2315,13 +2305,10 @@ vac_cleanup_one_index(IndexVacuumInfo *ivinfo, IndexBulkDeleteResult *istat)
+ 						istat->num_pages),
+ 				 errdetail("%.0f index row versions were removed.\n"
+ 						   "%u index pages were newly deleted.\n"
+-						   "%u index pages are currently deleted, of which %u are currently reusable.\n"
+-						   "%s.",
++						   "%u index pages are currently deleted, of which %u are currently reusable.",
+ 						   istat->tuples_removed,
+ 						   istat->pages_newly_deleted,
+-						   istat->pages_deleted, istat->pages_free,
+-						   pg_rusage_show(&ru0))));
+-	}
++						   istat->pages_deleted, istat->pages_free)));
+ 
+ 	return istat;
+ }
+diff --git a/src/backend/commands/vacuumparallel.c b/src/backend/commands/vacuumparallel.c
+index 53a59da2d64d..974a29e7a968 100644
+--- a/src/backend/commands/vacuumparallel.c
++++ b/src/backend/commands/vacuumparallel.c
+@@ -55,7 +55,8 @@
+ typedef struct PVShared
+ {
+ 	/*
+-	 * Target table relid and log level.  These fields are not modified during
++	 * Target table relid and log level (for messages about parallel workers
++	 * launched during VACUUM VERBOSE).  These fields are not modified during
+ 	 * the parallel vacuum.
+ 	 */
+ 	Oid			relid;
+@@ -830,7 +831,7 @@ parallel_vacuum_process_one_index(ParallelVacuumState *pvs, Relation indrel,
+ 	ivinfo.index = indrel;
+ 	ivinfo.analyze_only = false;
+ 	ivinfo.report_progress = false;
+-	ivinfo.message_level = pvs->shared->elevel;
++	ivinfo.message_level = DEBUG2;
+ 	ivinfo.estimated_count = pvs->shared->estimated_count;
+ 	ivinfo.num_heap_tuples = pvs->shared->reltuples;
+ 	ivinfo.strategy = pvs->bstrategy;
+diff --git a/src/include/commands/vacuum.h b/src/include/commands/vacuum.h
+index f8a7b3664a59..5d0bdfa42791 100644
+--- a/src/include/commands/vacuum.h
++++ b/src/include/commands/vacuum.h
+@@ -182,7 +182,7 @@ typedef struct VacAttrStats
+ /* flag bits for VacuumParams->options */
+ #define VACOPT_VACUUM 0x01		/* do VACUUM */
+ #define VACOPT_ANALYZE 0x02		/* do ANALYZE */
+-#define VACOPT_VERBOSE 0x04		/* print progress info */
++#define VACOPT_VERBOSE 0x04		/* output INFO instrumentation messages */
+ #define VACOPT_FREEZE 0x08		/* FREEZE option */
+ #define VACOPT_FULL 0x10		/* FULL (non-concurrent) vacuum */
+ #define VACOPT_SKIP_LOCKED 0x20 /* skip if cannot get lock */
+@@ -222,8 +222,8 @@ typedef struct VacuumParams
+ 											 * whole table */
+ 	bool		is_wraparound;	/* force a for-wraparound vacuum */
+ 	int			log_min_duration;	/* minimum execution threshold in ms at
+-									 * which  verbose logs are activated, -1
+-									 * to use default */
++									 * which autovacuum is logged, -1 to use
++									 * default */
+ 	VacOptValue index_cleanup;	/* Do index vacuum and cleanup */
+ 	VacOptValue truncate;		/* Truncate empty pages at the end */
+ 

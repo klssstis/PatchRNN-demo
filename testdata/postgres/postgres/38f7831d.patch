@@ -1,0 +1,140 @@
+From 38f7831d703be98aaece8af6625faeab5123a02c Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 13 Mar 2018 12:28:15 -0400
+Subject: [PATCH] Avoid holding AutovacuumScheduleLock while rechecking table
+ statistics.
+
+In databases with many tables, re-fetching the statistics takes some time,
+so that this behavior seriously decreases the available concurrency for
+multiple autovac workers.  There's discussion afoot about more complete
+fixes, but a simple and back-patchable amelioration is to claim the table
+and release the lock before rechecking stats.  If we find out there's no
+longer a reason to process the table, re-taking the lock to un-claim the
+table is cheap enough.
+
+(This patch is quite old, but got lost amongst a discussion of more
+aggressive fixes.  It's not clear when or if such a fix will be
+accepted, but in any case it'd be unlikely to get back-patched.
+Let's do this now so we have some improvement for the back branches.)
+
+In passing, make the normal un-claim step take AutovacuumScheduleLock
+not AutovacuumLock, since that is what is documented to protect the
+wi_tableoid field.  This wasn't an actual bug in view of the fact that
+readers of that field hold both locks, but it creates some concurrency
+penalty against operations that need only AutovacuumLock.
+
+Back-patch to all supported versions.
+
+Jeff Janes
+
+Discussion: https://postgr.es/m/26118.1520865816@sss.pgh.pa.us
+---
+ src/backend/postmaster/autovacuum.c | 53 ++++++++++++++++++++---------
+ 1 file changed, 37 insertions(+), 16 deletions(-)
+
+diff --git a/src/backend/postmaster/autovacuum.c b/src/backend/postmaster/autovacuum.c
+index 21f5e2ce9560..639bd716b1ec 100644
+--- a/src/backend/postmaster/autovacuum.c
++++ b/src/backend/postmaster/autovacuum.c
+@@ -212,9 +212,9 @@ typedef struct autovac_table
+  * wi_launchtime Time at which this worker was launched
+  * wi_cost_*	Vacuum cost-based delay parameters current in this worker
+  *
+- * All fields are protected by AutovacuumLock, except for wi_tableoid which is
+- * protected by AutovacuumScheduleLock (which is read-only for everyone except
+- * that worker itself).
++ * All fields are protected by AutovacuumLock, except for wi_tableoid and
++ * wi_sharedrel which are protected by AutovacuumScheduleLock (note these
++ * two fields are read-only for everyone except that worker itself).
+  *-------------
+  */
+ typedef struct WorkerInfoData
+@@ -2317,7 +2317,9 @@ do_autovacuum(void)
+ 	foreach(cell, table_oids)
+ 	{
+ 		Oid			relid = lfirst_oid(cell);
++		HeapTuple	classTup;
+ 		autovac_table *tab;
++		bool		isshared;
+ 		bool		skipit;
+ 		int			stdVacuumCostDelay;
+ 		int			stdVacuumCostLimit;
+@@ -2342,9 +2344,23 @@ do_autovacuum(void)
+ 		}
+ 
+ 		/*
+-		 * hold schedule lock from here until we're sure that this table still
+-		 * needs vacuuming.  We also need the AutovacuumLock to walk the
+-		 * worker array, but we'll let go of that one quickly.
++		 * Find out whether the table is shared or not.  (It's slightly
++		 * annoying to fetch the syscache entry just for this, but in typical
++		 * cases it adds little cost because table_recheck_autovac would
++		 * refetch the entry anyway.  We could buy that back by copying the
++		 * tuple here and passing it to table_recheck_autovac, but that
++		 * increases the odds of that function working with stale data.)
++		 */
++		classTup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
++		if (!HeapTupleIsValid(classTup))
++			continue;			/* somebody deleted the rel, forget it */
++		isshared = ((Form_pg_class) GETSTRUCT(classTup))->relisshared;
++		ReleaseSysCache(classTup);
++
++		/*
++		 * Hold schedule lock from here until we've claimed the table.  We
++		 * also need the AutovacuumLock to walk the worker array, but that one
++		 * can just be a shared lock.
+ 		 */
+ 		LWLockAcquire(AutovacuumScheduleLock, LW_EXCLUSIVE);
+ 		LWLockAcquire(AutovacuumLock, LW_SHARED);
+@@ -2380,6 +2396,16 @@ do_autovacuum(void)
+ 			continue;
+ 		}
+ 
++		/*
++		 * Store the table's OID in shared memory before releasing the
++		 * schedule lock, so that other workers don't try to vacuum it
++		 * concurrently.  (We claim it here so as not to hold
++		 * AutovacuumScheduleLock while rechecking the stats.)
++		 */
++		MyWorkerInfo->wi_tableoid = relid;
++		MyWorkerInfo->wi_sharedrel = isshared;
++		LWLockRelease(AutovacuumScheduleLock);
++
+ 		/*
+ 		 * Check whether pgstat data still says we need to vacuum this table.
+ 		 * It could have changed if something else processed the table while
+@@ -2396,18 +2422,13 @@ do_autovacuum(void)
+ 		if (tab == NULL)
+ 		{
+ 			/* someone else vacuumed the table, or it went away */
++			LWLockAcquire(AutovacuumScheduleLock, LW_EXCLUSIVE);
++			MyWorkerInfo->wi_tableoid = InvalidOid;
++			MyWorkerInfo->wi_sharedrel = false;
+ 			LWLockRelease(AutovacuumScheduleLock);
+ 			continue;
+ 		}
+ 
+-		/*
+-		 * Ok, good to go.  Store the table in shared memory before releasing
+-		 * the lock so that other workers don't vacuum it concurrently.
+-		 */
+-		MyWorkerInfo->wi_tableoid = relid;
+-		MyWorkerInfo->wi_sharedrel = tab->at_sharedrel;
+-		LWLockRelease(AutovacuumScheduleLock);
+-
+ 		/*
+ 		 * Remember the prevailing values of the vacuum cost GUCs.  We have to
+ 		 * restore these at the bottom of the loop, else we'll compute wrong
+@@ -2522,10 +2543,10 @@ do_autovacuum(void)
+ 		 * settings, so we don't want to give up our share of I/O for a very
+ 		 * short interval and thereby thrash the global balance.
+ 		 */
+-		LWLockAcquire(AutovacuumLock, LW_EXCLUSIVE);
++		LWLockAcquire(AutovacuumScheduleLock, LW_EXCLUSIVE);
+ 		MyWorkerInfo->wi_tableoid = InvalidOid;
+ 		MyWorkerInfo->wi_sharedrel = false;
+-		LWLockRelease(AutovacuumLock);
++		LWLockRelease(AutovacuumScheduleLock);
+ 
+ 		/* restore vacuum cost GUCs for the next iteration */
+ 		VacuumCostDelay = stdVacuumCostDelay;

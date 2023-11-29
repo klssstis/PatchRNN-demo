@@ -1,0 +1,199 @@
+From 38bb3aef354ca98ff88cb37337995039a3b5135f Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 16 Feb 2021 12:07:14 -0500
+Subject: [PATCH] Convert tsginidx.c's GIN indexing logic to fully ternary
+ operation.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Commit 2f2007fbb did this partially, but there were two remaining
+warts.  checkcondition_gin handled some uncertain cases by setting
+the out-of-band recheck flag, some by returning TS_MAYBE, and some
+by doing both.  Meanwhile, TS_execute arbitrarily converted a
+TS_MAYBE result to TS_YES.  Thus, if checkcondition_gin chose to
+only return TS_MAYBE, the outcome would be TS_YES with no recheck
+flag, potentially resulting in wrong query outputs.
+
+The case where this'd happen is if there were GIN_MAYBE entries
+in the indexscan results passed to gin_tsquery_[tri]consistent,
+which so far as I can see would only happen if the tidbitmap used
+to accumulate indexscan results grew large enough to become lossy.
+
+I initially thought of fixing this by ensuring we always set the
+recheck flag as well as returning TS_MAYBE in uncertain cases.
+But that errs in the other direction, potentially forcing rechecks
+of rows that provably match the query (since the recheck flag
+remains set even if TS_execute later finds that the answer must be
+TS_YES).  Instead, let's get rid of the out-of-band recheck flag
+altogether and rely on returning TS_MAYBE.  This requires exporting
+a version of TS_execute that will actually return the full ternary
+result of the evaluation ... but we likely should have done that
+to start with.
+
+Unfortunately it doesn't seem practical to add a regression test case
+that covers this: the amount of data needed to cause the GIN bitmap to
+become lossy results in a longer runtime than I think we want to have
+in the tests.  (I'm wondering about allowing smaller work_mem settings
+to ameliorate that, but it'd be a matter for a separate patch.)
+
+Per bug #16865 from Dimitri Nüscheler.  Back-patch to v13 where
+the faulty commit came in.
+
+Discussion: https://postgr.es/m/16865-4ffdc3e682e6d75b@postgresql.org
+---
+ src/backend/utils/adt/tsginidx.c    | 57 +++++++++++++++--------------
+ src/backend/utils/adt/tsvector_op.c | 12 ++++++
+ src/include/tsearch/ts_utils.h      |  3 ++
+ 3 files changed, 44 insertions(+), 28 deletions(-)
+
+diff --git a/src/backend/utils/adt/tsginidx.c b/src/backend/utils/adt/tsginidx.c
+index 6c913baabacd..7e0e31f69df6 100644
+--- a/src/backend/utils/adt/tsginidx.c
++++ b/src/backend/utils/adt/tsginidx.c
+@@ -175,7 +175,6 @@ typedef struct
+ 	QueryItem  *first_item;
+ 	GinTernaryValue *check;
+ 	int		   *map_item_operand;
+-	bool	   *need_recheck;
+ } GinChkVal;
+ 
+ /*
+@@ -186,25 +185,22 @@ checkcondition_gin(void *checkval, QueryOperand *val, ExecPhraseData *data)
+ {
+ 	GinChkVal  *gcv = (GinChkVal *) checkval;
+ 	int			j;
+-
+-	/*
+-	 * if any val requiring a weight is used or caller needs position
+-	 * information then set recheck flag
+-	 */
+-	if (val->weight != 0 || data != NULL)
+-		*(gcv->need_recheck) = true;
++	GinTernaryValue result;
+ 
+ 	/* convert item's number to corresponding entry's (operand's) number */
+ 	j = gcv->map_item_operand[((QueryItem *) val) - gcv->first_item];
+ 
++	/* determine presence of current entry in indexed value */
++	result = gcv->check[j];
++
+ 	/*
+-	 * return presence of current entry in indexed value; but TRUE becomes
+-	 * MAYBE in the presence of a query requiring recheck
++	 * If any val requiring a weight is used or caller needs position
++	 * information then we must recheck, so replace TRUE with MAYBE.
+ 	 */
+-	if (gcv->check[j] == GIN_TRUE)
++	if (result == GIN_TRUE)
+ 	{
+ 		if (val->weight != 0 || data != NULL)
+-			return TS_MAYBE;
++			result = GIN_MAYBE;
+ 	}
+ 
+ 	/*
+@@ -212,7 +208,7 @@ checkcondition_gin(void *checkval, QueryOperand *val, ExecPhraseData *data)
+ 	 * assignments.  We could use a switch statement to map the values if that
+ 	 * ever stops being true, but it seems unlikely to happen.
+ 	 */
+-	return (TSTernaryValue) gcv->check[j];
++	return (TSTernaryValue) result;
+ }
+ 
+ Datum
+@@ -244,12 +240,23 @@ gin_tsquery_consistent(PG_FUNCTION_ARGS)
+ 						 "sizes of GinTernaryValue and bool are not equal");
+ 		gcv.check = (GinTernaryValue *) check;
+ 		gcv.map_item_operand = (int *) (extra_data[0]);
+-		gcv.need_recheck = recheck;
+ 
+-		res = TS_execute(GETQUERY(query),
+-						 &gcv,
+-						 TS_EXEC_PHRASE_NO_POS,
+-						 checkcondition_gin);
++		switch (TS_execute_ternary(GETQUERY(query),
++								   &gcv,
++								   TS_EXEC_PHRASE_NO_POS,
++								   checkcondition_gin))
++		{
++			case TS_NO:
++				res = false;
++				break;
++			case TS_YES:
++				res = true;
++				break;
++			case TS_MAYBE:
++				res = true;
++				*recheck = true;
++				break;
++		}
+ 	}
+ 
+ 	PG_RETURN_BOOL(res);
+@@ -266,10 +273,6 @@ gin_tsquery_triconsistent(PG_FUNCTION_ARGS)
+ 	/* int32	nkeys = PG_GETARG_INT32(3); */
+ 	Pointer    *extra_data = (Pointer *) PG_GETARG_POINTER(4);
+ 	GinTernaryValue res = GIN_FALSE;
+-	bool		recheck;
+-
+-	/* Initially assume query doesn't require recheck */
+-	recheck = false;
+ 
+ 	if (query->size > 0)
+ 	{
+@@ -282,13 +285,11 @@ gin_tsquery_triconsistent(PG_FUNCTION_ARGS)
+ 		gcv.first_item = GETQUERY(query);
+ 		gcv.check = check;
+ 		gcv.map_item_operand = (int *) (extra_data[0]);
+-		gcv.need_recheck = &recheck;
+ 
+-		if (TS_execute(GETQUERY(query),
+-					   &gcv,
+-					   TS_EXEC_PHRASE_NO_POS,
+-					   checkcondition_gin))
+-			res = recheck ? GIN_MAYBE : GIN_TRUE;
++		res = TS_execute_ternary(GETQUERY(query),
++								 &gcv,
++								 TS_EXEC_PHRASE_NO_POS,
++								 checkcondition_gin);
+ 	}
+ 
+ 	PG_RETURN_GIN_TERNARY_VALUE(res);
+diff --git a/src/backend/utils/adt/tsvector_op.c b/src/backend/utils/adt/tsvector_op.c
+index 2939fb5c2103..9236ebcc8fe5 100644
+--- a/src/backend/utils/adt/tsvector_op.c
++++ b/src/backend/utils/adt/tsvector_op.c
+@@ -1854,6 +1854,18 @@ TS_execute(QueryItem *curitem, void *arg, uint32 flags,
+ 	return TS_execute_recurse(curitem, arg, flags, chkcond) != TS_NO;
+ }
+ 
++/*
++ * Evaluate tsquery boolean expression.
++ *
++ * This is the same as TS_execute except that TS_MAYBE is returned as-is.
++ */
++TSTernaryValue
++TS_execute_ternary(QueryItem *curitem, void *arg, uint32 flags,
++				   TSExecuteCallback chkcond)
++{
++	return TS_execute_recurse(curitem, arg, flags, chkcond);
++}
++
+ /*
+  * TS_execute recursion for operators above any phrase operator.  Here we do
+  * not need to worry about lexeme positions.  As soon as we hit an OP_PHRASE
+diff --git a/src/include/tsearch/ts_utils.h b/src/include/tsearch/ts_utils.h
+index 69a9ba8524ed..4266560151f1 100644
+--- a/src/include/tsearch/ts_utils.h
++++ b/src/include/tsearch/ts_utils.h
+@@ -199,6 +199,9 @@ typedef TSTernaryValue (*TSExecuteCallback) (void *arg, QueryOperand *val,
+ 
+ extern bool TS_execute(QueryItem *curitem, void *arg, uint32 flags,
+ 					   TSExecuteCallback chkcond);
++extern TSTernaryValue TS_execute_ternary(QueryItem *curitem, void *arg,
++										 uint32 flags,
++										 TSExecuteCallback chkcond);
+ extern bool tsquery_requires_match(QueryItem *curitem);
+ 
+ /*

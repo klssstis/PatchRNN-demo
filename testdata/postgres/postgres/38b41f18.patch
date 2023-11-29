@@ -1,0 +1,161 @@
+From 38b41f182a66b67e36e2adf53d078599b1b65483 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 21 Feb 2018 18:40:24 -0500
+Subject: [PATCH] Repair pg_upgrade's failure to preserve relfrozenxid for
+ matviews.
+
+This oversight led to data corruption in matviews, manifesting as
+"could not access status of transaction" before our most recent releases,
+and "found xmin from before relfrozenxid" errors since then.
+
+The proximate cause of the problem seems to have been confusion between
+the task of preserving dropped-column status and the task of preserving
+frozenxid status.  Those are required for distinct sets of relkinds,
+and the reasoning was entirely undocumented in the source code.  In hopes
+of forestalling future errors of the same kind, try to improve the
+commentary in this area.
+
+In passing, also improve the remarkably unhelpful comments around
+pg_upgrade's set_frozenxids().  That's not actually buggy AFAICS,
+but good luck figuring out what it does from the old comments.
+
+Per report from Claudio Freire.  It appears that bug #14852 from Alexey
+Ermakov is an earlier report of the same issue, and there may be other
+cases that we failed to identify at the time.
+
+Patch by me based on analysis by Andres Freund.  The bug dates back
+to the introduction of matviews, so back-patch to all supported branches.
+
+Discussion: https://postgr.es/m/CAGTBQpbrY9CdRGGhyBZ9yqY4jWaGC85rUF4X+R7d-aim=mBNsw@mail.gmail.com
+Discussion: https://postgr.es/m/20171013115320.28049.86457@wrigleys.postgresql.org
+---
+ src/bin/pg_dump/pg_dump.c       | 31 ++++++++++++++++++++++++++++---
+ src/bin/pg_upgrade/pg_upgrade.c | 33 ++++++++++++++++++++++-----------
+ 2 files changed, 50 insertions(+), 14 deletions(-)
+
+diff --git a/src/bin/pg_dump/pg_dump.c b/src/bin/pg_dump/pg_dump.c
+index 0ffb3725e01a..f7a079f0b1d6 100644
+--- a/src/bin/pg_dump/pg_dump.c
++++ b/src/bin/pg_dump/pg_dump.c
+@@ -6548,7 +6548,8 @@ getTables(Archive *fout, int *numTables)
+ 		 * alterations to parent tables.
+ 		 *
+ 		 * NOTE: it'd be kinda nice to lock other relations too, not only
+-		 * plain tables, but the backend doesn't presently allow that.
++		 * plain or partitioned tables, but the backend doesn't presently
++		 * allow that.
+ 		 *
+ 		 * We only need to lock the table for certain components; see
+ 		 * pg_dump.h
+@@ -15898,6 +15899,14 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 		 * column order.  That also means we have to take care about setting
+ 		 * attislocal correctly, plus fix up any inherited CHECK constraints.
+ 		 * Analogously, we set up typed tables using ALTER TABLE / OF here.
++		 *
++		 * We process foreign and partitioned tables here, even though they
++		 * lack heap storage, because they can participate in inheritance
++		 * relationships and we want this stuff to be consistent across the
++		 * inheritance tree.  We can exclude indexes, toast tables, sequences
++		 * and matviews, even though they have storage, because we don't
++		 * support altering or dropping columns in them, nor can they be part
++		 * of inheritance trees.
+ 		 */
+ 		if (dopt->binary_upgrade &&
+ 			(tbinfo->relkind == RELKIND_RELATION ||
+@@ -16009,7 +16018,19 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 								  fmtId(tbinfo->dobj.name),
+ 								  tbinfo->reloftype);
+ 			}
++		}
+ 
++		/*
++		 * In binary_upgrade mode, arrange to restore the old relfrozenxid and
++		 * relminmxid of all vacuumable relations.  (While vacuum.c processes
++		 * TOAST tables semi-independently, here we see them only as children
++		 * of other relations; so this "if" lacks RELKIND_TOASTVALUE, and the
++		 * child toast table is handled below.)
++		 */
++		if (dopt->binary_upgrade &&
++			(tbinfo->relkind == RELKIND_RELATION ||
++			 tbinfo->relkind == RELKIND_MATVIEW))
++		{
+ 			appendPQExpBufferStr(q, "\n-- For binary upgrade, set heap's relfrozenxid and relminmxid\n");
+ 			appendPQExpBuffer(q, "UPDATE pg_catalog.pg_class\n"
+ 							  "SET relfrozenxid = '%u', relminmxid = '%u'\n"
+@@ -16020,7 +16041,10 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 
+ 			if (tbinfo->toast_oid)
+ 			{
+-				/* We preserve the toast oids, so we can use it during restore */
++				/*
++				 * The toast table will have the same OID at restore, so we
++				 * can safely target it by OID.
++				 */
+ 				appendPQExpBufferStr(q, "\n-- For binary upgrade, set toast's relfrozenxid and relminmxid\n");
+ 				appendPQExpBuffer(q, "UPDATE pg_catalog.pg_class\n"
+ 								  "SET relfrozenxid = '%u', relminmxid = '%u'\n"
+@@ -16034,7 +16058,8 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 		 * In binary_upgrade mode, restore matviews' populated status by
+ 		 * poking pg_class directly.  This is pretty ugly, but we can't use
+ 		 * REFRESH MATERIALIZED VIEW since it's possible that some underlying
+-		 * matview is not populated even though this matview is.
++		 * matview is not populated even though this matview is; in any case,
++		 * we want to transfer the matview's heap storage, not run REFRESH.
+ 		 */
+ 		if (dopt->binary_upgrade && tbinfo->relkind == RELKIND_MATVIEW &&
+ 			tbinfo->relispopulated)
+diff --git a/src/bin/pg_upgrade/pg_upgrade.c b/src/bin/pg_upgrade/pg_upgrade.c
+index 3f57a25b05f7..bbfa4c1ef388 100644
+--- a/src/bin/pg_upgrade/pg_upgrade.c
++++ b/src/bin/pg_upgrade/pg_upgrade.c
+@@ -278,13 +278,13 @@ static void
+ prepare_new_globals(void)
+ {
+ 	/*
+-	 * We set autovacuum_freeze_max_age to its maximum value so autovacuum
+-	 * does not launch here and delete clog files, before the frozen xids are
+-	 * set.
++	 * Before we restore anything, set frozenxids of initdb-created tables.
+ 	 */
+-
+ 	set_frozenxids(false);
+ 
++	/*
++	 * Now restore global objects (roles and tablespaces).
++	 */
+ 	prep_status("Restoring global objects in the new cluster");
+ 
+ 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+@@ -506,14 +506,25 @@ copy_xact_xlog_xid(void)
+ /*
+  *	set_frozenxids()
+  *
+- *	We have frozen all xids, so set datfrozenxid, relfrozenxid, and
+- *	relminmxid to be the old cluster's xid counter, which we just set
+- *	in the new cluster.  User-table frozenxid and minmxid values will
+- *	be set by pg_dump --binary-upgrade, but objects not set by the pg_dump
+- *	must have proper frozen counters.
++ * This is called on the new cluster before we restore anything, with
++ * minmxid_only = false.  Its purpose is to ensure that all initdb-created
++ * vacuumable tables have relfrozenxid/relminmxid matching the old cluster's
++ * xid/mxid counters.  We also initialize the datfrozenxid/datminmxid of the
++ * built-in databases to match.
++ *
++ * As we create user tables later, their relfrozenxid/relminmxid fields will
++ * be restored properly by the binary-upgrade restore script.  Likewise for
++ * user-database datfrozenxid/datminmxid.  However, if we're upgrading from a
++ * pre-9.3 database, which does not store per-table or per-DB minmxid, then
++ * the relminmxid/datminmxid values filled in by the restore script will just
++ * be zeroes.
++ *
++ * Hence, with a pre-9.3 source database, a second call occurs after
++ * everything is restored, with minmxid_only = true.  This pass will
++ * initialize all tables and databases, both those made by initdb and user
++ * objects, with the desired minmxid value.  frozenxid values are left alone.
+  */
+-static
+-void
++static void
+ set_frozenxids(bool minmxid_only)
+ {
+ 	int			dbnum;

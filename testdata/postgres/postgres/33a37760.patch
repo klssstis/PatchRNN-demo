@@ -1,0 +1,1392 @@
+From 33a377608fc29cdd1f6b63be561eab0aee5c81f0 Mon Sep 17 00:00:00 2001
+From: Andrew Dunstan <andrew@dunslane.net>
+Date: Thu, 3 Mar 2022 13:02:53 -0500
+Subject: [PATCH] IS JSON predicate
+
+This patch intrdocuces the SQL standard IS JSON predicate. It operates
+on text and bytea values representing JSON as well as on the json and
+jsonb types. Each test has an IS and IS NOT variant. The tests are:
+
+IS JSON [VALUE]
+IS JSON ARRAY
+IS JSON OBJECT
+IS JSON SCALAR
+IS JSON  WITH | WITHOUT UNIQUE KEYS
+
+These are mostly self-explanatory, but note that IS JSON WITHOUT UNIQUE
+KEYS is true whenever IS JSON is true, and IS JSON WITH UNIQUE KEYS is
+true whenever IS JSON is true except it IS JSON OBJECT is true and there
+are duplicate keys (which is never the case when applied to jsonb values).
+
+Nikita Glukhov
+
+Reviewers have included (in no particular order) Andres Freund, Alexander
+Korotkov, Pavel Stehule, Andrew Alsup, Erik Rijkers, Zihong Yu,
+Himanshu Upadhyaya, Daniel Gustafsson, Justin Pryzby.
+
+Discussion: https://postgr.es/m/cd0bb935-0158-78a7-08b5-904886deac4b@postgrespro.ru
+---
+ src/backend/executor/execExpr.c       |  13 ++
+ src/backend/executor/execExprInterp.c |  95 ++++++++++++
+ src/backend/jit/llvm/llvmjit_expr.c   |   6 +
+ src/backend/jit/llvm/llvmjit_types.c  |   1 +
+ src/backend/nodes/copyfuncs.c         |  20 +++
+ src/backend/nodes/equalfuncs.c        |  15 ++
+ src/backend/nodes/makefuncs.c         |  19 +++
+ src/backend/nodes/nodeFuncs.c         |  26 ++++
+ src/backend/nodes/outfuncs.c          |  14 ++
+ src/backend/nodes/readfuncs.c         |  18 +++
+ src/backend/parser/gram.y             |  63 +++++++-
+ src/backend/parser/parse_expr.c       |  76 ++++++++++
+ src/backend/utils/adt/json.c          | 105 ++++++++++++--
+ src/backend/utils/adt/jsonfuncs.c     |  20 +++
+ src/backend/utils/adt/ruleutils.c     |  35 +++++
+ src/backend/utils/misc/queryjumble.c  |  10 ++
+ src/include/executor/execExpr.h       |   8 ++
+ src/include/nodes/makefuncs.h         |   3 +
+ src/include/nodes/nodes.h             |   1 +
+ src/include/nodes/primnodes.h         |  26 ++++
+ src/include/parser/kwlist.h           |   1 +
+ src/include/utils/json.h              |   1 +
+ src/include/utils/jsonfuncs.h         |   3 +
+ src/test/regress/expected/sqljson.out | 198 ++++++++++++++++++++++++++
+ src/test/regress/sql/sqljson.sql      |  96 +++++++++++++
+ 25 files changed, 856 insertions(+), 17 deletions(-)
+
+diff --git a/src/backend/executor/execExpr.c b/src/backend/executor/execExpr.c
+index a9547aaef153..acd3ea613440 100644
+--- a/src/backend/executor/execExpr.c
++++ b/src/backend/executor/execExpr.c
+@@ -2513,6 +2513,19 @@ ExecInitExprRec(Expr *node, ExprState *state,
+ 			}
+ 			break;
+ 
++		case T_JsonIsPredicate:
++			{
++				JsonIsPredicate *pred = (JsonIsPredicate *) node;
++
++				ExecInitExprRec((Expr *) pred->expr, state, resv, resnull);
++
++				scratch.opcode = EEOP_IS_JSON;
++				scratch.d.is_json.pred = pred;
++
++				ExprEvalPushStep(state, &scratch);
++				break;
++			}
++
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+diff --git a/src/backend/executor/execExprInterp.c b/src/backend/executor/execExprInterp.c
+index f2a0821a7abf..c0bd9556209d 100644
+--- a/src/backend/executor/execExprInterp.c
++++ b/src/backend/executor/execExprInterp.c
+@@ -73,6 +73,7 @@
+ #include "utils/expandedrecord.h"
+ #include "utils/json.h"
+ #include "utils/jsonb.h"
++#include "utils/jsonfuncs.h"
+ #include "utils/lsyscache.h"
+ #include "utils/memutils.h"
+ #include "utils/timestamp.h"
+@@ -480,6 +481,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
+ 		&&CASE_EEOP_WINDOW_FUNC,
+ 		&&CASE_EEOP_SUBPLAN,
+ 		&&CASE_EEOP_JSON_CONSTRUCTOR,
++		&&CASE_EEOP_IS_JSON,
+ 		&&CASE_EEOP_AGG_STRICT_DESERIALIZE,
+ 		&&CASE_EEOP_AGG_DESERIALIZE,
+ 		&&CASE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS,
+@@ -1799,6 +1801,14 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
+ 			EEO_NEXT();
+ 		}
+ 
++		EEO_CASE(EEOP_IS_JSON)
++		{
++			/* too complex for an inline implementation */
++			ExecEvalJsonIsPredicate(state, op);
++
++			EEO_NEXT();
++		}
++
+ 		EEO_CASE(EEOP_LAST)
+ 		{
+ 			/* unreachable */
+@@ -3909,6 +3919,91 @@ ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op)
+ 	}
+ }
+ 
++void
++ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op)
++{
++	JsonIsPredicate *pred = op->d.is_json.pred;
++	Datum		js = *op->resvalue;
++	Oid			exprtype;
++	bool		res;
++
++	if (*op->resnull)
++	{
++		*op->resvalue = BoolGetDatum(false);
++		return;
++	}
++
++	exprtype = exprType(pred->expr);
++
++	if (exprtype == TEXTOID || exprtype == JSONOID)
++	{
++		text	   *json = DatumGetTextP(js);
++
++		if (pred->value_type == JS_TYPE_ANY)
++			res = true;
++		else
++		{
++			switch (json_get_first_token(json, false))
++			{
++				case JSON_TOKEN_OBJECT_START:
++					res = pred->value_type == JS_TYPE_OBJECT;
++					break;
++				case JSON_TOKEN_ARRAY_START:
++					res = pred->value_type == JS_TYPE_ARRAY;
++					break;
++				case JSON_TOKEN_STRING:
++				case JSON_TOKEN_NUMBER:
++				case JSON_TOKEN_TRUE:
++				case JSON_TOKEN_FALSE:
++				case JSON_TOKEN_NULL:
++					res = pred->value_type == JS_TYPE_SCALAR;
++					break;
++				default:
++					res = false;
++					break;
++			}
++		}
++
++		/*
++		 * Do full parsing pass only for uniqueness check or for
++		 * JSON text validation.
++		 */
++		if (res && (pred->unique_keys || exprtype == TEXTOID))
++			res = json_validate(json, pred->unique_keys);
++	}
++	else if (exprtype == JSONBOID)
++	{
++		if (pred->value_type == JS_TYPE_ANY)
++			res = true;
++		else
++		{
++			Jsonb	   *jb = DatumGetJsonbP(js);
++
++			switch (pred->value_type)
++			{
++				case JS_TYPE_OBJECT:
++					res = JB_ROOT_IS_OBJECT(jb);
++					break;
++				case JS_TYPE_ARRAY:
++					res = JB_ROOT_IS_ARRAY(jb) && !JB_ROOT_IS_SCALAR(jb);
++					break;
++				case JS_TYPE_SCALAR:
++					res = JB_ROOT_IS_ARRAY(jb) && JB_ROOT_IS_SCALAR(jb);
++					break;
++				default:
++					res = false;
++					break;
++			}
++		}
++
++		/* Key uniqueness check is redundant for jsonb */
++	}
++	else
++		res = false;
++
++	*op->resvalue = BoolGetDatum(res);
++}
++
+ /*
+  * ExecEvalGroupingFunc
+  *
+diff --git a/src/backend/jit/llvm/llvmjit_expr.c b/src/backend/jit/llvm/llvmjit_expr.c
+index d0c26cf58b7a..02511c6aecc4 100644
+--- a/src/backend/jit/llvm/llvmjit_expr.c
++++ b/src/backend/jit/llvm/llvmjit_expr.c
+@@ -2354,6 +2354,12 @@ llvm_compile_expr(ExprState *state)
+ 				LLVMBuildBr(b, opblocks[opno + 1]);
+ 				break;
+ 
++			case EEOP_IS_JSON:
++				build_EvalXFunc(b, mod, "ExecEvalJsonIsPredicate",
++								v_state, op);
++				LLVMBuildBr(b, opblocks[opno + 1]);
++				break;
++
+ 			case EEOP_LAST:
+ 				Assert(false);
+ 				break;
+diff --git a/src/backend/jit/llvm/llvmjit_types.c b/src/backend/jit/llvm/llvmjit_types.c
+index 53c75dd9d699..4d7029a27f10 100644
+--- a/src/backend/jit/llvm/llvmjit_types.c
++++ b/src/backend/jit/llvm/llvmjit_types.c
+@@ -132,6 +132,7 @@ void	   *referenced_functions[] =
+ 	ExecEvalWholeRowVar,
+ 	ExecEvalXmlExpr,
+ 	ExecEvalJsonConstructor,
++	ExecEvalJsonIsPredicate,
+ 	MakeExpandedObjectReadOnlyInternal,
+ 	slot_getmissingattrs,
+ 	slot_getsomeattrs_int,
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index c09172164b9e..cb4b4d01f800 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -2491,6 +2491,23 @@ _copyJsonArrayQueryConstructor(const JsonArrayQueryConstructor *from)
+ 	return newnode;
+ }
+ 
++/*
++ * _copyJsonIsPredicate
++ */
++static JsonIsPredicate *
++_copyJsonIsPredicate(const JsonIsPredicate *from)
++{
++	JsonIsPredicate *newnode = makeNode(JsonIsPredicate);
++
++	COPY_NODE_FIELD(expr);
++	COPY_SCALAR_FIELD(format);
++	COPY_SCALAR_FIELD(value_type);
++	COPY_SCALAR_FIELD(unique_keys);
++	COPY_LOCATION_FIELD(location);
++
++	return newnode;
++}
++
+ /* ****************************************************************
+  *						pathnodes.h copy functions
+  *
+@@ -5625,6 +5642,9 @@ copyObjectImpl(const void *from)
+ 		case T_JsonArrayAgg:
+ 			retval = _copyJsonArrayAgg(from);
+ 			break;
++		case T_JsonIsPredicate:
++			retval = _copyJsonIsPredicate(from);
++			break;
+ 
+ 			/*
+ 			 * RELATION NODES
+diff --git a/src/backend/nodes/equalfuncs.c b/src/backend/nodes/equalfuncs.c
+index 3fb423be47a0..084d98b34cc8 100644
+--- a/src/backend/nodes/equalfuncs.c
++++ b/src/backend/nodes/equalfuncs.c
+@@ -976,6 +976,18 @@ _equalJsonArrayQueryConstructor(const JsonArrayQueryConstructor *a,
+ 	return true;
+ }
+ 
++static bool
++_equalJsonIsPredicate(const JsonIsPredicate *a,
++					  const JsonIsPredicate *b)
++{
++	COMPARE_NODE_FIELD(expr);
++	COMPARE_SCALAR_FIELD(value_type);
++	COMPARE_SCALAR_FIELD(unique_keys);
++	COMPARE_LOCATION_FIELD(location);
++
++	return true;
++}
++
+ /*
+  * Stuff from pathnodes.h
+  */
+@@ -3546,6 +3558,9 @@ equal(const void *a, const void *b)
+ 		case T_JsonConstructorExpr:
+ 			retval = _equalJsonConstructorExpr(a, b);
+ 			break;
++		case T_JsonIsPredicate:
++			retval = _equalJsonIsPredicate(a, b);
++			break;
+ 
+ 			/*
+ 			 * RELATION NODES
+diff --git a/src/backend/nodes/makefuncs.c b/src/backend/nodes/makefuncs.c
+index 7b4f7972e626..b67e7c52973c 100644
+--- a/src/backend/nodes/makefuncs.c
++++ b/src/backend/nodes/makefuncs.c
+@@ -887,3 +887,22 @@ makeJsonKeyValue(Node *key, Node *value)
+ 
+ 	return (Node *) n;
+ }
++
++/*
++ * makeJsonIsPredicate -
++ *	  creates a JsonIsPredicate node
++ */
++Node *
++makeJsonIsPredicate(Node *expr, JsonFormat *format, JsonValueType value_type,
++					bool unique_keys, int location)
++{
++	JsonIsPredicate *n = makeNode(JsonIsPredicate);
++
++	n->expr = expr;
++	n->format = format;
++	n->value_type = value_type;
++	n->unique_keys = unique_keys;
++	n->location = location;
++
++	return (Node *) n;
++}
+diff --git a/src/backend/nodes/nodeFuncs.c b/src/backend/nodes/nodeFuncs.c
+index 50898246f966..d697c7abd8c8 100644
+--- a/src/backend/nodes/nodeFuncs.c
++++ b/src/backend/nodes/nodeFuncs.c
+@@ -260,6 +260,9 @@ exprType(const Node *expr)
+ 		case T_JsonConstructorExpr:
+ 			type = ((const JsonConstructorExpr *) expr)->returning->typid;
+ 			break;
++		case T_JsonIsPredicate:
++			type = BOOLOID;
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			type = InvalidOid;	/* keep compiler quiet */
+@@ -985,6 +988,9 @@ exprCollation(const Node *expr)
+ 					coll = InvalidOid;
+ 			}
+ 			break;
++		case T_JsonIsPredicate:
++			coll = InvalidOid;	/* result is always an boolean type */
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			coll = InvalidOid;	/* keep compiler quiet */
+@@ -1211,6 +1217,9 @@ exprSetCollation(Node *expr, Oid collation)
+ 					Assert(!OidIsValid(collation)); /* result is always a json[b] type */
+ 			}
+ 			break;
++		case T_JsonIsPredicate:
++			Assert(!OidIsValid(collation)); /* result is always boolean */
++			break;
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+ 			break;
+@@ -1663,6 +1672,9 @@ exprLocation(const Node *expr)
+ 		case T_JsonConstructorExpr:
+ 			loc = ((const JsonConstructorExpr *) expr)->location;
+ 			break;
++		case T_JsonIsPredicate:
++			loc = ((const JsonIsPredicate *) expr)->location;
++			break;
+ 		default:
+ 			/* for any other node type it's just unknown... */
+ 			loc = -1;
+@@ -2429,6 +2441,8 @@ expression_tree_walker(Node *node,
+ 					return true;
+ 			}
+ 			break;
++		case T_JsonIsPredicate:
++			return walker(((JsonIsPredicate *) node)->expr, context);
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+@@ -3438,6 +3452,16 @@ expression_tree_mutator(Node *node,
+ 				MUTATE(newnode->coercion, jve->coercion, Expr *);
+ 				MUTATE(newnode->returning, jve->returning, JsonReturning *);
+ 
++				return (Node *) newnode;
++			}
++		case T_JsonIsPredicate:
++			{
++				JsonIsPredicate *pred = (JsonIsPredicate *) node;
++				JsonIsPredicate *newnode;
++
++				FLATCOPY(newnode, pred, JsonIsPredicate);
++				MUTATE(newnode->expr, pred->expr, Node *);
++
+ 				return (Node *) newnode;
+ 			}
+ 		default:
+@@ -4290,6 +4314,8 @@ raw_expression_tree_walker(Node *node,
+ 					return true;
+ 			}
+ 			break;
++		case T_JsonIsPredicate:
++			return walker(((JsonIsPredicate *) node)->expr, context);
+ 		default:
+ 			elog(ERROR, "unrecognized node type: %d",
+ 				 (int) nodeTag(node));
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index 0c01f350867a..278e87259dc5 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -1797,6 +1797,17 @@ _outJsonConstructorExpr(StringInfo str, const JsonConstructorExpr *node)
+ 	WRITE_LOCATION_FIELD(location);
+ }
+ 
++static void
++_outJsonIsPredicate(StringInfo str, const JsonIsPredicate *node)
++{
++	WRITE_NODE_TYPE("JSONISPREDICATE");
++
++	WRITE_NODE_FIELD(expr);
++	WRITE_ENUM_FIELD(value_type, JsonValueType);
++	WRITE_BOOL_FIELD(unique_keys);
++	WRITE_LOCATION_FIELD(location);
++}
++
+ /*****************************************************************************
+  *
+  *	Stuff from pathnodes.h.
+@@ -4630,6 +4641,9 @@ outNode(StringInfo str, const void *obj)
+ 			case T_JsonConstructorExpr:
+ 				_outJsonConstructorExpr(str, obj);
+ 				break;
++			case T_JsonIsPredicate:
++				_outJsonIsPredicate(str, obj);
++				break;
+ 
+ 			default:
+ 
+diff --git a/src/backend/nodes/readfuncs.c b/src/backend/nodes/readfuncs.c
+index 3ee8ba6f159e..5b9e235e9ad7 100644
+--- a/src/backend/nodes/readfuncs.c
++++ b/src/backend/nodes/readfuncs.c
+@@ -1492,6 +1492,22 @@ _readJsonConstructorExpr(void)
+ 	READ_DONE();
+ }
+ 
++/*
++ * _readJsonIsPredicate
++ */
++static JsonIsPredicate *
++_readJsonIsPredicate()
++{
++	READ_LOCALS(JsonIsPredicate);
++
++	READ_NODE_FIELD(expr);
++	READ_ENUM_FIELD(value_type, JsonValueType);
++	READ_BOOL_FIELD(unique_keys);
++	READ_LOCATION_FIELD(location);
++
++	READ_DONE();
++}
++
+ /*
+  *	Stuff from pathnodes.h.
+  *
+@@ -3090,6 +3106,8 @@ parseNodeString(void)
+ 		return_value = _readJsonValueExpr();
+ 	else if (MATCH("JSONCTOREXPR", 12))
+ 		return_value = _readJsonConstructorExpr();
++	else if (MATCH("JSONISPREDICATE", 15))
++		return_value = _readJsonIsPredicate();
+ 	else
+ 	{
+ 		elog(ERROR, "badly formatted node string \"%.32s\"...", token);
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 9399fff610f8..b658bcc182c6 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -665,6 +665,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 
+ %type <ival>		json_encoding
+ 					json_encoding_clause_opt
++					json_predicate_type_constraint_opt
+ 
+ %type <boolean>		json_key_uniqueness_constraint_opt
+ 					json_object_constructor_null_clause_opt
+@@ -734,7 +735,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 
+ 	JOIN JSON JSON_ARRAY JSON_ARRAYAGG JSON_OBJECT JSON_OBJECTAGG
+ 
+-	KEY KEYS
++	KEY KEYS KEEP
+ 
+ 	LABEL LANGUAGE LARGE_P LAST_P LATERAL_P
+ 	LEADING LEAKPROOF LEAST LEFT LEVEL LIKE LIMIT LISTEN LOAD LOCAL
+@@ -763,9 +764,9 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
+ 	ROUTINE ROUTINES ROW ROWS RULE
+ 
+-	SAVEPOINT SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT SEQUENCE SEQUENCES
+-	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
+-	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SQL_P STABLE STANDALONE_P
++	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
++	SEQUENCE SEQUENCES SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF
++	SHARE SHOW SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SQL_P STABLE STANDALONE_P
+ 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRIP_P
+ 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P
+ 
+@@ -853,13 +854,14 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+  * Using the same precedence as IDENT seems right for the reasons given above.
+  */
+ %nonassoc	UNBOUNDED		/* ideally would have same precedence as IDENT */
+-%nonassoc	ABSENT UNIQUE
++%nonassoc	ABSENT UNIQUE JSON
+ %nonassoc	IDENT PARTITION RANGE ROWS GROUPS PRECEDING FOLLOWING CUBE ROLLUP
+ %left		Op OPERATOR		/* multi-character ops and user-defined operators */
+ %left		'+' '-'
+ %left		'*' '/' '%'
+ %left		'^'
+ %left		KEYS						/* UNIQUE [ KEYS ] */
++%left		OBJECT_P SCALAR VALUE_P		/* JSON [ OBJECT | SCALAR | VALUE ] */
+ /* Unary Operators */
+ %left		AT				/* sets precedence for AT TIME ZONE */
+ %left		COLLATE
+@@ -14141,6 +14143,46 @@ a_expr:		c_expr									{ $$ = $1; }
+ 														   @2),
+ 									 @2);
+ 				}
++			| a_expr
++				IS json_predicate_type_constraint_opt
++					json_key_uniqueness_constraint_opt		%prec IS
++				{
++					JsonFormat *format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
++					$$ = makeJsonIsPredicate($1, format, $3, $4, @1);
++				}
++			/*
++			 * Required by standard, but it would conflict with expressions
++			 * like: 'str' || format(...)
++			| a_expr
++				FORMAT json_representation
++				IS  json_predicate_type_constraint_opt
++					json_key_uniqueness_constraint_opt		%prec FORMAT
++				{
++					$3.location = @2;
++					$$ = makeJsonIsPredicate($1, $3, $5, $6, @1);
++				}
++			*/
++			| a_expr
++				IS NOT
++					json_predicate_type_constraint_opt
++					json_key_uniqueness_constraint_opt		%prec IS
++				{
++					JsonFormat *format = makeJsonFormat(JS_FORMAT_DEFAULT, JS_ENC_DEFAULT, -1);
++					$$ = makeNotExpr(makeJsonIsPredicate($1, format, $4, $5, @1), @1);
++				}
++			/*
++			 * Required by standard, but it would conflict with expressions
++			 * like: 'str' || format(...)
++			| a_expr
++				FORMAT json_representation
++				IS NOT
++					json_predicate_type_constraint_opt
++					json_key_uniqueness_constraint_opt		%prec FORMAT
++				{
++					$3.location = @2;
++					$$ = makeNotExpr(makeJsonIsPredicate($1, $3, $6, $7, @1), @1);
++				}
++			*/
+ 			| DEFAULT
+ 				{
+ 					/*
+@@ -14223,6 +14265,14 @@ b_expr:		c_expr
+ 				}
+ 		;
+ 
++json_predicate_type_constraint_opt:
++			JSON									{ $$ = JS_TYPE_ANY; }
++			| JSON VALUE_P							{ $$ = JS_TYPE_ANY; }
++			| JSON ARRAY							{ $$ = JS_TYPE_ARRAY; }
++			| JSON OBJECT_P							{ $$ = JS_TYPE_OBJECT; }
++			| JSON SCALAR							{ $$ = JS_TYPE_SCALAR; }
++		;
++
+ json_key_uniqueness_constraint_opt:
+ 			WITH_LA_UNIQUE unique_keys				{ $$ = true; }
+ 			| WITHOUT unique_keys					{ $$ = false; }
+@@ -16412,6 +16462,7 @@ unreserved_keyword:
+ 			| ROWS
+ 			| RULE
+ 			| SAVEPOINT
++			| SCALAR
+ 			| SCHEMA
+ 			| SCHEMAS
+ 			| SCROLL
+@@ -16882,6 +16933,7 @@ bare_label_keyword:
+ 			| JSON_ARRAYAGG
+ 			| JSON_OBJECT
+ 			| JSON_OBJECTAGG
++			| KEEP
+ 			| KEY
+ 			| KEYS
+ 			| LABEL
+@@ -17011,6 +17063,7 @@ bare_label_keyword:
+ 			| ROWS
+ 			| RULE
+ 			| SAVEPOINT
++			| SCALAR
+ 			| SCHEMA
+ 			| SCHEMAS
+ 			| SCROLL
+diff --git a/src/backend/parser/parse_expr.c b/src/backend/parser/parse_expr.c
+index 84be354f714c..0b972ea6322c 100644
+--- a/src/backend/parser/parse_expr.c
++++ b/src/backend/parser/parse_expr.c
+@@ -85,6 +85,7 @@ static Node *transformJsonArrayQueryConstructor(ParseState *pstate,
+ 												JsonArrayQueryConstructor *ctor);
+ static Node *transformJsonObjectAgg(ParseState *pstate, JsonObjectAgg *agg);
+ static Node *transformJsonArrayAgg(ParseState *pstate, JsonArrayAgg *agg);
++static Node *transformJsonIsPredicate(ParseState *pstate, JsonIsPredicate *p);
+ static Node *make_row_comparison_op(ParseState *pstate, List *opname,
+ 									List *largs, List *rargs, int location);
+ static Node *make_row_distinct_op(ParseState *pstate, List *opname,
+@@ -332,6 +333,10 @@ transformExprRecurse(ParseState *pstate, Node *expr)
+ 			result = transformJsonArrayAgg(pstate, (JsonArrayAgg *) expr);
+ 			break;
+ 
++		case T_JsonIsPredicate:
++			result = transformJsonIsPredicate(pstate, (JsonIsPredicate *) expr);
++			break;
++
+ 		default:
+ 			/* should not reach here */
+ 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
+@@ -3869,3 +3874,74 @@ transformJsonArrayConstructor(ParseState *pstate, JsonArrayConstructor *ctor)
+ 								   returning, false, ctor->absent_on_null,
+ 								   ctor->location);
+ }
++
++static Node *
++transformJsonParseArg(ParseState *pstate, Node *jsexpr, JsonFormat *format,
++					  Oid *exprtype)
++{
++	Node	   *raw_expr = transformExprRecurse(pstate, jsexpr);
++	Node	   *expr = raw_expr;
++
++	*exprtype = exprType(expr);
++
++	/* prepare input document */
++	if (*exprtype == BYTEAOID)
++	{
++		JsonValueExpr *jve;
++
++		expr = makeCaseTestExpr(raw_expr);
++		expr = makeJsonByteaToTextConversion(expr, format, exprLocation(expr));
++		*exprtype = TEXTOID;
++
++		jve = makeJsonValueExpr((Expr *) raw_expr, format);
++
++		jve->formatted_expr = (Expr *) expr;
++		expr = (Node *) jve;
++	}
++	else
++	{
++		char		typcategory;
++		bool		typispreferred;
++
++		get_type_category_preferred(*exprtype, &typcategory, &typispreferred);
++
++		if (*exprtype == UNKNOWNOID || typcategory == TYPCATEGORY_STRING)
++		{
++			expr = coerce_to_target_type(pstate, (Node *) expr, *exprtype,
++										 TEXTOID, -1,
++										 COERCION_IMPLICIT,
++										 COERCE_IMPLICIT_CAST, -1);
++			*exprtype = TEXTOID;
++		}
++
++		if (format->encoding != JS_ENC_DEFAULT)
++			ereport(ERROR,
++					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++					 parser_errposition(pstate, format->location),
++					 errmsg("cannot use JSON FORMAT ENCODING clause for non-bytea input types")));
++	}
++
++	return expr;
++}
++
++/*
++ * Transform IS JSON predicate into
++ * json[b]_is_valid(json, value_type [, check_key_uniqueness]) call.
++ */
++static Node *
++transformJsonIsPredicate(ParseState *pstate, JsonIsPredicate *pred)
++{
++	Oid			exprtype;
++	Node	   *expr = transformJsonParseArg(pstate, pred->expr, pred->format,
++											 &exprtype);
++
++	/* make resulting expression */
++	if (exprtype != TEXTOID && exprtype != JSONOID && exprtype != JSONBOID)
++		ereport(ERROR,
++				(errcode(ERRCODE_DATATYPE_MISMATCH),
++				 errmsg("cannot use type %s in IS JSON predicate",
++						format_type_be(exprtype))));
++
++	return makeJsonIsPredicate(expr, NULL, pred->value_type,
++							   pred->unique_keys, pred->location);
++}
+diff --git a/src/backend/utils/adt/json.c b/src/backend/utils/adt/json.c
+index d088fafc567f..5edcb8bb60e1 100644
+--- a/src/backend/utils/adt/json.c
++++ b/src/backend/utils/adt/json.c
+@@ -13,6 +13,7 @@
+  */
+ #include "postgres.h"
+ 
++#include "access/hash.h"
+ #include "catalog/pg_proc.h"
+ #include "catalog/pg_type.h"
+ #include "common/hashfn.h"
+@@ -1655,6 +1656,94 @@ escape_json(StringInfo buf, const char *str)
+ 	appendStringInfoCharMacro(buf, '"');
+ }
+ 
++/* Semantic actions for key uniqueness check */
++static void
++json_unique_object_start(void *_state)
++{
++	JsonUniqueParsingState *state = _state;
++	JsonUniqueStackEntry *entry;
++
++	if (!state->unique)
++		return;
++
++	/* push object entry to stack */
++	entry = palloc(sizeof(*entry));
++	entry->object_id = state->id_counter++;
++	entry->parent = state->stack;
++	state->stack = entry;
++}
++
++static void
++json_unique_object_end(void *_state)
++{
++	JsonUniqueParsingState *state = _state;
++	JsonUniqueStackEntry *entry;
++
++	if (!state->unique)
++		return;
++
++	entry = state->stack;
++	state->stack = entry->parent;	/* pop object from stack */
++	pfree(entry);
++}
++
++static void
++json_unique_object_field_start(void *_state, char *field, bool isnull)
++{
++	JsonUniqueParsingState *state = _state;
++	JsonUniqueStackEntry *entry;
++
++	if (!state->unique)
++		return;
++
++	/* find key collision in the current object */
++	if (json_unique_check_key(&state->check, field, state->stack->object_id))
++		return;
++
++	state->unique = false;
++
++	/* pop all objects entries */
++	while ((entry = state->stack))
++	{
++		state->stack = entry->parent;
++		pfree(entry);
++	}
++}
++
++/* Validate JSON text and additionally check key uniqueness */
++bool
++json_validate(text *json, bool check_unique_keys)
++{
++	JsonLexContext *lex = makeJsonLexContext(json, check_unique_keys);
++	JsonSemAction uniqueSemAction = {0};
++	JsonUniqueParsingState state;
++	JsonParseErrorType result;
++
++	if (check_unique_keys)
++	{
++		state.lex = lex;
++		state.stack = NULL;
++		state.id_counter = 0;
++		state.unique = true;
++		json_unique_check_init(&state.check);
++
++		uniqueSemAction.semstate = &state;
++		uniqueSemAction.object_start = json_unique_object_start;
++		uniqueSemAction.object_field_start = json_unique_object_field_start;
++		uniqueSemAction.object_end = json_unique_object_end;
++	}
++
++	result = pg_parse_json(lex, check_unique_keys ? &uniqueSemAction : &nullSemAction);
++
++	if (result != JSON_SUCCESS)
++		return false;	/* invalid json */
++
++	if (check_unique_keys && !state.unique)
++		return false;	/* not unique keys */
++
++	return true;	/* ok */
++}
++
+ /*
+  * SQL function json_typeof(json) -> text
+  *
+@@ -1670,21 +1759,13 @@ escape_json(StringInfo buf, const char *str)
+ Datum
+ json_typeof(PG_FUNCTION_ARGS)
+ {
+-	text	   *json;
+-
+-	JsonLexContext *lex;
+-	JsonTokenType tok;
++	text	   *json = PG_GETARG_TEXT_PP(0);
+ 	char	   *type;
+-	JsonParseErrorType result;
+-
+-	json = PG_GETARG_TEXT_PP(0);
+-	lex = makeJsonLexContext(json, false);
++	JsonTokenType tok;
+ 
+ 	/* Lex exactly one token from the input and check its type. */
+-	result = json_lex(lex);
+-	if (result != JSON_SUCCESS)
+-		json_ereport_error(result, lex);
+-	tok = lex->token_type;
++	tok = json_get_first_token(json, true);
++
+ 	switch (tok)
+ 	{
+ 		case JSON_TOKEN_OBJECT_START:
+diff --git a/src/backend/utils/adt/jsonfuncs.c b/src/backend/utils/adt/jsonfuncs.c
+index 29664aa6e40e..a24d498b0608 100644
+--- a/src/backend/utils/adt/jsonfuncs.c
++++ b/src/backend/utils/adt/jsonfuncs.c
+@@ -5528,3 +5528,23 @@ transform_string_values_scalar(void *state, char *token, JsonTokenType tokentype
+ 	else
+ 		appendStringInfoString(_state->strval, token);
+ }
++
++JsonTokenType
++json_get_first_token(text *json, bool throw_error)
++{
++	JsonLexContext *lex;
++	JsonParseErrorType result;
++
++	lex = makeJsonLexContext(json, false);
++
++	/* Lex exactly one token from the input and check its type. */
++	result = json_lex(lex);
++
++	if (result == JSON_SUCCESS)
++		return lex->token_type;
++
++	if (throw_error)
++		json_ereport_error(result, lex);
++
++	return JSON_TOKEN_INVALID;	/* invalid json */
++}
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index 38da26951978..0ed774f6e663 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -8230,6 +8230,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
+ 		case T_NullTest:
+ 		case T_BooleanTest:
+ 		case T_DistinctExpr:
++		case T_JsonIsPredicate:
+ 			switch (nodeTag(parentNode))
+ 			{
+ 				case T_FuncExpr:
+@@ -9635,6 +9636,40 @@ get_rule_expr(Node *node, deparse_context *context,
+ 			get_json_constructor((JsonConstructorExpr *) node, context, false);
+ 			break;
+ 
++		case T_JsonIsPredicate:
++			{
++				JsonIsPredicate *pred = (JsonIsPredicate *) node;
++
++				if (!PRETTY_PAREN(context))
++					appendStringInfoChar(context->buf, '(');
++
++				get_rule_expr_paren(pred->expr, context, true, node);
++
++				appendStringInfoString(context->buf, " IS JSON");
++
++				switch (pred->value_type)
++				{
++					case JS_TYPE_SCALAR:
++						appendStringInfoString(context->buf, " SCALAR");
++						break;
++					case JS_TYPE_ARRAY:
++						appendStringInfoString(context->buf, " ARRAY");
++						break;
++					case JS_TYPE_OBJECT:
++						appendStringInfoString(context->buf, " OBJECT");
++						break;
++					default:
++						break;
++				}
++
++				if (pred->unique_keys)
++					appendStringInfoString(context->buf, " WITH UNIQUE KEYS");
++
++				if (!PRETTY_PAREN(context))
++					appendStringInfoChar(context->buf, ')');
++			}
++			break;
++
+ 		case T_List:
+ 			{
+ 				char	   *sep;
+diff --git a/src/backend/utils/misc/queryjumble.c b/src/backend/utils/misc/queryjumble.c
+index d14b75105819..831581279366 100644
+--- a/src/backend/utils/misc/queryjumble.c
++++ b/src/backend/utils/misc/queryjumble.c
+@@ -775,6 +775,16 @@ JumbleExpr(JumbleState *jstate, Node *node)
+ 				APP_JUMB(ctor->absent_on_null);
+ 			}
+ 			break;
++		case T_JsonIsPredicate:
++			{
++				JsonIsPredicate *pred = (JsonIsPredicate *) node;
++
++				JumbleExpr(jstate, (Node *) pred->expr);
++				JumbleExpr(jstate, (Node *) pred->format);
++				APP_JUMB(pred->unique_keys);
++				APP_JUMB(pred->value_type);
++			}
++			break;
+ 		case T_List:
+ 			foreach(temp, (List *) node)
+ 			{
+diff --git a/src/include/executor/execExpr.h b/src/include/executor/execExpr.h
+index c830fcf7262f..a41722ae1e41 100644
+--- a/src/include/executor/execExpr.h
++++ b/src/include/executor/execExpr.h
+@@ -240,6 +240,7 @@ typedef enum ExprEvalOp
+ 	EEOP_WINDOW_FUNC,
+ 	EEOP_SUBPLAN,
+ 	EEOP_JSON_CONSTRUCTOR,
++	EEOP_IS_JSON,
+ 
+ 	/* aggregation related nodes */
+ 	EEOP_AGG_STRICT_DESERIALIZE,
+@@ -680,6 +681,12 @@ typedef struct ExprEvalStep
+ 			int			nargs;
+ 		}			json_constructor;
+ 
++		/* for EEOP_IS_JSON */
++		struct
++		{
++					JsonIsPredicate *pred;	/* original expression node */
++		}			is_json;
++
+ 	}			d;
+ } ExprEvalStep;
+ 
+@@ -774,6 +781,7 @@ extern void ExecEvalHashedScalarArrayOp(ExprState *state, ExprEvalStep *op,
+ extern void ExecEvalConstraintNotNull(ExprState *state, ExprEvalStep *op);
+ extern void ExecEvalConstraintCheck(ExprState *state, ExprEvalStep *op);
+ extern void ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op);
++extern void ExecEvalJsonIsPredicate(ExprState *state, ExprEvalStep *op);
+ extern void ExecEvalGroupingFunc(ExprState *state, ExprEvalStep *op);
+ extern void ExecEvalSubPlan(ExprState *state, ExprEvalStep *op,
+ 							ExprContext *econtext);
+diff --git a/src/include/nodes/makefuncs.h b/src/include/nodes/makefuncs.h
+index e50b933288d9..380940968bdb 100644
+--- a/src/include/nodes/makefuncs.h
++++ b/src/include/nodes/makefuncs.h
+@@ -110,6 +110,9 @@ extern JsonFormat *makeJsonFormat(JsonFormatType type, JsonEncoding encoding,
+ 								  int location);
+ extern JsonValueExpr *makeJsonValueExpr(Expr *expr, JsonFormat *format);
+ extern Node *makeJsonKeyValue(Node *key, Node *value);
++extern Node *makeJsonIsPredicate(Node *expr, JsonFormat *format,
++								 JsonValueType vtype, bool unique_keys,
++								 int location);
+ extern JsonEncoding makeJsonEncoding(char *name);
+ 
+ #endif							/* MAKEFUNC_H */
+diff --git a/src/include/nodes/nodes.h b/src/include/nodes/nodes.h
+index ca440eb75ffd..e8f30367a48a 100644
+--- a/src/include/nodes/nodes.h
++++ b/src/include/nodes/nodes.h
+@@ -505,6 +505,7 @@ typedef enum NodeTag
+ 	T_JsonAggConstructor,
+ 	T_JsonObjectAgg,
+ 	T_JsonArrayAgg,
++	T_JsonIsPredicate,
+ 	T_JsonKeyValue,
+ 	T_JsonOutput,
+ 
+diff --git a/src/include/nodes/primnodes.h b/src/include/nodes/primnodes.h
+index c48527e998a9..f4a39653ac67 100644
+--- a/src/include/nodes/primnodes.h
++++ b/src/include/nodes/primnodes.h
+@@ -1317,6 +1317,32 @@ typedef struct JsonConstructorExpr
+ 	int			location;
+ } JsonConstructorExpr;
+ 
++/*
++ * JsonValueType -
++ *		representation of JSON item type in IS JSON predicate
++ */
++typedef enum JsonValueType
++{
++	JS_TYPE_ANY,				/* IS JSON [VALUE] */
++	JS_TYPE_OBJECT,				/* IS JSON OBJECT */
++	JS_TYPE_ARRAY,				/* IS JSON ARRAY*/
++	JS_TYPE_SCALAR				/* IS JSON SCALAR */
++} JsonValueType;
++
++/*
++ * JsonIsPredicate -
++ *		untransformed representation of IS JSON predicate
++ */
++typedef struct JsonIsPredicate
++{
++	NodeTag		type;
++	Node	   *expr;			/* untransformed expression */
++	JsonFormat *format;			/* FORMAT clause, if specified */
++	JsonValueType value_type;	/* JSON item type */
++	bool		unique_keys;	/* check key uniqueness? */
++	int			location;		/* token location, or -1 if unknown */
++} JsonIsPredicate;
++
+ /* ----------------
+  * NullTest
+  *
+diff --git a/src/include/parser/kwlist.h b/src/include/parser/kwlist.h
+index 10829941e0dd..c0ffa516d063 100644
+--- a/src/include/parser/kwlist.h
++++ b/src/include/parser/kwlist.h
+@@ -374,6 +374,7 @@ PG_KEYWORD("row", ROW, COL_NAME_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("rows", ROWS, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("rule", RULE, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("savepoint", SAVEPOINT, UNRESERVED_KEYWORD, BARE_LABEL)
++PG_KEYWORD("scalar", SCALAR, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("schema", SCHEMA, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("schemas", SCHEMAS, UNRESERVED_KEYWORD, BARE_LABEL)
+ PG_KEYWORD("scroll", SCROLL, UNRESERVED_KEYWORD, BARE_LABEL)
+diff --git a/src/include/utils/json.h b/src/include/utils/json.h
+index 63d83b815fb9..bfe5b215912e 100644
+--- a/src/include/utils/json.h
++++ b/src/include/utils/json.h
+@@ -26,5 +26,6 @@ extern Datum json_build_object_worker(int nargs, Datum *args, bool *nulls,
+ 									  bool unique_keys);
+ extern Datum json_build_array_worker(int nargs, Datum *args, bool *nulls,
+ 									 Oid *types, bool absent_on_null);
++extern bool json_validate(text *json, bool check_unique_keys);
+ 
+ #endif							/* JSON_H */
+diff --git a/src/include/utils/jsonfuncs.h b/src/include/utils/jsonfuncs.h
+index 865b2ff7c11b..cd16b6c0c846 100644
+--- a/src/include/utils/jsonfuncs.h
++++ b/src/include/utils/jsonfuncs.h
+@@ -45,6 +45,9 @@ extern void pg_parse_json_or_ereport(JsonLexContext *lex, JsonSemAction *sem);
+ /* report an error during json lexing or parsing */
+ extern void json_ereport_error(JsonParseErrorType error, JsonLexContext *lex);
+ 
++/* get first JSON token */
++extern JsonTokenType json_get_first_token(text *json, bool throw_error);
++
+ extern uint32 parse_jsonb_index_flags(Jsonb *jb);
+ extern void iterate_jsonb_values(Jsonb *jb, uint32 flags, void *state,
+ 								 JsonIterateStringValuesAction action);
+diff --git a/src/test/regress/expected/sqljson.out b/src/test/regress/expected/sqljson.out
+index 7dca5a8a30f4..27dca7815a72 100644
+--- a/src/test/regress/expected/sqljson.out
++++ b/src/test/regress/expected/sqljson.out
+@@ -744,3 +744,201 @@ CREATE OR REPLACE VIEW public.json_array_subquery_view AS
+            FROM ( SELECT foo.i
+                    FROM ( VALUES (1), (2), (NULL::integer), (4)) foo(i)) q(a)) AS "json_array"
+ DROP VIEW json_array_subquery_view;
++-- IS JSON predicate
++SELECT NULL IS JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL IS NOT JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL::json IS JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL::jsonb IS JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL::text IS JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL::bytea IS JSON;
++ ?column? 
++----------
++ 
++(1 row)
++
++SELECT NULL::int IS JSON;
++ERROR:  cannot use type integer in IS JSON predicate
++SELECT '' IS JSON;
++ ?column? 
++----------
++ f
++(1 row)
++
++SELECT bytea '\x00' IS JSON;
++ERROR:  invalid byte sequence for encoding "UTF8": 0x00
++CREATE TABLE test_is_json (js text);
++INSERT INTO test_is_json VALUES
++ (NULL),
++ (''),
++ ('123'),
++ ('"aaa "'),
++ ('true'),
++ ('null'),
++ ('[]'),
++ ('[1, "2", {}]'),
++ ('{}'),
++ ('{ "a": 1, "b": null }'),
++ ('{ "a": 1, "a": null }'),
++ ('{ "a": 1, "b": [{ "a": 1 }, { "a": 2 }] }'),
++ ('{ "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] }'),
++ ('aaa'),
++ ('{a:1}'),
++ ('["a",]');
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	test_is_json;
++                      js                       | IS JSON | IS NOT JSON | IS VALUE | IS OBJECT | IS ARRAY | IS SCALAR | WITHOUT UNIQUE | WITH UNIQUE 
++-----------------------------------------------+---------+-------------+----------+-----------+----------+-----------+----------------+-------------
++                                               |         |             |          |           |          |           |                | 
++                                               | f       | t           | f        | f         | f        | f         | f              | f
++ 123                                           | t       | f           | t        | f         | f        | t         | t              | t
++ "aaa "                                        | t       | f           | t        | f         | f        | t         | t              | t
++ true                                          | t       | f           | t        | f         | f        | t         | t              | t
++ null                                          | t       | f           | t        | f         | f        | t         | t              | t
++ []                                            | t       | f           | t        | f         | t        | f         | t              | t
++ [1, "2", {}]                                  | t       | f           | t        | f         | t        | f         | t              | t
++ {}                                            | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": null }                         | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "a": null }                         | t       | f           | t        | t         | f        | f         | t              | f
++ { "a": 1, "b": [{ "a": 1 }, { "a": 2 }] }     | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] } | t       | f           | t        | t         | f        | f         | t              | f
++ aaa                                           | f       | t           | f        | f         | f        | f         | f              | f
++ {a:1}                                         | f       | t           | f        | f         | f        | f         | f              | f
++ ["a",]                                        | f       | t           | f        | f         | f        | f         | f              | f
++(16 rows)
++
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js::json FROM test_is_json WHERE js IS JSON) foo(js);
++                      js                       | IS JSON | IS NOT JSON | IS VALUE | IS OBJECT | IS ARRAY | IS SCALAR | WITHOUT UNIQUE | WITH UNIQUE 
++-----------------------------------------------+---------+-------------+----------+-----------+----------+-----------+----------------+-------------
++ 123                                           | t       | f           | t        | f         | f        | t         | t              | t
++ "aaa "                                        | t       | f           | t        | f         | f        | t         | t              | t
++ true                                          | t       | f           | t        | f         | f        | t         | t              | t
++ null                                          | t       | f           | t        | f         | f        | t         | t              | t
++ []                                            | t       | f           | t        | f         | t        | f         | t              | t
++ [1, "2", {}]                                  | t       | f           | t        | f         | t        | f         | t              | t
++ {}                                            | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": null }                         | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "a": null }                         | t       | f           | t        | t         | f        | f         | t              | f
++ { "a": 1, "b": [{ "a": 1 }, { "a": 2 }] }     | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] } | t       | f           | t        | t         | f        | f         | t              | f
++(11 rows)
++
++SELECT
++	js0,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js, js::bytea FROM test_is_json WHERE js IS JSON) foo(js0, js);
++                      js0                      | IS JSON | IS NOT JSON | IS VALUE | IS OBJECT | IS ARRAY | IS SCALAR | WITHOUT UNIQUE | WITH UNIQUE 
++-----------------------------------------------+---------+-------------+----------+-----------+----------+-----------+----------------+-------------
++ 123                                           | t       | f           | t        | f         | f        | t         | t              | t
++ "aaa "                                        | t       | f           | t        | f         | f        | t         | t              | t
++ true                                          | t       | f           | t        | f         | f        | t         | t              | t
++ null                                          | t       | f           | t        | f         | f        | t         | t              | t
++ []                                            | t       | f           | t        | f         | t        | f         | t              | t
++ [1, "2", {}]                                  | t       | f           | t        | f         | t        | f         | t              | t
++ {}                                            | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": null }                         | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "a": null }                         | t       | f           | t        | t         | f        | f         | t              | f
++ { "a": 1, "b": [{ "a": 1 }, { "a": 2 }] }     | t       | f           | t        | t         | f        | f         | t              | t
++ { "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] } | t       | f           | t        | t         | f        | f         | t              | f
++(11 rows)
++
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js::jsonb FROM test_is_json WHERE js IS JSON) foo(js);
++                 js                  | IS JSON | IS NOT JSON | IS VALUE | IS OBJECT | IS ARRAY | IS SCALAR | WITHOUT UNIQUE | WITH UNIQUE 
++-------------------------------------+---------+-------------+----------+-----------+----------+-----------+----------------+-------------
++ 123                                 | t       | f           | t        | f         | f        | t         | t              | t
++ "aaa "                              | t       | f           | t        | f         | f        | t         | t              | t
++ true                                | t       | f           | t        | f         | f        | t         | t              | t
++ null                                | t       | f           | t        | f         | f        | t         | t              | t
++ []                                  | t       | f           | t        | f         | t        | f         | t              | t
++ [1, "2", {}]                        | t       | f           | t        | f         | t        | f         | t              | t
++ {}                                  | t       | f           | t        | t         | f        | f         | t              | t
++ {"a": 1, "b": null}                 | t       | f           | t        | t         | f        | f         | t              | t
++ {"a": null}                         | t       | f           | t        | t         | f        | f         | t              | t
++ {"a": 1, "b": [{"a": 1}, {"a": 2}]} | t       | f           | t        | t         | f        | f         | t              | t
++ {"a": 1, "b": [{"a": 2, "b": 0}]}   | t       | f           | t        | t         | f        | f         | t              | t
++(11 rows)
++
++-- Test IS JSON deparsing
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT '1' IS JSON AS "any", ('1' || i) IS JSON SCALAR AS "scalar", '[]' IS NOT JSON ARRAY AS "array", '{}' IS JSON OBJECT WITH UNIQUE AS "object" FROM generate_series(1, 3) i;
++                                                                        QUERY PLAN                                                                        
++----------------------------------------------------------------------------------------------------------------------------------------------------------
++ Function Scan on pg_catalog.generate_series i
++   Output: ('1'::text IS JSON), (('1'::text || (i)::text) IS JSON SCALAR), (NOT ('[]'::text IS JSON ARRAY)), ('{}'::text IS JSON OBJECT WITH UNIQUE KEYS)
++   Function Call: generate_series(1, 3)
++(3 rows)
++
++CREATE VIEW is_json_view AS
++SELECT '1' IS JSON AS "any", ('1' || i) IS JSON SCALAR AS "scalar", '[]' IS NOT JSON ARRAY AS "array", '{}' IS JSON OBJECT WITH UNIQUE AS "object" FROM generate_series(1, 3) i;
++\sv is_json_view
++CREATE OR REPLACE VIEW public.is_json_view AS
++ SELECT '1'::text IS JSON AS "any",
++    ('1'::text || i.i) IS JSON SCALAR AS scalar,
++    NOT '[]'::text IS JSON ARRAY AS "array",
++    '{}'::text IS JSON OBJECT WITH UNIQUE KEYS AS object
++   FROM generate_series(1, 3) i(i)
++DROP VIEW is_json_view;
+diff --git a/src/test/regress/sql/sqljson.sql b/src/test/regress/sql/sqljson.sql
+index aaef2d8aab0c..4f3c06dcb3db 100644
+--- a/src/test/regress/sql/sqljson.sql
++++ b/src/test/regress/sql/sqljson.sql
+@@ -280,3 +280,99 @@ SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING
+ \sv json_array_subquery_view
+ 
+ DROP VIEW json_array_subquery_view;
++
++-- IS JSON predicate
++SELECT NULL IS JSON;
++SELECT NULL IS NOT JSON;
++SELECT NULL::json IS JSON;
++SELECT NULL::jsonb IS JSON;
++SELECT NULL::text IS JSON;
++SELECT NULL::bytea IS JSON;
++SELECT NULL::int IS JSON;
++
++SELECT '' IS JSON;
++
++SELECT bytea '\x00' IS JSON;
++
++CREATE TABLE test_is_json (js text);
++
++INSERT INTO test_is_json VALUES
++ (NULL),
++ (''),
++ ('123'),
++ ('"aaa "'),
++ ('true'),
++ ('null'),
++ ('[]'),
++ ('[1, "2", {}]'),
++ ('{}'),
++ ('{ "a": 1, "b": null }'),
++ ('{ "a": 1, "a": null }'),
++ ('{ "a": 1, "b": [{ "a": 1 }, { "a": 2 }] }'),
++ ('{ "a": 1, "b": [{ "a": 1, "b": 0, "a": 2 }] }'),
++ ('aaa'),
++ ('{a:1}'),
++ ('["a",]');
++
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	test_is_json;
++
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js::json FROM test_is_json WHERE js IS JSON) foo(js);
++
++SELECT
++	js0,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js, js::bytea FROM test_is_json WHERE js IS JSON) foo(js0, js);
++
++SELECT
++	js,
++	js IS JSON "IS JSON",
++	js IS NOT JSON "IS NOT JSON",
++	js IS JSON VALUE "IS VALUE",
++	js IS JSON OBJECT "IS OBJECT",
++	js IS JSON ARRAY "IS ARRAY",
++	js IS JSON SCALAR "IS SCALAR",
++	js IS JSON WITHOUT UNIQUE KEYS "WITHOUT UNIQUE",
++	js IS JSON WITH UNIQUE KEYS "WITH UNIQUE"
++FROM
++	(SELECT js::jsonb FROM test_is_json WHERE js IS JSON) foo(js);
++
++-- Test IS JSON deparsing
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT '1' IS JSON AS "any", ('1' || i) IS JSON SCALAR AS "scalar", '[]' IS NOT JSON ARRAY AS "array", '{}' IS JSON OBJECT WITH UNIQUE AS "object" FROM generate_series(1, 3) i;
++
++CREATE VIEW is_json_view AS
++SELECT '1' IS JSON AS "any", ('1' || i) IS JSON SCALAR AS "scalar", '[]' IS NOT JSON ARRAY AS "array", '{}' IS JSON OBJECT WITH UNIQUE AS "object" FROM generate_series(1, 3) i;
++
++\sv is_json_view
++
++DROP VIEW is_json_view;

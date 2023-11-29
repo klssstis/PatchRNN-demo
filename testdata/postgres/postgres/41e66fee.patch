@@ -1,0 +1,118 @@
+From 41e66fee051619ab84828814554f73556a958850 Mon Sep 17 00:00:00 2001
+From: Amit Kapila <akapila@postgresql.org>
+Date: Wed, 1 Dec 2021 12:51:37 +0530
+Subject: [PATCH] Fix regression test failure caused by commit 8d74fc96db.
+
+The tests didn't considered that an error unrelated to apply changes, e.g.
+"replication origin with OID %d is already active ...", could occur on the
+table sync worker before starting to copy changes.
+
+To make the test robust we instead need to check the expected error and
+the source of error which will be either tablesync or apply worker.
+
+In passing remove the harmless option "streaming = off" from Create
+Subscription command as that is anyway the default.
+
+Per buildfarm member sidewinder.
+
+Author: Masahiko Sawada
+Reviewed-by: Hou Zhijie, Vignesh C, Amit Kapila
+Discussion: https://postgr.es/m/CAD21AoDeScrsHhLyEPYqN3sydg6PxAPVBboK=30xJfUVihNZDA@mail.gmail.com
+Discussion: https://postgr.es/m/E1mrtvV-0002Gz-73@gemulon.postgresql.org
+---
+ src/test/subscription/t/026_worker_stats.pl | 59 ++++++++++++---------
+ 1 file changed, 34 insertions(+), 25 deletions(-)
+
+diff --git a/src/test/subscription/t/026_worker_stats.pl b/src/test/subscription/t/026_worker_stats.pl
+index e64e0a74b87f..b662be3c7b04 100644
+--- a/src/test/subscription/t/026_worker_stats.pl
++++ b/src/test/subscription/t/026_worker_stats.pl
+@@ -6,31 +6,38 @@
+ use warnings;
+ use PostgreSQL::Test::Cluster;
+ use PostgreSQL::Test::Utils;
+-use Test::More tests => 5;
++use Test::More tests => 3;
+ 
+ # Test if the error reported on pg_stat_subscription_workers view is expected.
+ sub test_subscription_error
+ {
+-    my ($node, $relname, $xid, $expected_error, $msg) = @_;
++    my ($node, $relname, $command, $xid, $by_apply_worker, $errmsg_prefix, $msg)
++	= @_;
+ 
+     my $check_sql = qq[
+-SELECT count(1) > 0 FROM pg_stat_subscription_workers
+-WHERE last_error_relid = '$relname'::regclass];
+-    $check_sql .= " AND last_error_xid = '$xid'::xid;" if $xid ne '';
+-
+-    # Wait for the error statistics to be updated.
+-    $node->poll_query_until(
+-	'postgres', $check_sql,
+-) or die "Timed out while waiting for statistics to be updated";
+-
+-    my $result = $node->safe_psql(
+-	'postgres',
+-	qq[
+-SELECT subname, last_error_command, last_error_relid::regclass, last_error_count > 0
++SELECT count(1) > 0
+ FROM pg_stat_subscription_workers
+-WHERE last_error_relid = '$relname'::regclass;
+-]);
+-    is($result, $expected_error, $msg);
++WHERE last_error_relid = '$relname'::regclass
++    AND starts_with(last_error_message, '$errmsg_prefix')];
++
++    # subrelid
++    $check_sql .= $by_apply_worker
++	? qq[ AND subrelid IS NULL]
++	: qq[ AND subrelid = '$relname'::regclass];
++
++    # last_error_command
++    $check_sql .= $command eq ''
++	? qq[ AND last_error_command IS NULL]
++	: qq[ AND last_error_command = '$command'];
++
++    # last_error_xid
++    $check_sql .= $xid eq ''
++	? qq[ AND last_error_xid IS NULL]
++	: qq[ AND last_error_xid = '$xid'::xid];
++
++    # Wait for the particular error statistics to be reported.
++    $node->poll_query_until('postgres', $check_sql,
++) or die "Timed out while waiting for " . $msg;
+ }
+ 
+ # Create publisher node.
+@@ -89,7 +96,7 @@ sub test_subscription_error
+ # infinite error loop due to violating the unique constraint.
+ $node_subscriber->safe_psql(
+     'postgres',
+-    "CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr' PUBLICATION tap_pub WITH (streaming = off);");
++    "CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr' PUBLICATION tap_pub;");
+ 
+ $node_publisher->wait_for_catchup('tap_sub');
+ 
+@@ -117,14 +124,16 @@ sub test_subscription_error
+ SELECT pg_current_xact_id()::xid;
+ COMMIT;
+ ]);
+-test_subscription_error($node_subscriber, 'test_tab1', $xid,
+-			qq(tap_sub|INSERT|test_tab1|t),
+-			'check the error reported by the apply worker');
++test_subscription_error($node_subscriber, 'test_tab1', 'INSERT', $xid,
++			1,	# check apply worker error
++			qq(duplicate key value violates unique constraint),
++			'error reported by the apply worker');
+ 
+ # Check the table sync worker's error in the view.
+-test_subscription_error($node_subscriber, 'test_tab2', '',
+-			qq(tap_sub||test_tab2|t),
+-			'check the error reported by the table sync worker');
++test_subscription_error($node_subscriber, 'test_tab2', '', '',
++			0,	# check tablesync worker error
++			qq(duplicate key value violates unique constraint),
++			'the error reported by the table sync worker');
+ 
+ # Test for resetting subscription worker statistics.
+ # Truncate test_tab1 and test_tab2 so that applying changes and table sync can

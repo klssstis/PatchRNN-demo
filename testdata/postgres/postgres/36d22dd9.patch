@@ -1,0 +1,334 @@
+From 36d22dd95bc87ca68e742da91f47f8826f8758c9 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Mon, 30 Sep 2019 16:06:16 -0700
+Subject: [PATCH] Don't generate EEOP_*_FETCHSOME operations for slots know to
+ be virtual.
+
+That avoids unnecessary work during both interpreted execution, and
+JIT compiled expression evaluation. Both benefit from fewer expression
+steps needing be processed, and for interpreted execution there now is
+a fastpath dedicated to just fetching a value from a virtual
+slot. That's e.g. beneficial for hashjoins over nodes that perform
+projections, as the hashed columns are currently fetched individually.
+
+Author: Soumyadeep Chakraborty, Andres Freund
+Discussion: https://postgr.es/m/CAE-ML+9OKSN71+mHtfMD-L24oDp8dGTfaVjDU6U+j+FNAW5kRQ@mail.gmail.com
+---
+ src/backend/executor/execExpr.c       |  43 ++++++---
+ src/backend/executor/execExprInterp.c | 133 +++++++++++++++++++++++++-
+ src/backend/jit/llvm/llvmjit_expr.c   |   6 +-
+ 3 files changed, 160 insertions(+), 22 deletions(-)
+
+diff --git a/src/backend/executor/execExpr.c b/src/backend/executor/execExpr.c
+index a608ff67b27e..7e486449eca3 100644
+--- a/src/backend/executor/execExpr.c
++++ b/src/backend/executor/execExpr.c
+@@ -65,7 +65,7 @@ static void ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args,
+ static void ExecInitExprSlots(ExprState *state, Node *node);
+ static void ExecPushExprSlots(ExprState *state, LastAttnumInfo *info);
+ static bool get_last_attnums_walker(Node *node, LastAttnumInfo *info);
+-static void ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op);
++static bool ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op);
+ static void ExecInitWholeRowVar(ExprEvalStep *scratch, Var *variable,
+ 								ExprState *state);
+ static void ExecInitSubscriptingRef(ExprEvalStep *scratch,
+@@ -2285,8 +2285,8 @@ ExecPushExprSlots(ExprState *state, LastAttnumInfo *info)
+ 		scratch.d.fetch.fixed = false;
+ 		scratch.d.fetch.kind = NULL;
+ 		scratch.d.fetch.known_desc = NULL;
+-		ExecComputeSlotInfo(state, &scratch);
+-		ExprEvalPushStep(state, &scratch);
++		if (ExecComputeSlotInfo(state, &scratch))
++			ExprEvalPushStep(state, &scratch);
+ 	}
+ 	if (info->last_outer > 0)
+ 	{
+@@ -2295,8 +2295,8 @@ ExecPushExprSlots(ExprState *state, LastAttnumInfo *info)
+ 		scratch.d.fetch.fixed = false;
+ 		scratch.d.fetch.kind = NULL;
+ 		scratch.d.fetch.known_desc = NULL;
+-		ExecComputeSlotInfo(state, &scratch);
+-		ExprEvalPushStep(state, &scratch);
++		if (ExecComputeSlotInfo(state, &scratch))
++			ExprEvalPushStep(state, &scratch);
+ 	}
+ 	if (info->last_scan > 0)
+ 	{
+@@ -2305,8 +2305,8 @@ ExecPushExprSlots(ExprState *state, LastAttnumInfo *info)
+ 		scratch.d.fetch.fixed = false;
+ 		scratch.d.fetch.kind = NULL;
+ 		scratch.d.fetch.known_desc = NULL;
+-		ExecComputeSlotInfo(state, &scratch);
+-		ExprEvalPushStep(state, &scratch);
++		if (ExecComputeSlotInfo(state, &scratch))
++			ExprEvalPushStep(state, &scratch);
+ 	}
+ }
+ 
+@@ -2364,14 +2364,21 @@ get_last_attnums_walker(Node *node, LastAttnumInfo *info)
+  * The goal is to determine whether a slot is 'fixed', that is, every
+  * evaluation of the expression will have the same type of slot, with an
+  * equivalent descriptor.
++ *
++ * Returns true if the the deforming step is required, false otherwise.
+  */
+-static void
++static bool
+ ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op)
+ {
+ 	PlanState  *parent = state->parent;
+ 	TupleDesc	desc = NULL;
+ 	const TupleTableSlotOps *tts_ops = NULL;
+ 	bool		isfixed = false;
++	ExprEvalOp	opcode = op->opcode;
++
++	Assert(opcode == EEOP_INNER_FETCHSOME ||
++		   opcode == EEOP_OUTER_FETCHSOME ||
++		   opcode == EEOP_SCAN_FETCHSOME);
+ 
+ 	if (op->d.fetch.known_desc != NULL)
+ 	{
+@@ -2383,7 +2390,7 @@ ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op)
+ 	{
+ 		isfixed = false;
+ 	}
+-	else if (op->opcode == EEOP_INNER_FETCHSOME)
++	else if (opcode == EEOP_INNER_FETCHSOME)
+ 	{
+ 		PlanState  *is = innerPlanState(parent);
+ 
+@@ -2403,7 +2410,7 @@ ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op)
+ 			desc = ExecGetResultType(is);
+ 		}
+ 	}
+-	else if (op->opcode == EEOP_OUTER_FETCHSOME)
++	else if (opcode == EEOP_OUTER_FETCHSOME)
+ 	{
+ 		PlanState  *os = outerPlanState(parent);
+ 
+@@ -2423,7 +2430,7 @@ ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op)
+ 			desc = ExecGetResultType(os);
+ 		}
+ 	}
+-	else if (op->opcode == EEOP_SCAN_FETCHSOME)
++	else if (opcode == EEOP_SCAN_FETCHSOME)
+ 	{
+ 		desc = parent->scandesc;
+ 
+@@ -2446,6 +2453,12 @@ ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op)
+ 		op->d.fetch.kind = NULL;
+ 		op->d.fetch.known_desc = NULL;
+ 	}
++
++	/* if the slot is known to always virtual we never need to deform */
++	if (op->d.fetch.fixed && op->d.fetch.kind == &TTSOpsVirtual)
++		return false;
++
++	return true;
+ }
+ 
+ /*
+@@ -3360,16 +3373,16 @@ ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
+ 	scratch.d.fetch.fixed = false;
+ 	scratch.d.fetch.known_desc = ldesc;
+ 	scratch.d.fetch.kind = lops;
+-	ExecComputeSlotInfo(state, &scratch);
+-	ExprEvalPushStep(state, &scratch);
++	if (ExecComputeSlotInfo(state, &scratch))
++		ExprEvalPushStep(state, &scratch);
+ 
+ 	scratch.opcode = EEOP_OUTER_FETCHSOME;
+ 	scratch.d.fetch.last_var = maxatt;
+ 	scratch.d.fetch.fixed = false;
+ 	scratch.d.fetch.known_desc = rdesc;
+ 	scratch.d.fetch.kind = rops;
+-	ExecComputeSlotInfo(state, &scratch);
+-	ExprEvalPushStep(state, &scratch);
++	if (ExecComputeSlotInfo(state, &scratch))
++		ExprEvalPushStep(state, &scratch);
+ 
+ 	/*
+ 	 * Start comparing at the last field (least significant sort key). That's
+diff --git a/src/backend/executor/execExprInterp.c b/src/backend/executor/execExprInterp.c
+index e876160a0e71..0cd6f65bc749 100644
+--- a/src/backend/executor/execExprInterp.c
++++ b/src/backend/executor/execExprInterp.c
+@@ -160,6 +160,12 @@ static Datum ExecJustAssignOuterVar(ExprState *state, ExprContext *econtext, boo
+ static Datum ExecJustAssignScanVar(ExprState *state, ExprContext *econtext, bool *isnull);
+ static Datum ExecJustApplyFuncToCase(ExprState *state, ExprContext *econtext, bool *isnull);
+ static Datum ExecJustConst(ExprState *state, ExprContext *econtext, bool *isnull);
++static Datum ExecJustInnerVarVirt(ExprState *state, ExprContext *econtext, bool *isnull);
++static Datum ExecJustOuterVarVirt(ExprState *state, ExprContext *econtext, bool *isnull);
++static Datum ExecJustScanVarVirt(ExprState *state, ExprContext *econtext, bool *isnull);
++static Datum ExecJustAssignInnerVarVirt(ExprState *state, ExprContext *econtext, bool *isnull);
++static Datum ExecJustAssignOuterVarVirt(ExprState *state, ExprContext *econtext, bool *isnull);
++static Datum ExecJustAssignScanVarVirt(ExprState *state, ExprContext *econtext, bool *isnull);
+ 
+ 
+ /*
+@@ -255,11 +261,45 @@ ExecReadyInterpretedExpr(ExprState *state)
+ 			return;
+ 		}
+ 	}
+-	else if (state->steps_len == 2 &&
+-			 state->steps[0].opcode == EEOP_CONST)
++	else if (state->steps_len == 2)
+ 	{
+-		state->evalfunc_private = (void *) ExecJustConst;
+-		return;
++		ExprEvalOp	step0 = state->steps[0].opcode;
++
++		if (step0 == EEOP_CONST)
++		{
++			state->evalfunc_private = (void *) ExecJustConst;
++			return;
++		}
++		else if (step0 == EEOP_INNER_VAR)
++		{
++			state->evalfunc_private = (void *) ExecJustInnerVarVirt;
++			return;
++		}
++		else if (step0 == EEOP_OUTER_VAR)
++		{
++			state->evalfunc_private = (void *) ExecJustOuterVarVirt;
++			return;
++		}
++		else if (step0 == EEOP_SCAN_VAR)
++		{
++			state->evalfunc_private = (void *) ExecJustScanVarVirt;
++			return;
++		}
++		else if (step0 == EEOP_ASSIGN_INNER_VAR)
++		{
++			state->evalfunc_private = (void *) ExecJustAssignInnerVarVirt;
++			return;
++		}
++		else if (step0 == EEOP_ASSIGN_OUTER_VAR)
++		{
++			state->evalfunc_private = (void *) ExecJustAssignOuterVarVirt;
++			return;
++		}
++		else if (step0 == EEOP_ASSIGN_SCAN_VAR)
++		{
++			state->evalfunc_private = (void *) ExecJustAssignScanVarVirt;
++			return;
++		}
+ 	}
+ 
+ #if defined(EEO_USE_COMPUTED_GOTO)
+@@ -2096,6 +2136,91 @@ ExecJustConst(ExprState *state, ExprContext *econtext, bool *isnull)
+ 	return op->d.constval.value;
+ }
+ 
++/* implementation of ExecJust(Inner|Outer|Scan)VarVirt */
++static pg_attribute_always_inline Datum
++ExecJustVarVirtImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
++{
++	ExprEvalStep *op = &state->steps[0];
++	int			attnum = op->d.var.attnum;
++
++	/*
++	 * As it is guaranteed that a virtual slot is used, there never is a need
++	 * to perform tuple deforming (nor would it be possible). Therefore
++	 * execExpr.c has not emitted an EEOP_*_FETCHSOME step. Verify, as much as
++	 * possible, that that determination was accurate.
++	 */
++	Assert(TTS_IS_VIRTUAL(slot));
++	Assert(TTS_FIXED(slot));
++	Assert(attnum >= 0 && attnum < slot->tts_nvalid);
++
++	*isnull = slot->tts_isnull[attnum];
++
++	return slot->tts_values[attnum];
++}
++
++/* Like ExecJustInnerVar, optimized for virtual slots */
++static Datum
++ExecJustInnerVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
++{
++	return ExecJustVarVirtImpl(state, econtext->ecxt_innertuple, isnull);
++}
++
++/* Like ExecJustOuterVar, optimized for virtual slots */
++static Datum
++ExecJustOuterVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
++{
++	return ExecJustVarVirtImpl(state, econtext->ecxt_outertuple, isnull);
++}
++
++/* Like ExecJustScanVar, optimized for virtual slots */
++static Datum
++ExecJustScanVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
++{
++	return ExecJustVarVirtImpl(state, econtext->ecxt_scantuple, isnull);
++}
++
++/* implementation of ExecJustAssign(Inner|Outer|Scan)VarVirt */
++static pg_attribute_always_inline Datum
++ExecJustAssignVarVirtImpl(ExprState *state, TupleTableSlot *inslot, bool *isnull)
++{
++	ExprEvalStep *op = &state->steps[0];
++	int			attnum = op->d.assign_var.attnum;
++	int			resultnum = op->d.assign_var.resultnum;
++	TupleTableSlot *outslot = state->resultslot;
++
++	/* see ExecJustVarVirtImpl for comments */
++
++	Assert(TTS_IS_VIRTUAL(inslot));
++	Assert(TTS_FIXED(inslot));
++	Assert(attnum >= 0 && attnum < inslot->tts_nvalid);
++
++	outslot->tts_values[resultnum] = inslot->tts_values[attnum];
++	outslot->tts_isnull[resultnum] = inslot->tts_isnull[attnum];
++
++	return 0;
++}
++
++/* Like ExecJustAssignInnerVar, optimized for virtual slots */
++static Datum
++ExecJustAssignInnerVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
++{
++	return ExecJustAssignVarVirtImpl(state, econtext->ecxt_innertuple, isnull);
++}
++
++/* Like ExecJustAssignOuterVar, optimized for virtual slots */
++static Datum
++ExecJustAssignOuterVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
++{
++	return ExecJustAssignVarVirtImpl(state, econtext->ecxt_outertuple, isnull);
++}
++
++/* Like ExecJustAssignScanVar, optimized for virtual slots */
++static Datum
++ExecJustAssignScanVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
++{
++	return ExecJustAssignVarVirtImpl(state, econtext->ecxt_scantuple, isnull);
++}
++
+ #if defined(EEO_USE_COMPUTED_GOTO)
+ /*
+  * Comparator used when building address->opcode lookup table for
+diff --git a/src/backend/jit/llvm/llvmjit_expr.c b/src/backend/jit/llvm/llvmjit_expr.c
+index 30133634c70b..d09324637b98 100644
+--- a/src/backend/jit/llvm/llvmjit_expr.c
++++ b/src/backend/jit/llvm/llvmjit_expr.c
+@@ -287,6 +287,9 @@ llvm_compile_expr(ExprState *state)
+ 					if (op->d.fetch.fixed)
+ 						tts_ops = op->d.fetch.kind;
+ 
++					/* step should not have been generated */
++					Assert(tts_ops != &TTSOpsVirtual);
++
+ 					if (opcode == EEOP_INNER_FETCHSOME)
+ 						v_slot = v_innerslot;
+ 					else if (opcode == EEOP_OUTER_FETCHSOME)
+@@ -297,9 +300,6 @@ llvm_compile_expr(ExprState *state)
+ 					/*
+ 					 * Check if all required attributes are available, or
+ 					 * whether deforming is required.
+-					 *
+-					 * TODO: skip nvalid check if slot is fixed and known to
+-					 * be a virtual slot.
+ 					 */
+ 					v_nvalid =
+ 						l_load_struct_gep(b, v_slot,

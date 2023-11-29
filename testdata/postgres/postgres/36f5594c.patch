@@ -1,0 +1,112 @@
+From 36f5594c0fe694600c07c803324b51fcfbea4079 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 9 Nov 2023 15:46:16 -0500
+Subject: [PATCH] Fix computation of varnullingrels when const-folding field
+ selection.
+
+We can simplify FieldSelect on a whole-row Var into a plain Var
+for the selected field.  However, we should copy the whole-row Var's
+varnullingrels when we do so, because the new Var is clearly nullable
+by exactly the same rels as the original.  Failure to do this led to
+errors like "wrong varnullingrels (b) (expected (b 3)) for Var 2/2".
+
+Richard Guo, per bug #18184 from Marian Krucina.  Back-patch to
+v16 where varnullingrels was introduced.
+
+Discussion: https://postgr.es/m/18184-5868dd258782058e@postgresql.org
+---
+ src/backend/optimizer/util/clauses.c | 19 +++++++++++++------
+ src/test/regress/expected/join.out   | 26 ++++++++++++++++++++++++++
+ src/test/regress/sql/join.sql        | 12 ++++++++++++
+ 3 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
+index da258968b8c3..948c2bf06db0 100644
+--- a/src/backend/optimizer/util/clauses.c
++++ b/src/backend/optimizer/util/clauses.c
+@@ -3296,12 +3296,19 @@ eval_const_expressions_mutator(Node *node,
+ 											  fselect->resulttype,
+ 											  fselect->resulttypmod,
+ 											  fselect->resultcollid))
+-						return (Node *) makeVar(((Var *) arg)->varno,
+-												fselect->fieldnum,
+-												fselect->resulttype,
+-												fselect->resulttypmod,
+-												fselect->resultcollid,
+-												((Var *) arg)->varlevelsup);
++					{
++						Var		   *newvar;
++
++						newvar = makeVar(((Var *) arg)->varno,
++										 fselect->fieldnum,
++										 fselect->resulttype,
++										 fselect->resulttypmod,
++										 fselect->resultcollid,
++										 ((Var *) arg)->varlevelsup);
++						/* New Var is nullable by same rels as the old one */
++						newvar->varnullingrels = ((Var *) arg)->varnullingrels;
++						return (Node *) newvar;
++					}
+ 				}
+ 				if (arg && IsA(arg, RowExpr))
+ 				{
+diff --git a/src/test/regress/expected/join.out b/src/test/regress/expected/join.out
+index ddc4e6923299..b60f5a67c1e2 100644
+--- a/src/test/regress/expected/join.out
++++ b/src/test/regress/expected/join.out
+@@ -4133,6 +4133,32 @@ select * from mki4(42);
+ 
+ drop function mki8(bigint, bigint);
+ drop function mki4(int);
++-- test const-folding of a whole-row Var into a per-field Var
++-- (need to inline a function to reach this case, else parser does it)
++create function f_field_select(t onek) returns int4 as
++$$ select t.unique2; $$ language sql immutable;
++explain (verbose, costs off)
++select (t2.*).unique1, f_field_select(t2) from tenk1 t1
++    left join onek t2 on t1.unique1 = t2.unique1
++    left join int8_tbl t3 on true;
++                             QUERY PLAN                             
++--------------------------------------------------------------------
++ Nested Loop Left Join
++   Output: t2.unique1, t2.unique2
++   ->  Hash Left Join
++         Output: t2.unique1, t2.unique2
++         Hash Cond: (t1.unique1 = t2.unique1)
++         ->  Index Only Scan using tenk1_unique1 on public.tenk1 t1
++               Output: t1.unique1
++         ->  Hash
++               Output: t2.unique1, t2.unique2
++               ->  Seq Scan on public.onek t2
++                     Output: t2.unique1, t2.unique2
++   ->  Materialize
++         ->  Seq Scan on public.int8_tbl t3
++(13 rows)
++
++drop function f_field_select(t onek);
+ --
+ -- test extraction of restriction OR clauses from join OR clause
+ -- (we used to only do this for indexable clauses)
+diff --git a/src/test/regress/sql/join.sql b/src/test/regress/sql/join.sql
+index a41787d1f1e0..fbaee480d32a 100644
+--- a/src/test/regress/sql/join.sql
++++ b/src/test/regress/sql/join.sql
+@@ -1381,6 +1381,18 @@ select * from mki4(42);
+ drop function mki8(bigint, bigint);
+ drop function mki4(int);
+ 
++-- test const-folding of a whole-row Var into a per-field Var
++-- (need to inline a function to reach this case, else parser does it)
++create function f_field_select(t onek) returns int4 as
++$$ select t.unique2; $$ language sql immutable;
++
++explain (verbose, costs off)
++select (t2.*).unique1, f_field_select(t2) from tenk1 t1
++    left join onek t2 on t1.unique1 = t2.unique1
++    left join int8_tbl t3 on true;
++
++drop function f_field_select(t onek);
++
+ --
+ -- test extraction of restriction OR clauses from join OR clause
+ -- (we used to only do this for indexable clauses)

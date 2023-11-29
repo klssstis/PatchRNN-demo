@@ -1,0 +1,476 @@
+From 49d9cfc68bf4e0d32a948fe72d5a0ef7f464944e Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Fri, 25 Mar 2022 13:16:21 +0100
+Subject: [PATCH] Fix replay of create database records on standby
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Crash recovery on standby may encounter missing directories when
+replaying create database WAL records.  Prior to this patch, the standby
+would fail to recover in such a case.  However, the directories could be
+legitimately missing.  Consider a sequence of WAL records as follows:
+
+    CREATE DATABASE
+    DROP DATABASE
+    DROP TABLESPACE
+
+If, after replaying the last WAL record and removing the tablespace
+directory, the standby crashes and has to replay the create database
+record again, the crash recovery must be able to move on.
+
+This patch adds a mechanism similar to invalid-page tracking, to keep a
+tally of missing directories during crash recovery.  If all the missing
+directory references are matched with corresponding drop records at the
+end of crash recovery, the standby can safely continue following the
+primary.
+
+Backpatch to 13, at least for now.  The bug is older, but fixing it in
+older branches requires more careful study of the interactions with
+commit e6d8069522c8, which appeared in 13.
+
+A new TAP test file is added to verify the condition.  However, because
+it depends on commit d6d317dbf615, it can only be added to branch
+master.  I (Álvaro) manually verified that the code behaves as expected
+in branch 14.  It's a bit nervous-making to leave the code uncovered by
+tests in older branches, but leaving the bug unfixed is even worse.
+Also, the main reason this fix took so long is precisely that we
+couldn't agree on a good strategy to approach testing for the bug, so
+perhaps this is the best we can do.
+
+Diagnosed-by: Paul Guo <paulguo@gmail.com>
+Author: Paul Guo <paulguo@gmail.com>
+Author: Kyotaro Horiguchi <horikyota.ntt@gmail.com>
+Author: Asim R Praveen <apraveen@pivotal.io>
+Discussion: https://postgr.es/m/CAEET0ZGx9AvioViLf7nbR_8tH9-=27DN5xWJ2P9-ROH16e4JUA@mail.gmail.com
+---
+ src/backend/access/transam/xlogrecovery.c   |   6 +
+ src/backend/access/transam/xlogutils.c      | 159 +++++++++++++++++++-
+ src/backend/commands/dbcommands.c           |  57 +++++++
+ src/backend/commands/tablespace.c           |  17 +++
+ src/include/access/xlogutils.h              |   4 +
+ src/test/recovery/t/029_replay_tsp_drops.pl |  67 +++++++++
+ src/tools/pgindent/typedefs.list            |   2 +
+ 7 files changed, 311 insertions(+), 1 deletion(-)
+ create mode 100644 src/test/recovery/t/029_replay_tsp_drops.pl
+
+diff --git a/src/backend/access/transam/xlogrecovery.c b/src/backend/access/transam/xlogrecovery.c
+index 8d2395dae256..8b22c4e634f3 100644
+--- a/src/backend/access/transam/xlogrecovery.c
++++ b/src/backend/access/transam/xlogrecovery.c
+@@ -2047,6 +2047,12 @@ CheckRecoveryConsistency(void)
+ 		 */
+ 		XLogCheckInvalidPages();
+ 
++		/*
++		 * Check if the XLOG sequence contained any unresolved references to
++		 * missing directories.
++		 */
++		XLogCheckMissingDirs();
++
+ 		reachedConsistency = true;
+ 		ereport(LOG,
+ 				(errmsg("consistent recovery state reached at %X/%X",
+diff --git a/src/backend/access/transam/xlogutils.c b/src/backend/access/transam/xlogutils.c
+index 511f2f186f56..8c1b8216be50 100644
+--- a/src/backend/access/transam/xlogutils.c
++++ b/src/backend/access/transam/xlogutils.c
+@@ -54,6 +54,164 @@ bool		InRecovery = false;
+ /* Are we in Hot Standby mode? Only valid in startup process, see xlogutils.h */
+ HotStandbyState standbyState = STANDBY_DISABLED;
+ 
++
++/*
++ * If a create database WAL record is being replayed more than once during
++ * crash recovery on a standby, it is possible that either the tablespace
++ * directory or the template database directory is missing.  This happens when
++ * the directories are removed by replay of subsequent drop records.  Note
++ * that this problem happens only on standby and not on master.  On master, a
++ * checkpoint is created at the end of create database operation. On standby,
++ * however, such a strategy (creating restart points during replay) is not
++ * viable because it will slow down WAL replay.
++ *
++ * The alternative is to track references to each missing directory
++ * encountered when performing crash recovery in the following hash table.
++ * Similar to invalid page table above, the expectation is that each missing
++ * directory entry should be matched with a drop database or drop tablespace
++ * WAL record by the end of crash recovery.
++ */
++typedef struct xl_missing_dir_key
++{
++	Oid			spcNode;
++	Oid			dbNode;
++} xl_missing_dir_key;
++
++typedef struct xl_missing_dir
++{
++	xl_missing_dir_key key;
++	char		path[MAXPGPATH];
++} xl_missing_dir;
++
++static HTAB *missing_dir_tab = NULL;
++
++
++/*
++ * Keep track of a directory that wasn't found while replaying database
++ * creation records.  These should match up with tablespace removal records
++ * later in the WAL stream; we verify that before reaching consistency.
++ */
++void
++XLogRememberMissingDir(Oid spcNode, Oid dbNode, char *path)
++{
++	xl_missing_dir_key key;
++	bool		found;
++	xl_missing_dir *entry;
++
++	/*
++	 * Database OID may be invalid but tablespace OID must be valid.  If
++	 * dbNode is InvalidOid, we are logging a missing tablespace directory,
++	 * otherwise we are logging a missing database directory.
++	 */
++	Assert(OidIsValid(spcNode));
++
++	if (missing_dir_tab == NULL)
++	{
++		/* create hash table when first needed */
++		HASHCTL		ctl;
++
++		memset(&ctl, 0, sizeof(ctl));
++		ctl.keysize = sizeof(xl_missing_dir_key);
++		ctl.entrysize = sizeof(xl_missing_dir);
++
++		missing_dir_tab = hash_create("XLOG missing directory table",
++									  100,
++									  &ctl,
++									  HASH_ELEM | HASH_BLOBS);
++	}
++
++	key.spcNode = spcNode;
++	key.dbNode = dbNode;
++
++	entry = hash_search(missing_dir_tab, &key, HASH_ENTER, &found);
++
++	if (found)
++	{
++		if (dbNode == InvalidOid)
++			elog(DEBUG1, "missing directory %s (tablespace %u) already exists: %s",
++				 path, spcNode, entry->path);
++		else
++			elog(DEBUG1, "missing directory %s (tablespace %u database %u) already exists: %s",
++				 path, spcNode, dbNode, entry->path);
++	}
++	else
++	{
++		strlcpy(entry->path, path, sizeof(entry->path));
++		if (dbNode == InvalidOid)
++			elog(DEBUG1, "logged missing dir %s (tablespace %u)",
++				 path, spcNode);
++		else
++			elog(DEBUG1, "logged missing dir %s (tablespace %u database %u)",
++				 path, spcNode, dbNode);
++	}
++}
++
++/*
++ * Remove an entry from the list of directories not found.  This is to be done
++ * when the matching tablespace removal WAL record is found.
++ */
++void
++XLogForgetMissingDir(Oid spcNode, Oid dbNode)
++{
++	xl_missing_dir_key key;
++
++	key.spcNode = spcNode;
++	key.dbNode = dbNode;
++
++	/* Database OID may be invalid but tablespace OID must be valid. */
++	Assert(OidIsValid(spcNode));
++
++	if (missing_dir_tab == NULL)
++		return;
++
++	if (hash_search(missing_dir_tab, &key, HASH_REMOVE, NULL) != NULL)
++	{
++		if (dbNode == InvalidOid)
++		{
++			elog(DEBUG2, "forgot missing dir (tablespace %u)", spcNode);
++		}
++		else
++		{
++			char	   *path = GetDatabasePath(dbNode, spcNode);
++
++			elog(DEBUG2, "forgot missing dir %s (tablespace %u database %u)",
++				 path, spcNode, dbNode);
++			pfree(path);
++		}
++	}
++}
++
++/*
++ * This is called at the end of crash recovery, before entering archive
++ * recovery on a standby.  PANIC if the hash table is not empty.
++ */
++void
++XLogCheckMissingDirs(void)
++{
++	HASH_SEQ_STATUS status;
++	xl_missing_dir *hentry;
++	bool		foundone = false;
++
++	if (missing_dir_tab == NULL)
++		return;					/* nothing to do */
++
++	hash_seq_init(&status, missing_dir_tab);
++
++	while ((hentry = (xl_missing_dir *) hash_seq_search(&status)) != NULL)
++	{
++		elog(WARNING, "missing directory \"%s\" tablespace %u database %u",
++			 hentry->path, hentry->key.spcNode, hentry->key.dbNode);
++		foundone = true;
++	}
++
++	if (foundone)
++		elog(PANIC, "WAL contains references to missing directories");
++
++	hash_destroy(missing_dir_tab);
++	missing_dir_tab = NULL;
++}
++
++
+ /*
+  * During XLOG replay, we may see XLOG records for incremental updates of
+  * pages that no longer exist, because their relation was later dropped or
+@@ -79,7 +237,6 @@ typedef struct xl_invalid_page
+ 
+ static HTAB *invalid_page_tab = NULL;
+ 
+-
+ /* Report a reference to an invalid page */
+ static void
+ report_invalid_page(int elevel, RelFileNode node, ForkNumber forkno,
+diff --git a/src/backend/commands/dbcommands.c b/src/backend/commands/dbcommands.c
+index 623e5ec77895..95771b06a2e4 100644
+--- a/src/backend/commands/dbcommands.c
++++ b/src/backend/commands/dbcommands.c
+@@ -30,6 +30,7 @@
+ #include "access/tableam.h"
+ #include "access/xact.h"
+ #include "access/xloginsert.h"
++#include "access/xlogrecovery.h"
+ #include "access/xlogutils.h"
+ #include "catalog/catalog.h"
+ #include "catalog/dependency.h"
+@@ -2483,7 +2484,9 @@ dbase_redo(XLogReaderState *record)
+ 		xl_dbase_create_rec *xlrec = (xl_dbase_create_rec *) XLogRecGetData(record);
+ 		char	   *src_path;
+ 		char	   *dst_path;
++		char	   *parent_path;
+ 		struct stat st;
++		bool		skip = false;
+ 
+ 		src_path = GetDatabasePath(xlrec->src_db_id, xlrec->src_tablespace_id);
+ 		dst_path = GetDatabasePath(xlrec->db_id, xlrec->tablespace_id);
+@@ -2501,6 +2504,56 @@ dbase_redo(XLogReaderState *record)
+ 						(errmsg("some useless files may be left behind in old database directory \"%s\"",
+ 								dst_path)));
+ 		}
++		else if (!reachedConsistency)
++		{
++			/*
++			 * It is possible that a drop tablespace record appearing later in
++			 * WAL has already been replayed -- in other words, that we are
++			 * replaying the database creation record a second time with no
++			 * intervening checkpoint.  In that case, the tablespace directory
++			 * has already been removed and the create database operation
++			 * cannot be replayed.  Skip the replay itself, but remember the
++			 * fact that the tablespace directory is missing, to be matched
++			 * with the expected tablespace drop record later.
++			 */
++			parent_path = pstrdup(dst_path);
++			get_parent_directory(parent_path);
++			if (!(stat(parent_path, &st) == 0 && S_ISDIR(st.st_mode)))
++			{
++				XLogRememberMissingDir(xlrec->tablespace_id, InvalidOid, parent_path);
++				skip = true;
++				ereport(WARNING,
++						(errmsg("skipping replay of database creation WAL record"),
++						 errdetail("The target tablespace \"%s\" directory was not found.",
++								   parent_path),
++						 errhint("A future WAL record that removes the directory before reaching consistent mode is expected.")));
++			}
++			pfree(parent_path);
++		}
++
++		/*
++		 * If the source directory is missing, skip the copy and make a note of
++		 * it for later.
++		 *
++		 * One possible reason for this is that the template database used for
++		 * creating this database may have been dropped, as noted above.
++		 * Moving a database from one tablespace may also be a partner in the
++		 * crime.
++		 */
++		if (!(stat(src_path, &st) == 0 && S_ISDIR(st.st_mode)) &&
++			!reachedConsistency)
++		{
++			XLogRememberMissingDir(xlrec->src_tablespace_id, xlrec->src_db_id, src_path);
++			skip = true;
++			ereport(WARNING,
++					(errmsg("skipping replay of database creation WAL record"),
++					 errdetail("The source database directory \"%s\" was not found.",
++							   src_path),
++					 errhint("A future WAL record that removes the directory before reaching consistent mode is expected.")));
++		}
++
++		if (skip)
++			return;
+ 
+ 		/*
+ 		 * Force dirty buffers out to disk, to ensure source database is
+@@ -2563,6 +2616,10 @@ dbase_redo(XLogReaderState *record)
+ 				ereport(WARNING,
+ 						(errmsg("some useless files may be left behind in old database directory \"%s\"",
+ 								dst_path)));
++
++			if (!reachedConsistency)
++				XLogForgetMissingDir(xlrec->tablespace_ids[i], xlrec->db_id);
++
+ 			pfree(dst_path);
+ 		}
+ 
+diff --git a/src/backend/commands/tablespace.c b/src/backend/commands/tablespace.c
+index 40514ab550fe..55f40831da96 100644
+--- a/src/backend/commands/tablespace.c
++++ b/src/backend/commands/tablespace.c
+@@ -57,6 +57,7 @@
+ #include "access/tableam.h"
+ #include "access/xact.h"
+ #include "access/xloginsert.h"
++#include "access/xlogrecovery.h"
+ #include "access/xlogutils.h"
+ #include "catalog/catalog.h"
+ #include "catalog/dependency.h"
+@@ -1574,6 +1575,22 @@ tblspc_redo(XLogReaderState *record)
+ 	{
+ 		xl_tblspc_drop_rec *xlrec = (xl_tblspc_drop_rec *) XLogRecGetData(record);
+ 
++		if (!reachedConsistency)
++			XLogForgetMissingDir(xlrec->ts_id, InvalidOid);
++
++		/*
++		 * Before we remove the tablespace directory, update minimum recovery
++		 * point to cover this WAL record. Once the tablespace is removed,
++		 * there's no going back.  This manually enforces the WAL-first rule.
++		 * Doing this before the removal means that if the removal fails for
++		 * some reason, the directory is left alone and needs to be manually
++		 * removed.  Alternatively we could update the minimum recovery point
++		 * after removal, but that would leave a small window where the
++		 * WAL-first rule could be violated.
++		 */
++		if (!reachedConsistency)
++			XLogFlush(record->EndRecPtr);
++
+ 		/*
+ 		 * If we issued a WAL record for a drop tablespace it implies that
+ 		 * there were no files in it at all when the DROP was done. That means
+diff --git a/src/include/access/xlogutils.h b/src/include/access/xlogutils.h
+index 64708949db95..8d48f003b055 100644
+--- a/src/include/access/xlogutils.h
++++ b/src/include/access/xlogutils.h
+@@ -65,6 +65,10 @@ extern void XLogDropDatabase(Oid dbid);
+ extern void XLogTruncateRelation(RelFileNode rnode, ForkNumber forkNum,
+ 								 BlockNumber nblocks);
+ 
++extern void XLogRememberMissingDir(Oid spcNode, Oid dbNode, char *path);
++extern void XLogForgetMissingDir(Oid spcNode, Oid dbNode);
++extern void XLogCheckMissingDirs(void);
++
+ /* Result codes for XLogReadBufferForRedo[Extended] */
+ typedef enum
+ {
+diff --git a/src/test/recovery/t/029_replay_tsp_drops.pl b/src/test/recovery/t/029_replay_tsp_drops.pl
+new file mode 100644
+index 000000000000..90a72be489f2
+--- /dev/null
++++ b/src/test/recovery/t/029_replay_tsp_drops.pl
+@@ -0,0 +1,67 @@
++# Copyright (c) 2022, PostgreSQL Global Development Group
++
++# Test recovery involving tablespace removal.  If recovery stops
++# after once tablespace is removed, the next recovery should properly
++# ignore the operations within the removed tablespaces.
++
++use strict;
++use warnings;
++
++use PostgreSQL::Test::Cluster;
++use PostgreSQL::Test::Utils;
++use Test::More;
++
++my $node_primary = PostgreSQL::Test::Cluster->new('primary1');
++$node_primary->init(allows_streaming => 1);
++$node_primary->start;
++$node_primary->psql('postgres',
++qq[
++	SET allow_in_place_tablespaces=on;
++	CREATE TABLESPACE dropme_ts1 LOCATION '';
++	CREATE TABLESPACE dropme_ts2 LOCATION '';
++	CREATE TABLESPACE source_ts  LOCATION '';
++	CREATE TABLESPACE target_ts  LOCATION '';
++    CREATE DATABASE template_db IS_TEMPLATE = true;
++]);
++my $backup_name = 'my_backup';
++$node_primary->backup($backup_name);
++
++my $node_standby = PostgreSQL::Test::Cluster->new('standby1');
++$node_standby->init_from_backup($node_primary, $backup_name, has_streaming => 1);
++$node_standby->start;
++
++# Make sure connection is made
++$node_primary->poll_query_until(
++	'postgres', 'SELECT count(*) = 1 FROM pg_stat_replication');
++
++$node_standby->safe_psql('postgres', 'CHECKPOINT');
++
++# Do immediate shutdown just after a sequence of CREATE DATABASE / DROP
++# DATABASE / DROP TABLESPACE. This causes CREATE DATABASE WAL records
++# to be applied to already-removed directories.
++$node_primary->safe_psql('postgres',
++						q[CREATE DATABASE dropme_db1 WITH TABLESPACE dropme_ts1;
++						  CREATE DATABASE dropme_db2 WITH TABLESPACE dropme_ts2;
++						  CREATE DATABASE moveme_db TABLESPACE source_ts;
++						  ALTER DATABASE moveme_db SET TABLESPACE target_ts;
++						  CREATE DATABASE newdb TEMPLATE template_db;
++						  ALTER DATABASE template_db IS_TEMPLATE = false;
++						  DROP DATABASE dropme_db1;
++						  DROP DATABASE dropme_db2; DROP TABLESPACE dropme_ts2;
++						  DROP TABLESPACE source_ts;
++						  DROP DATABASE template_db;]);
++
++$node_primary->wait_for_catchup($node_standby, 'replay',
++							   $node_primary->lsn('replay'));
++$node_standby->stop('immediate');
++
++# Should restart ignoring directory creation error.
++is($node_standby->start, 1, "standby started successfully");
++
++my $log = PostgreSQL::Test::Utils::slurp_file($node_standby->logfile);
++like(
++	$log,
++	qr[WARNING:  skipping replay of database creation WAL record],
++	"warning message is logged");
++
++done_testing();
+diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list
+index 49688036a7e4..85c808af90e7 100644
+--- a/src/tools/pgindent/typedefs.list
++++ b/src/tools/pgindent/typedefs.list
+@@ -3736,6 +3736,8 @@ xl_invalid_page
+ xl_invalid_page_key
+ xl_invalidations
+ xl_logical_message
++xl_missing_dir_key
++xl_missing_dir
+ xl_multi_insert_tuple
+ xl_multixact_create
+ xl_multixact_truncate
