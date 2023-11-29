@@ -1,0 +1,184 @@
+From 2b0ee126bbf01cbfd657bd53c94f9284ba903ca2 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 21 May 2021 15:02:06 -0400
+Subject: [PATCH] Fix usage of "tableoid" in GENERATED expressions.
+
+We consider this supported (though I've got my doubts that it's a
+good idea, because tableoid is not immutable).  However, several
+code paths failed to fill the field in soon enough, causing such
+a GENERATED expression to see zero or the wrong value.  This
+occurred when ALTER TABLE adds a new GENERATED column to a table
+with existing rows, and during regular INSERT or UPDATE on a
+foreign table with GENERATED columns.
+
+Noted during investigation of a report from Vitaly Ustinov.
+Back-patch to v12 where GENERATED came in.
+
+Discussion: https://postgr.es/m/CAM_DEiWR2DPT6U4xb-Ehigozzd3n3G37ZB1+867zbsEVtYoJww@mail.gmail.com
+---
+ src/backend/commands/tablecmds.c        | 13 ++++++++-----
+ src/backend/executor/nodeModifyTable.c  | 24 ++++++++++++++++++------
+ src/test/regress/expected/generated.out | 13 ++++++++-----
+ src/test/regress/sql/generated.sql      |  5 ++++-
+ 4 files changed, 38 insertions(+), 17 deletions(-)
+
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index ebc62034d26e..85dcc330638a 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -5761,6 +5761,14 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap, LOCKMODE lockmode)
+ 				foreach(lc, dropped_attrs)
+ 					newslot->tts_isnull[lfirst_int(lc)] = true;
+ 
++				/*
++				 * Constraints and GENERATED expressions might reference the
++				 * tableoid column, so fill tts_tableOid with the desired
++				 * value.  (We must do this each time, because it gets
++				 * overwritten with newrel's OID during storing.)
++				 */
++				newslot->tts_tableOid = RelationGetRelid(oldrel);
++
+ 				/*
+ 				 * Process supplied expressions to replace selected columns.
+ 				 *
+@@ -5804,11 +5812,6 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap, LOCKMODE lockmode)
+ 									   &newslot->tts_isnull[ex->attnum - 1]);
+ 				}
+ 
+-				/*
+-				 * Constraints might reference the tableoid column, so
+-				 * initialize t_tableOid before evaluating them.
+-				 */
+-				newslot->tts_tableOid = RelationGetRelid(oldrel);
+ 				insertslot = newslot;
+ 			}
+ 			else
+diff --git a/src/backend/executor/nodeModifyTable.c b/src/backend/executor/nodeModifyTable.c
+index 0816027f7f7c..379b05631050 100644
+--- a/src/backend/executor/nodeModifyTable.c
++++ b/src/backend/executor/nodeModifyTable.c
+@@ -658,6 +658,12 @@ ExecInsert(ModifyTableState *mtstate,
+ 	}
+ 	else if (resultRelInfo->ri_FdwRoutine)
+ 	{
++		/*
++		 * GENERATED expressions might reference the tableoid column, so
++		 * (re-)initialize tts_tableOid before evaluating them.
++		 */
++		slot->tts_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
++
+ 		/*
+ 		 * Compute stored generated columns
+ 		 */
+@@ -729,7 +735,7 @@ ExecInsert(ModifyTableState *mtstate,
+ 		/*
+ 		 * AFTER ROW Triggers or RETURNING expressions might reference the
+ 		 * tableoid column, so (re-)initialize tts_tableOid before evaluating
+-		 * them.
++		 * them.  (This covers the case where the FDW replaced the slot.)
+ 		 */
+ 		slot->tts_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+ 	}
+@@ -738,8 +744,8 @@ ExecInsert(ModifyTableState *mtstate,
+ 		WCOKind		wco_kind;
+ 
+ 		/*
+-		 * Constraints might reference the tableoid column, so (re-)initialize
+-		 * tts_tableOid before evaluating them.
++		 * Constraints and GENERATED expressions might reference the tableoid
++		 * column, so (re-)initialize tts_tableOid before evaluating them.
+ 		 */
+ 		slot->tts_tableOid = RelationGetRelid(resultRelationDesc);
+ 
+@@ -1629,6 +1635,12 @@ ExecUpdate(ModifyTableState *mtstate,
+ 	}
+ 	else if (resultRelInfo->ri_FdwRoutine)
+ 	{
++		/*
++		 * GENERATED expressions might reference the tableoid column, so
++		 * (re-)initialize tts_tableOid before evaluating them.
++		 */
++		slot->tts_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
++
+ 		/*
+ 		 * Compute stored generated columns
+ 		 */
+@@ -1651,7 +1663,7 @@ ExecUpdate(ModifyTableState *mtstate,
+ 		/*
+ 		 * AFTER ROW Triggers or RETURNING expressions might reference the
+ 		 * tableoid column, so (re-)initialize tts_tableOid before evaluating
+-		 * them.
++		 * them.  (This covers the case where the FDW replaced the slot.)
+ 		 */
+ 		slot->tts_tableOid = RelationGetRelid(resultRelationDesc);
+ 	}
+@@ -1662,8 +1674,8 @@ ExecUpdate(ModifyTableState *mtstate,
+ 		bool		update_indexes;
+ 
+ 		/*
+-		 * Constraints might reference the tableoid column, so (re-)initialize
+-		 * tts_tableOid before evaluating them.
++		 * Constraints and GENERATED expressions might reference the tableoid
++		 * column, so (re-)initialize tts_tableOid before evaluating them.
+ 		 */
+ 		slot->tts_tableOid = RelationGetRelid(resultRelationDesc);
+ 
+diff --git a/src/test/regress/expected/generated.out b/src/test/regress/expected/generated.out
+index 675773f0c1f2..71542e95d5f0 100644
+--- a/src/test/regress/expected/generated.out
++++ b/src/test/regress/expected/generated.out
+@@ -64,6 +64,7 @@ ERROR:  both identity and generation expression specified for column "b" of tabl
+ LINE 1: ...t PRIMARY KEY, b int GENERATED ALWAYS AS identity GENERATED ...
+                                                              ^
+ -- reference to system column not allowed in generated column
++-- (except tableoid, which we test below)
+ CREATE TABLE gtest_err_6a (a int PRIMARY KEY, b bool GENERATED ALWAYS AS (xmin <> 37) STORED);
+ ERROR:  cannot use system column "xmin" in column generation expression
+ LINE 1: ...a (a int PRIMARY KEY, b bool GENERATED ALWAYS AS (xmin <> 37...
+@@ -455,14 +456,16 @@ DROP TYPE double_int;
+ -- using tableoid is allowed
+ CREATE TABLE gtest_tableoid (
+   a int PRIMARY KEY,
+-  b bool GENERATED ALWAYS AS (tableoid <> 0) STORED
++  b bool GENERATED ALWAYS AS (tableoid = 'gtest_tableoid'::regclass) STORED
+ );
+ INSERT INTO gtest_tableoid VALUES (1), (2);
++ALTER TABLE gtest_tableoid ADD COLUMN
++  c regclass GENERATED ALWAYS AS (tableoid) STORED;
+ SELECT * FROM gtest_tableoid;
+- a | b 
+----+---
+- 1 | t
+- 2 | t
++ a | b |       c        
++---+---+----------------
++ 1 | t | gtest_tableoid
++ 2 | t | gtest_tableoid
+ (2 rows)
+ 
+ -- drop column behavior
+diff --git a/src/test/regress/sql/generated.sql b/src/test/regress/sql/generated.sql
+index 63251c443a96..914197608b74 100644
+--- a/src/test/regress/sql/generated.sql
++++ b/src/test/regress/sql/generated.sql
+@@ -29,6 +29,7 @@ CREATE TABLE gtest_err_5a (a int PRIMARY KEY, b int DEFAULT 5 GENERATED ALWAYS A
+ CREATE TABLE gtest_err_5b (a int PRIMARY KEY, b int GENERATED ALWAYS AS identity GENERATED ALWAYS AS (a * 2) STORED);
+ 
+ -- reference to system column not allowed in generated column
++-- (except tableoid, which we test below)
+ CREATE TABLE gtest_err_6a (a int PRIMARY KEY, b bool GENERATED ALWAYS AS (xmin <> 37) STORED);
+ 
+ -- various prohibited constructs
+@@ -218,9 +219,11 @@ DROP TYPE double_int;
+ -- using tableoid is allowed
+ CREATE TABLE gtest_tableoid (
+   a int PRIMARY KEY,
+-  b bool GENERATED ALWAYS AS (tableoid <> 0) STORED
++  b bool GENERATED ALWAYS AS (tableoid = 'gtest_tableoid'::regclass) STORED
+ );
+ INSERT INTO gtest_tableoid VALUES (1), (2);
++ALTER TABLE gtest_tableoid ADD COLUMN
++  c regclass GENERATED ALWAYS AS (tableoid) STORED;
+ SELECT * FROM gtest_tableoid;
+ 
+ -- drop column behavior

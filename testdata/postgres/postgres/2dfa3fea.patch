@@ -1,0 +1,182 @@
+From 2dfa3fea88bc951d0812a18649d801f07964c9b9 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 28 Sep 2020 13:44:01 -0400
+Subject: [PATCH] Remove complaints about COLLATE clauses in partition bound
+ values.
+
+transformPartitionBoundValue went out of its way to do the wrong
+thing: there is no reason to complain about a non-matching COLLATE
+clause in a partition boundary expression.  We're coercing the
+bound expression to the target column type as though by an
+implicit assignment, and the rules for implicit assignment say
+that collations can be implicitly converted.
+
+What we *do* need to do, and the code is not doing, is apply
+assign_expr_collations() to the bound expression.  While this is
+merely a definition disagreement, that is a bug that needs to be
+back-patched, so I'll commit it separately.
+
+Discussion: https://postgr.es/m/CAJV4CdrZ5mKuaEsRSbLf2URQ3h6iMtKD=hik8MaF5WwdmC9uZw@mail.gmail.com
+---
+ src/backend/parser/parse_utilcmd.c         | 44 ----------------------
+ src/test/regress/expected/create_table.out | 32 ++++++++--------
+ src/test/regress/sql/create_table.sql      | 18 +++------
+ 3 files changed, 21 insertions(+), 73 deletions(-)
+
+diff --git a/src/backend/parser/parse_utilcmd.c b/src/backend/parser/parse_utilcmd.c
+index 164312d60e25..6d2f36da2df0 100644
+--- a/src/backend/parser/parse_utilcmd.c
++++ b/src/backend/parser/parse_utilcmd.c
+@@ -4183,50 +4183,6 @@ transformPartitionBoundValue(ParseState *pstate, Node *val,
+ 	 */
+ 	Assert(!contain_var_clause(value));
+ 
+-	/*
+-	 * Check that the input expression's collation is compatible with one
+-	 * specified for the parent's partition key (partcollation).  Don't throw
+-	 * an error if it's the default collation which we'll replace with the
+-	 * parent's collation anyway.
+-	 */
+-	if (IsA(value, CollateExpr))
+-	{
+-		Oid			exprCollOid = exprCollation(value);
+-
+-		/*
+-		 * Check we have a collation iff it is a collatable type.  The only
+-		 * expected failures here are (1) COLLATE applied to a noncollatable
+-		 * type, or (2) partition bound expression had an unresolved
+-		 * collation.  But we might as well code this to be a complete
+-		 * consistency check.
+-		 */
+-		if (type_is_collatable(colType))
+-		{
+-			if (!OidIsValid(exprCollOid))
+-				ereport(ERROR,
+-						(errcode(ERRCODE_INDETERMINATE_COLLATION),
+-						 errmsg("could not determine which collation to use for partition bound expression"),
+-						 errhint("Use the COLLATE clause to set the collation explicitly.")));
+-		}
+-		else
+-		{
+-			if (OidIsValid(exprCollOid))
+-				ereport(ERROR,
+-						(errcode(ERRCODE_DATATYPE_MISMATCH),
+-						 errmsg("collations are not supported by type %s",
+-								format_type_be(colType))));
+-		}
+-
+-		if (OidIsValid(exprCollOid) &&
+-			exprCollOid != DEFAULT_COLLATION_OID &&
+-			exprCollOid != partCollation)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_DATATYPE_MISMATCH),
+-					 errmsg("collation of partition bound value for column \"%s\" does not match partition key collation \"%s\"",
+-							colName, get_collation_name(partCollation)),
+-					 parser_errposition(pstate, exprLocation(value))));
+-	}
+-
+ 	/*
+ 	 * Coerce to the correct type.  This might cause an explicit coercion step
+ 	 * to be added on top of the expression, which must be evaluated before
+diff --git a/src/test/regress/expected/create_table.out b/src/test/regress/expected/create_table.out
+index 41dce69cc4c8..8ed4fae934d0 100644
+--- a/src/test/regress/expected/create_table.out
++++ b/src/test/regress/expected/create_table.out
+@@ -652,8 +652,6 @@ CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (genera
+ ERROR:  set-returning functions are not allowed in partition bound
+ LINE 1: ...expr_fail PARTITION OF list_parted FOR VALUES IN (generate_s...
+                                                              ^
+-CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN ('1' collate "POSIX");
+-ERROR:  collations are not supported by type integer
+ CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN ((1+1) collate "POSIX");
+ ERROR:  collations are not supported by type integer
+ LINE 1: ...ail PARTITION OF list_parted FOR VALUES IN ((1+1) collate "P...
+@@ -1026,28 +1024,28 @@ create table parted_collate_must_match1 partition of parted_collate_must_match
+ create table parted_collate_must_match2 partition of parted_collate_must_match
+   (b collate "POSIX") for values from ('m') to ('z');
+ drop table parted_collate_must_match;
+--- check that specifying incompatible collations for partition bound
+--- expressions fails promptly
++-- check that non-matching collations for partition bound
++-- expressions are coerced to the right collation
+ create table test_part_coll_posix (a text) partition by range (a collate "POSIX");
+--- fail
++-- ok, collation is implicitly coerced
+ create table test_part_coll partition of test_part_coll_posix for values from ('a' collate "C") to ('g');
+-ERROR:  collation of partition bound value for column "a" does not match partition key collation "POSIX"
+-LINE 1: ...artition of test_part_coll_posix for values from ('a' collat...
+-                                                             ^
+--- ok
+-create table test_part_coll partition of test_part_coll_posix for values from ('a' collate "POSIX") to ('g');
+ -- ok
+ create table test_part_coll2 partition of test_part_coll_posix for values from ('g') to ('m');
+--- using a cast expression uses the target type's default collation
+--- fail
++-- ok, collation is implicitly coerced
+ create table test_part_coll_cast partition of test_part_coll_posix for values from (name 'm' collate "C") to ('s');
+-ERROR:  collation of partition bound value for column "a" does not match partition key collation "POSIX"
+-LINE 1: ...ion of test_part_coll_posix for values from (name 'm' collat...
+-                                                             ^
+--- ok
+-create table test_part_coll_cast partition of test_part_coll_posix for values from (name 'm' collate "POSIX") to ('s');
+ -- ok; partition collation silently overrides the default collation of type 'name'
+ create table test_part_coll_cast2 partition of test_part_coll_posix for values from (name 's') to ('z');
++\d+ test_part_coll_posix
++                    Partitioned table "public.test_part_coll_posix"
++ Column | Type | Collation | Nullable | Default | Storage  | Stats target | Description 
++--------+------+-----------+----------+---------+----------+--------------+-------------
++ a      | text |           |          |         | extended |              | 
++Partition key: RANGE (a COLLATE "POSIX")
++Partitions: test_part_coll FOR VALUES FROM ('a') TO ('g'),
++            test_part_coll2 FOR VALUES FROM ('g') TO ('m'),
++            test_part_coll_cast FOR VALUES FROM ('m') TO ('s'),
++            test_part_coll_cast2 FOR VALUES FROM ('s') TO ('z')
++
+ drop table test_part_coll_posix;
+ -- Partition bound in describe output
+ \d+ part_b
+diff --git a/src/test/regress/sql/create_table.sql b/src/test/regress/sql/create_table.sql
+index 9b1adcb8adda..e6f0188a5189 100644
+--- a/src/test/regress/sql/create_table.sql
++++ b/src/test/regress/sql/create_table.sql
+@@ -549,7 +549,6 @@ CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (sum(so
+ CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (sum(1));
+ CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN ((select 1));
+ CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (generate_series(4, 6));
+-CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN ('1' collate "POSIX");
+ CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN ((1+1) collate "POSIX");
+ 
+ -- syntax does not allow empty list of values for list partitions
+@@ -813,26 +812,21 @@ create table parted_collate_must_match2 partition of parted_collate_must_match
+   (b collate "POSIX") for values from ('m') to ('z');
+ drop table parted_collate_must_match;
+ 
+--- check that specifying incompatible collations for partition bound
+--- expressions fails promptly
++-- check that non-matching collations for partition bound
++-- expressions are coerced to the right collation
+ 
+ create table test_part_coll_posix (a text) partition by range (a collate "POSIX");
+--- fail
++-- ok, collation is implicitly coerced
+ create table test_part_coll partition of test_part_coll_posix for values from ('a' collate "C") to ('g');
+ -- ok
+-create table test_part_coll partition of test_part_coll_posix for values from ('a' collate "POSIX") to ('g');
+--- ok
+ create table test_part_coll2 partition of test_part_coll_posix for values from ('g') to ('m');
+-
+--- using a cast expression uses the target type's default collation
+-
+--- fail
++-- ok, collation is implicitly coerced
+ create table test_part_coll_cast partition of test_part_coll_posix for values from (name 'm' collate "C") to ('s');
+--- ok
+-create table test_part_coll_cast partition of test_part_coll_posix for values from (name 'm' collate "POSIX") to ('s');
+ -- ok; partition collation silently overrides the default collation of type 'name'
+ create table test_part_coll_cast2 partition of test_part_coll_posix for values from (name 's') to ('z');
+ 
++\d+ test_part_coll_posix
++
+ drop table test_part_coll_posix;
+ 
+ -- Partition bound in describe output

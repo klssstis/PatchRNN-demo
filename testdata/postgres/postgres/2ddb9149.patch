@@ -1,0 +1,230 @@
+From 2ddb9149d14de9a2e7ac9ec6accf3ad442702b24 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 19 Oct 2018 21:39:21 -0400
+Subject: [PATCH] Server-side fix for delayed NOTIFY and SIGTERM processing.
+
+Commit 4f85fde8e introduced some code that was meant to ensure that we'd
+process cancel, die, sinval catchup, and notify interrupts while waiting
+for client input.  But there was a flaw: it supposed that the process
+latch would be set upon arrival at secure_read() if any such interrupt
+was pending.  In reality, we might well have cleared the process latch
+at some earlier point while those flags remained set -- particularly
+notifyInterruptPending, which can't be handled as long as we're within
+a transaction.
+
+To fix the NOTIFY case, also attempt to process signals (except
+ProcDiePending) before trying to read.
+
+Also, if we see that ProcDiePending is set before we read, forcibly set the
+process latch to ensure that we will handle that signal promptly if no data
+is available.  I also made it set the process latch on the way out, in case
+there is similar logic elsewhere.  (It remains true that we won't service
+ProcDiePending here unless we need to wait for input.)
+
+The code for handling ProcDiePending during a write needs those changes,
+too.
+
+Also be a little more careful about when to reset whereToSendOutput,
+and improve related comments.
+
+Back-patch to 9.5 where this code was added.  I'm not entirely convinced
+that older branches don't have similar issues, but the complaint at hand
+is just about the >= 9.5 code.
+
+Jeff Janes and Tom Lane
+
+Discussion: https://postgr.es/m/CAOYf6ec-TmRYjKBXLLaGaB-jrd=mjG1Hzn1a1wufUAR39PQYhw@mail.gmail.com
+---
+ src/backend/libpq/be-secure.c | 20 +++++----
+ src/backend/tcop/postgres.c   | 77 +++++++++++++++++++++++------------
+ 2 files changed, 62 insertions(+), 35 deletions(-)
+
+diff --git a/src/backend/libpq/be-secure.c b/src/backend/libpq/be-secure.c
+index d349d7c2c725..4eb21fe89de6 100644
+--- a/src/backend/libpq/be-secure.c
++++ b/src/backend/libpq/be-secure.c
+@@ -145,6 +145,9 @@ secure_read(Port *port, void *ptr, size_t len)
+ 	ssize_t		n;
+ 	int			waitfor;
+ 
++	/* Deal with any already-pending interrupt condition. */
++	ProcessClientReadInterrupt(false);
++
+ retry:
+ #ifdef USE_SSL
+ 	waitfor = 0;
+@@ -209,9 +212,8 @@ secure_read(Port *port, void *ptr, size_t len)
+ 	}
+ 
+ 	/*
+-	 * Process interrupts that happened while (or before) receiving. Note that
+-	 * we signal that we're not blocking, which will prevent some types of
+-	 * interrupts from being processed.
++	 * Process interrupts that happened during a successful (or non-blocking,
++	 * or hard-failed) read.
+ 	 */
+ 	ProcessClientReadInterrupt(false);
+ 
+@@ -248,6 +250,9 @@ secure_write(Port *port, void *ptr, size_t len)
+ 	ssize_t		n;
+ 	int			waitfor;
+ 
++	/* Deal with any already-pending interrupt condition. */
++	ProcessClientWriteInterrupt(false);
++
+ retry:
+ 	waitfor = 0;
+ #ifdef USE_SSL
+@@ -287,17 +292,16 @@ secure_write(Port *port, void *ptr, size_t len)
+ 
+ 			/*
+ 			 * We'll retry the write. Most likely it will return immediately
+-			 * because there's still no data available, and we'll wait for the
+-			 * socket to become ready again.
++			 * because there's still no buffer space available, and we'll wait
++			 * for the socket to become ready again.
+ 			 */
+ 		}
+ 		goto retry;
+ 	}
+ 
+ 	/*
+-	 * Process interrupts that happened while (or before) sending. Note that
+-	 * we signal that we're not blocking, which will prevent some types of
+-	 * interrupts from being processed.
++	 * Process interrupts that happened during a successful (or non-blocking,
++	 * or hard-failed) write.
+ 	 */
+ 	ProcessClientWriteInterrupt(false);
+ 
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index 6e13d14fcd0e..a3b9757565e7 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -315,7 +315,7 @@ interactive_getc(void)
+ 
+ 	c = getc(stdin);
+ 
+-	ProcessClientReadInterrupt(true);
++	ProcessClientReadInterrupt(false);
+ 
+ 	return c;
+ }
+@@ -520,8 +520,9 @@ ReadCommand(StringInfo inBuf)
+ /*
+  * ProcessClientReadInterrupt() - Process interrupts specific to client reads
+  *
+- * This is called just after low-level reads. That might be after the read
+- * finished successfully, or it was interrupted via interrupt.
++ * This is called just before and after low-level reads.
++ * 'blocked' is true if no data was available to read and we plan to retry,
++ * false if about to read or done reading.
+  *
+  * Must preserve errno!
+  */
+@@ -532,23 +533,31 @@ ProcessClientReadInterrupt(bool blocked)
+ 
+ 	if (DoingCommandRead)
+ 	{
+-		/* Check for general interrupts that arrived while reading */
++		/* Check for general interrupts that arrived before/while reading */
+ 		CHECK_FOR_INTERRUPTS();
+ 
+-		/* Process sinval catchup interrupts that happened while reading */
++		/* Process sinval catchup interrupts, if any */
+ 		if (catchupInterruptPending)
+ 			ProcessCatchupInterrupt();
+ 
+-		/* Process sinval catchup interrupts that happened while reading */
++		/* Process notify interrupts, if any */
+ 		if (notifyInterruptPending)
+ 			ProcessNotifyInterrupt();
+ 	}
+-	else if (ProcDiePending && blocked)
++	else if (ProcDiePending)
+ 	{
+ 		/*
+-		 * We're dying. It's safe (and sane) to handle that now.
++		 * We're dying.  If there is no data available to read, then it's safe
++		 * (and sane) to handle that now.  If we haven't tried to read yet,
++		 * make sure the process latch is set, so that if there is no data
++		 * then we'll come back here and die.  If we're done reading, also
++		 * make sure the process latch is set, as we might've undesirably
++		 * cleared it while reading.
+ 		 */
+-		CHECK_FOR_INTERRUPTS();
++		if (blocked)
++			CHECK_FOR_INTERRUPTS();
++		else
++			SetLatch(MyLatch);
+ 	}
+ 
+ 	errno = save_errno;
+@@ -557,9 +566,9 @@ ProcessClientReadInterrupt(bool blocked)
+ /*
+  * ProcessClientWriteInterrupt() - Process interrupts specific to client writes
+  *
+- * This is called just after low-level writes. That might be after the read
+- * finished successfully, or it was interrupted via interrupt. 'blocked' tells
+- * us whether the
++ * This is called just before and after low-level writes.
++ * 'blocked' is true if no data could be written and we plan to retry,
++ * false if about to write or done writing.
+  *
+  * Must preserve errno!
+  */
+@@ -568,25 +577,39 @@ ProcessClientWriteInterrupt(bool blocked)
+ {
+ 	int			save_errno = errno;
+ 
+-	/*
+-	 * We only want to process the interrupt here if socket writes are
+-	 * blocking to increase the chance to get an error message to the client.
+-	 * If we're not blocked there'll soon be a CHECK_FOR_INTERRUPTS(). But if
+-	 * we're blocked we'll never get out of that situation if the client has
+-	 * died.
+-	 */
+-	if (ProcDiePending && blocked)
++	if (ProcDiePending)
+ 	{
+ 		/*
+-		 * We're dying. It's safe (and sane) to handle that now. But we don't
+-		 * want to send the client the error message as that a) would possibly
+-		 * block again b) would possibly lead to sending an error message to
+-		 * the client, while we already started to send something else.
++		 * We're dying.  If it's not possible to write, then we should handle
++		 * that immediately, else a stuck client could indefinitely delay our
++		 * response to the signal.  If we haven't tried to write yet, make
++		 * sure the process latch is set, so that if the write would block
++		 * then we'll come back here and die.  If we're done writing, also
++		 * make sure the process latch is set, as we might've undesirably
++		 * cleared it while writing.
+ 		 */
+-		if (whereToSendOutput == DestRemote)
+-			whereToSendOutput = DestNone;
++		if (blocked)
++		{
++			/*
++			 * Don't mess with whereToSendOutput if ProcessInterrupts wouldn't
++			 * do anything.
++			 */
++			if (InterruptHoldoffCount == 0 && CritSectionCount == 0)
++			{
++				/*
++				 * We don't want to send the client the error message, as a)
++				 * that would possibly block again, and b) it would likely
++				 * lead to loss of protocol sync because we may have already
++				 * sent a partial protocol message.
++				 */
++				if (whereToSendOutput == DestRemote)
++					whereToSendOutput = DestNone;
+ 
+-		CHECK_FOR_INTERRUPTS();
++				CHECK_FOR_INTERRUPTS();
++			}
++		}
++		else
++			SetLatch(MyLatch);
+ 	}
+ 
+ 	errno = save_errno;

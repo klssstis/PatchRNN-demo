@@ -1,0 +1,303 @@
+From 2e668c522e58854ae19b7fdc5ac23f9b8a1275f5 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sat, 27 Jan 2018 13:52:24 -0500
+Subject: [PATCH] Avoid crash during EvalPlanQual recheck of an inner
+ indexscan.
+
+Commit 09529a70b changed nodeIndexscan.c and nodeIndexonlyscan.c to
+postpone initialization of the indexscan proper until the first tuple
+fetch.  It overlooked the question of mark/restore behavior, which means
+that if some caller attempts to mark the scan before the first tuple fetch,
+you get a null pointer dereference.
+
+The only existing user of mark/restore is nodeMergejoin.c, which (somewhat
+accidentally) will never attempt to set a mark before the first inner tuple
+unless the inner child node is a Material node.  Hence the case can't arise
+normally, so it seems sufficient to document the assumption at both ends.
+However, during an EvalPlanQual recheck, ExecScanFetch doesn't call
+IndexNext but just returns the jammed-in test tuple.  Therefore, if we're
+doing a recheck in a plan tree with a mergejoin with inner indexscan,
+it's possible to reach ExecIndexMarkPos with iss_ScanDesc still null,
+as reported by Guo Xiang Tan in bug #15032.
+
+Really, when there's a test tuple supplied during an EPQ recheck, touching
+the index at all is the wrong thing: rather, the behavior of mark/restore
+ought to amount to saving and restoring the es_epqScanDone flag.  We can
+avoid finding a place to actually save the flag, for the moment, because
+given the assumption that no caller will set a mark before fetching a
+tuple, es_epqScanDone must always be set by the time we try to mark.
+So the actual behavior change required is just to not reach the index
+access if a test tuple is supplied.
+
+The set of plan node types that need to consider this issue are those
+that support EPQ test tuples (i.e., call ExecScan()) and also support
+mark/restore; which is to say, IndexScan, IndexOnlyScan, and perhaps
+CustomScan.  It's tempting to try to fix the problem in one place by
+teaching ExecMarkPos() itself about EPQ; but ExecMarkPos supports some
+plan types that aren't Scans, and also it seems risky to make assumptions
+about what a CustomScan wants to do here.  Also, the most likely future
+change here is to decide that we do need to support marks placed before
+the first tuple, which would require additional work in IndexScan and
+IndexOnlyScan in any case.  Hence, fix the EPQ issue in nodeIndexscan.c
+and nodeIndexonlyscan.c, accepting the small amount of code duplicated
+thereby, and leave it to CustomScan providers to fix this bug if they
+have it.
+
+Back-patch to v10 where commit 09529a70b came in.  In earlier branches,
+the index_markpos() call is a waste of cycles when EPQ is active, but
+no more than that, so it doesn't seem appropriate to back-patch further.
+
+Discussion: https://postgr.es/m/20180126074932.3098.97815@wrigleys.postgresql.org
+---
+ src/backend/executor/nodeIndexonlyscan.c      | 45 +++++++++++++++++++
+ src/backend/executor/nodeIndexscan.c          | 45 +++++++++++++++++++
+ src/backend/executor/nodeMergejoin.c          |  4 ++
+ .../isolation/expected/eval-plan-qual.out     | 33 ++++++++++++++
+ src/test/isolation/specs/eval-plan-qual.spec  | 18 +++++++-
+ 5 files changed, 144 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/executor/nodeIndexonlyscan.c b/src/backend/executor/nodeIndexonlyscan.c
+index 9b7f470ee28f..f61b3abf3262 100644
+--- a/src/backend/executor/nodeIndexonlyscan.c
++++ b/src/backend/executor/nodeIndexonlyscan.c
+@@ -421,11 +421,39 @@ ExecEndIndexOnlyScan(IndexOnlyScanState *node)
+ 
+ /* ----------------------------------------------------------------
+  *		ExecIndexOnlyMarkPos
++ *
++ * Note: we assume that no caller attempts to set a mark before having read
++ * at least one tuple.  Otherwise, ioss_ScanDesc might still be NULL.
+  * ----------------------------------------------------------------
+  */
+ void
+ ExecIndexOnlyMarkPos(IndexOnlyScanState *node)
+ {
++	EState	   *estate = node->ss.ps.state;
++
++	if (estate->es_epqTuple != NULL)
++	{
++		/*
++		 * We are inside an EvalPlanQual recheck.  If a test tuple exists for
++		 * this relation, then we shouldn't access the index at all.  We would
++		 * instead need to save, and later restore, the state of the
++		 * es_epqScanDone flag, so that re-fetching the test tuple is
++		 * possible.  However, given the assumption that no caller sets a mark
++		 * at the start of the scan, we can only get here with es_epqScanDone
++		 * already set, and so no state need be saved.
++		 */
++		Index		scanrelid = ((Scan *) node->ss.ps.plan)->scanrelid;
++
++		Assert(scanrelid > 0);
++		if (estate->es_epqTupleSet[scanrelid - 1])
++		{
++			/* Verify the claim above */
++			if (!estate->es_epqScanDone[scanrelid - 1])
++				elog(ERROR, "unexpected ExecIndexOnlyMarkPos call in EPQ recheck");
++			return;
++		}
++	}
++
+ 	index_markpos(node->ioss_ScanDesc);
+ }
+ 
+@@ -436,6 +464,23 @@ ExecIndexOnlyMarkPos(IndexOnlyScanState *node)
+ void
+ ExecIndexOnlyRestrPos(IndexOnlyScanState *node)
+ {
++	EState	   *estate = node->ss.ps.state;
++
++	if (estate->es_epqTuple != NULL)
++	{
++		/* See comments in ExecIndexOnlyMarkPos */
++		Index		scanrelid = ((Scan *) node->ss.ps.plan)->scanrelid;
++
++		Assert(scanrelid > 0);
++		if (estate->es_epqTupleSet[scanrelid - 1])
++		{
++			/* Verify the claim above */
++			if (!estate->es_epqScanDone[scanrelid - 1])
++				elog(ERROR, "unexpected ExecIndexOnlyRestrPos call in EPQ recheck");
++			return;
++		}
++	}
++
+ 	index_restrpos(node->ioss_ScanDesc);
+ }
+ 
+diff --git a/src/backend/executor/nodeIndexscan.c b/src/backend/executor/nodeIndexscan.c
+index 54fafa5033fd..eed69a0c665a 100644
+--- a/src/backend/executor/nodeIndexscan.c
++++ b/src/backend/executor/nodeIndexscan.c
+@@ -849,11 +849,39 @@ ExecEndIndexScan(IndexScanState *node)
+ 
+ /* ----------------------------------------------------------------
+  *		ExecIndexMarkPos
++ *
++ * Note: we assume that no caller attempts to set a mark before having read
++ * at least one tuple.  Otherwise, iss_ScanDesc might still be NULL.
+  * ----------------------------------------------------------------
+  */
+ void
+ ExecIndexMarkPos(IndexScanState *node)
+ {
++	EState	   *estate = node->ss.ps.state;
++
++	if (estate->es_epqTuple != NULL)
++	{
++		/*
++		 * We are inside an EvalPlanQual recheck.  If a test tuple exists for
++		 * this relation, then we shouldn't access the index at all.  We would
++		 * instead need to save, and later restore, the state of the
++		 * es_epqScanDone flag, so that re-fetching the test tuple is
++		 * possible.  However, given the assumption that no caller sets a mark
++		 * at the start of the scan, we can only get here with es_epqScanDone
++		 * already set, and so no state need be saved.
++		 */
++		Index		scanrelid = ((Scan *) node->ss.ps.plan)->scanrelid;
++
++		Assert(scanrelid > 0);
++		if (estate->es_epqTupleSet[scanrelid - 1])
++		{
++			/* Verify the claim above */
++			if (!estate->es_epqScanDone[scanrelid - 1])
++				elog(ERROR, "unexpected ExecIndexMarkPos call in EPQ recheck");
++			return;
++		}
++	}
++
+ 	index_markpos(node->iss_ScanDesc);
+ }
+ 
+@@ -864,6 +892,23 @@ ExecIndexMarkPos(IndexScanState *node)
+ void
+ ExecIndexRestrPos(IndexScanState *node)
+ {
++	EState	   *estate = node->ss.ps.state;
++
++	if (estate->es_epqTuple != NULL)
++	{
++		/* See comments in ExecIndexMarkPos */
++		Index		scanrelid = ((Scan *) node->ss.ps.plan)->scanrelid;
++
++		Assert(scanrelid > 0);
++		if (estate->es_epqTupleSet[scanrelid - 1])
++		{
++			/* Verify the claim above */
++			if (!estate->es_epqScanDone[scanrelid - 1])
++				elog(ERROR, "unexpected ExecIndexRestrPos call in EPQ recheck");
++			return;
++		}
++	}
++
+ 	index_restrpos(node->iss_ScanDesc);
+ }
+ 
+diff --git a/src/backend/executor/nodeMergejoin.c b/src/backend/executor/nodeMergejoin.c
+index b52946f180a5..ec5f82f6a925 100644
+--- a/src/backend/executor/nodeMergejoin.c
++++ b/src/backend/executor/nodeMergejoin.c
+@@ -1502,6 +1502,10 @@ ExecInitMergeJoin(MergeJoin *node, EState *estate, int eflags)
+ 	 *
+ 	 * Currently, only Material wants the extra MARKs, and it will be helpful
+ 	 * only if eflags doesn't specify REWIND.
++	 *
++	 * Note that for IndexScan and IndexOnlyScan, it is *necessary* that we
++	 * not set mj_ExtraMarks; otherwise we might attempt to set a mark before
++	 * the first inner tuple, which they do not support.
+ 	 */
+ 	if (IsA(innerPlan(node), Material) &&
+ 		(eflags & EXEC_FLAG_REWIND) == 0 &&
+diff --git a/src/test/isolation/expected/eval-plan-qual.out b/src/test/isolation/expected/eval-plan-qual.out
+index 10c784a05f18..eb40717679cb 100644
+--- a/src/test/isolation/expected/eval-plan-qual.out
++++ b/src/test/isolation/expected/eval-plan-qual.out
+@@ -184,3 +184,36 @@ step readwcte: <... completed>
+ id             value          
+ 
+ 1              tableAValue2   
++
++starting permutation: wrjt selectjoinforupdate c2 c1
++step wrjt: UPDATE jointest SET data = 42 WHERE id = 7;
++step selectjoinforupdate: 
++	set enable_nestloop to 0;
++	set enable_hashjoin to 0;
++	set enable_seqscan to 0;
++	explain (costs off)
++	select * from jointest a join jointest b on a.id=b.id for update;
++	select * from jointest a join jointest b on a.id=b.id for update;
++ <waiting ...>
++step c2: COMMIT;
++step selectjoinforupdate: <... completed>
++QUERY PLAN     
++
++LockRows       
++  ->  Merge Join
++        Merge Cond: (a.id = b.id)
++        ->  Index Scan using jointest_id_idx on jointest a
++        ->  Index Scan using jointest_id_idx on jointest b
++id             data           id             data           
++
++1              0              1              0              
++2              0              2              0              
++3              0              3              0              
++4              0              4              0              
++5              0              5              0              
++6              0              6              0              
++7              42             7              42             
++8              0              8              0              
++9              0              9              0              
++10             0              10             0              
++step c1: COMMIT;
+diff --git a/src/test/isolation/specs/eval-plan-qual.spec b/src/test/isolation/specs/eval-plan-qual.spec
+index 7ff6f6b8cc90..d2b34ec7cc27 100644
+--- a/src/test/isolation/specs/eval-plan-qual.spec
++++ b/src/test/isolation/specs/eval-plan-qual.spec
+@@ -21,13 +21,16 @@ setup
+  CREATE TABLE table_b (id integer, value text);
+  INSERT INTO table_a VALUES (1, 'tableAValue');
+  INSERT INTO table_b VALUES (1, 'tableBValue');
++
++ CREATE TABLE jointest AS SELECT generate_series(1,10) AS id, 0 AS data;
++ CREATE INDEX ON jointest(id);
+ }
+ 
+ teardown
+ {
+  DROP TABLE accounts;
+  DROP TABLE p CASCADE;
+- DROP TABLE table_a, table_b;
++ DROP TABLE table_a, table_b, jointest;
+ }
+ 
+ session "s1"
+@@ -78,6 +81,17 @@ step "updateforss"	{
+ 	UPDATE table_b SET value = 'newTableBValue' WHERE id = 1;
+ }
+ 
++# these tests exercise mark/restore during EPQ recheck, cf bug #15032
++
++step "selectjoinforupdate"	{
++	set enable_nestloop to 0;
++	set enable_hashjoin to 0;
++	set enable_seqscan to 0;
++	explain (costs off)
++	select * from jointest a join jointest b on a.id=b.id for update;
++	select * from jointest a join jointest b on a.id=b.id for update;
++}
++
+ 
+ session "s2"
+ setup		{ BEGIN ISOLATION LEVEL READ COMMITTED; }
+@@ -104,6 +118,7 @@ step "readforss"	{
+ 	WHERE ta.id = 1 FOR UPDATE OF ta;
+ }
+ step "wrtwcte"	{ UPDATE table_a SET value = 'tableAValue2' WHERE id = 1; }
++step "wrjt"	{ UPDATE jointest SET data = 42 WHERE id = 7; }
+ step "c2"	{ COMMIT; }
+ 
+ session "s3"
+@@ -135,3 +150,4 @@ permutation "wx2" "partiallock" "c2" "c1" "read"
+ permutation "wx2" "lockwithvalues" "c2" "c1" "read"
+ permutation "updateforss" "readforss" "c1" "c2"
+ permutation "wrtwcte" "readwcte" "c1" "c2"
++permutation "wrjt" "selectjoinforupdate" "c2" "c1"

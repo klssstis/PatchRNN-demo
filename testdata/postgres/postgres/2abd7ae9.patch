@@ -1,0 +1,716 @@
+From 2abd7ae9b20bcd810d4f19d28aefb97048813825 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Fri, 2 Aug 2019 00:02:46 -0700
+Subject: [PATCH] Fix representation of hash keys in Hash/HashJoin nodes.
+
+In 5f32b29c1819 I changed the creation of HashState.hashkeys to
+actually use HashState as the parent (instead of HashJoinState, which
+was incorrect, as they were executed below HashState), to fix the
+problem of hashkeys expressions otherwise relying on slot types
+appropriate for HashJoinState, rather than HashState as would be
+correct. That reliance was only introduced in 12, which is why it
+previously worked to use HashJoinState as the parent (although I'd be
+unsurprised if there were problematic cases).
+
+Unfortunately that's not a sufficient solution, because before this
+commit, the to-be-hashed expressions referenced inner/outer as
+appropriate for the HashJoin, not Hash. That didn't have obvious bad
+consequences, because the slots containing the tuples were put into
+ecxt_innertuple when hashing a tuple for HashState (even though Hash
+doesn't have an inner plan).
+
+There are less common cases where this can cause visible problems
+however (rather than just confusion when inspecting such executor
+trees). E.g. "ERROR: bogus varno: 65000", when explaining queries
+containing a HashJoin where the subsidiary Hash node's hash keys
+reference a subplan. While normally hashkeys aren't displayed by
+EXPLAIN, if one of those expressions references a subplan, that
+subplan may be printed as part of the Hash node - which then failed
+because an inner plan was referenced, and Hash doesn't have that.
+
+It seems quite possible that there's other broken cases, too.
+
+Fix the problem by properly splitting the expression for the HashJoin
+and Hash nodes at plan time, and have them reference the proper
+subsidiary node. While other workarounds are possible, fixing this
+correctly seems easy enough. It was a pretty ugly hack to have
+ExecInitHashJoin put the expression into the already initialized
+HashState, in the first place.
+
+I decided to not just split inner/outer hashkeys inside
+make_hashjoin(), but also to separate out hashoperators and
+hashcollations at plan time. Otherwise we would have ended up having
+two very similar loops, one at plan time and the other during executor
+startup. The work seems to more appropriately belong to plan time,
+anyway.
+
+Reported-By: Nikita Glukhov, Alexander Korotkov
+Author: Andres Freund
+Reviewed-By: Tom Lane, in an earlier version
+Discussion: https://postgr.es/m/CAPpHfdvGVegF_TKKRiBrSmatJL2dR9uwFCuR+teQ_8tEXU8mxg@mail.gmail.com
+Backpatch: 12-
+---
+ src/backend/executor/nodeHash.c         |  22 ++--
+ src/backend/executor/nodeHashjoin.c     |  40 +------
+ src/backend/nodes/copyfuncs.c           |   4 +
+ src/backend/nodes/outfuncs.c            |   4 +
+ src/backend/nodes/readfuncs.c           |   4 +
+ src/backend/optimizer/plan/createplan.c |  38 +++++++
+ src/backend/optimizer/plan/setrefs.c    |  44 ++++++++
+ src/include/nodes/execnodes.h           |   3 -
+ src/include/nodes/plannodes.h           |  14 +++
+ src/test/regress/expected/join_hash.out | 134 ++++++++++++++++++++++++
+ src/test/regress/sql/join_hash.sql      |  70 +++++++++++++
+ 11 files changed, 330 insertions(+), 47 deletions(-)
+
+diff --git a/src/backend/executor/nodeHash.c b/src/backend/executor/nodeHash.c
+index d16120b9c480..224cbb32badd 100644
+--- a/src/backend/executor/nodeHash.c
++++ b/src/backend/executor/nodeHash.c
+@@ -157,7 +157,8 @@ MultiExecPrivateHash(HashState *node)
+ 	econtext = node->ps.ps_ExprContext;
+ 
+ 	/*
+-	 * get all inner tuples and insert into the hash table (or temp files)
++	 * Get all tuples from the node below the Hash node and insert into the
++	 * hash table (or temp files).
+ 	 */
+ 	for (;;)
+ 	{
+@@ -165,7 +166,7 @@ MultiExecPrivateHash(HashState *node)
+ 		if (TupIsNull(slot))
+ 			break;
+ 		/* We have to compute the hash value */
+-		econtext->ecxt_innertuple = slot;
++		econtext->ecxt_outertuple = slot;
+ 		if (ExecHashGetHashValue(hashtable, econtext, hashkeys,
+ 								 false, hashtable->keepNulls,
+ 								 &hashvalue))
+@@ -281,7 +282,7 @@ MultiExecParallelHash(HashState *node)
+ 				slot = ExecProcNode(outerNode);
+ 				if (TupIsNull(slot))
+ 					break;
+-				econtext->ecxt_innertuple = slot;
++				econtext->ecxt_outertuple = slot;
+ 				if (ExecHashGetHashValue(hashtable, econtext, hashkeys,
+ 										 false, hashtable->keepNulls,
+ 										 &hashvalue))
+@@ -388,8 +389,9 @@ ExecInitHash(Hash *node, EState *estate, int eflags)
+ 	/*
+ 	 * initialize child expressions
+ 	 */
+-	hashstate->ps.qual =
+-		ExecInitQual(node->plan.qual, (PlanState *) hashstate);
++	Assert(node->plan.qual == NIL);
++	hashstate->hashkeys =
++		ExecInitExprList(node->hashkeys, (PlanState *) hashstate);
+ 
+ 	return hashstate;
+ }
+@@ -1773,9 +1775,13 @@ ExecParallelHashTableInsertCurrentBatch(HashJoinTable hashtable,
+  * ExecHashGetHashValue
+  *		Compute the hash value for a tuple
+  *
+- * The tuple to be tested must be in either econtext->ecxt_outertuple or
+- * econtext->ecxt_innertuple.  Vars in the hashkeys expressions should have
+- * varno either OUTER_VAR or INNER_VAR.
++ * The tuple to be tested must be in econtext->ecxt_outertuple (thus Vars in
++ * the hashkeys expressions need to have OUTER_VAR as varno). If outer_tuple
++ * is false (meaning it's the HashJoin's inner node, Hash), econtext,
++ * hashkeys, and slot need to be from Hash, with hashkeys/slot referencing and
++ * being suitable for tuples from the node below the Hash. Conversely, if
++ * outer_tuple is true, econtext is from HashJoin, and hashkeys/slot need to
++ * be appropriate for tuples from HashJoin's outer node.
+  *
+  * A true result means the tuple's hash value has been successfully computed
+  * and stored at *hashvalue.  A false result means the tuple cannot match
+diff --git a/src/backend/executor/nodeHashjoin.c b/src/backend/executor/nodeHashjoin.c
+index 8484a287e733..ec37558c1270 100644
+--- a/src/backend/executor/nodeHashjoin.c
++++ b/src/backend/executor/nodeHashjoin.c
+@@ -600,14 +600,8 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
+ 	HashJoinState *hjstate;
+ 	Plan	   *outerNode;
+ 	Hash	   *hashNode;
+-	List	   *lclauses;
+-	List	   *rclauses;
+-	List	   *rhclauses;
+-	List	   *hoperators;
+-	List	   *hcollations;
+ 	TupleDesc	outerDesc,
+ 				innerDesc;
+-	ListCell   *l;
+ 	const TupleTableSlotOps *ops;
+ 
+ 	/* check for unsupported flags */
+@@ -730,36 +724,10 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
+ 	hjstate->hj_CurSkewBucketNo = INVALID_SKEW_BUCKET_NO;
+ 	hjstate->hj_CurTuple = NULL;
+ 
+-	/*
+-	 * Deconstruct the hash clauses into outer and inner argument values, so
+-	 * that we can evaluate those subexpressions separately.  Also make a list
+-	 * of the hash operator OIDs, in preparation for looking up the hash
+-	 * functions to use.
+-	 */
+-	lclauses = NIL;
+-	rclauses = NIL;
+-	rhclauses = NIL;
+-	hoperators = NIL;
+-	hcollations = NIL;
+-	foreach(l, node->hashclauses)
+-	{
+-		OpExpr	   *hclause = lfirst_node(OpExpr, l);
+-
+-		lclauses = lappend(lclauses, ExecInitExpr(linitial(hclause->args),
+-												  (PlanState *) hjstate));
+-		rclauses = lappend(rclauses, ExecInitExpr(lsecond(hclause->args),
+-												  (PlanState *) hjstate));
+-		rhclauses = lappend(rhclauses, ExecInitExpr(lsecond(hclause->args),
+-													innerPlanState(hjstate)));
+-		hoperators = lappend_oid(hoperators, hclause->opno);
+-		hcollations = lappend_oid(hcollations, hclause->inputcollid);
+-	}
+-	hjstate->hj_OuterHashKeys = lclauses;
+-	hjstate->hj_InnerHashKeys = rclauses;
+-	hjstate->hj_HashOperators = hoperators;
+-	hjstate->hj_Collations = hcollations;
+-	/* child Hash node needs to evaluate inner hash keys, too */
+-	((HashState *) innerPlanState(hjstate))->hashkeys = rhclauses;
++	hjstate->hj_OuterHashKeys = ExecInitExprList(node->hashkeys,
++												 (PlanState *) hjstate);
++	hjstate->hj_HashOperators = node->hashoperators;
++	hjstate->hj_Collations = node->hashcollations;
+ 
+ 	hjstate->hj_JoinState = HJ_BUILD_HASHTABLE;
+ 	hjstate->hj_MatchedOuter = false;
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index 6414aded0efe..a2617c7cfd3c 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -899,6 +899,9 @@ _copyHashJoin(const HashJoin *from)
+ 	 * copy remainder of node
+ 	 */
+ 	COPY_NODE_FIELD(hashclauses);
++	COPY_NODE_FIELD(hashoperators);
++	COPY_NODE_FIELD(hashcollations);
++	COPY_NODE_FIELD(hashkeys);
+ 
+ 	return newnode;
+ }
+@@ -1066,6 +1069,7 @@ _copyHash(const Hash *from)
+ 	/*
+ 	 * copy remainder of node
+ 	 */
++	COPY_NODE_FIELD(hashkeys);
+ 	COPY_SCALAR_FIELD(skewTable);
+ 	COPY_SCALAR_FIELD(skewColumn);
+ 	COPY_SCALAR_FIELD(skewInherit);
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index 86c31a48c983..e6ce8e211017 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -761,6 +761,9 @@ _outHashJoin(StringInfo str, const HashJoin *node)
+ 	_outJoinPlanInfo(str, (const Join *) node);
+ 
+ 	WRITE_NODE_FIELD(hashclauses);
++	WRITE_NODE_FIELD(hashoperators);
++	WRITE_NODE_FIELD(hashcollations);
++	WRITE_NODE_FIELD(hashkeys);
+ }
+ 
+ static void
+@@ -863,6 +866,7 @@ _outHash(StringInfo str, const Hash *node)
+ 
+ 	_outPlanInfo(str, (const Plan *) node);
+ 
++	WRITE_NODE_FIELD(hashkeys);
+ 	WRITE_OID_FIELD(skewTable);
+ 	WRITE_INT_FIELD(skewColumn);
+ 	WRITE_BOOL_FIELD(skewInherit);
+diff --git a/src/backend/nodes/readfuncs.c b/src/backend/nodes/readfuncs.c
+index 6c2626ee62b0..764e3bb90c98 100644
+--- a/src/backend/nodes/readfuncs.c
++++ b/src/backend/nodes/readfuncs.c
+@@ -2096,6 +2096,9 @@ _readHashJoin(void)
+ 	ReadCommonJoin(&local_node->join);
+ 
+ 	READ_NODE_FIELD(hashclauses);
++	READ_NODE_FIELD(hashoperators);
++	READ_NODE_FIELD(hashcollations);
++	READ_NODE_FIELD(hashkeys);
+ 
+ 	READ_DONE();
+ }
+@@ -2274,6 +2277,7 @@ _readHash(void)
+ 
+ 	ReadCommonPlan(&local_node->plan);
+ 
++	READ_NODE_FIELD(hashkeys);
+ 	READ_OID_FIELD(skewTable);
+ 	READ_INT_FIELD(skewColumn);
+ 	READ_BOOL_FIELD(skewInherit);
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index c6b8553a083f..f2325694c53d 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -222,9 +222,12 @@ static NestLoop *make_nestloop(List *tlist,
+ static HashJoin *make_hashjoin(List *tlist,
+ 							   List *joinclauses, List *otherclauses,
+ 							   List *hashclauses,
++							   List *hashoperators, List *hashcollations,
++							   List *hashkeys,
+ 							   Plan *lefttree, Plan *righttree,
+ 							   JoinType jointype, bool inner_unique);
+ static Hash *make_hash(Plan *lefttree,
++					   List *hashkeys,
+ 					   Oid skewTable,
+ 					   AttrNumber skewColumn,
+ 					   bool skewInherit);
+@@ -4380,9 +4383,14 @@ create_hashjoin_plan(PlannerInfo *root,
+ 	List	   *joinclauses;
+ 	List	   *otherclauses;
+ 	List	   *hashclauses;
++	List	   *hashoperators = NIL;
++	List	   *hashcollations = NIL;
++	List	   *inner_hashkeys = NIL;
++	List	   *outer_hashkeys = NIL;
+ 	Oid			skewTable = InvalidOid;
+ 	AttrNumber	skewColumn = InvalidAttrNumber;
+ 	bool		skewInherit = false;
++	ListCell   *lc;
+ 
+ 	/*
+ 	 * HashJoin can project, so we don't have to demand exact tlists from the
+@@ -4474,10 +4482,29 @@ create_hashjoin_plan(PlannerInfo *root,
+ 		}
+ 	}
+ 
++	/*
++	 * Collect hash related information. The hashed expressions are
++	 * deconstructed into outer/inner expressions, so they can be computed
++	 * separately (inner expressions are used to build the hashtable via Hash,
++	 * outer expressions to perform lookups of tuples from HashJoin's outer
++	 * plan in the hashtable). Also collect operator information necessary to
++	 * build the hashtable.
++	 */
++	foreach(lc, hashclauses)
++	{
++		OpExpr	   *hclause = lfirst_node(OpExpr, lc);
++
++		hashoperators = lappend_oid(hashoperators, hclause->opno);
++		hashcollations = lappend_oid(hashcollations, hclause->inputcollid);
++		outer_hashkeys = lappend(outer_hashkeys, linitial(hclause->args));
++		inner_hashkeys = lappend(inner_hashkeys, lsecond(hclause->args));
++	}
++
+ 	/*
+ 	 * Build the hash node and hash join node.
+ 	 */
+ 	hash_plan = make_hash(inner_plan,
++						  inner_hashkeys,
+ 						  skewTable,
+ 						  skewColumn,
+ 						  skewInherit);
+@@ -4504,6 +4531,9 @@ create_hashjoin_plan(PlannerInfo *root,
+ 							  joinclauses,
+ 							  otherclauses,
+ 							  hashclauses,
++							  hashoperators,
++							  hashcollations,
++							  outer_hashkeys,
+ 							  outer_plan,
+ 							  (Plan *) hash_plan,
+ 							  best_path->jpath.jointype,
+@@ -5545,6 +5575,9 @@ make_hashjoin(List *tlist,
+ 			  List *joinclauses,
+ 			  List *otherclauses,
+ 			  List *hashclauses,
++			  List *hashoperators,
++			  List *hashcollations,
++			  List *hashkeys,
+ 			  Plan *lefttree,
+ 			  Plan *righttree,
+ 			  JoinType jointype,
+@@ -5558,6 +5591,9 @@ make_hashjoin(List *tlist,
+ 	plan->lefttree = lefttree;
+ 	plan->righttree = righttree;
+ 	node->hashclauses = hashclauses;
++	node->hashoperators = hashoperators;
++	node->hashcollations = hashcollations;
++	node->hashkeys = hashkeys;
+ 	node->join.jointype = jointype;
+ 	node->join.inner_unique = inner_unique;
+ 	node->join.joinqual = joinclauses;
+@@ -5567,6 +5603,7 @@ make_hashjoin(List *tlist,
+ 
+ static Hash *
+ make_hash(Plan *lefttree,
++		  List *hashkeys,
+ 		  Oid skewTable,
+ 		  AttrNumber skewColumn,
+ 		  bool skewInherit)
+@@ -5579,6 +5616,7 @@ make_hash(Plan *lefttree,
+ 	plan->lefttree = lefttree;
+ 	plan->righttree = NULL;
+ 
++	node->hashkeys = hashkeys;
+ 	node->skewTable = skewTable;
+ 	node->skewColumn = skewColumn;
+ 	node->skewInherit = skewInherit;
+diff --git a/src/backend/optimizer/plan/setrefs.c b/src/backend/optimizer/plan/setrefs.c
+index dc11f098e0f5..329ebd5f287e 100644
+--- a/src/backend/optimizer/plan/setrefs.c
++++ b/src/backend/optimizer/plan/setrefs.c
+@@ -107,6 +107,7 @@ static Plan *set_append_references(PlannerInfo *root,
+ static Plan *set_mergeappend_references(PlannerInfo *root,
+ 										MergeAppend *mplan,
+ 										int rtoffset);
++static void set_hash_references(PlannerInfo *root, Plan *plan, int rtoffset);
+ static Node *fix_scan_expr(PlannerInfo *root, Node *node, int rtoffset);
+ static Node *fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context);
+ static bool fix_scan_expr_walker(Node *node, fix_scan_expr_context *context);
+@@ -646,6 +647,9 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
+ 			break;
+ 
+ 		case T_Hash:
++			set_hash_references(root, plan, rtoffset);
++			break;
++
+ 		case T_Material:
+ 		case T_Sort:
+ 		case T_Unique:
+@@ -1419,6 +1423,36 @@ set_mergeappend_references(PlannerInfo *root,
+ 	return (Plan *) mplan;
+ }
+ 
++/*
++ * set_hash_references
++ *	   Do set_plan_references processing on a Hash node
++ */
++static void
++set_hash_references(PlannerInfo *root, Plan *plan, int rtoffset)
++{
++	Hash	   *hplan = (Hash *) plan;
++	Plan	   *outer_plan = plan->lefttree;
++	indexed_tlist *outer_itlist;
++
++	/*
++	 * Hash's hashkeys are used when feeding tuples into the hashtable,
++	 * therefore have them reference Hash's outer plan (which itself is the
++	 * inner plan of the HashJoin).
++	 */
++	outer_itlist = build_tlist_index(outer_plan->targetlist);
++	hplan->hashkeys = (List *)
++		fix_upper_expr(root,
++					   (Node *) hplan->hashkeys,
++					   outer_itlist,
++					   OUTER_VAR,
++					   rtoffset);
++
++	/* Hash doesn't project */
++	set_dummy_tlist_references(plan, rtoffset);
++
++	/* Hash nodes don't have their own quals */
++	Assert(plan->qual == NIL);
++}
+ 
+ /*
+  * copyVar
+@@ -1754,6 +1788,16 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
+ 										inner_itlist,
+ 										(Index) 0,
+ 										rtoffset);
++
++		/*
++		 * HashJoin's hashkeys are used to look for matching tuples from its
++		 * outer plan (not the Hash node!) in the hashtable.
++		 */
++		hj->hashkeys = (List *) fix_upper_expr(root,
++											   (Node *) hj->hashkeys,
++											   outer_itlist,
++											   OUTER_VAR,
++											   rtoffset);
+ 	}
+ 
+ 	/*
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index 98bdcbcef5a5..4ec78491f6f7 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -1852,7 +1852,6 @@ typedef struct MergeJoinState
+  *
+  *		hashclauses				original form of the hashjoin condition
+  *		hj_OuterHashKeys		the outer hash keys in the hashjoin condition
+- *		hj_InnerHashKeys		the inner hash keys in the hashjoin condition
+  *		hj_HashOperators		the join operators in the hashjoin condition
+  *		hj_HashTable			hash table for the hashjoin
+  *								(NULL if table not built yet)
+@@ -1883,7 +1882,6 @@ typedef struct HashJoinState
+ 	JoinState	js;				/* its first field is NodeTag */
+ 	ExprState  *hashclauses;
+ 	List	   *hj_OuterHashKeys;	/* list of ExprState nodes */
+-	List	   *hj_InnerHashKeys;	/* list of ExprState nodes */
+ 	List	   *hj_HashOperators;	/* list of operator OIDs */
+ 	List	   *hj_Collations;
+ 	HashJoinTable hj_HashTable;
+@@ -2222,7 +2220,6 @@ typedef struct HashState
+ 	PlanState	ps;				/* its first field is NodeTag */
+ 	HashJoinTable hashtable;	/* hash table for the hashjoin */
+ 	List	   *hashkeys;		/* list of ExprState nodes */
+-	/* hashkeys is same as parent's hj_InnerHashKeys */
+ 
+ 	SharedHashInfo *shared_info;	/* one entry per worker */
+ 	HashInstrumentation *hinstrument;	/* this worker's entry */
+diff --git a/src/include/nodes/plannodes.h b/src/include/nodes/plannodes.h
+index 70f8b8e22b78..8e6594e35514 100644
+--- a/src/include/nodes/plannodes.h
++++ b/src/include/nodes/plannodes.h
+@@ -737,6 +737,14 @@ typedef struct HashJoin
+ {
+ 	Join		join;
+ 	List	   *hashclauses;
++	List	   *hashoperators;
++	List	   *hashcollations;
++
++	/*
++	 * List of expressions to be hashed for tuples from the outer plan, to
++	 * perform lookups in the hashtable over the inner plan.
++	 */
++	List	   *hashkeys;
+ } HashJoin;
+ 
+ /* ----------------
+@@ -899,6 +907,12 @@ typedef struct GatherMerge
+ typedef struct Hash
+ {
+ 	Plan		plan;
++
++	/*
++	 * List of expressions to be hashed for tuples from Hash's outer plan,
++	 * needed to put them into the hashtable.
++	 */
++	List	   *hashkeys;		/* hash keys for the hashjoin condition */
+ 	Oid			skewTable;		/* outer join key's table OID, or InvalidOid */
+ 	AttrNumber	skewColumn;		/* outer join key's column #, or zero */
+ 	bool		skewInherit;	/* is outer join rel an inheritance tree? */
+diff --git a/src/test/regress/expected/join_hash.out b/src/test/regress/expected/join_hash.out
+index 6080ebb961dc..3a91c144a27f 100644
+--- a/src/test/regress/expected/join_hash.out
++++ b/src/test/regress/expected/join_hash.out
+@@ -879,3 +879,137 @@ $$);
+ 
+ rollback to settings;
+ rollback;
++-- Verify that hash key expressions reference the correct
++-- nodes. Hashjoin's hashkeys need to reference its outer plan, Hash's
++-- need to reference Hash's outer plan (which is below HashJoin's
++-- inner plan). It's not trivial to verify that the references are
++-- correct (we don't display the hashkeys themselves), but if the
++-- hashkeys contain subplan references, those will be displayed. Force
++-- subplans to appear just about everywhere.
++--
++-- Bug report:
++-- https://www.postgresql.org/message-id/CAPpHfdvGVegF_TKKRiBrSmatJL2dR9uwFCuR%2BteQ_8tEXU8mxg%40mail.gmail.com
++--
++BEGIN;
++SET LOCAL enable_sort = OFF; -- avoid mergejoins
++SET LOCAL from_collapse_limit = 1; -- allows easy changing of join order
++CREATE TABLE hjtest_1 (a text, b int, id int, c bool);
++CREATE TABLE hjtest_2 (a bool, id int, b text, c int);
++INSERT INTO hjtest_1(a, b, id, c) VALUES ('text', 2, 1, false); -- matches
++INSERT INTO hjtest_1(a, b, id, c) VALUES ('text', 1, 2, false); -- fails id join condition
++INSERT INTO hjtest_1(a, b, id, c) VALUES ('text', 20, 1, false); -- fails < 50
++INSERT INTO hjtest_1(a, b, id, c) VALUES ('text', 1, 1, false); -- fails (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++INSERT INTO hjtest_2(a, id, b, c) VALUES (true, 1, 'another', 2); -- matches
++INSERT INTO hjtest_2(a, id, b, c) VALUES (true, 3, 'another', 7); -- fails id join condition
++INSERT INTO hjtest_2(a, id, b, c) VALUES (true, 1, 'another', 90);  -- fails < 55
++INSERT INTO hjtest_2(a, id, b, c) VALUES (true, 1, 'another', 3); -- fails (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++INSERT INTO hjtest_2(a, id, b, c) VALUES (true, 1, 'text', 1); --  fails hjtest_1.a <> hjtest_2.b;
++EXPLAIN (COSTS OFF, VERBOSE)
++SELECT hjtest_1.a a1, hjtest_2.a a2,hjtest_1.tableoid::regclass t1, hjtest_2.tableoid::regclass t2
++FROM hjtest_1, hjtest_2
++WHERE
++    hjtest_1.id = (SELECT 1 WHERE hjtest_2.id = 1)
++    AND (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++    AND (SELECT hjtest_1.b * 5) < 50
++    AND (SELECT hjtest_2.c * 5) < 55
++    AND hjtest_1.a <> hjtest_2.b;
++                                           QUERY PLAN                                           
++------------------------------------------------------------------------------------------------
++ Hash Join
++   Output: hjtest_1.a, hjtest_2.a, (hjtest_1.tableoid)::regclass, (hjtest_2.tableoid)::regclass
++   Hash Cond: ((hjtest_1.id = (SubPlan 1)) AND ((SubPlan 2) = (SubPlan 3)))
++   Join Filter: (hjtest_1.a <> hjtest_2.b)
++   ->  Seq Scan on public.hjtest_1
++         Output: hjtest_1.a, hjtest_1.tableoid, hjtest_1.id, hjtest_1.b
++         Filter: ((SubPlan 4) < 50)
++         SubPlan 4
++           ->  Result
++                 Output: (hjtest_1.b * 5)
++   ->  Hash
++         Output: hjtest_2.a, hjtest_2.tableoid, hjtest_2.id, hjtest_2.c, hjtest_2.b
++         ->  Seq Scan on public.hjtest_2
++               Output: hjtest_2.a, hjtest_2.tableoid, hjtest_2.id, hjtest_2.c, hjtest_2.b
++               Filter: ((SubPlan 5) < 55)
++               SubPlan 5
++                 ->  Result
++                       Output: (hjtest_2.c * 5)
++         SubPlan 1
++           ->  Result
++                 Output: 1
++                 One-Time Filter: (hjtest_2.id = 1)
++         SubPlan 3
++           ->  Result
++                 Output: (hjtest_2.c * 5)
++   SubPlan 2
++     ->  Result
++           Output: (hjtest_1.b * 5)
++(28 rows)
++
++SELECT hjtest_1.a a1, hjtest_2.a a2,hjtest_1.tableoid::regclass t1, hjtest_2.tableoid::regclass t2
++FROM hjtest_1, hjtest_2
++WHERE
++    hjtest_1.id = (SELECT 1 WHERE hjtest_2.id = 1)
++    AND (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++    AND (SELECT hjtest_1.b * 5) < 50
++    AND (SELECT hjtest_2.c * 5) < 55
++    AND hjtest_1.a <> hjtest_2.b;
++  a1  | a2 |    t1    |    t2    
++------+----+----------+----------
++ text | t  | hjtest_1 | hjtest_2
++(1 row)
++
++EXPLAIN (COSTS OFF, VERBOSE)
++SELECT hjtest_1.a a1, hjtest_2.a a2,hjtest_1.tableoid::regclass t1, hjtest_2.tableoid::regclass t2
++FROM hjtest_2, hjtest_1
++WHERE
++    hjtest_1.id = (SELECT 1 WHERE hjtest_2.id = 1)
++    AND (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++    AND (SELECT hjtest_1.b * 5) < 50
++    AND (SELECT hjtest_2.c * 5) < 55
++    AND hjtest_1.a <> hjtest_2.b;
++                                           QUERY PLAN                                           
++------------------------------------------------------------------------------------------------
++ Hash Join
++   Output: hjtest_1.a, hjtest_2.a, (hjtest_1.tableoid)::regclass, (hjtest_2.tableoid)::regclass
++   Hash Cond: (((SubPlan 1) = hjtest_1.id) AND ((SubPlan 3) = (SubPlan 2)))
++   Join Filter: (hjtest_1.a <> hjtest_2.b)
++   ->  Seq Scan on public.hjtest_2
++         Output: hjtest_2.a, hjtest_2.tableoid, hjtest_2.id, hjtest_2.c, hjtest_2.b
++         Filter: ((SubPlan 5) < 55)
++         SubPlan 5
++           ->  Result
++                 Output: (hjtest_2.c * 5)
++   ->  Hash
++         Output: hjtest_1.a, hjtest_1.tableoid, hjtest_1.id, hjtest_1.b
++         ->  Seq Scan on public.hjtest_1
++               Output: hjtest_1.a, hjtest_1.tableoid, hjtest_1.id, hjtest_1.b
++               Filter: ((SubPlan 4) < 50)
++               SubPlan 4
++                 ->  Result
++                       Output: (hjtest_1.b * 5)
++         SubPlan 2
++           ->  Result
++                 Output: (hjtest_1.b * 5)
++   SubPlan 1
++     ->  Result
++           Output: 1
++           One-Time Filter: (hjtest_2.id = 1)
++   SubPlan 3
++     ->  Result
++           Output: (hjtest_2.c * 5)
++(28 rows)
++
++SELECT hjtest_1.a a1, hjtest_2.a a2,hjtest_1.tableoid::regclass t1, hjtest_2.tableoid::regclass t2
++FROM hjtest_2, hjtest_1
++WHERE
++    hjtest_1.id = (SELECT 1 WHERE hjtest_2.id = 1)
++    AND (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++    AND (SELECT hjtest_1.b * 5) < 50
++    AND (SELECT hjtest_2.c * 5) < 55
++    AND hjtest_1.a <> hjtest_2.b;
++  a1  | a2 |    t1    |    t2    
++------+----+----------+----------
++ text | t  | hjtest_1 | hjtest_2
++(1 row)
++
++ROLLBACK;
+diff --git a/src/test/regress/sql/join_hash.sql b/src/test/regress/sql/join_hash.sql
+index 5b41d01a2454..68c1a8c7b65e 100644
+--- a/src/test/regress/sql/join_hash.sql
++++ b/src/test/regress/sql/join_hash.sql
+@@ -468,3 +468,73 @@ $$);
+ rollback to settings;
+ 
+ rollback;
++
++
++-- Verify that hash key expressions reference the correct
++-- nodes. Hashjoin's hashkeys need to reference its outer plan, Hash's
++-- need to reference Hash's outer plan (which is below HashJoin's
++-- inner plan). It's not trivial to verify that the references are
++-- correct (we don't display the hashkeys themselves), but if the
++-- hashkeys contain subplan references, those will be displayed. Force
++-- subplans to appear just about everywhere.
++--
++-- Bug report:
++-- https://www.postgresql.org/message-id/CAPpHfdvGVegF_TKKRiBrSmatJL2dR9uwFCuR%2BteQ_8tEXU8mxg%40mail.gmail.com
++--
++BEGIN;
++SET LOCAL enable_sort = OFF; -- avoid mergejoins
++SET LOCAL from_collapse_limit = 1; -- allows easy changing of join order
++
++CREATE TABLE hjtest_1 (a text, b int, id int, c bool);
++CREATE TABLE hjtest_2 (a bool, id int, b text, c int);
++
++INSERT INTO hjtest_1(a, b, id, c) VALUES ('text', 2, 1, false); -- matches
++INSERT INTO hjtest_1(a, b, id, c) VALUES ('text', 1, 2, false); -- fails id join condition
++INSERT INTO hjtest_1(a, b, id, c) VALUES ('text', 20, 1, false); -- fails < 50
++INSERT INTO hjtest_1(a, b, id, c) VALUES ('text', 1, 1, false); -- fails (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++
++INSERT INTO hjtest_2(a, id, b, c) VALUES (true, 1, 'another', 2); -- matches
++INSERT INTO hjtest_2(a, id, b, c) VALUES (true, 3, 'another', 7); -- fails id join condition
++INSERT INTO hjtest_2(a, id, b, c) VALUES (true, 1, 'another', 90);  -- fails < 55
++INSERT INTO hjtest_2(a, id, b, c) VALUES (true, 1, 'another', 3); -- fails (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++INSERT INTO hjtest_2(a, id, b, c) VALUES (true, 1, 'text', 1); --  fails hjtest_1.a <> hjtest_2.b;
++
++EXPLAIN (COSTS OFF, VERBOSE)
++SELECT hjtest_1.a a1, hjtest_2.a a2,hjtest_1.tableoid::regclass t1, hjtest_2.tableoid::regclass t2
++FROM hjtest_1, hjtest_2
++WHERE
++    hjtest_1.id = (SELECT 1 WHERE hjtest_2.id = 1)
++    AND (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++    AND (SELECT hjtest_1.b * 5) < 50
++    AND (SELECT hjtest_2.c * 5) < 55
++    AND hjtest_1.a <> hjtest_2.b;
++
++SELECT hjtest_1.a a1, hjtest_2.a a2,hjtest_1.tableoid::regclass t1, hjtest_2.tableoid::regclass t2
++FROM hjtest_1, hjtest_2
++WHERE
++    hjtest_1.id = (SELECT 1 WHERE hjtest_2.id = 1)
++    AND (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++    AND (SELECT hjtest_1.b * 5) < 50
++    AND (SELECT hjtest_2.c * 5) < 55
++    AND hjtest_1.a <> hjtest_2.b;
++
++EXPLAIN (COSTS OFF, VERBOSE)
++SELECT hjtest_1.a a1, hjtest_2.a a2,hjtest_1.tableoid::regclass t1, hjtest_2.tableoid::regclass t2
++FROM hjtest_2, hjtest_1
++WHERE
++    hjtest_1.id = (SELECT 1 WHERE hjtest_2.id = 1)
++    AND (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++    AND (SELECT hjtest_1.b * 5) < 50
++    AND (SELECT hjtest_2.c * 5) < 55
++    AND hjtest_1.a <> hjtest_2.b;
++
++SELECT hjtest_1.a a1, hjtest_2.a a2,hjtest_1.tableoid::regclass t1, hjtest_2.tableoid::regclass t2
++FROM hjtest_2, hjtest_1
++WHERE
++    hjtest_1.id = (SELECT 1 WHERE hjtest_2.id = 1)
++    AND (SELECT hjtest_1.b * 5) = (SELECT hjtest_2.c*5)
++    AND (SELECT hjtest_1.b * 5) < 50
++    AND (SELECT hjtest_2.c * 5) < 55
++    AND hjtest_1.a <> hjtest_2.b;
++
++ROLLBACK;

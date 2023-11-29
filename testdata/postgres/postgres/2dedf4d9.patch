@@ -1,0 +1,3856 @@
+From 2dedf4d9a899b36d1a8ed29be5efbd1b31a8fe85 Mon Sep 17 00:00:00 2001
+From: Peter Eisentraut <peter_e@gmx.net>
+Date: Sun, 25 Nov 2018 16:31:16 +0100
+Subject: [PATCH] Integrate recovery.conf into postgresql.conf
+
+recovery.conf settings are now set in postgresql.conf (or other GUC
+sources).  Currently, all the affected settings are PGC_POSTMASTER;
+this could be refined in the future case by case.
+
+Recovery is now initiated by a file recovery.signal.  Standby mode is
+initiated by a file standby.signal.  The standby_mode setting is
+gone.  If a recovery.conf file is found, an error is issued.
+
+The trigger_file setting has been renamed to promote_trigger_file as
+part of the move.
+
+The documentation chapter "Recovery Configuration" has been integrated
+into "Server Configuration".
+
+pg_basebackup -R now appends settings to postgresql.auto.conf and
+creates a standby.signal file.
+
+Author: Fujii Masao <masao.fujii@gmail.com>
+Author: Simon Riggs <simon@2ndquadrant.com>
+Author: Abhijit Menon-Sen <ams@2ndquadrant.com>
+Author: Sergei Kornilov <sk@zsrv.org>
+Discussion: https://www.postgresql.org/message-id/flat/607741529606767@web3g.yandex.ru/
+---
+ contrib/pg_standby/pg_standby.c               |   2 +-
+ doc/src/sgml/backup.sgml                      |  22 +-
+ doc/src/sgml/config.sgml                      | 515 +++++++++++++++++-
+ doc/src/sgml/filelist.sgml                    |   1 -
+ doc/src/sgml/func.sgml                        |   2 +-
+ doc/src/sgml/high-availability.sgml           |  56 +-
+ doc/src/sgml/pgstandby.sgml                   |   2 +-
+ doc/src/sgml/postgres.sgml                    |   1 -
+ doc/src/sgml/recovery-config.sgml             | 510 -----------------
+ doc/src/sgml/ref/pg_basebackup.sgml           |   7 +-
+ doc/src/sgml/ref/pg_rewind.sgml               |   8 +-
+ doc/src/sgml/ref/pgarchivecleanup.sgml        |   4 +-
+ doc/src/sgml/ref/pgupgrade.sgml               |   2 +-
+ doc/src/sgml/release-10.sgml                  |   2 +-
+ doc/src/sgml/release-9.1.sgml                 |   5 +-
+ doc/src/sgml/release-9.4.sgml                 |  15 +-
+ doc/src/sgml/release-9.5.sgml                 |  11 +-
+ doc/src/sgml/release.sgml                     |   3 +-
+ src/backend/Makefile                          |   4 +-
+ .../access/transam/recovery.conf.sample       | 158 ------
+ src/backend/access/transam/xlog.c             | 500 ++++++-----------
+ src/backend/access/transam/xlogarchive.c      |   4 +-
+ src/backend/commands/extension.c              |   4 +-
+ src/backend/utils/misc/guc.c                  | 421 ++++++++++++++
+ src/backend/utils/misc/postgresql.conf.sample |  47 ++
+ src/bin/pg_archivecleanup/pg_archivecleanup.c |   2 +-
+ src/bin/pg_basebackup/pg_basebackup.c         | 148 +++--
+ src/bin/pg_basebackup/t/010_pg_basebackup.pl  |  15 +-
+ src/bin/pg_rewind/RewindTest.pm               |  10 +-
+ src/include/access/xlog.h                     |  39 +-
+ src/include/utils/guc_tables.h                |   2 +
+ src/port/quotes.c                             |   2 +-
+ src/test/perl/PostgresNode.pm                 |  26 +-
+ src/test/recovery/t/001_stream_rep.pl         |   4 +-
+ src/test/recovery/t/003_recovery_targets.pl   |   2 +-
+ src/test/recovery/t/004_timeline_switch.pl    |   4 +-
+ src/test/recovery/t/005_replay_delay.pl       |   2 +-
+ src/test/recovery/t/009_twophase.pl           |   6 +-
+ .../t/010_logical_decoding_timelines.pl       |   2 +-
+ src/test/recovery/t/012_subtransactions.pl    |   6 +-
+ 40 files changed, 1403 insertions(+), 1173 deletions(-)
+ delete mode 100644 doc/src/sgml/recovery-config.sgml
+ delete mode 100644 src/backend/access/transam/recovery.conf.sample
+
+diff --git a/contrib/pg_standby/pg_standby.c b/contrib/pg_standby/pg_standby.c
+index ee1fbd7b3327..946239c2ac71 100644
+--- a/contrib/pg_standby/pg_standby.c
++++ b/contrib/pg_standby/pg_standby.c
+@@ -611,7 +611,7 @@ usage(void)
+ 	printf("  -w MAXWAITTIME     max seconds to wait for a file (0=no limit) (default=0)\n");
+ 	printf("  -?, --help         show this help, then exit\n");
+ 	printf("\n"
+-		   "Main intended use as restore_command in recovery.conf:\n"
++		   "Main intended use as restore_command in postgresql.conf:\n"
+ 		   "  restore_command = 'pg_standby [OPTION]... ARCHIVELOCATION %%f %%p %%r'\n"
+ 		   "e.g.\n"
+ 		   "  restore_command = 'pg_standby /mnt/server/archiverdir %%f %%p %%r'\n");
+diff --git a/doc/src/sgml/backup.sgml b/doc/src/sgml/backup.sgml
+index 3fa5efdd789b..a73fd4d044fb 100644
+--- a/doc/src/sgml/backup.sgml
++++ b/doc/src/sgml/backup.sgml
+@@ -1220,8 +1220,11 @@ SELECT pg_stop_backup();
+    </listitem>
+    <listitem>
+     <para>
+-     Create a recovery command file <filename>recovery.conf</filename> in the cluster
+-     data directory (see <xref linkend="recovery-config"/>). You might
++     Set recovery configuration settings in
++     <filename>postgresql.conf</filename> (see <xref
++     linkend="runtime-config-wal-archive-recovery"/>) and create a file
++     <filename>recovery.signal</filename> in the cluster
++     data directory. You might
+      also want to temporarily modify <filename>pg_hba.conf</filename> to prevent
+      ordinary users from connecting until you are sure the recovery was successful.
+     </para>
+@@ -1232,8 +1235,8 @@ SELECT pg_stop_backup();
+      proceed to read through the archived WAL files it needs.  Should the
+      recovery be terminated because of an external error, the server can
+      simply be restarted and it will continue recovery.  Upon completion
+-     of the recovery process, the server will rename
+-     <filename>recovery.conf</filename> to <filename>recovery.done</filename> (to prevent
++     of the recovery process, the server will remove
++     <filename>recovery.signal</filename> (to prevent
+      accidentally re-entering recovery mode later) and then
+      commence normal database operations.
+     </para>
+@@ -1249,12 +1252,9 @@ SELECT pg_stop_backup();
+    </para>
+ 
+    <para>
+-    The key part of all this is to set up a recovery configuration file that
++    The key part of all this is to set up a recovery configuration that
+     describes how you want to recover and how far the recovery should
+-    run.  You can use <filename>recovery.conf.sample</filename> (normally
+-    located in the installation's <filename>share/</filename> directory) as a
+-    prototype.  The one thing that you absolutely must specify in
+-    <filename>recovery.conf</filename> is the <varname>restore_command</varname>,
++    run.  The one thing that you absolutely must specify is the <varname>restore_command</varname>,
+     which tells <productname>PostgreSQL</productname> how to retrieve archived
+     WAL file segments.  Like the <varname>archive_command</varname>, this is
+     a shell command string.  It can contain <literal>%f</literal>, which is
+@@ -1316,7 +1316,7 @@ restore_command = 'cp /mnt/server/archivedir/%f %p'
+    <para>
+     If you want to recover to some previous point in time (say, right before
+     the junior DBA dropped your main transaction table), just specify the
+-    required <link linkend="recovery-target-settings">stopping point</link> in <filename>recovery.conf</filename>.  You can specify
++    required <link linkend="runtime-config-wal-recovery-target">stopping point</link>.  You can specify
+     the stop point, known as the <quote>recovery target</quote>, either by
+     date/time, named restore point or by completion of a specific transaction
+     ID.  As of this writing only the date/time and named restore point options
+@@ -1414,7 +1414,7 @@ restore_command = 'cp /mnt/server/archivedir/%f %p'
+     that was current when the base backup was taken.  If you wish to recover
+     into some child timeline (that is, you want to return to some state that
+     was itself generated after a recovery attempt), you need to specify the
+-    target timeline ID in <filename>recovery.conf</filename>.  You cannot recover into
++    target timeline ID in <xref linkend="guc-recovery-target-timeline"/>. You cannot recover into
+     timelines that branched off earlier than the base backup.
+    </para>
+   </sect2>
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index d1dab3555906..db1a2d4e746a 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -3044,6 +3044,377 @@ include_dir 'conf.d'
+      </variablelist>
+     </sect2>
+ 
++  <sect2 id="runtime-config-wal-archive-recovery">
++
++    <title>Archive Recovery</title>
++
++    <indexterm>
++     <primary>configuration</primary>
++     <secondary>of recovery</secondary>
++     <tertiary>of a standby server</tertiary>
++    </indexterm>
++
++    <para>
++     This section describes the settings that apply only for the duration of
++     the recovery.  They must be reset for any subsequent recovery you wish to
++     perform.  They can only be set at server start and cannot be changed once
++     recovery has begun.
++    </para>
++
++    <para>
++     <quote>Recovery</quote> covers using the server as a standby or for
++     executing a targeted recovery.  Typically, standby mode would be used to
++     provide high availability and/or read scalability, whereas a targeted
++     recovery is used to recover from data loss.
++    </para>
++
++    <para>
++     To start the server in standby mode create file called
++     <filename>standby.signal</filename><indexterm><primary>standby.signal</primary></indexterm>
++     in the data directory.  The server will enter recovery and will not stop
++     recovery when the end of archived WAL is reached, but will keep trying to
++     continue recovery by connecting to the sending server as specified by the
++     <varname>primary_conninfo</varname> setting and/or by fetching new WAL
++     segments using <varname>restore_command</varname>.  In this mode, you may
++     use parameters in both <xref
++     linkend="runtime-config-wal-archive-recovery"/> and <xref
++     linkend="runtime-config-replication-standby"/> sections.  Parameters from
++     <xref linkend="runtime-config-wal-recovery-target"/> will not be used.
++    </para>
++
++    <para>
++     To start the server in targeted recovery create a file called
++     <filename>recovery.signal</filename><indexterm><primary>recovery.signal</primary></indexterm>
++     in the data directory.  If both <filename>standby.signal</filename> and
++     <filename>recovery.signal</filename> files are created, standby mode
++     takes precedence.  Targeted recovery mode will end when end of archived
++     WAL is reached, or when <varname>recovery_target</varname> is reached.
++     In this mode you may use parameters from both <xref
++     linkend="runtime-config-wal-archive-recovery"/> and <xref
++     linkend="runtime-config-wal-recovery-target"/> sections.  Parameters from <xref
++     linkend="runtime-config-replication-standby"/> will not be used.
++    </para>
++
++    <variablelist>
++     <varlistentry id="guc-restore-command" xreflabel="restore_command">
++      <term><varname>restore_command</varname> (<type>string</type>)
++      <indexterm>
++        <primary><varname>restore_command</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        The local shell command to execute to retrieve an archived segment of
++        the WAL file series. This parameter is required for archive recovery,
++        but optional for streaming replication.
++        Any <literal>%f</literal> in the string is
++        replaced by the name of the file to retrieve from the archive,
++        and any <literal>%p</literal> is replaced by the copy destination path name
++        on the server.
++        (The path name is relative to the current working directory,
++        i.e., the cluster's data directory.)
++        Any <literal>%r</literal> is replaced by the name of the file containing the
++        last valid restart point. That is the earliest file that must be kept
++        to allow a restore to be restartable, so this information can be used
++        to truncate the archive to just the minimum required to support
++        restarting from the current restore. <literal>%r</literal> is typically only
++        used by warm-standby configurations
++        (see <xref linkend="warm-standby"/>).
++        Write <literal>%%</literal> to embed an actual <literal>%</literal> character.
++       </para>
++
++       <para>
++        It is important for the command to return a zero exit status
++        only if it succeeds.  The command <emphasis>will</emphasis> be asked for file
++        names that are not present in the archive; it must return nonzero
++        when so asked.  Examples:
++<programlisting>
++restore_command = 'cp /mnt/server/archivedir/%f "%p"'
++restore_command = 'copy "C:\\server\\archivedir\\%f" "%p"'  # Windows
++</programlisting>
++        An exception is that if the command was terminated by a signal (other
++        than <systemitem>SIGTERM</systemitem>, which is used as part of a
++        database server shutdown) or an error by the shell (such as command
++        not found), then recovery will abort and the server will not start up.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry id="guc-archive-cleanup-command" xreflabel="archive_cleanup_command">
++      <term><varname>archive_cleanup_command</varname> (<type>string</type>)
++      <indexterm>
++        <primary><varname>archive_cleanup_command</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        This optional parameter specifies a shell command that will be executed
++        at every restartpoint.  The purpose of
++        <varname>archive_cleanup_command</varname> is to provide a mechanism for
++        cleaning up old archived WAL files that are no longer needed by the
++        standby server.
++        Any <literal>%r</literal> is replaced by the name of the file containing the
++        last valid restart point.
++        That is the earliest file that must be <emphasis>kept</emphasis> to allow a
++        restore to be restartable, and so all files earlier than <literal>%r</literal>
++        may be safely removed.
++        This information can be used to truncate the archive to just the
++        minimum required to support restart from the current restore.
++        The <xref linkend="pgarchivecleanup"/> module
++        is often used in <varname>archive_cleanup_command</varname> for
++        single-standby configurations, for example:
++<programlisting>archive_cleanup_command = 'pg_archivecleanup /mnt/server/archivedir %r'</programlisting>
++        Note however that if multiple standby servers are restoring from the
++        same archive directory, you will need to ensure that you do not delete
++        WAL files until they are no longer needed by any of the servers.
++        <varname>archive_cleanup_command</varname> would typically be used in a
++        warm-standby configuration (see <xref linkend="warm-standby"/>).
++        Write <literal>%%</literal> to embed an actual <literal>%</literal> character in the
++        command.
++       </para>
++       <para>
++        If the command returns a nonzero exit status then a warning log
++        message will be written.  An exception is that if the command was
++        terminated by a signal or an error by the shell (such as command not
++        found), a fatal error will be raised.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry id="guc-recovery-end-command" xreflabel="recovery_end_command">
++      <term><varname>recovery_end_command</varname> (<type>string</type>)
++      <indexterm>
++        <primary><varname>recovery_end_command</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        This parameter specifies a shell command that will be executed once only
++        at the end of recovery. This parameter is optional. The purpose of the
++        <varname>recovery_end_command</varname> is to provide a mechanism for cleanup
++        following replication or recovery.
++        Any <literal>%r</literal> is replaced by the name of the file containing the
++        last valid restart point, like in <xref linkend="guc-archive-cleanup-command"/>.
++       </para>
++       <para>
++        If the command returns a nonzero exit status then a warning log
++        message will be written and the database will proceed to start up
++        anyway.  An exception is that if the command was terminated by a
++        signal or an error by the shell (such as command not found), the
++        database will not proceed with startup.
++       </para>
++      </listitem>
++     </varlistentry>
++
++    </variablelist>
++
++  </sect2>
++
++  <sect2 id="runtime-config-wal-recovery-target">
++
++    <title>Recovery Target</title>
++
++     <para>
++      By default, recovery will recover to the end of the WAL log. The
++      following parameters can be used to specify an earlier stopping point.
++      At most one of <varname>recovery_target</varname>,
++      <varname>recovery_target_lsn</varname>, <varname>recovery_target_name</varname>,
++      <varname>recovery_target_time</varname>, or <varname>recovery_target_xid</varname>
++      can be used; if more than one of these is specified in the configuration
++      file, the last entry will be used.
++      These parameters can only be set at server start.
++     </para>
++
++     <variablelist>
++     <varlistentry id="guc-recovery-target" xreflabel="recovery_target">
++      <term><varname>recovery_target</varname><literal> = 'immediate'</literal>
++      <indexterm>
++        <primary><varname>recovery_target</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        This parameter specifies that recovery should end as soon as a
++        consistent state is reached, i.e. as early as possible. When restoring
++        from an online backup, this means the point where taking the backup
++        ended.
++       </para>
++       <para>
++        Technically, this is a string parameter, but <literal>'immediate'</literal>
++        is currently the only allowed value.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry id="guc-recovery-target-name" xreflabel="recovery_target_name">
++      <term><varname>recovery_target_name</varname> (<type>string</type>)
++      <indexterm>
++        <primary><varname>recovery_target_name</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        This parameter specifies the named restore point (created with
++        <function>pg_create_restore_point()</function>) to which recovery will proceed.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry id="guc-recovery-target-time" xreflabel="recovery_target_time">
++      <term><varname>recovery_target_time</varname> (<type>timestamp</type>)
++      <indexterm>
++        <primary><varname>recovery_target_time</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        This parameter specifies the time stamp up to which recovery
++        will proceed.
++        The precise stopping point is also influenced by
++        <xref linkend="guc-recovery-target-inclusive"/>.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry id="guc-recovery-target-xid" xreflabel="recovery_target_xid">
++      <term><varname>recovery_target_xid</varname> (<type>string</type>)
++      <indexterm>
++        <primary><varname>recovery_target_xid</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        This parameter specifies the transaction ID up to which recovery
++        will proceed. Keep in mind
++        that while transaction IDs are assigned sequentially at transaction
++        start, transactions can complete in a different numeric order.
++        The transactions that will be recovered are those that committed
++        before (and optionally including) the specified one.
++        The precise stopping point is also influenced by
++        <xref linkend="guc-recovery-target-inclusive"/>.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry id="guc-recovery-target-lsn" xreflabel="recovery_target_lsn">
++      <term><varname>recovery_target_lsn</varname> (<type>pg_lsn</type>)
++      <indexterm>
++        <primary><varname>recovery_target_lsn</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        This parameter specifies the LSN of the write-ahead log location up
++        to which recovery will proceed. The precise stopping point is also
++        influenced by <xref linkend="guc-recovery-target-inclusive"/>. This
++        parameter is parsed using the system data type
++        <link linkend="datatype-pg-lsn"><type>pg_lsn</type></link>.
++       </para>
++      </listitem>
++     </varlistentry>
++     </variablelist>
++
++     <para>
++       The following options further specify the recovery target, and affect
++       what happens when the target is reached:
++     </para>
++
++     <variablelist>
++     <varlistentry id="guc-recovery-target-inclusive"
++                   xreflabel="recovery_target_inclusive">
++      <term><varname>recovery_target_inclusive</varname> (<type>boolean</type>)
++      <indexterm>
++        <primary><varname>recovery_target_inclusive</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        Specifies whether to stop just after the specified recovery target
++        (<literal>true</literal>), or just before the recovery target
++        (<literal>false</literal>).
++        Applies when <xref linkend="guc-recovery-target-lsn"/>,
++        <xref linkend="guc-recovery-target-time"/>, or
++        <xref linkend="guc-recovery-target-xid"/> is specified.
++        This setting controls whether transactions
++        having exactly the target WAL location (LSN), commit time, or transaction ID, respectively, will
++        be included in the recovery.  Default is <literal>true</literal>.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry id="guc-recovery-target-timeline"
++                   xreflabel="recovery_target_timeline">
++      <term><varname>recovery_target_timeline</varname> (<type>string</type>)
++      <indexterm>
++        <primary><varname>recovery_target_timeline</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        Specifies recovering into a particular timeline.  The default is
++        to recover along the same timeline that was current when the
++        base backup was taken. Setting this to <literal>latest</literal> recovers
++        to the latest timeline found in the archive, which is useful in
++        a standby server. Other than that you only need to set this parameter
++        in complex re-recovery situations, where you need to return to
++        a state that itself was reached after a point-in-time recovery.
++        See <xref linkend="backup-timelines"/> for discussion.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry id="guc-recovery-target-action"
++                   xreflabel="recovery_target_action">
++      <term><varname>recovery_target_action</varname> (<type>enum</type>)
++      <indexterm>
++        <primary><varname>recovery_target_action</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        Specifies what action the server should take once the recovery target is
++        reached. The default is <literal>pause</literal>, which means recovery will
++        be paused. <literal>promote</literal> means the recovery process will finish
++        and the server will start to accept connections.
++        Finally <literal>shutdown</literal> will stop the server after reaching the
++        recovery target.
++       </para>
++       <para>
++        The intended use of the <literal>pause</literal> setting is to allow queries
++        to be executed against the database to check if this recovery target
++        is the most desirable point for recovery.
++        The paused state can be resumed by
++        using <function>pg_wal_replay_resume()</function> (see
++        <xref linkend="functions-recovery-control-table"/>), which then
++        causes recovery to end. If this recovery target is not the
++        desired stopping point, then shut down the server, change the
++        recovery target settings to a later target and restart to
++        continue recovery.
++       </para>
++       <para>
++        The <literal>shutdown</literal> setting is useful to have the instance ready
++        at the exact replay point desired.  The instance will still be able to
++        replay more WAL records (and in fact will have to replay WAL records
++        since the last checkpoint next time it is started).
++       </para>
++       <para>
++        Note that because <filename>recovery.signal</filename> will not be
++        removed when <varname>recovery_target_action</varname> is set to <literal>shutdown</literal>,
++        any subsequent start will end with immediate shutdown unless the
++        configuration is changed or the <filename>recovery.signal</filename>
++        file is removed manually.
++       </para>
++       <para>
++        This setting has no effect if no recovery target is set.
++        If <xref linkend="guc-hot-standby"/> is not enabled, a setting of
++        <literal>pause</literal> will act the same as <literal>shutdown</literal>.
++       </para>
++      </listitem>
++     </varlistentry>
++
++    </variablelist>
++   </sect2>
++
+    </sect1>
+ 
+    <sect1 id="runtime-config-replication">
+@@ -3247,11 +3618,11 @@ include_dir 'conf.d'
+         <varname>application_name</varname> setting of the standby, as set in the
+         standby's connection information.  In case of a physical replication
+         standby, this should be set in the <varname>primary_conninfo</varname>
+-        setting in <filename>recovery.conf</filename>; the default
+-        is <literal>walreceiver</literal>.  For logical replication, this can
+-        be set in the connection information of the subscription, and it
+-        defaults to the subscription name.  For other replication stream
+-        consumers, consult their documentation.
++        setting; the default is <literal>walreceiver</literal>.
++        For logical replication, this can be set in the connection
++        information of the subscription, and it defaults to the
++        subscription name.  For other replication stream consumers,
++        consult their documentation.
+        </para>
+        <para>
+         This parameter specifies a list of standby servers using
+@@ -3394,6 +3765,79 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
+ 
+     <variablelist>
+ 
++       <varlistentry id="guc-primary-conninfo" xreflabel="primary_conninfo">
++        <term><varname>primary_conninfo</varname> (<type>string</type>)
++        <indexterm>
++          <primary><varname>primary_conninfo</varname> configuration parameter</primary>
++        </indexterm>
++        </term>
++        <listitem>
++         <para>
++          Specifies a connection string to be used for the standby server
++          to connect with a sending server. This string is in the format
++          described in <xref linkend="libpq-connstring"/>. If any option is
++          unspecified in this string, then the corresponding environment
++          variable (see <xref linkend="libpq-envars"/>) is checked. If the
++          environment variable is not set either, then
++          defaults are used.
++         </para>
++         <para>
++          The connection string should specify the host name (or address)
++          of the sending server, as well as the port number if it is not
++          the same as the standby server's default.
++          Also specify a user name corresponding to a suitably-privileged role
++          on the sending server (see
++          <xref linkend="streaming-replication-authentication"/>).
++          A password needs to be provided too, if the sender demands password
++          authentication.  It can be provided in the
++          <varname>primary_conninfo</varname> string, or in a separate
++          <filename>~/.pgpass</filename> file on the standby server (use
++          <literal>replication</literal> as the database name).
++          Do not specify a database name in the
++          <varname>primary_conninfo</varname> string.
++         </para>
++         <para>
++          This parameter can only be set at server start.
++          This setting has no effect if the server is not in standby mode.
++         </para>
++        </listitem>
++       </varlistentry>
++       <varlistentry id="guc-primary-slot-name" xreflabel="primary_slot_name">
++        <term><varname>primary_slot_name</varname> (<type>string</type>)
++        <indexterm>
++          <primary><varname>primary_slot_name</varname> configuration parameter</primary>
++        </indexterm>
++        </term>
++        <listitem>
++         <para>
++          Optionally specifies an existing replication slot to be used when
++          connecting to the sending server via streaming replication to control
++          resource removal on the upstream node
++          (see <xref linkend="streaming-replication-slots"/>).
++          This parameter can only be set at server start.
++          This setting has no effect if <varname>primary_conninfo</varname> is not
++          set.
++         </para>
++        </listitem>
++       </varlistentry>
++
++       <varlistentry id="guc-promote-trigger-file" xreflabel="promote_trigger_file">
++        <term><varname>promote_trigger_file</varname> (<type>string</type>)
++        <indexterm>
++          <primary><varname>promote_trigger_file</varname> configuration parameter</primary>
++        </indexterm>
++        </term>
++        <listitem>
++         <para>
++          Specifies a trigger file whose presence ends recovery in the
++          standby.  Even if this value is not set, you can still promote
++          the standby using <command>pg_ctl promote</command> or calling
++          <function>pg_promote</function>.
++          This parameter can only be set at server start.
++         </para>
++        </listitem>
++       </varlistentry>
++
+      <varlistentry id="guc-hot-standby" xreflabel="hot_standby">
+       <term><varname>hot_standby</varname> (<type>boolean</type>)
+       <indexterm>
+@@ -3587,6 +4031,67 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry id="guc-recovery-min-apply-delay" xreflabel="recovery_min_apply_delay">
++      <term><varname>recovery_min_apply_delay</varname> (<type>integer</type>)
++      <indexterm>
++        <primary><varname>recovery_min_apply_delay</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        By default, a standby server restores WAL records from the
++        sending server as soon as possible. It may be useful to have a time-delayed
++        copy of the data, offering opportunities to correct data loss errors.
++        This parameter allows you to delay recovery by a fixed period of time,
++        measured in milliseconds if no unit is specified.  For example, if
++        you set this parameter to <literal>5min</literal>, the standby will
++        replay each transaction commit only when the system time on the standby
++        is at least five minutes past the commit time reported by the master.
++       </para>
++       <para>
++        It is possible that the replication delay between servers exceeds the
++        value of this parameter, in which case no delay is added.
++        Note that the delay is calculated between the WAL time stamp as written
++        on master and the current time on the standby. Delays in transfer
++        because of network lag or cascading replication configurations
++        may reduce the actual wait time significantly. If the system
++        clocks on master and standby are not synchronized, this may lead to
++        recovery applying records earlier than expected; but that is not a
++        major issue because useful settings of this parameter are much larger
++        than typical time deviations between servers.
++       </para>
++       <para>
++        The delay occurs only on WAL records for transaction commits.
++        Other records are replayed as quickly as possible, which
++        is not a problem because MVCC visibility rules ensure their effects
++        are not visible until the corresponding commit record is applied.
++       </para>
++       <para>
++        The delay occurs once the database in recovery has reached a consistent
++        state, until the standby is promoted or triggered. After that the standby
++        will end recovery without further waiting.
++       </para>
++       <para>
++        This parameter is intended for use with streaming replication deployments;
++        however, if the parameter is specified it will be honored in all cases.
++
++        <varname>hot_standby_feedback</varname> will be delayed by use of this feature
++        which could lead to bloat on the master; use both together with care.
++
++        <warning>
++         <para>
++          Synchronous replication is affected by this setting when <varname>synchronous_commit</varname>
++          is set to <literal>remote_apply</literal>; every <literal>COMMIT</literal>
++          will need to wait to be applied.
++         </para>
++        </warning>
++       </para>
++       <para>
++        This parameter can only be set at server start.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      </variablelist>
+     </sect2>
+ 
+diff --git a/doc/src/sgml/filelist.sgml b/doc/src/sgml/filelist.sgml
+index 48ac14a8380f..0a10df640222 100644
+--- a/doc/src/sgml/filelist.sgml
++++ b/doc/src/sgml/filelist.sgml
+@@ -42,7 +42,6 @@
+ <!ENTITY manage-ag     SYSTEM "manage-ag.sgml">
+ <!ENTITY monitoring    SYSTEM "monitoring.sgml">
+ <!ENTITY regress       SYSTEM "regress.sgml">
+-<!ENTITY recovery-config SYSTEM "recovery-config.sgml">
+ <!ENTITY runtime       SYSTEM "runtime.sgml">
+ <!ENTITY config        SYSTEM "config.sgml">
+ <!ENTITY user-manag    SYSTEM "user-manag.sgml">
+diff --git a/doc/src/sgml/func.sgml b/doc/src/sgml/func.sgml
+index d73026174237..09c77db04552 100644
+--- a/doc/src/sgml/func.sgml
++++ b/doc/src/sgml/func.sgml
+@@ -19094,7 +19094,7 @@ postgres=# select pg_start_backup('label_goes_here');
+     <function>pg_create_restore_point</function> creates a named write-ahead log
+     record that can be used as recovery target, and returns the corresponding
+     write-ahead log location.  The given name can then be used with
+-    <xref linkend="recovery-target-name"/> to specify the point up to which
++    <xref linkend="guc-recovery-target-name"/> to specify the point up to which
+     recovery will proceed.  Avoid creating multiple restore points with the
+     same name, since recovery will stop at the first one whose name matches
+     the recovery target.
+diff --git a/doc/src/sgml/high-availability.sgml b/doc/src/sgml/high-availability.sgml
+index faf8e7185498..d8fd195da092 100644
+--- a/doc/src/sgml/high-availability.sgml
++++ b/doc/src/sgml/high-availability.sgml
+@@ -618,7 +618,7 @@ protocol to make nodes agree on a serializable transactional order.
+    <para>
+     In standby mode, the server continuously applies WAL received from the
+     master server. The standby server can read WAL from a WAL archive
+-    (see <xref linkend="restore-command"/>) or directly from the master
++    (see <xref linkend="guc-restore-command"/>) or directly from the master
+     over a TCP connection (streaming replication). The standby server will
+     also attempt to restore any WAL found in the standby cluster's
+     <filename>pg_wal</filename> directory. That typically happens after a server
+@@ -645,7 +645,7 @@ protocol to make nodes agree on a serializable transactional order.
+    <para>
+     Standby mode is exited and the server switches to normal operation
+     when <command>pg_ctl promote</command> is run or a trigger file is found
+-    (<varname>trigger_file</varname>). Before failover,
++    (<varname>promote_trigger_file</varname>). Before failover,
+     any WAL immediately available in the archive or in <filename>pg_wal</filename> will be
+     restored, but no attempt is made to connect to the master.
+    </para>
+@@ -686,10 +686,9 @@ protocol to make nodes agree on a serializable transactional order.
+ 
+    <para>
+     To set up the standby server, restore the base backup taken from primary
+-    server (see <xref linkend="backup-pitr-recovery"/>). Create a recovery
+-    command file <filename>recovery.conf</filename> in the standby's cluster data
+-    directory, and turn on <varname>standby_mode</varname>. Set
+-    <varname>restore_command</varname> to a simple command to copy files from
++    server (see <xref linkend="backup-pitr-recovery"/>). Create a file
++    <filename>standby.signal</filename> in the standby's cluster data
++    directory. Set <xref linkend="guc-restore-command"/> to a simple command to copy files from
+     the WAL archive. If you plan to have multiple standby servers for high
+     availability purposes, set <varname>recovery_target_timeline</varname> to
+     <literal>latest</literal>, to make the standby server follow the timeline change
+@@ -699,7 +698,7 @@ protocol to make nodes agree on a serializable transactional order.
+    <note>
+      <para>
+      Do not use pg_standby or similar tools with the built-in standby mode
+-     described here. <varname>restore_command</varname> should return immediately
++     described here. <xref linkend="guc-restore-command"/> should return immediately
+      if the file does not exist; the server will retry the command again if
+      necessary. See <xref linkend="log-shipping-alternative"/>
+      for using tools like pg_standby.
+@@ -708,11 +707,11 @@ protocol to make nodes agree on a serializable transactional order.
+ 
+    <para>
+      If you want to use streaming replication, fill in
+-     <varname>primary_conninfo</varname> with a libpq connection string, including
++     <xref linkend="guc-primary-conninfo"/> with a libpq connection string, including
+      the host name (or IP address) and any additional details needed to
+      connect to the primary server. If the primary needs a password for
+      authentication, the password needs to be specified in
+-     <varname>primary_conninfo</varname> as well.
++     <xref linkend="guc-primary-conninfo"/> as well.
+    </para>
+ 
+    <para>
+@@ -724,7 +723,7 @@ protocol to make nodes agree on a serializable transactional order.
+ 
+    <para>
+     If you're using a WAL archive, its size can be minimized using the <xref
+-    linkend="archive-cleanup-command"/> parameter to remove files that are no
++    linkend="guc-archive-cleanup-command"/> parameter to remove files that are no
+     longer required by the standby server.
+     The <application>pg_archivecleanup</application> utility is designed specifically to
+     be used with <varname>archive_cleanup_command</varname> in typical single-standby
+@@ -735,9 +734,8 @@ protocol to make nodes agree on a serializable transactional order.
+    </para>
+ 
+    <para>
+-    A simple example of a <filename>recovery.conf</filename> is:
++    A simple example of configuration is:
+ <programlisting>
+-standby_mode = 'on'
+ primary_conninfo = 'host=192.168.1.50 port=5432 user=foo password=foopass options=''-c wal_sender_timeout=5000'''
+ restore_command = 'cp /path/to/archive/%f %p'
+ archive_cleanup_command = 'pg_archivecleanup /path/to/archive %r'
+@@ -793,8 +791,8 @@ archive_cleanup_command = 'pg_archivecleanup /path/to/archive %r'
+     To use streaming replication, set up a file-based log-shipping standby
+     server as described in <xref linkend="warm-standby"/>. The step that
+     turns a file-based log-shipping standby into streaming replication
+-    standby is setting <varname>primary_conninfo</varname> setting in the
+-    <filename>recovery.conf</filename> file to point to the primary server. Set
++    standby is setting the <varname>primary_conninfo</varname> setting
++    to point to the primary server. Set
+     <xref linkend="guc-listen-addresses"/> and authentication options
+     (see <filename>pg_hba.conf</filename>) on the primary so that the standby server
+     can connect to the <literal>replication</literal> pseudo-database on the primary
+@@ -854,14 +852,14 @@ host    replication     foo             192.168.1.100/32        md5
+     </para>
+     <para>
+      The host name and port number of the primary, connection user name,
+-     and password are specified in the <filename>recovery.conf</filename> file.
++     and password are specified in the <xref linkend="guc-primary-conninfo"/>.
+      The password can also be set in the <filename>~/.pgpass</filename> file on the
+      standby (specify <literal>replication</literal> in the <replaceable>database</replaceable>
+      field).
+      For example, if the primary is running on host IP <literal>192.168.1.50</literal>,
+      port <literal>5432</literal>, the account name for replication is
+      <literal>foo</literal>, and the password is <literal>foopass</literal>, the administrator
+-     can add the following line to the <filename>recovery.conf</filename> file on the
++     can add the following line to the <filename>postgresql.conf</filename> file on the
+      standby:
+ 
+ <programlisting>
+@@ -973,10 +971,8 @@ postgres=# SELECT slot_name, slot_type, active FROM pg_replication_slots;
+ (1 row)
+ </programlisting>
+      To configure the standby to use this slot, <varname>primary_slot_name</varname>
+-     should be configured in the standby's <filename>recovery.conf</filename>.
+-     Here is a simple example:
++     should be configured on the standby. Here is a simple example:
+ <programlisting>
+-standby_mode = 'on'
+ primary_conninfo = 'host=192.168.1.50 port=5432 user=foo password=foopass'
+ primary_slot_name = 'node_a_slot'
+ </programlisting>
+@@ -1474,11 +1470,10 @@ synchronous_standby_names = 'ANY 2 (s1, s2, s3)'
+     To trigger failover of a log-shipping standby server, run
+     <command>pg_ctl promote</command>, call <function>pg_promote</function>,
+     or create a trigger file with the file name and path specified by the
+-    <varname>trigger_file</varname> setting in
+-    <filename>recovery.conf</filename>. If you're planning to use
++    <varname>promote_trigger_file</varname>. If you're planning to use
+     <command>pg_ctl promote</command> or to call
+     <function>pg_promote</function> to fail over,
+-    <varname>trigger_file</varname> is not required. If you're
++    <varname>promote_trigger_file</varname> is not required. If you're
+     setting up the reporting servers that are only used to offload read-only
+     queries from the primary, not for high availability purposes, you don't
+     need to promote it.
+@@ -1491,11 +1486,8 @@ synchronous_standby_names = 'ANY 2 (s1, s2, s3)'
+    <para>
+     An alternative to the built-in standby mode described in the previous
+     sections is to use a <varname>restore_command</varname> that polls the archive location.
+-    This was the only option available in versions 8.4 and below. In this
+-    setup, set <varname>standby_mode</varname> off, because you are implementing
+-    the polling required for standby operation yourself. See the
+-    <xref linkend="pgstandby"/> module for a reference
+-    implementation of this.
++    This was the only option available in versions 8.4 and below. See the
++    <xref linkend="pgstandby"/> module for a reference implementation of this.
+    </para>
+ 
+    <para>
+@@ -1522,8 +1514,7 @@ synchronous_standby_names = 'ANY 2 (s1, s2, s3)'
+     The magic that makes the two loosely coupled servers work together is
+     simply a <varname>restore_command</varname> used on the standby that,
+     when asked for the next WAL file, waits for it to become available from
+-    the primary. The <varname>restore_command</varname> is specified in the
+-    <filename>recovery.conf</filename> file on the standby server. Normal recovery
++    the primary. Normal recovery
+     processing would request a file from the WAL archive, reporting failure
+     if the file was unavailable.  For standby processing it is normal for
+     the next WAL file to be unavailable, so the standby must wait for
+@@ -1611,9 +1602,8 @@ if (!triggered)
+      <listitem>
+       <para>
+        Begin recovery on the standby server from the local WAL
+-       archive, using a <filename>recovery.conf</filename> that specifies a
+-       <varname>restore_command</varname> that waits as described
+-       previously (see <xref linkend="backup-pitr-recovery"/>).
++       archive, using <varname>restore_command</varname> that waits
++       as described previously (see <xref linkend="backup-pitr-recovery"/>).
+       </para>
+      </listitem>
+     </orderedlist>
+@@ -2108,7 +2098,7 @@ if (!triggered)
+ 
+    <para>
+     If <varname>hot_standby</varname> is <literal>on</literal> in <filename>postgresql.conf</filename>
+-    (the default value) and there is a <filename>recovery.conf</filename>
++    (the default value) and there is a <filename>standby.signal</filename>
+     file present, the server will run in Hot Standby mode.
+     However, it may take some time for Hot Standby connections to be allowed,
+     because the server will not accept connections until it has completed
+diff --git a/doc/src/sgml/pgstandby.sgml b/doc/src/sgml/pgstandby.sgml
+index 2cc58fe35670..d8aded43840a 100644
+--- a/doc/src/sgml/pgstandby.sgml
++++ b/doc/src/sgml/pgstandby.sgml
+@@ -47,7 +47,7 @@
+   <para>
+    To configure a standby
+    server to use <application>pg_standby</application>, put this into its
+-   <filename>recovery.conf</filename> configuration file:
++   <filename>postgresql.conf</filename> configuration file:
+ <programlisting>
+ restore_command = 'pg_standby <replaceable>archiveDir</replaceable> %f %p %r'
+ </programlisting>
+diff --git a/doc/src/sgml/postgres.sgml b/doc/src/sgml/postgres.sgml
+index 0070603fc363..142799316aa8 100644
+--- a/doc/src/sgml/postgres.sgml
++++ b/doc/src/sgml/postgres.sgml
+@@ -158,7 +158,6 @@
+   &maintenance;
+   &backup;
+   &high-availability;
+-  &recovery-config;
+   &monitoring;
+   &diskusage;
+   &wal;
+diff --git a/doc/src/sgml/recovery-config.sgml b/doc/src/sgml/recovery-config.sgml
+deleted file mode 100644
+index a2bdffda94d0..000000000000
+--- a/doc/src/sgml/recovery-config.sgml
++++ /dev/null
+@@ -1,510 +0,0 @@
+-<!-- doc/src/sgml/recovery-config.sgml -->
+-
+-<chapter id="recovery-config">
+-  <title>Recovery Configuration</title>
+-
+-  <indexterm>
+-   <primary>configuration</primary>
+-   <secondary>of recovery</secondary>
+-   <tertiary>of a standby server</tertiary>
+-  </indexterm>
+-
+-   <para>
+-    This chapter describes the settings available in the
+-    <filename>recovery.conf</filename><indexterm><primary>recovery.conf</primary></indexterm>
+-    file. They apply only for the duration of the
+-    recovery.  They must be reset for any subsequent recovery you wish to
+-    perform.  They cannot be changed once recovery has begun.
+-   </para>
+-
+-   <para>
+-     Settings in <filename>recovery.conf</filename> are specified in the format
+-     <literal>name = 'value'</literal>. One parameter is specified per line.
+-     Hash marks (<literal>#</literal>) designate the rest of the
+-     line as a comment.  To embed a single quote in a parameter
+-     value, write two quotes (<literal>''</literal>).
+-   </para>
+-
+-   <para>
+-    A sample file, <filename>share/recovery.conf.sample</filename>,
+-    is provided in the installation's <filename>share/</filename> directory.
+-   </para>
+-
+-  <sect1 id="archive-recovery-settings">
+-
+-    <title>Archive Recovery Settings</title>
+-     <variablelist>
+-
+-     <varlistentry id="restore-command" xreflabel="restore_command">
+-      <term><varname>restore_command</varname> (<type>string</type>)
+-      <indexterm>
+-        <primary><varname>restore_command</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        The local shell command to execute to retrieve an archived segment of
+-        the WAL file series. This parameter is required for archive recovery,
+-        but optional for streaming replication.
+-        Any <literal>%f</literal> in the string is
+-        replaced by the name of the file to retrieve from the archive,
+-        and any <literal>%p</literal> is replaced by the copy destination path name
+-        on the server.
+-        (The path name is relative to the current working directory,
+-        i.e., the cluster's data directory.)
+-        Any <literal>%r</literal> is replaced by the name of the file containing the
+-        last valid restart point. That is the earliest file that must be kept
+-        to allow a restore to be restartable, so this information can be used
+-        to truncate the archive to just the minimum required to support
+-        restarting from the current restore. <literal>%r</literal> is typically only
+-        used by warm-standby configurations
+-        (see <xref linkend="warm-standby"/>).
+-        Write <literal>%%</literal> to embed an actual <literal>%</literal> character.
+-       </para>
+-
+-       <para>
+-        It is important for the command to return a zero exit status
+-        only if it succeeds.  The command <emphasis>will</emphasis> be asked for file
+-        names that are not present in the archive; it must return nonzero
+-        when so asked.  Examples:
+-<programlisting>
+-restore_command = 'cp /mnt/server/archivedir/%f "%p"'
+-restore_command = 'copy "C:\\server\\archivedir\\%f" "%p"'  # Windows
+-</programlisting>
+-        An exception is that if the command was terminated by a signal (other
+-        than <systemitem>SIGTERM</systemitem>, which is used as part of a
+-        database server shutdown) or an error by the shell (such as command
+-        not found), then recovery will abort and the server will not start up.
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-
+-     <varlistentry id="archive-cleanup-command" xreflabel="archive_cleanup_command">
+-      <term><varname>archive_cleanup_command</varname> (<type>string</type>)
+-      <indexterm>
+-        <primary><varname>archive_cleanup_command</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        This optional parameter specifies a shell command that will be executed
+-        at every restartpoint.  The purpose of
+-        <varname>archive_cleanup_command</varname> is to provide a mechanism for
+-        cleaning up old archived WAL files that are no longer needed by the
+-        standby server.
+-        Any <literal>%r</literal> is replaced by the name of the file containing the
+-        last valid restart point.
+-        That is the earliest file that must be <emphasis>kept</emphasis> to allow a
+-        restore to be restartable, and so all files earlier than <literal>%r</literal>
+-        may be safely removed.
+-        This information can be used to truncate the archive to just the
+-        minimum required to support restart from the current restore.
+-        The <xref linkend="pgarchivecleanup"/> module
+-        is often used in <varname>archive_cleanup_command</varname> for
+-        single-standby configurations, for example:
+-<programlisting>archive_cleanup_command = 'pg_archivecleanup /mnt/server/archivedir %r'</programlisting>
+-        Note however that if multiple standby servers are restoring from the
+-        same archive directory, you will need to ensure that you do not delete
+-        WAL files until they are no longer needed by any of the servers.
+-        <varname>archive_cleanup_command</varname> would typically be used in a
+-        warm-standby configuration (see <xref linkend="warm-standby"/>).
+-        Write <literal>%%</literal> to embed an actual <literal>%</literal> character in the
+-        command.
+-       </para>
+-       <para>
+-        If the command returns a nonzero exit status then a warning log
+-        message will be written.  An exception is that if the command was
+-        terminated by a signal or an error by the shell (such as command not
+-        found), a fatal error will be raised.
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-
+-     <varlistentry id="recovery-end-command" xreflabel="recovery_end_command">
+-      <term><varname>recovery_end_command</varname> (<type>string</type>)
+-      <indexterm>
+-        <primary><varname>recovery_end_command</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        This parameter specifies a shell command that will be executed once only
+-        at the end of recovery. This parameter is optional. The purpose of the
+-        <varname>recovery_end_command</varname> is to provide a mechanism for cleanup
+-        following replication or recovery.
+-        Any <literal>%r</literal> is replaced by the name of the file containing the
+-        last valid restart point, like in <xref linkend="archive-cleanup-command"/>.
+-       </para>
+-       <para>
+-        If the command returns a nonzero exit status then a warning log
+-        message will be written and the database will proceed to start up
+-        anyway.  An exception is that if the command was terminated by a
+-        signal or an error by the shell (such as command not found), the
+-        database will not proceed with startup.
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-
+-    </variablelist>
+-
+-  </sect1>
+-
+-  <sect1 id="recovery-target-settings">
+-
+-    <title>Recovery Target Settings</title>
+-
+-     <para>
+-      By default, recovery will recover to the end of the WAL log. The
+-      following parameters can be used to specify an earlier stopping point.
+-      At most one of <varname>recovery_target</varname>,
+-      <varname>recovery_target_lsn</varname>, <varname>recovery_target_name</varname>,
+-      <varname>recovery_target_time</varname>, or <varname>recovery_target_xid</varname>
+-      can be used; if more than one of these is specified in the configuration
+-      file, the last entry will be used.
+-     </para>
+-
+-     <variablelist>
+-     <varlistentry id="recovery-target" xreflabel="recovery_target">
+-      <term><varname>recovery_target</varname><literal> = 'immediate'</literal>
+-      <indexterm>
+-        <primary><varname>recovery_target</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        This parameter specifies that recovery should end as soon as a
+-        consistent state is reached, i.e. as early as possible. When restoring
+-        from an online backup, this means the point where taking the backup
+-        ended.
+-       </para>
+-       <para>
+-        Technically, this is a string parameter, but <literal>'immediate'</literal>
+-        is currently the only allowed value.
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-
+-     <varlistentry id="recovery-target-name" xreflabel="recovery_target_name">
+-      <term><varname>recovery_target_name</varname> (<type>string</type>)
+-      <indexterm>
+-        <primary><varname>recovery_target_name</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        This parameter specifies the named restore point (created with
+-        <function>pg_create_restore_point()</function>) to which recovery will proceed.
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-
+-     <varlistentry id="recovery-target-time" xreflabel="recovery_target_time">
+-      <term><varname>recovery_target_time</varname> (<type>timestamp</type>)
+-      <indexterm>
+-        <primary><varname>recovery_target_time</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        This parameter specifies the time stamp up to which recovery
+-        will proceed.
+-        The precise stopping point is also influenced by
+-        <xref linkend="recovery-target-inclusive"/>.
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-
+-     <varlistentry id="recovery-target-xid" xreflabel="recovery_target_xid">
+-      <term><varname>recovery_target_xid</varname> (<type>string</type>)
+-      <indexterm>
+-        <primary><varname>recovery_target_xid</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        This parameter specifies the transaction ID up to which recovery
+-        will proceed. Keep in mind
+-        that while transaction IDs are assigned sequentially at transaction
+-        start, transactions can complete in a different numeric order.
+-        The transactions that will be recovered are those that committed
+-        before (and optionally including) the specified one.
+-        The precise stopping point is also influenced by
+-        <xref linkend="recovery-target-inclusive"/>.
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-
+-     <varlistentry id="recovery-target-lsn" xreflabel="recovery_target_lsn">
+-      <term><varname>recovery_target_lsn</varname> (<type>pg_lsn</type>)
+-      <indexterm>
+-        <primary><varname>recovery_target_lsn</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        This parameter specifies the LSN of the write-ahead log location up
+-        to which recovery will proceed. The precise stopping point is also
+-        influenced by <xref linkend="recovery-target-inclusive"/>. This
+-        parameter is parsed using the system data type
+-        <link linkend="datatype-pg-lsn"><type>pg_lsn</type></link>.
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-     </variablelist>
+-
+-     <para>
+-       The following options further specify the recovery target, and affect
+-       what happens when the target is reached:
+-     </para>
+-
+-     <variablelist>
+-     <varlistentry id="recovery-target-inclusive"
+-                   xreflabel="recovery_target_inclusive">
+-      <term><varname>recovery_target_inclusive</varname> (<type>boolean</type>)
+-      <indexterm>
+-        <primary><varname>recovery_target_inclusive</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        Specifies whether to stop just after the specified recovery target
+-        (<literal>true</literal>), or just before the recovery target
+-        (<literal>false</literal>).
+-        Applies when <xref linkend="recovery-target-lsn"/>,
+-        <xref linkend="recovery-target-time"/>, or
+-        <xref linkend="recovery-target-xid"/> is specified.
+-        This setting controls whether transactions
+-        having exactly the target WAL location (LSN), commit time, or transaction ID, respectively, will
+-        be included in the recovery.  Default is <literal>true</literal>.
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-
+-     <varlistentry id="recovery-target-timeline"
+-                   xreflabel="recovery_target_timeline">
+-      <term><varname>recovery_target_timeline</varname> (<type>string</type>)
+-      <indexterm>
+-        <primary><varname>recovery_target_timeline</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        Specifies recovering into a particular timeline.  The default is
+-        to recover along the same timeline that was current when the
+-        base backup was taken. Setting this to <literal>latest</literal> recovers
+-        to the latest timeline found in the archive, which is useful in
+-        a standby server. Other than that you only need to set this parameter
+-        in complex re-recovery situations, where you need to return to
+-        a state that itself was reached after a point-in-time recovery.
+-        See <xref linkend="backup-timelines"/> for discussion.
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-
+-     <varlistentry id="recovery-target-action"
+-                   xreflabel="recovery_target_action">
+-      <term><varname>recovery_target_action</varname> (<type>enum</type>)
+-      <indexterm>
+-        <primary><varname>recovery_target_action</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        Specifies what action the server should take once the recovery target is
+-        reached. The default is <literal>pause</literal>, which means recovery will
+-        be paused. <literal>promote</literal> means the recovery process will finish
+-        and the server will start to accept connections.
+-        Finally <literal>shutdown</literal> will stop the server after reaching the
+-        recovery target.
+-       </para>
+-       <para>
+-        The intended use of the <literal>pause</literal> setting is to allow queries
+-        to be executed against the database to check if this recovery target
+-        is the most desirable point for recovery.
+-        The paused state can be resumed by
+-        using <function>pg_wal_replay_resume()</function> (see
+-        <xref linkend="functions-recovery-control-table"/>), which then
+-        causes recovery to end. If this recovery target is not the
+-        desired stopping point, then shut down the server, change the
+-        recovery target settings to a later target and restart to
+-        continue recovery.
+-       </para>
+-       <para>
+-        The <literal>shutdown</literal> setting is useful to have the instance ready
+-        at the exact replay point desired.  The instance will still be able to
+-        replay more WAL records (and in fact will have to replay WAL records
+-        since the last checkpoint next time it is started).
+-       </para>
+-       <para>
+-        Note that because <filename>recovery.conf</filename> will not be renamed when
+-        <varname>recovery_target_action</varname> is set to <literal>shutdown</literal>,
+-        any subsequent start will end with immediate shutdown unless the
+-        configuration is changed or the <filename>recovery.conf</filename> file is
+-        removed manually.
+-       </para>
+-       <para>
+-        This setting has no effect if no recovery target is set.
+-        If <xref linkend="guc-hot-standby"/> is not enabled, a setting of
+-        <literal>pause</literal> will act the same as <literal>shutdown</literal>.
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-
+-    </variablelist>
+-   </sect1>
+-
+-  <sect1 id="standby-settings">
+-
+-    <title>Standby Server Settings</title>
+-     <variablelist>
+-
+-       <varlistentry id="standby-mode" xreflabel="standby_mode">
+-        <term><varname>standby_mode</varname> (<type>boolean</type>)
+-        <indexterm>
+-          <primary><varname>standby_mode</varname> recovery parameter</primary>
+-        </indexterm>
+-        </term>
+-        <listitem>
+-         <para>
+-          Specifies whether to start the <productname>PostgreSQL</productname> server as
+-          a standby. If this parameter is <literal>on</literal>, the server will
+-          not stop recovery when the end of archived WAL is reached, but
+-          will keep trying to continue recovery by fetching new WAL segments
+-          using <varname>restore_command</varname>
+-          and/or by connecting to the primary server as specified by the
+-          <varname>primary_conninfo</varname> setting.
+-         </para>
+-        </listitem>
+-       </varlistentry>
+-       <varlistentry id="primary-conninfo" xreflabel="primary_conninfo">
+-        <term><varname>primary_conninfo</varname> (<type>string</type>)
+-        <indexterm>
+-          <primary><varname>primary_conninfo</varname> recovery parameter</primary>
+-        </indexterm>
+-        </term>
+-        <listitem>
+-         <para>
+-          Specifies a connection string to be used for the standby server
+-          to connect with the primary. This string is in the format
+-          described in <xref linkend="libpq-connstring"/>. If any option is
+-          unspecified in this string, then the corresponding environment
+-          variable (see <xref linkend="libpq-envars"/>) is checked. If the
+-          environment variable is not set either, then
+-          defaults are used.
+-         </para>
+-         <para>
+-          The connection string should specify the host name (or address)
+-          of the primary server, as well as the port number if it is not
+-          the same as the standby server's default.
+-          Also specify a user name corresponding to a suitably-privileged role
+-          on the primary (see
+-          <xref linkend="streaming-replication-authentication"/>).
+-          A password needs to be provided too, if the primary demands password
+-          authentication.  It can be provided in the
+-          <varname>primary_conninfo</varname> string, or in a separate
+-          <filename>~/.pgpass</filename> file on the standby server (use
+-          <literal>replication</literal> as the database name).
+-          Do not specify a database name in the
+-          <varname>primary_conninfo</varname> string.
+-         </para>
+-         <para>
+-          This setting has no effect if <varname>standby_mode</varname> is <literal>off</literal>.
+-         </para>
+-        </listitem>
+-       </varlistentry>
+-       <varlistentry id="primary-slot-name" xreflabel="primary_slot_name">
+-        <term><varname>primary_slot_name</varname> (<type>string</type>)
+-        <indexterm>
+-          <primary><varname>primary_slot_name</varname> recovery parameter</primary>
+-        </indexterm>
+-        </term>
+-        <listitem>
+-         <para>
+-          Optionally specifies an existing replication slot to be used when
+-          connecting to the primary via streaming replication to control
+-          resource removal on the upstream node
+-          (see <xref linkend="streaming-replication-slots"/>).
+-          This setting has no effect if <varname>primary_conninfo</varname> is not
+-          set.
+-         </para>
+-        </listitem>
+-       </varlistentry>
+-       <varlistentry id="trigger-file" xreflabel="trigger_file">
+-        <term><varname>trigger_file</varname> (<type>string</type>)
+-        <indexterm>
+-          <primary><varname>trigger_file</varname> recovery parameter</primary>
+-        </indexterm>
+-        </term>
+-        <listitem>
+-         <para>
+-          Specifies a trigger file whose presence ends recovery in the
+-          standby.  Even if this value is not set, you can still promote
+-          the standby using <command>pg_ctl promote</command> or calling
+-          <function>pg_promote</function>.
+-          This setting has no effect if <varname>standby_mode</varname> is <literal>off</literal>.
+-         </para>
+-        </listitem>
+-       </varlistentry>
+-
+-     <varlistentry id="recovery-min-apply-delay" xreflabel="recovery_min_apply_delay">
+-      <term><varname>recovery_min_apply_delay</varname> (<type>integer</type>)
+-      <indexterm>
+-        <primary><varname>recovery_min_apply_delay</varname> recovery parameter</primary>
+-      </indexterm>
+-      </term>
+-      <listitem>
+-       <para>
+-        By default, a standby server restores WAL records from the
+-        primary as soon as possible. It may be useful to have a time-delayed
+-        copy of the data, offering opportunities to correct data loss errors.
+-        This parameter allows you to delay recovery by a fixed period of time,
+-        measured in milliseconds if no unit is specified.  For example, if
+-        you set this parameter to <literal>5min</literal>, the standby will
+-        replay each transaction commit only when the system time on the standby
+-        is at least five minutes past the commit time reported by the master.
+-       </para>
+-       <para>
+-        It is possible that the replication delay between servers exceeds the
+-        value of this parameter, in which case no delay is added.
+-        Note that the delay is calculated between the WAL time stamp as written
+-        on master and the current time on the standby. Delays in transfer
+-        because of network lag or cascading replication configurations
+-        may reduce the actual wait time significantly. If the system
+-        clocks on master and standby are not synchronized, this may lead to
+-        recovery applying records earlier than expected; but that is not a
+-        major issue because useful settings of this parameter are much larger
+-        than typical time deviations between servers.
+-       </para>
+-       <para>
+-        The delay occurs only on WAL records for transaction commits.
+-        Other records are replayed as quickly as possible, which
+-        is not a problem because MVCC visibility rules ensure their effects
+-        are not visible until the corresponding commit record is applied.
+-       </para>
+-       <para>
+-        The delay occurs once the database in recovery has reached a consistent
+-        state, until the standby is promoted or triggered. After that the standby
+-        will end recovery without further waiting.
+-       </para>
+-       <para>
+-        This parameter is intended for use with streaming replication deployments;
+-        however, if the parameter is specified it will be honored in all cases.
+-
+-        <varname>hot_standby_feedback</varname> will be delayed by use of this feature
+-        which could lead to bloat on the master; use both together with care.
+-
+-        <warning>
+-         <para>
+-          Synchronous replication is affected by this setting when <varname>synchronous_commit</varname>
+-          is set to <literal>remote_apply</literal>; every <literal>COMMIT</literal>
+-          will need to wait to be applied.
+-         </para>
+-        </warning>
+-       </para>
+-      </listitem>
+-     </varlistentry>
+-
+-     </variablelist>
+-   </sect1>
+-
+-</chapter>
+diff --git a/doc/src/sgml/ref/pg_basebackup.sgml b/doc/src/sgml/ref/pg_basebackup.sgml
+index c9f6ce4bb336..57dc83b620b8 100644
+--- a/doc/src/sgml/ref/pg_basebackup.sgml
++++ b/doc/src/sgml/ref/pg_basebackup.sgml
+@@ -214,10 +214,11 @@ PostgreSQL documentation
+       <listitem>
+ 
+        <para>
+-        Write a minimal <filename>recovery.conf</filename> in the output
++        Create <filename>standby.signal</filename> and append connection settings
++        to <filename>postgresql.auto.conf</filename> in the output
+         directory (or into the base archive file when using tar format) to
+         ease setting up a standby server.
+-        The <filename>recovery.conf</filename> file will record the connection
++        The <filename>postgresql.auto.conf</filename> file will record the connection
+         settings and, if specified, the replication slot
+         that <application>pg_basebackup</application> is using, so that the
+         streaming replication will use the same settings later on.
+@@ -470,7 +471,7 @@ PostgreSQL documentation
+         replication slot.  If the base backup is intended to be used as a
+         streaming replication standby using replication slots, it should then
+         use the same replication slot name
+-        in <filename>recovery.conf</filename>.  That way, it is ensured that
++        in <xref linkend="guc-primary-slot-name"/>.  That way, it is ensured that
+         the server does not remove any necessary WAL data in the time between
+         the end of the base backup and the start of streaming replication.
+        </para>
+diff --git a/doc/src/sgml/ref/pg_rewind.sgml b/doc/src/sgml/ref/pg_rewind.sgml
+index e2662bbf819b..53a64ee29ef0 100644
+--- a/doc/src/sgml/ref/pg_rewind.sgml
++++ b/doc/src/sgml/ref/pg_rewind.sgml
+@@ -69,7 +69,8 @@ PostgreSQL documentation
+    target cluster ran for a long time after the divergence, the old WAL
+    files might no longer be present. In that case, they can be manually
+    copied from the WAL archive to the <filename>pg_wal</filename> directory, or
+-   fetched on startup by configuring <filename>recovery.conf</filename>.  The use of
++   fetched on startup by configuring <xref linkend="guc-primary-conninfo"/> or
++   <xref linkend="guc-restore-command"/>.  The use of
+    <application>pg_rewind</application> is not limited to failover, e.g.  a standby
+    server can be promoted, run some write transactions, and then rewinded
+    to become a standby again.
+@@ -83,8 +84,9 @@ PostgreSQL documentation
+    <application>pg_rewind</application> was run, and therefore could not be copied by the
+    <application>pg_rewind</application> session, it must be made available when the
+    target server is started. This can be done by creating a
+-   <filename>recovery.conf</filename> file in the target data directory with a
+-   suitable <varname>restore_command</varname>.
++   <filename>recovery.signal</filename> file in the target data directory
++   and configuring suitable <xref linkend="guc-restore-command"/>
++   in <filename>postgresql.conf</filename>.
+   </para>
+ 
+   <para>
+diff --git a/doc/src/sgml/ref/pgarchivecleanup.sgml b/doc/src/sgml/ref/pgarchivecleanup.sgml
+index 4117a4392c1f..a3d3538b28a2 100644
+--- a/doc/src/sgml/ref/pgarchivecleanup.sgml
++++ b/doc/src/sgml/ref/pgarchivecleanup.sgml
+@@ -39,7 +39,7 @@
+   <para>
+    To configure a standby
+    server to use <application>pg_archivecleanup</application>, put this into its
+-   <filename>recovery.conf</filename> configuration file:
++   <filename>postgresql.conf</filename> configuration file:
+ <programlisting>
+ archive_cleanup_command = 'pg_archivecleanup <replaceable>archivelocation</replaceable> %r'
+ </programlisting>
+@@ -47,7 +47,7 @@ archive_cleanup_command = 'pg_archivecleanup <replaceable>archivelocation</repla
+    files should be removed.
+   </para>
+   <para>
+-   When used within <xref linkend="archive-cleanup-command"/>, all WAL files
++   When used within <xref linkend="guc-archive-cleanup-command"/>, all WAL files
+    logically preceding the value of the <literal>%r</literal> argument will be removed
+    from <replaceable>archivelocation</replaceable>. This minimizes the number of files
+    that need to be retained, while preserving crash-restart capability.  Use of
+diff --git a/doc/src/sgml/ref/pgupgrade.sgml b/doc/src/sgml/ref/pgupgrade.sgml
+index 2d722b2e7924..978fa252e400 100644
+--- a/doc/src/sgml/ref/pgupgrade.sgml
++++ b/doc/src/sgml/ref/pgupgrade.sgml
+@@ -506,7 +506,7 @@ pg_upgrade.exe
+       <para>
+        Save any configuration files from the old standbys' configuration
+        directories you need to keep, e.g.  <filename>postgresql.conf</filename>,
+-       <literal>recovery.conf</literal>, because these will be overwritten or
++       <literal>pg_hba.conf</literal>, because these will be overwritten or
+        removed in the next step.
+       </para>
+      </step>
+diff --git a/doc/src/sgml/release-10.sgml b/doc/src/sgml/release-10.sgml
+index de7779f622bc..aacdd360e054 100644
+--- a/doc/src/sgml/release-10.sgml
++++ b/doc/src/sgml/release-10.sgml
+@@ -7303,7 +7303,7 @@ This was disabled in the PG 9.6 branch so there is no commit here.
+       <para>
+        Allow specification of the recovery stopping point by Log Sequence
+        Number (<acronym>LSN</acronym>) in
+-       <link linkend="recovery-config"><filename>recovery.conf</filename></link>
++       <filename>recovery.conf</filename>
+        (Michael Paquier)
+       </para>
+ 
+diff --git a/doc/src/sgml/release-9.1.sgml b/doc/src/sgml/release-9.1.sgml
+index 3407d8ad7398..217b340bc3cd 100644
+--- a/doc/src/sgml/release-9.1.sgml
++++ b/doc/src/sgml/release-9.1.sgml
+@@ -9811,7 +9811,7 @@ Branch: REL9_0_STABLE [9d6af7367] 2015-08-15 11:02:34 -0400
+        <para>
+         These named restore points can be specified as recovery
+         targets using the new <filename>recovery.conf</filename> setting
+-        <link linkend="recovery-target-name"><varname>recovery_target_name</varname></link>.
++        <varname>recovery_target_name</varname>.
+        </para>
+       </listitem>
+ 
+@@ -9843,8 +9843,7 @@ Branch: REL9_0_STABLE [9d6af7367] 2015-08-15 11:02:34 -0400
+ 
+       <listitem>
+        <para>
+-        Allow <link
+-        linkend="recovery-config"><filename>recovery.conf</filename></link>
++        Allow <filename>recovery.conf</filename>
+         to use the same quoting behavior as <filename>postgresql.conf</filename>
+         (Dimitri Fontaine)
+        </para>
+diff --git a/doc/src/sgml/release-9.4.sgml b/doc/src/sgml/release-9.4.sgml
+index 50442e98b4e1..9851d96d42f5 100644
+--- a/doc/src/sgml/release-9.4.sgml
++++ b/doc/src/sgml/release-9.4.sgml
+@@ -5350,7 +5350,7 @@ Branch: REL9_1_STABLE [de887cc8a] 2016-05-25 19:39:49 -0400
+ 
+     <listitem>
+      <para>
+-      Ignore <xref linkend="recovery-min-apply-delay"/> parameter until
++      Ignore <varname>recovery_min_apply_delay</varname> parameter until
+       recovery has reached a consistent state (Michael Paquier)
+      </para>
+ 
+@@ -10869,8 +10869,8 @@ Branch: REL9_4_STABLE [c2b06ab17] 2015-01-30 22:45:58 -0500
+ 
+     <listitem>
+      <para>
+-      Use the last specified <link linkend="recovery-target-settings">recovery
+-      target parameter</link> if multiple target parameters are specified
++      Use the last specified recovery
++      target parameter if multiple target parameters are specified
+       (Heikki Linnakangas)
+      </para>
+ 
+@@ -10889,7 +10889,7 @@ Branch: REL9_4_STABLE [c2b06ab17] 2015-01-30 22:45:58 -0500
+      <para>
+       User commands that did their own quote preservation might need
+       adjustment.  This is likely to be an issue for commands used in
+-      <xref linkend="guc-archive-command"/>, <xref linkend="restore-command"/>,
++      <xref linkend="guc-archive-command"/>, <xref linkend="guc-restore-command"/>,
+       and <link linkend="sql-copy"><command>COPY TO/FROM PROGRAM</command></link>.
+      </para>
+     </listitem>
+@@ -11510,7 +11510,7 @@ Branch: REL9_4_STABLE [c2b06ab17] 2015-01-30 22:45:58 -0500
+ 
+       <listitem>
+        <para>
+-        Add recovery parameter <xref linkend="recovery-min-apply-delay"/>
++        Add recovery parameter <varname>recovery_min_apply_delay</varname>
+         to delay replication (Robert Haas, Fabr&iacute;zio de Royes Mello,
+         Simon Riggs)
+        </para>
+@@ -11523,7 +11523,7 @@ Branch: REL9_4_STABLE [c2b06ab17] 2015-01-30 22:45:58 -0500
+ 
+       <listitem>
+        <para>
+-        Add <xref linkend="recovery-target"/>
++        Add <varname>recovery_target</varname>
+         option <option>immediate</option> to stop <link
+         linkend="wal"><acronym>WAL</acronym></link> recovery as soon as a
+         consistent state is reached (MauMau, Heikki Linnakangas)
+@@ -11559,8 +11559,7 @@ Branch: REL9_4_STABLE [c2b06ab17] 2015-01-30 22:45:58 -0500
+ 
+       <listitem>
+        <para>
+-        Report failure return codes from <link
+-        linkend="archive-recovery-settings">external recovery commands</link>
++        Report failure return codes from external recovery commands
+         (Peter Eisentraut)
+        </para>
+       </listitem>
+diff --git a/doc/src/sgml/release-9.5.sgml b/doc/src/sgml/release-9.5.sgml
+index ccd8eee3e371..00d5619a0a56 100644
+--- a/doc/src/sgml/release-9.5.sgml
++++ b/doc/src/sgml/release-9.5.sgml
+@@ -7305,7 +7305,7 @@ Branch: REL9_4_STABLE [a9613ee69] 2016-03-06 02:43:26 +0900
+ 
+     <listitem>
+      <para>
+-      Ignore <xref linkend="recovery-min-apply-delay"/> parameter until
++      Ignore <varname>recovery_min_apply_delay</varname> parameter until
+       recovery has reached a consistent state (Michael Paquier)
+      </para>
+ 
+@@ -9096,9 +9096,8 @@ Add GUC and storage parameter to set the maximum size of GIN pending list.
+ 2015-03-15 [51c11a7] Andres..: Remove pause_at_recovery_target recovery.conf s..
+ -->
+        <para>
+-        Add <link linkend="recovery-config"><filename>recovery.conf</filename></link>
+-        parameter <link
+-        linkend="recovery-target-action"><varname>recovery_target_action</varname></link>
++        Add <filename>recovery.conf</filename>
++        parameter <varname>recovery_target_action</varname>
+         to control post-recovery activity (Petr Jel&iacute;nek)
+        </para>
+ 
+@@ -9199,8 +9198,8 @@ Add GUC and storage parameter to set the maximum size of GIN pending list.
+ 2014-11-25 [b3fc672] Heikki..: Allow using connection URI in primary_conninfo.
+ -->
+        <para>
+-        Allow <filename>recovery.conf</filename>'s <link
+-        linkend="primary-conninfo"><varname>primary_conninfo</varname></link> setting to
++        Allow <filename>recovery.conf</filename>'s
++        <varname>primary_conninfo</varname> setting to
+         use connection <acronym>URI</acronym>s, e.g. <literal>postgres://</literal>
+         (Alexander Shulgin)
+        </para>
+diff --git a/doc/src/sgml/release.sgml b/doc/src/sgml/release.sgml
+index c4e763a04320..4055adf88f26 100644
+--- a/doc/src/sgml/release.sgml
++++ b/doc/src/sgml/release.sgml
+@@ -5,8 +5,7 @@ Typical markup:
+ 
+ &<>                             use & escapes
+ PostgreSQL                      <productname>
+-postgresql.conf, pg_hba.conf,
+-        recovery.conf           <filename>
++postgresql.conf, pg_hba.conf    <filename>
+ [A-Z][A-Z_ ]+[A-Z_]             <command>, <literal>, <envar>, <acronym>
+ [A-Za-z_][A-Za-z0-9_]+()        <function>
+ \-\-?[A-Za-z_]+[-A-Za-z_]*      <option> (use backslashes to avoid SGML markup)
+diff --git a/src/backend/Makefile b/src/backend/Makefile
+index 3a58bf6685bb..25eb04394164 100644
+--- a/src/backend/Makefile
++++ b/src/backend/Makefile
+@@ -209,7 +209,6 @@ endif
+ 	$(INSTALL_DATA) $(srcdir)/libpq/pg_hba.conf.sample '$(DESTDIR)$(datadir)/pg_hba.conf.sample'
+ 	$(INSTALL_DATA) $(srcdir)/libpq/pg_ident.conf.sample '$(DESTDIR)$(datadir)/pg_ident.conf.sample'
+ 	$(INSTALL_DATA) $(srcdir)/utils/misc/postgresql.conf.sample '$(DESTDIR)$(datadir)/postgresql.conf.sample'
+-	$(INSTALL_DATA) $(srcdir)/access/transam/recovery.conf.sample '$(DESTDIR)$(datadir)/recovery.conf.sample'
+ 
+ ifeq ($(with_llvm), yes)
+ install-bin: install-postgres-bitcode
+@@ -274,8 +273,7 @@ endif
+ 	$(MAKE) -C utils uninstall-data
+ 	rm -f '$(DESTDIR)$(datadir)/pg_hba.conf.sample' \
+ 	      '$(DESTDIR)$(datadir)/pg_ident.conf.sample' \
+-	      '$(DESTDIR)$(datadir)/postgresql.conf.sample' \
+-	      '$(DESTDIR)$(datadir)/recovery.conf.sample'
++	      '$(DESTDIR)$(datadir)/postgresql.conf.sample'
+ ifeq ($(with_llvm), yes)
+ 	$(call uninstall_llvm_module,postgres)
+ endif
+diff --git a/src/backend/access/transam/recovery.conf.sample b/src/backend/access/transam/recovery.conf.sample
+deleted file mode 100644
+index 8e466126428d..000000000000
+--- a/src/backend/access/transam/recovery.conf.sample
++++ /dev/null
+@@ -1,158 +0,0 @@
+-# -------------------------------
+-# PostgreSQL recovery config file
+-# -------------------------------
+-#
+-# Edit this file to provide the parameters that PostgreSQL needs to
+-# perform an archive recovery of a database, or to act as a replication
+-# standby.
+-#
+-# If "recovery.conf" is present in the PostgreSQL data directory, it is
+-# read on postmaster startup.  After successful recovery, it is renamed
+-# to "recovery.done" to ensure that we do not accidentally re-enter
+-# archive recovery or standby mode.
+-#
+-# This file consists of lines of the form:
+-#
+-#   name = value
+-#
+-# Comments are introduced with '#'.
+-#
+-# The complete list of option names and allowed values can be found
+-# in the PostgreSQL documentation.
+-#
+-#---------------------------------------------------------------------------
+-# ARCHIVE RECOVERY PARAMETERS
+-#---------------------------------------------------------------------------
+-#
+-# restore_command
+-#
+-# specifies the shell command that is executed to copy log files
+-# back from archival storage.  The command string may contain %f,
+-# which is replaced by the name of the desired log file, and %p,
+-# which is replaced by the absolute path to copy the log file to.
+-#
+-# This parameter is *required* for an archive recovery, but optional
+-# for streaming replication.
+-#
+-# It is important that the command return nonzero exit status on failure.
+-# The command *will* be asked for log files that are not present in the
+-# archive; it must return nonzero when so asked.
+-#
+-# NOTE that the basename of %p will be different from %f; do not
+-# expect them to be interchangeable.
+-#
+-#restore_command = ''		# e.g. 'cp /mnt/server/archivedir/%f %p'
+-#
+-#
+-# archive_cleanup_command
+-#
+-# specifies an optional shell command to execute at every restartpoint.
+-# This can be useful for cleaning up the archive of a standby server.
+-#
+-#archive_cleanup_command = ''
+-#
+-# recovery_end_command
+-#
+-# specifies an optional shell command to execute at completion of recovery.
+-# This can be useful for cleaning up after the restore_command.
+-#
+-#recovery_end_command = ''
+-#
+-#---------------------------------------------------------------------------
+-# RECOVERY TARGET PARAMETERS
+-#---------------------------------------------------------------------------
+-#
+-# By default, recovery will rollforward to the end of the WAL log.
+-# If you want to stop rollforward at a specific point, you
+-# must set a recovery target.
+-#
+-# You may set a recovery target either by transactionId, by name, by
+-# timestamp or by WAL location (LSN). Recovery may either include or
+-# exclude the transaction(s) with the recovery target value (i.e.,
+-# stop either just after or just before the given target,
+-# respectively).
+-#
+-#
+-#recovery_target_name = ''	# e.g. 'daily backup 2011-01-26'
+-#
+-#recovery_target_time = ''	# e.g. '2004-07-14 22:39:00 EST'
+-#
+-#recovery_target_xid = ''
+-#
+-#recovery_target_lsn = ''	# e.g. '0/70006B8'
+-#
+-#recovery_target_inclusive = true
+-#
+-#
+-# Alternatively, you can request stopping as soon as a consistent state
+-# is reached, by uncommenting this option.
+-#
+-#recovery_target = 'immediate'
+-#
+-#
+-# If you want to recover into a timeline other than the "main line" shown in
+-# pg_control, specify the timeline number here, or write 'latest' to get
+-# the latest branch for which there's a history file.
+-#
+-#recovery_target_timeline = 'latest'
+-#
+-#
+-# If recovery_target_action = 'pause', recovery will pause when the
+-# recovery target is reached. The pause state will continue until
+-# pg_wal_replay_resume() is called. This setting has no effect if
+-# no recovery target is set. If hot_standby is not enabled then the
+-# server will shutdown instead, though you may request this in
+-# any case by specifying 'shutdown'.
+-#
+-#recovery_target_action = 'pause'
+-#
+-#---------------------------------------------------------------------------
+-# STANDBY SERVER PARAMETERS
+-#---------------------------------------------------------------------------
+-#
+-# standby_mode
+-#
+-# When standby_mode is enabled, the PostgreSQL server will work as a
+-# standby. It will continuously wait for the additional XLOG records, using
+-# restore_command and/or primary_conninfo.
+-#
+-#standby_mode = off
+-#
+-# primary_conninfo
+-#
+-# If set, the PostgreSQL server will try to connect to the primary using this
+-# connection string and receive XLOG records continuously.
+-#
+-#primary_conninfo = ''		# e.g. 'host=localhost port=5432'
+-#
+-# If set, the PostgreSQL server will use the specified replication slot when
+-# connecting to the primary via streaming replication to control resource
+-# removal on the upstream node. This setting has no effect if primary_conninfo
+-# is not set.
+-#
+-#primary_slot_name = ''
+-#
+-# By default, a standby server keeps restoring XLOG records from the
+-# primary indefinitely. If you want to stop the standby mode, finish recovery
+-# and open the system in read/write mode, specify a path to a trigger file.
+-# The server will poll the trigger file path periodically and start as a
+-# primary server when it's found.
+-#
+-#trigger_file = ''
+-#
+-# By default, a standby server restores XLOG records from the primary as
+-# soon as possible. If you want to explicitly delay the replay of committed
+-# transactions from the master, specify a minimum apply delay. For example,
+-# if you set this parameter to 5min, the standby will replay each transaction
+-# commit only when the system time on the standby is at least five minutes
+-# past the commit time reported by the master.
+-#
+-#recovery_min_apply_delay = 0
+-#
+-#---------------------------------------------------------------------------
+-# HOT STANDBY PARAMETERS
+-#---------------------------------------------------------------------------
+-#
+-# Hot Standby related parameters are listed in postgresql.conf
+-#
+-#---------------------------------------------------------------------------
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 7397b6ee06b3..c80b14ed9718 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -69,7 +69,6 @@
+ #include "utils/builtins.h"
+ #include "utils/guc.h"
+ #include "utils/memutils.h"
+-#include "utils/pg_lsn.h"
+ #include "utils/ps_status.h"
+ #include "utils/relmapper.h"
+ #include "utils/snapmgr.h"
+@@ -78,6 +77,9 @@
+ 
+ extern uint32 bootstrap_data_checksum_version;
+ 
++/* Unsupported old recovery command file names (relative to $PGDATA) */
++#define RECOVERY_COMMAND_FILE	"recovery.conf"
++#define RECOVERY_COMMAND_DONE	"recovery.done"
+ 
+ /* User-settable parameters */
+ int			max_wal_size_mb = 1024; /* 1 GB */
+@@ -161,6 +163,13 @@ const struct config_enum_entry archive_mode_options[] = {
+ 	{NULL, 0, false}
+ };
+ 
++const struct config_enum_entry recovery_target_action_options[] = {
++	{"pause", RECOVERY_TARGET_ACTION_PAUSE, false},
++	{"promote", RECOVERY_TARGET_ACTION_PROMOTE, false},
++	{"shutdown", RECOVERY_TARGET_ACTION_SHUTDOWN, false},
++	{NULL, 0, false}
++};
++
+ /*
+  * Statistics for current checkpoint are collected in this global struct.
+  * Because only the checkpointer or a stand-alone backend can perform
+@@ -230,7 +239,7 @@ static int	LocalXLogInsertAllowed = -1;
+ 
+ /*
+  * When ArchiveRecoveryRequested is set, archive recovery was requested,
+- * ie. recovery.conf file was present. When InArchiveRecovery is set, we are
++ * ie. signal files were present. When InArchiveRecovery is set, we are
+  * currently recovering using offline XLOG archives. These variables are only
+  * valid in the startup process.
+  *
+@@ -242,6 +251,9 @@ static int	LocalXLogInsertAllowed = -1;
+ bool		ArchiveRecoveryRequested = false;
+ bool		InArchiveRecovery = false;
+ 
++static bool standby_signal_file_found = false;
++static bool recovery_signal_file_found = false;
++
+ /* Was the last xlog file restored from archive, or local? */
+ static bool restoredFromArchive = false;
+ 
+@@ -249,25 +261,25 @@ static bool restoredFromArchive = false;
+ static char *replay_image_masked = NULL;
+ static char *master_image_masked = NULL;
+ 
+-/* options taken from recovery.conf for archive recovery */
++/* options formerly taken from recovery.conf for archive recovery */
+ char	   *recoveryRestoreCommand = NULL;
+-static char *recoveryEndCommand = NULL;
+-static char *archiveCleanupCommand = NULL;
+-static RecoveryTargetType recoveryTarget = RECOVERY_TARGET_UNSET;
+-static bool recoveryTargetInclusive = true;
+-static RecoveryTargetAction recoveryTargetAction = RECOVERY_TARGET_ACTION_PAUSE;
+-static TransactionId recoveryTargetXid;
+-static TimestampTz recoveryTargetTime;
+-static char *recoveryTargetName;
+-static XLogRecPtr recoveryTargetLSN;
+-static int	recovery_min_apply_delay = 0;
+-static TimestampTz recoveryDelayUntilTime;
+-
+-/* options taken from recovery.conf for XLOG streaming */
+-static bool StandbyModeRequested = false;
+-static char *PrimaryConnInfo = NULL;
+-static char *PrimarySlotName = NULL;
+-static char *TriggerFile = NULL;
++char	   *recoveryEndCommand = NULL;
++char	   *archiveCleanupCommand = NULL;
++RecoveryTargetType recoveryTarget = RECOVERY_TARGET_UNSET;
++bool		recoveryTargetInclusive = true;
++int			recoveryTargetAction = RECOVERY_TARGET_ACTION_PAUSE;
++TransactionId recoveryTargetXid;
++TimestampTz recoveryTargetTime;
++char	   *recoveryTargetName;
++XLogRecPtr	recoveryTargetLSN;
++int			recovery_min_apply_delay = 0;
++TimestampTz recoveryDelayUntilTime;
++
++/* options formerly taken from recovery.conf for XLOG streaming */
++bool		StandbyModeRequested = false;
++char	   *PrimaryConnInfo = NULL;
++char	   *PrimarySlotName = NULL;
++char	   *PromoteTriggerFile = NULL;
+ 
+ /* are we currently in standby mode? */
+ bool		StandbyMode = false;
+@@ -293,7 +305,11 @@ static bool recoveryStopAfter;
+  * the currently-scanned WAL record was generated).  We also need these
+  * timeline values:
+  *
+- * recoveryTargetTLI: the desired timeline that we want to end in.
++ * recoveryTargetTimeLineGoal: what the user requested, if any
++ *
++ * recoveryTargetTLIRequested: numeric value of requested timeline, if constant
++ *
++ * recoveryTargetTLI: the currently understood target timeline; changes
+  *
+  * recoveryTargetIsLatest: was the requested target timeline 'latest'?
+  *
+@@ -309,8 +325,9 @@ static bool recoveryStopAfter;
+  * file was created.)  During a sequential scan we do not allow this value
+  * to decrease.
+  */
+-static TimeLineID recoveryTargetTLI;
+-static bool recoveryTargetIsLatest = false;
++RecoveryTargetTimeLineGoal recoveryTargetTimeLineGoal = RECOVERY_TARGET_TIMELINE_CONTROLFILE;
++TimeLineID	recoveryTargetTLIRequested = 0;
++TimeLineID	recoveryTargetTLI = 0;
+ static List *expectedTLEs;
+ static TimeLineID curFileTLI;
+ 
+@@ -624,12 +641,6 @@ typedef struct XLogCtlData
+ 	TimeLineID	ThisTimeLineID;
+ 	TimeLineID	PrevTimeLineID;
+ 
+-	/*
+-	 * archiveCleanupCommand is read from recovery.conf but needs to be in
+-	 * shared memory so that the checkpointer process can access it.
+-	 */
+-	char		archiveCleanupCommand[MAXPGPATH];
+-
+ 	/*
+ 	 * SharedRecoveryInProgress indicates if we're still in crash or archive
+ 	 * recovery.  Protected by info_lck.
+@@ -846,7 +857,8 @@ static bool holdingAllLocks = false;
+ static MemoryContext walDebugCxt = NULL;
+ #endif
+ 
+-static void readRecoveryCommandFile(void);
++static void readRecoverySignalFile(void);
++static void validateRecoveryParameters(void);
+ static void exitArchiveRecovery(TimeLineID endTLI, XLogRecPtr endOfLog);
+ static bool recoveryStopsBefore(XLogReaderState *record);
+ static bool recoveryStopsAfter(XLogReaderState *record);
+@@ -5285,283 +5297,111 @@ str_time(pg_time_t tnow)
+ }
+ 
+ /*
+- * See if there is a recovery command file (recovery.conf), and if so
+- * read in parameters for archive recovery and XLOG streaming.
++ * See if there are any recovery signal files and if so, set state for
++ * recovery.
+  *
+- * The file is parsed using the main configuration parser.
++ * See if there is a recovery command file (recovery.conf), and if so
++ * throw an ERROR since as of PG12 we no longer recognize that.
+  */
+ static void
+-readRecoveryCommandFile(void)
++readRecoverySignalFile(void)
+ {
+-	FILE	   *fd;
+-	TimeLineID	rtli = 0;
+-	bool		rtliGiven = false;
+-	ConfigVariable *item,
+-			   *head = NULL,
+-			   *tail = NULL;
+-	bool		recoveryTargetActionSet = false;
++	struct stat stat_buf;
+ 
++	if (IsBootstrapProcessingMode())
++		return;
+ 
+-	fd = AllocateFile(RECOVERY_COMMAND_FILE, "r");
+-	if (fd == NULL)
+-	{
+-		if (errno == ENOENT)
+-			return;				/* not there, so no archive recovery */
++	/*
++	 * Check for old recovery API file: recovery.conf
++	 */
++	if (stat(RECOVERY_COMMAND_FILE, &stat_buf) == 0)
+ 		ereport(FATAL,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not open recovery command file \"%s\": %m",
++				 errmsg("using recovery command file \"%s\" is not supported",
+ 						RECOVERY_COMMAND_FILE)));
+-	}
+ 
+ 	/*
+-	 * Since we're asking ParseConfigFp() to report errors as FATAL, there's
+-	 * no need to check the return value.
++	 * Remove unused .done file, if present. Ignore if absent.
+ 	 */
+-	(void) ParseConfigFp(fd, RECOVERY_COMMAND_FILE, 0, FATAL, &head, &tail);
+-
+-	FreeFile(fd);
++	unlink(RECOVERY_COMMAND_DONE);
+ 
+-	for (item = head; item; item = item->next)
++	/*
++	 * Check for recovery signal files and if found, fsync them since they
++	 * represent server state information.
++	 *
++	 * If present, standby signal file takes precedence. If neither is present
++	 * then we won't enter archive recovery.
++	 */
++	if (stat(STANDBY_SIGNAL_FILE, &stat_buf) == 0)
+ 	{
+-		if (strcmp(item->name, "restore_command") == 0)
+-		{
+-			recoveryRestoreCommand = pstrdup(item->value);
+-			ereport(DEBUG2,
+-					(errmsg_internal("restore_command = '%s'",
+-									 recoveryRestoreCommand)));
+-		}
+-		else if (strcmp(item->name, "recovery_end_command") == 0)
+-		{
+-			recoveryEndCommand = pstrdup(item->value);
+-			ereport(DEBUG2,
+-					(errmsg_internal("recovery_end_command = '%s'",
+-									 recoveryEndCommand)));
+-		}
+-		else if (strcmp(item->name, "archive_cleanup_command") == 0)
+-		{
+-			archiveCleanupCommand = pstrdup(item->value);
+-			ereport(DEBUG2,
+-					(errmsg_internal("archive_cleanup_command = '%s'",
+-									 archiveCleanupCommand)));
+-		}
+-		else if (strcmp(item->name, "recovery_target_action") == 0)
+-		{
+-			if (strcmp(item->value, "pause") == 0)
+-				recoveryTargetAction = RECOVERY_TARGET_ACTION_PAUSE;
+-			else if (strcmp(item->value, "promote") == 0)
+-				recoveryTargetAction = RECOVERY_TARGET_ACTION_PROMOTE;
+-			else if (strcmp(item->value, "shutdown") == 0)
+-				recoveryTargetAction = RECOVERY_TARGET_ACTION_SHUTDOWN;
+-			else
+-				ereport(ERROR,
+-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-						 errmsg("invalid value for recovery parameter \"%s\": \"%s\"",
+-								"recovery_target_action",
+-								item->value),
+-						 errhint("Valid values are \"pause\", \"promote\", and \"shutdown\".")));
+-
+-			ereport(DEBUG2,
+-					(errmsg_internal("recovery_target_action = '%s'",
+-									 item->value)));
+-
+-			recoveryTargetActionSet = true;
+-		}
+-		else if (strcmp(item->name, "recovery_target_timeline") == 0)
+-		{
+-			rtliGiven = true;
+-			if (strcmp(item->value, "latest") == 0)
+-				rtli = 0;
+-			else
+-			{
+-				errno = 0;
+-				rtli = (TimeLineID) strtoul(item->value, NULL, 0);
+-				if (errno == EINVAL || errno == ERANGE)
+-					ereport(FATAL,
+-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-							 errmsg("recovery_target_timeline is not a valid number: \"%s\"",
+-									item->value)));
+-			}
+-			if (rtli)
+-				ereport(DEBUG2,
+-						(errmsg_internal("recovery_target_timeline = %u", rtli)));
+-			else
+-				ereport(DEBUG2,
+-						(errmsg_internal("recovery_target_timeline = latest")));
+-		}
+-		else if (strcmp(item->name, "recovery_target_xid") == 0)
+-		{
+-			errno = 0;
+-			recoveryTargetXid = (TransactionId) strtoul(item->value, NULL, 0);
+-			if (errno == EINVAL || errno == ERANGE)
+-				ereport(FATAL,
+-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-						 errmsg("recovery_target_xid is not a valid number: \"%s\"",
+-								item->value)));
+-			ereport(DEBUG2,
+-					(errmsg_internal("recovery_target_xid = %u",
+-									 recoveryTargetXid)));
+-			recoveryTarget = RECOVERY_TARGET_XID;
+-		}
+-		else if (strcmp(item->name, "recovery_target_time") == 0)
+-		{
+-			recoveryTarget = RECOVERY_TARGET_TIME;
+-
+-			if (strcmp(item->value, "epoch") == 0 ||
+-				strcmp(item->value, "infinity") == 0 ||
+-				strcmp(item->value, "-infinity") == 0 ||
+-				strcmp(item->value, "now") == 0 ||
+-				strcmp(item->value, "today") == 0 ||
+-				strcmp(item->value, "tomorrow") == 0 ||
+-				strcmp(item->value, "yesterday") == 0)
+-				ereport(FATAL,
+-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-						 errmsg("recovery_target_time is not a valid timestamp: \"%s\"",
+-								item->value)));
++		int			fd;
+ 
+-			/*
+-			 * Convert the time string given by the user to TimestampTz form.
+-			 */
+-			recoveryTargetTime =
+-				DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
+-														CStringGetDatum(item->value),
+-														ObjectIdGetDatum(InvalidOid),
+-														Int32GetDatum(-1)));
+-			ereport(DEBUG2,
+-					(errmsg_internal("recovery_target_time = '%s'",
+-									 timestamptz_to_str(recoveryTargetTime))));
+-		}
+-		else if (strcmp(item->name, "recovery_target_name") == 0)
+-		{
+-			recoveryTarget = RECOVERY_TARGET_NAME;
++		fd = BasicOpenFilePerm(STANDBY_SIGNAL_FILE, O_RDWR | PG_BINARY | get_sync_bit(sync_method),
++							   S_IRUSR | S_IWUSR);
++		pg_fsync(fd);
++		close(fd);
++		standby_signal_file_found = true;
++	}
++	else if (stat(RECOVERY_SIGNAL_FILE, &stat_buf) == 0)
++	{
++		int			fd;
+ 
+-			recoveryTargetName = pstrdup(item->value);
+-			if (strlen(recoveryTargetName) >= MAXFNAMELEN)
+-				ereport(FATAL,
+-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-						 errmsg("recovery_target_name is too long (maximum %d characters)",
+-								MAXFNAMELEN - 1)));
++		fd = BasicOpenFilePerm(RECOVERY_SIGNAL_FILE, O_RDWR | PG_BINARY | get_sync_bit(sync_method),
++							   S_IRUSR | S_IWUSR);
++		pg_fsync(fd);
++		close(fd);
++		recovery_signal_file_found = true;
++	}
+ 
+-			ereport(DEBUG2,
+-					(errmsg_internal("recovery_target_name = '%s'",
+-									 recoveryTargetName)));
+-		}
+-		else if (strcmp(item->name, "recovery_target_lsn") == 0)
+-		{
+-			recoveryTarget = RECOVERY_TARGET_LSN;
++	StandbyModeRequested = false;
++	ArchiveRecoveryRequested = false;
++	if (standby_signal_file_found)
++	{
++		StandbyModeRequested = true;
++		ArchiveRecoveryRequested = true;
++	}
++	else if (recovery_signal_file_found)
++	{
++		StandbyModeRequested = false;
++		ArchiveRecoveryRequested = true;
++	}
++	else
++		return;
+ 
+-			/*
+-			 * Convert the LSN string given by the user to XLogRecPtr form.
+-			 */
+-			recoveryTargetLSN =
+-				DatumGetLSN(DirectFunctionCall3(pg_lsn_in,
+-												CStringGetDatum(item->value),
+-												ObjectIdGetDatum(InvalidOid),
+-												Int32GetDatum(-1)));
+-			ereport(DEBUG2,
+-					(errmsg_internal("recovery_target_lsn = '%X/%X'",
+-									 (uint32) (recoveryTargetLSN >> 32),
+-									 (uint32) recoveryTargetLSN)));
+-		}
+-		else if (strcmp(item->name, "recovery_target") == 0)
+-		{
+-			if (strcmp(item->value, "immediate") == 0)
+-				recoveryTarget = RECOVERY_TARGET_IMMEDIATE;
+-			else
+-				ereport(ERROR,
+-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-						 errmsg("invalid value for recovery parameter \"%s\": \"%s\"",
+-								"recovery_target",
+-								item->value),
+-						 errhint("The only allowed value is \"immediate\".")));
+-			ereport(DEBUG2,
+-					(errmsg_internal("recovery_target = '%s'",
+-									 item->value)));
+-		}
+-		else if (strcmp(item->name, "recovery_target_inclusive") == 0)
+-		{
+-			/*
+-			 * does nothing if a recovery_target is not also set
+-			 */
+-			if (!parse_bool(item->value, &recoveryTargetInclusive))
+-				ereport(ERROR,
+-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-						 errmsg("parameter \"%s\" requires a Boolean value",
+-								"recovery_target_inclusive")));
+-			ereport(DEBUG2,
+-					(errmsg_internal("recovery_target_inclusive = %s",
+-									 item->value)));
+-		}
+-		else if (strcmp(item->name, "standby_mode") == 0)
+-		{
+-			if (!parse_bool(item->value, &StandbyModeRequested))
+-				ereport(ERROR,
+-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-						 errmsg("parameter \"%s\" requires a Boolean value",
+-								"standby_mode")));
+-			ereport(DEBUG2,
+-					(errmsg_internal("standby_mode = '%s'", item->value)));
+-		}
+-		else if (strcmp(item->name, "primary_conninfo") == 0)
+-		{
+-			PrimaryConnInfo = pstrdup(item->value);
+-			ereport(DEBUG2,
+-					(errmsg_internal("primary_conninfo = '%s'",
+-									 PrimaryConnInfo)));
+-		}
+-		else if (strcmp(item->name, "primary_slot_name") == 0)
+-		{
+-			ReplicationSlotValidateName(item->value, ERROR);
+-			PrimarySlotName = pstrdup(item->value);
+-			ereport(DEBUG2,
+-					(errmsg_internal("primary_slot_name = '%s'",
+-									 PrimarySlotName)));
+-		}
+-		else if (strcmp(item->name, "trigger_file") == 0)
+-		{
+-			TriggerFile = pstrdup(item->value);
+-			ereport(DEBUG2,
+-					(errmsg_internal("trigger_file = '%s'",
+-									 TriggerFile)));
+-		}
+-		else if (strcmp(item->name, "recovery_min_apply_delay") == 0)
+-		{
+-			const char *hintmsg;
++	/*
++	 * We don't support standby mode in standalone backends; that requires
++	 * other processes such as the WAL receiver to be alive.
++	 */
++	if (StandbyModeRequested && !IsUnderPostmaster)
++		ereport(FATAL,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("standby mode is not supported by single-user servers")));
++}
+ 
+-			if (!parse_int(item->value, &recovery_min_apply_delay, GUC_UNIT_MS,
+-						   &hintmsg))
+-				ereport(ERROR,
+-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-						 errmsg("parameter \"%s\" requires a temporal value",
+-								"recovery_min_apply_delay"),
+-						 hintmsg ? errhint("%s", _(hintmsg)) : 0));
+-			ereport(DEBUG2,
+-					(errmsg_internal("recovery_min_apply_delay = '%s'", item->value)));
+-		}
+-		else
+-			ereport(FATAL,
+-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-					 errmsg("unrecognized recovery parameter \"%s\"",
+-							item->name)));
+-	}
++static void
++validateRecoveryParameters(void)
++{
++	if (!ArchiveRecoveryRequested)
++		return;
+ 
+ 	/*
+ 	 * Check for compulsory parameters
+ 	 */
+ 	if (StandbyModeRequested)
+ 	{
+-		if (PrimaryConnInfo == NULL && recoveryRestoreCommand == NULL)
++		if ((PrimaryConnInfo == NULL || strcmp(PrimaryConnInfo, "") == 0) &&
++			(recoveryRestoreCommand == NULL || strcmp(recoveryRestoreCommand, "") == 0))
+ 			ereport(WARNING,
+-					(errmsg("recovery command file \"%s\" specified neither primary_conninfo nor restore_command",
+-							RECOVERY_COMMAND_FILE),
++					(errmsg("specified neither primary_conninfo nor restore_command"),
+ 					 errhint("The database server will regularly poll the pg_wal subdirectory to check for files placed there.")));
+ 	}
+ 	else
+ 	{
+-		if (recoveryRestoreCommand == NULL)
++		if (recoveryRestoreCommand == NULL ||
++			strcmp(recoveryRestoreCommand, "") == 0)
+ 			ereport(FATAL,
+ 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-					 errmsg("recovery command file \"%s\" must specify restore_command when standby mode is not enabled",
+-							RECOVERY_COMMAND_FILE)));
++					 errmsg("must specify restore_command when standby mode is not enabled")));
+ 	}
+ 
+ 	/*
+@@ -5570,50 +5410,40 @@ readRecoveryCommandFile(void)
+ 	 * hot_standby = off, which was surprising behaviour.
+ 	 */
+ 	if (recoveryTargetAction == RECOVERY_TARGET_ACTION_PAUSE &&
+-		recoveryTargetActionSet &&
+ 		!EnableHotStandby)
+ 		recoveryTargetAction = RECOVERY_TARGET_ACTION_SHUTDOWN;
+ 
+-	/*
+-	 * We don't support standby_mode in standalone backends; that requires
+-	 * other processes such as the WAL receiver to be alive.
+-	 */
+-	if (StandbyModeRequested && !IsUnderPostmaster)
+-		ereport(FATAL,
+-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+-				 errmsg("standby mode is not supported by single-user servers")));
+-
+-	/* Enable fetching from archive recovery area */
+-	ArchiveRecoveryRequested = true;
+-
+ 	/*
+ 	 * If user specified recovery_target_timeline, validate it or compute the
+ 	 * "latest" value.  We can't do this until after we've gotten the restore
+ 	 * command and set InArchiveRecovery, because we need to fetch timeline
+ 	 * history files from the archive.
+ 	 */
+-	if (rtliGiven)
++	if (recoveryTargetTimeLineGoal == RECOVERY_TARGET_TIMELINE_NUMERIC)
+ 	{
+-		if (rtli)
+-		{
+-			/* Timeline 1 does not have a history file, all else should */
+-			if (rtli != 1 && !existsTimeLineHistory(rtli))
+-				ereport(FATAL,
+-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-						 errmsg("recovery target timeline %u does not exist",
+-								rtli)));
+-			recoveryTargetTLI = rtli;
+-			recoveryTargetIsLatest = false;
+-		}
+-		else
+-		{
+-			/* We start the "latest" search from pg_control's timeline */
+-			recoveryTargetTLI = findNewestTimeLine(recoveryTargetTLI);
+-			recoveryTargetIsLatest = true;
+-		}
+-	}
++		TimeLineID	rtli = recoveryTargetTLIRequested;
+ 
+-	FreeConfigVariables(head);
++		/* Timeline 1 does not have a history file, all else should */
++		if (rtli != 1 && !existsTimeLineHistory(rtli))
++			ereport(FATAL,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("recovery target timeline %u does not exist",
++							rtli)));
++		recoveryTargetTLI = rtli;
++	}
++	else if (recoveryTargetTimeLineGoal == RECOVERY_TARGET_TIMELINE_LATEST)
++	{
++		/* We start the "latest" search from pg_control's timeline */
++		recoveryTargetTLI = findNewestTimeLine(recoveryTargetTLI);
++	}
++	else
++	{
++		/*
++		 * else we just use the recoveryTargetTLI as already read from
++		 * ControlFile
++		 */
++		Assert(recoveryTargetTimeLineGoal == RECOVERY_TARGET_TIMELINE_CONTROLFILE);
++	}
+ }
+ 
+ /*
+@@ -5714,11 +5544,14 @@ exitArchiveRecovery(TimeLineID endTLI, XLogRecPtr endOfLog)
+ 	unlink(recoveryPath);		/* ignore any error */
+ 
+ 	/*
+-	 * Rename the config file out of the way, so that we don't accidentally
++	 * Remove the signal files out of the way, so that we don't accidentally
+ 	 * re-enter archive recovery mode in a subsequent crash.
+ 	 */
+-	unlink(RECOVERY_COMMAND_DONE);
+-	durable_rename(RECOVERY_COMMAND_FILE, RECOVERY_COMMAND_DONE, FATAL);
++	if (standby_signal_file_found)
++		durable_unlink(STANDBY_SIGNAL_FILE, FATAL);
++
++	if (recovery_signal_file_found)
++		durable_unlink(RECOVERY_SIGNAL_FILE, FATAL);
+ 
+ 	ereport(LOG,
+ 			(errmsg("archive recovery complete")));
+@@ -6461,18 +6294,10 @@ StartupXLOG(void)
+ 		recoveryTargetTLI = ControlFile->checkPointCopy.ThisTimeLineID;
+ 
+ 	/*
+-	 * Check for recovery control file, and if so set up state for offline
+-	 * recovery
+-	 */
+-	readRecoveryCommandFile();
+-
+-	/*
+-	 * Save archive_cleanup_command in shared memory so that other processes
+-	 * can see it.
++	 * Check for signal files, and if so set up state for offline recovery
+ 	 */
+-	strlcpy(XLogCtl->archiveCleanupCommand,
+-			archiveCleanupCommand ? archiveCleanupCommand : "",
+-			sizeof(XLogCtl->archiveCleanupCommand));
++	readRecoverySignalFile();
++	validateRecoveryParameters();
+ 
+ 	if (ArchiveRecoveryRequested)
+ 	{
+@@ -6652,7 +6477,8 @@ StartupXLOG(void)
+ 		 * This can happen for example if a base backup is taken from a
+ 		 * running server using an atomic filesystem snapshot, without calling
+ 		 * pg_start/stop_backup. Or if you just kill a running master server
+-		 * and put it into archive recovery by creating a recovery.conf file.
++		 * and put it into archive recovery by creating a recovery signal
++		 * file.
+ 		 *
+ 		 * Our strategy in that case is to perform crash recovery first,
+ 		 * replaying all the WAL present in pg_wal, and only enter archive
+@@ -6687,7 +6513,7 @@ StartupXLOG(void)
+ 		{
+ 			/*
+ 			 * We used to attempt to go back to a secondary checkpoint record
+-			 * here, but only when not in standby_mode. We now just fail if we
++			 * here, but only when not in standby mode. We now just fail if we
+ 			 * can't read the last checkpoint because this allows us to
+ 			 * simplify processing around checkpoints.
+ 			 */
+@@ -6878,7 +6704,7 @@ StartupXLOG(void)
+ 
+ 	/*
+ 	 * Check whether we need to force recovery from WAL.  If it appears to
+-	 * have been a clean shutdown and we did not have a recovery.conf file,
++	 * have been a clean shutdown and we did not have a recovery signal file,
+ 	 * then assume no recovery needed.
+ 	 */
+ 	if (checkPoint.redo < RecPtr)
+@@ -6892,7 +6718,7 @@ StartupXLOG(void)
+ 		InRecovery = true;
+ 	else if (ArchiveRecoveryRequested)
+ 	{
+-		/* force recovery due to presence of recovery.conf */
++		/* force recovery due to presence of recovery signal file */
+ 		InRecovery = true;
+ 	}
+ 
+@@ -7763,7 +7589,7 @@ StartupXLOG(void)
+ 		/*
+ 		 * And finally, execute the recovery_end_command, if any.
+ 		 */
+-		if (recoveryEndCommand)
++		if (recoveryEndCommand && strcmp(recoveryEndCommand, "") != 0)
+ 			ExecuteRecoveryCommand(recoveryEndCommand,
+ 								   "recovery_end_command",
+ 								   true);
+@@ -9485,8 +9311,8 @@ CreateRestartPoint(int flags)
+ 	/*
+ 	 * Finally, execute archive_cleanup_command, if any.
+ 	 */
+-	if (XLogCtl->archiveCleanupCommand[0])
+-		ExecuteRecoveryCommand(XLogCtl->archiveCleanupCommand,
++	if (archiveCleanupCommand && strcmp(archiveCleanupCommand, "") != 0)
++		ExecuteRecoveryCommand(archiveCleanupCommand,
+ 							   "archive_cleanup_command",
+ 							   false);
+ 
+@@ -11995,7 +11821,7 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
+ 					 * that when we later jump backwards to start redo at
+ 					 * RedoStartLSN, we will have the logs streamed already.
+ 					 */
+-					if (PrimaryConnInfo)
++					if (PrimaryConnInfo && strcmp(PrimaryConnInfo, "") != 0)
+ 					{
+ 						XLogRecPtr	ptr;
+ 						TimeLineID	tli;
+@@ -12064,7 +11890,7 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
+ 					 * Before we sleep, re-scan for possible new timelines if
+ 					 * we were requested to recover to the latest timeline.
+ 					 */
+-					if (recoveryTargetIsLatest)
++					if (recoveryTargetTimeLineGoal == RECOVERY_TARGET_TIMELINE_LATEST)
+ 					{
+ 						if (rescanLatestTimeLine())
+ 						{
+@@ -12367,14 +12193,14 @@ CheckForStandbyTrigger(void)
+ 		return true;
+ 	}
+ 
+-	if (TriggerFile == NULL)
++	if (PromoteTriggerFile == NULL || strcmp(PromoteTriggerFile, "") == 0)
+ 		return false;
+ 
+-	if (stat(TriggerFile, &stat_buf) == 0)
++	if (stat(PromoteTriggerFile, &stat_buf) == 0)
+ 	{
+ 		ereport(LOG,
+-				(errmsg("trigger file found: %s", TriggerFile)));
+-		unlink(TriggerFile);
++				(errmsg("promote trigger file found: %s", PromoteTriggerFile)));
++		unlink(PromoteTriggerFile);
+ 		triggered = true;
+ 		fast_promote = true;
+ 		return true;
+@@ -12382,8 +12208,8 @@ CheckForStandbyTrigger(void)
+ 	else if (errno != ENOENT)
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+-				 errmsg("could not stat trigger file \"%s\": %m",
+-						TriggerFile)));
++				 errmsg("could not stat promote trigger file \"%s\": %m",
++						PromoteTriggerFile)));
+ 
+ 	return false;
+ }
+diff --git a/src/backend/access/transam/xlogarchive.c b/src/backend/access/transam/xlogarchive.c
+index d40317168e20..b8da714b8003 100644
+--- a/src/backend/access/transam/xlogarchive.c
++++ b/src/backend/access/transam/xlogarchive.c
+@@ -66,7 +66,7 @@ RestoreArchivedFile(char *path, const char *xlogfname,
+ 	TimeLineID	restartTli;
+ 
+ 	/* In standby mode, restore_command might not be supplied */
+-	if (recoveryRestoreCommand == NULL)
++	if (recoveryRestoreCommand == NULL || strcmp(recoveryRestoreCommand, "") == 0)
+ 		goto not_available;
+ 
+ 	/*
+@@ -410,7 +410,7 @@ ExecuteRecoveryCommand(const char *command, const char *commandName, bool failOn
+ 
+ 		ereport((signaled && failOnSignal) ? FATAL : WARNING,
+ 		/*------
+-		   translator: First %s represents a recovery.conf parameter name like
++		   translator: First %s represents a postgresql.conf parameter name like
+ 		  "recovery_end_command", the 2nd is the value of that parameter, the
+ 		  third an already translated error message. */
+ 				(errmsg("%s \"%s\": %s", commandName,
+diff --git a/src/backend/commands/extension.c b/src/backend/commands/extension.c
+index a587a1bc03eb..87e4dd824533 100644
+--- a/src/backend/commands/extension.c
++++ b/src/backend/commands/extension.c
+@@ -9,8 +9,8 @@
+  * dependent objects can be associated with it.  An extension is created by
+  * populating the pg_extension catalog from a "control" file.
+  * The extension control file is parsed with the same parser we use for
+- * postgresql.conf and recovery.conf.  An extension also has an installation
+- * script file, containing SQL commands to create the extension's objects.
++ * postgresql.conf.  An extension also has an installation script file,
++ * containing SQL commands to create the extension's objects.
+  *
+  * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+  * Portions Copyright (c) 1994, Regents of the University of California
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index 0ec3ff0fd6b5..6497393c0328 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -84,6 +84,7 @@
+ #include "utils/float.h"
+ #include "utils/memutils.h"
+ #include "utils/pg_locale.h"
++#include "utils/pg_lsn.h"
+ #include "utils/plancache.h"
+ #include "utils/portal.h"
+ #include "utils/ps_status.h"
+@@ -195,6 +196,19 @@ static bool check_cluster_name(char **newval, void **extra, GucSource source);
+ static const char *show_unix_socket_permissions(void);
+ static const char *show_log_file_mode(void);
+ static const char *show_data_directory_mode(void);
++static bool check_recovery_target_timeline(char **newval, void **extra, GucSource source);
++static void assign_recovery_target_timeline(const char *newval, void *extra);
++static bool check_recovery_target(char **newval, void **extra, GucSource source);
++static void assign_recovery_target(const char *newval, void *extra);
++static bool check_recovery_target_xid(char **newval, void **extra, GucSource source);
++static void assign_recovery_target_xid(const char *newval, void *extra);
++static bool check_recovery_target_time(char **newval, void **extra, GucSource source);
++static void assign_recovery_target_time(const char *newval, void *extra);
++static bool check_recovery_target_name(char **newval, void **extra, GucSource source);
++static void assign_recovery_target_name(const char *newval, void *extra);
++static bool check_recovery_target_lsn(char **newval, void **extra, GucSource source);
++static void assign_recovery_target_lsn(const char *newval, void *extra);
++static bool check_primary_slot_name(char **newval, void **extra, GucSource source);
+ 
+ /* Private functions in guc-file.l that need to be called from guc.c */
+ static ConfigVariable *ProcessConfigFileInternal(GucContext context,
+@@ -442,6 +456,7 @@ const struct config_enum_entry ssl_protocol_versions_info[] = {
+  */
+ extern const struct config_enum_entry wal_level_options[];
+ extern const struct config_enum_entry archive_mode_options[];
++extern const struct config_enum_entry recovery_target_action_options[];
+ extern const struct config_enum_entry sync_method_options[];
+ extern const struct config_enum_entry dynamic_shared_memory_options[];
+ 
+@@ -533,6 +548,13 @@ static int	wal_block_size;
+ static bool data_checksums;
+ static bool integer_datetimes;
+ static bool assert_enabled;
++static char *recovery_target_timeline_string;
++static char *recovery_target_string;
++static char *recovery_target_xid_string;
++static char *recovery_target_time_string;
++static char *recovery_target_name_string;
++static char *recovery_target_lsn_string;
++
+ 
+ /* should be static, but commands/variable.c needs to get at this */
+ char	   *role_string;
+@@ -616,6 +638,10 @@ const char *const config_group_names[] =
+ 	gettext_noop("Write-Ahead Log / Checkpoints"),
+ 	/* WAL_ARCHIVING */
+ 	gettext_noop("Write-Ahead Log / Archiving"),
++	/* WAL_ARCHIVE_RECOVERY */
++	gettext_noop("Write-Ahead Log / Archive Recovery"),
++	/* WAL_RECOVERY_TARGET */
++	gettext_noop("Write-Ahead Log / Recovery Target"),
+ 	/* REPLICATION */
+ 	gettext_noop("Replication"),
+ 	/* REPLICATION_SENDING */
+@@ -1637,6 +1663,16 @@ static struct config_bool ConfigureNamesBool[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"recovery_target_inclusive", PGC_POSTMASTER, WAL_RECOVERY_TARGET,
++			gettext_noop("Sets whether to include or exclude transaction with recovery target."),
++			NULL
++		},
++		&recoveryTargetInclusive,
++		true,
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"hot_standby", PGC_POSTMASTER, REPLICATION_STANDBY,
+ 			gettext_noop("Allows connections and queries during recovery."),
+@@ -1973,6 +2009,17 @@ static struct config_int ConfigureNamesInt[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"recovery_min_apply_delay", PGC_POSTMASTER, REPLICATION_STANDBY,
++			gettext_noop("Sets the minimum delay for applying changes during recovery."),
++			NULL,
++			GUC_UNIT_MS
++		},
++		&recovery_min_apply_delay,
++		0, 0, INT_MAX,
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"wal_receiver_status_interval", PGC_SIGHUP, REPLICATION_STANDBY,
+ 			gettext_noop("Sets the maximum interval between WAL receiver status reports to the sending server."),
+@@ -3291,6 +3338,123 @@ static struct config_string ConfigureNamesString[] =
+ 		NULL, NULL, show_archive_command
+ 	},
+ 
++	{
++		{"restore_command", PGC_POSTMASTER, WAL_ARCHIVE_RECOVERY,
++			gettext_noop("Sets the shell command that will retrieve an archived WAL file."),
++			NULL
++		},
++		&recoveryRestoreCommand,
++		"",
++		NULL, NULL, NULL
++	},
++
++	{
++		{"archive_cleanup_command", PGC_POSTMASTER, WAL_ARCHIVE_RECOVERY,
++			gettext_noop("Sets the shell command that will be executed at every restart point."),
++			NULL
++		},
++		&archiveCleanupCommand,
++		"",
++		NULL, NULL, NULL
++	},
++
++	{
++		{"recovery_end_command", PGC_POSTMASTER, WAL_ARCHIVE_RECOVERY,
++			gettext_noop("Sets the shell command that will be executed once at the end of recovery."),
++			NULL
++		},
++		&recoveryEndCommand,
++		"",
++		NULL, NULL, NULL
++	},
++
++	{
++		{"recovery_target_timeline", PGC_POSTMASTER, WAL_RECOVERY_TARGET,
++			gettext_noop("Specifies the timeline to recovery into."),
++			NULL
++		},
++		&recovery_target_timeline_string,
++		"",
++		check_recovery_target_timeline, assign_recovery_target_timeline, NULL
++	},
++
++	{
++		{"recovery_target", PGC_POSTMASTER, WAL_RECOVERY_TARGET,
++			gettext_noop("Set to 'immediate' to end recovery as soon as a consistent state is reached."),
++			NULL
++		},
++		&recovery_target_string,
++		"",
++		check_recovery_target, assign_recovery_target, NULL
++	},
++	{
++		{"recovery_target_xid", PGC_POSTMASTER, WAL_RECOVERY_TARGET,
++			gettext_noop("Sets the transaction ID up to which recovery will proceed."),
++			NULL
++		},
++		&recovery_target_xid_string,
++		"",
++		check_recovery_target_xid, assign_recovery_target_xid, NULL
++	},
++	{
++		{"recovery_target_time", PGC_POSTMASTER, WAL_RECOVERY_TARGET,
++			gettext_noop("Sets the time stamp up to which recovery will proceed."),
++			NULL
++		},
++		&recovery_target_time_string,
++		"",
++		check_recovery_target_time, assign_recovery_target_time, NULL
++	},
++	{
++		{"recovery_target_name", PGC_POSTMASTER, WAL_RECOVERY_TARGET,
++			gettext_noop("Sets the named restore point up to which recovery will proceed."),
++			NULL
++		},
++		&recovery_target_name_string,
++		"",
++		check_recovery_target_name, assign_recovery_target_name, NULL
++	},
++	{
++		{"recovery_target_lsn", PGC_POSTMASTER, WAL_RECOVERY_TARGET,
++			gettext_noop("Sets the LSN of the write-ahead log location up to which recovery will proceed."),
++			NULL
++		},
++		&recovery_target_lsn_string,
++		"",
++		check_recovery_target_lsn, assign_recovery_target_lsn, NULL
++	},
++
++	{
++		{"promote_trigger_file", PGC_POSTMASTER, REPLICATION_STANDBY,
++			gettext_noop("Specifies a file name whose presence ends recovery in the standby."),
++			NULL
++		},
++		&PromoteTriggerFile,
++		"",
++		NULL, NULL, NULL
++	},
++
++	{
++		{"primary_conninfo", PGC_POSTMASTER, REPLICATION_STANDBY,
++			gettext_noop("Sets the connection string to be used to connect to the sending server."),
++			NULL,
++			GUC_SUPERUSER_ONLY
++		},
++		&PrimaryConnInfo,
++		"",
++		NULL, NULL, NULL
++	},
++
++	{
++		{"primary_slot_name", PGC_POSTMASTER, REPLICATION_STANDBY,
++			gettext_noop("Sets the name of the replication slot to use on the sending server."),
++			NULL
++		},
++		&PrimarySlotName,
++		"",
++		check_primary_slot_name, NULL, NULL
++	},
++
+ 	{
+ 		{"client_encoding", PGC_USERSET, CLIENT_CONN_LOCALE,
+ 			gettext_noop("Sets the client's character set encoding."),
+@@ -4071,6 +4235,16 @@ static struct config_enum ConfigureNamesEnum[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"recovery_target_action", PGC_POSTMASTER, WAL_RECOVERY_TARGET,
++			gettext_noop("Sets the action to perform upon reaching the recovery target."),
++			NULL
++		},
++		&recoveryTargetAction,
++		RECOVERY_TARGET_ACTION_PAUSE, recovery_target_action_options,
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"trace_recovery_messages", PGC_SIGHUP, DEVELOPER_OPTIONS,
+ 			gettext_noop("Enables logging of recovery-related debugging information."),
+@@ -10838,4 +11012,251 @@ show_data_directory_mode(void)
+ 	return buf;
+ }
+ 
++static bool
++check_recovery_target_timeline(char **newval, void **extra, GucSource source)
++{
++	RecoveryTargetTimeLineGoal rttg = RECOVERY_TARGET_TIMELINE_CONTROLFILE;
++	RecoveryTargetTimeLineGoal *myextra;
++
++	if (strcmp(*newval, "") == 0)
++		rttg = RECOVERY_TARGET_TIMELINE_CONTROLFILE;
++	else if (strcmp(*newval, "latest") == 0)
++		rttg = RECOVERY_TARGET_TIMELINE_LATEST;
++	else
++	{
++		errno = 0;
++		strtoul(*newval, NULL, 0);
++		if (errno == EINVAL || errno == ERANGE)
++		{
++			GUC_check_errdetail("recovery_target_timeline is not a valid number");
++			return false;
++		}
++		rttg = RECOVERY_TARGET_TIMELINE_NUMERIC;
++	}
++
++	myextra = (RecoveryTargetTimeLineGoal *) guc_malloc(ERROR, sizeof(RecoveryTargetTimeLineGoal));
++	*myextra = rttg;
++	*extra = (void *) myextra;
++
++	return true;
++}
++
++static void
++assign_recovery_target_timeline(const char *newval, void *extra)
++{
++	recoveryTargetTimeLineGoal = *((RecoveryTargetTimeLineGoal *) extra);
++	if (recoveryTargetTimeLineGoal == RECOVERY_TARGET_TIMELINE_NUMERIC)
++		recoveryTargetTLIRequested = (TimeLineID) strtoul(newval, NULL, 0);
++	else
++		recoveryTargetTLIRequested = 0;
++}
++
++static bool
++check_recovery_target(char **newval, void **extra, GucSource source)
++{
++	if (strcmp(*newval, "immediate") != 0 && strcmp(*newval, "") != 0)
++	{
++		GUC_check_errdetail("The only allowed value is \"immediate\".");
++		return false;
++	}
++	return true;
++}
++
++static void
++assign_recovery_target(const char *newval, void *extra)
++{
++	if (newval && strcmp(newval, "") != 0)
++		recoveryTarget = RECOVERY_TARGET_IMMEDIATE;
++	else
++		/*
++		 * Reset recoveryTarget to RECOVERY_TARGET_UNSET to proper handle user
++		 * setting multiple recovery_target with blank value on last.
++		 */
++		recoveryTarget = RECOVERY_TARGET_UNSET;
++}
++
++static bool
++check_recovery_target_xid(char **newval, void **extra, GucSource source)
++{
++	if (strcmp(*newval, "") != 0)
++	{
++		TransactionId xid;
++		TransactionId *myextra;
++
++		errno = 0;
++		xid = (TransactionId) strtoul(*newval, NULL, 0);
++		if (errno == EINVAL || errno == ERANGE)
++			return false;
++
++		myextra = (TransactionId *) guc_malloc(ERROR, sizeof(TransactionId));
++		*myextra = xid;
++		*extra = (void *) myextra;
++	}
++	return true;
++}
++
++static void
++assign_recovery_target_xid(const char *newval, void *extra)
++{
++	if (newval && strcmp(newval, "") != 0)
++	{
++		recoveryTarget = RECOVERY_TARGET_XID;
++		recoveryTargetXid = *((TransactionId *) extra);
++	}
++	else
++		recoveryTarget = RECOVERY_TARGET_UNSET;
++}
++
++static bool
++check_recovery_target_time(char **newval, void **extra, GucSource source)
++{
++	if (strcmp(*newval, "") != 0)
++	{
++		TimestampTz time;
++		TimestampTz *myextra;
++		MemoryContext oldcontext = CurrentMemoryContext;
++
++		/* reject some special values */
++		if (strcmp(*newval, "epoch") == 0 ||
++			strcmp(*newval, "infinity") == 0 ||
++			strcmp(*newval, "-infinity") == 0 ||
++			strcmp(*newval, "now") == 0 ||
++			strcmp(*newval, "today") == 0 ||
++			strcmp(*newval, "tomorrow") == 0 ||
++			strcmp(*newval, "yesterday") == 0)
++		{
++			return false;
++		}
++
++		PG_TRY();
++		{
++			time = DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
++														   CStringGetDatum(*newval),
++														   ObjectIdGetDatum(InvalidOid),
++														   Int32GetDatum(-1)));
++		}
++		PG_CATCH();
++		{
++			ErrorData  *edata;
++
++			/* Save error info */
++			MemoryContextSwitchTo(oldcontext);
++			edata = CopyErrorData();
++			FlushErrorState();
++
++			/* Pass the error message */
++			GUC_check_errdetail("%s", edata->message);
++			FreeErrorData(edata);
++			return false;
++		}
++		PG_END_TRY();
++
++		myextra = (TimestampTz *) guc_malloc(ERROR, sizeof(TimestampTz));
++		*myextra = time;
++		*extra = (void *) myextra;
++	}
++	return true;
++}
++
++static void
++assign_recovery_target_time(const char *newval, void *extra)
++{
++	if (newval && strcmp(newval, "") != 0)
++	{
++		recoveryTarget = RECOVERY_TARGET_TIME;
++		recoveryTargetTime = *((TimestampTz *) extra);
++	}
++	else
++		recoveryTarget = RECOVERY_TARGET_UNSET;
++}
++
++static bool
++check_recovery_target_name(char **newval, void **extra, GucSource source)
++{
++	/* Use the value of newval directly */
++	if (strlen(*newval) >= MAXFNAMELEN)
++	{
++		GUC_check_errdetail("recovery_target_name is too long (maximum %d characters)",
++							MAXFNAMELEN - 1);
++		return false;
++	}
++	return true;
++}
++
++static void
++assign_recovery_target_name(const char *newval, void *extra)
++{
++	if (newval && strcmp(newval, "") != 0)
++	{
++		recoveryTarget = RECOVERY_TARGET_NAME;
++		recoveryTargetName = (char *) newval;
++	}
++	else
++		recoveryTarget = RECOVERY_TARGET_UNSET;
++}
++
++static bool
++check_recovery_target_lsn(char **newval, void **extra, GucSource source)
++{
++	if (strcmp(*newval, "") != 0)
++	{
++		XLogRecPtr	lsn;
++		XLogRecPtr *myextra;
++		MemoryContext oldcontext = CurrentMemoryContext;
++
++		/*
++		 * Convert the LSN string given by the user to XLogRecPtr form.
++		 */
++		PG_TRY();
++		{
++			lsn = DatumGetLSN(DirectFunctionCall3(pg_lsn_in,
++												  CStringGetDatum(*newval),
++												  ObjectIdGetDatum(InvalidOid),
++												  Int32GetDatum(-1)));
++		}
++		PG_CATCH();
++		{
++			ErrorData  *edata;
++
++			/* Save error info */
++			MemoryContextSwitchTo(oldcontext);
++			edata = CopyErrorData();
++			FlushErrorState();
++
++			/* Pass the error message */
++			GUC_check_errdetail("%s", edata->message);
++			FreeErrorData(edata);
++			return false;
++		}
++		PG_END_TRY();
++
++		myextra = (XLogRecPtr *) guc_malloc(ERROR, sizeof(XLogRecPtr));
++		*myextra = lsn;
++		*extra = (void *) myextra;
++	}
++	return true;
++}
++
++static void
++assign_recovery_target_lsn(const char *newval, void *extra)
++{
++	if (newval && strcmp(newval, "") != 0)
++	{
++		recoveryTarget = RECOVERY_TARGET_LSN;
++		recoveryTargetLSN = *((XLogRecPtr *) extra);
++	}
++	else
++		recoveryTarget = RECOVERY_TARGET_UNSET;
++}
++
++static bool
++check_primary_slot_name(char **newval, void **extra, GucSource source)
++{
++	if (*newval && strcmp(*newval, "") != 0 &&
++		!ReplicationSlotValidateName(*newval, WARNING))
++		return false;
++
++	return true;
++}
++
+ #include "guc-file.c"
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index 3038fe627b28..ee9ec6a12003 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -228,6 +228,45 @@
+ #archive_timeout = 0		# force a logfile segment switch after this
+ 				# number of seconds; 0 disables
+ 
++# - Archive Recovery -
++
++# These are only used in recovery mode.
++
++#restore_command = ''		# command to use to restore an archived logfile segment
++				# placeholders: %p = path of file to restore
++				#               %f = file name only
++				# e.g. 'cp /mnt/server/archivedir/%f %p'
++				# (change requires restart)
++#archive_cleanup_command = ''	# command to execute at every restartpoint
++				# (change requires restart)
++#recovery_end_command = ''	# command to execute at completion of recovery
++				# (change requires restart)
++
++# - Recovery Target -
++
++# Set these only when performing a targeted recovery.
++
++#recovery_target = ''		# 'immediate' to end recovery as soon as a
++                                # consistent state is reached
++				# (change requires restart)
++#recovery_target_name = ''	# the named restore point to which recovery will proceed
++				# (change requires restart)
++#recovery_target_time = ''	# the time stamp up to which recovery will proceed
++				# (change requires restart)
++#recovery_target_xid = ''	# the transaction ID up to which recovery will proceed
++				# (change requires restart)
++#recovery_target_lsn = ''	# the WAL LSN up to which recovery will proceed
++				# (change requires restart)
++#recovery_target_inclusive = on # Specifies whether to stop:
++				# just after the specified recovery target (on)
++				# just before the recovery target (off)
++				# (change requires restart)
++#recovery_target_timeline = ''	# unset means read from control file (default),
++				# or set to 'latest' or timeline ID
++				# (change requires restart)
++#recovery_target_action = 'pause'	# 'pause', 'promote', 'shutdown'
++				# (change requires restart)
++
+ 
+ #------------------------------------------------------------------------------
+ # REPLICATION
+@@ -261,6 +300,12 @@
+ 
+ # These settings are ignored on a master server.
+ 
++#primary_conninfo = ''			# connection string to sending server
++					# (change requires restart)
++#primary_slot_name = ''			# replication slot on sending server
++					# (change requires restart)
++#promote_trigger_file = ''		# file name whose presence ends recovery
++					# (change requires restart)
+ #hot_standby = on			# "off" disallows queries during recovery
+ 					# (change requires restart)
+ #max_standby_archive_delay = 30s	# max delay before canceling queries
+@@ -278,6 +323,8 @@
+ 					# in milliseconds; 0 disables
+ #wal_retrieve_retry_interval = 5s	# time to wait before retrying to
+ 					# retrieve WAL after a failed attempt
++#recovery_min_apply_delay = 0		# minimum delay for applying changes during recovery
++					# (change requires restart)
+ 
+ # - Subscribers -
+ 
+diff --git a/src/bin/pg_archivecleanup/pg_archivecleanup.c b/src/bin/pg_archivecleanup/pg_archivecleanup.c
+index 51904c6c2afa..c62478dbd6fc 100644
+--- a/src/bin/pg_archivecleanup/pg_archivecleanup.c
++++ b/src/bin/pg_archivecleanup/pg_archivecleanup.c
+@@ -265,7 +265,7 @@ usage(void)
+ 	printf(_("  -x EXT         clean up files if they have this extension\n"));
+ 	printf(_("  -?, --help     show this help, then exit\n"));
+ 	printf(_("\n"
+-			 "For use as archive_cleanup_command in recovery.conf when standby_mode = on:\n"
++			 "For use as archive_cleanup_command in postgresql.conf:\n"
+ 			 "  archive_cleanup_command = 'pg_archivecleanup [OPTION]... ARCHIVELOCATION %%r'\n"
+ 			 "e.g.\n"
+ 			 "  archive_cleanup_command = 'pg_archivecleanup /mnt/server/archiverdir %%r'\n"));
+diff --git a/src/bin/pg_basebackup/pg_basebackup.c b/src/bin/pg_basebackup/pg_basebackup.c
+index d6fef38760e3..af1c4de58f98 100644
+--- a/src/bin/pg_basebackup/pg_basebackup.c
++++ b/src/bin/pg_basebackup/pg_basebackup.c
+@@ -131,7 +131,7 @@ static int	has_xlogendptr = 0;
+ static volatile LONG has_xlogendptr = 0;
+ #endif
+ 
+-/* Contents of recovery.conf to be generated */
++/* Contents of configuration file to be generated */
+ static PQExpBuffer recoveryconfcontents = NULL;
+ 
+ /* Function headers */
+@@ -346,7 +346,7 @@ usage(void)
+ 	printf(_("  -r, --max-rate=RATE    maximum transfer rate to transfer data directory\n"
+ 			 "                         (in kB/s, or use suffix \"k\" or \"M\")\n"));
+ 	printf(_("  -R, --write-recovery-conf\n"
+-			 "                         write recovery.conf for replication\n"));
++			 "                         write configuration for replication\n"));
+ 	printf(_("  -T, --tablespace-mapping=OLDDIR=NEWDIR\n"
+ 			 "                         relocate tablespace in OLDDIR to NEWDIR\n"));
+ 	printf(_("      --waldir=WALDIR    location for the write-ahead log directory\n"));
+@@ -974,6 +974,9 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
+ 	bool		basetablespace = PQgetisnull(res, rownum, 0);
+ 	bool		in_tarhdr = true;
+ 	bool		skip_file = false;
++	bool		is_postgresql_auto_conf = false;
++	bool		found_postgresql_auto_conf = false;
++	int			file_padding_len = 0;
+ 	size_t		tarhdrsz = 0;
+ 	pgoff_t		filesz = 0;
+ 
+@@ -1113,8 +1116,8 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
+ 		{
+ 			/*
+ 			 * End of chunk. If requested, and this is the base tablespace,
+-			 * write recovery.conf into the tarfile. When done, close the file
+-			 * (but not stdout).
++			 * write configuration file into the tarfile. When done, close the
++			 * file (but not stdout).
+ 			 *
+ 			 * Also, write two completely empty blocks at the end of the tar
+ 			 * file, as required by some tar programs.
+@@ -1126,19 +1129,31 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
+ 			if (basetablespace && writerecoveryconf)
+ 			{
+ 				char		header[512];
+-				int			padding;
+ 
+-				tarCreateHeader(header, "recovery.conf", NULL,
+-								recoveryconfcontents->len,
++				if (!found_postgresql_auto_conf)
++				{
++					int			padding;
++
++					tarCreateHeader(header, "postgresql.auto.conf", NULL,
++									recoveryconfcontents->len,
++									pg_file_create_mode, 04000, 02000,
++									time(NULL));
++
++					padding = ((recoveryconfcontents->len + 511) & ~511) - recoveryconfcontents->len;
++
++					WRITE_TAR_DATA(header, sizeof(header));
++					WRITE_TAR_DATA(recoveryconfcontents->data, recoveryconfcontents->len);
++					if (padding)
++						WRITE_TAR_DATA(zerobuf, padding);
++				}
++
++				tarCreateHeader(header, "standby.signal", NULL,
++								0,	/* zero-length file */
+ 								pg_file_create_mode, 04000, 02000,
+ 								time(NULL));
+ 
+-				padding = ((recoveryconfcontents->len + 511) & ~511) - recoveryconfcontents->len;
+-
+ 				WRITE_TAR_DATA(header, sizeof(header));
+-				WRITE_TAR_DATA(recoveryconfcontents->data, recoveryconfcontents->len);
+-				if (padding)
+-					WRITE_TAR_DATA(zerobuf, padding);
++				WRITE_TAR_DATA(zerobuf, 511);
+ 			}
+ 
+ 			/* 2 * 512 bytes empty data at end of file */
+@@ -1182,8 +1197,8 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
+ 		if (!writerecoveryconf || !basetablespace)
+ 		{
+ 			/*
+-			 * When not writing recovery.conf, or when not working on the base
+-			 * tablespace, we never have to look for an existing recovery.conf
++			 * When not writing config file, or when not working on the base
++			 * tablespace, we never have to look for an existing configuration
+ 			 * file in the stream.
+ 			 */
+ 			WRITE_TAR_DATA(copybuf, r);
+@@ -1191,7 +1206,7 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
+ 		else
+ 		{
+ 			/*
+-			 * Look for a recovery.conf in the existing tar stream. If it's
++			 * Look for a config file in the existing tar stream. If it's
+ 			 * there, we must skip it so we can later overwrite it with our
+ 			 * own version of the file.
+ 			 *
+@@ -1235,29 +1250,46 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
+ 					{
+ 						/*
+ 						 * We have the complete header structure in tarhdr,
+-						 * look at the file metadata: - the subsequent file
+-						 * contents have to be skipped if the filename is
+-						 * recovery.conf - find out the size of the file
+-						 * padded to the next multiple of 512
++						 * look at the file metadata: we may want append
++						 * recovery info into postgresql.auto.conf and skip
++						 * standby.signal file.  In both cases we must
++						 * calculate tar padding
+ 						 */
+-						int			padding;
+-
+-						skip_file = (strcmp(&tarhdr[0], "recovery.conf") == 0);
++						skip_file = (strcmp(&tarhdr[0], "standby.signal") == 0);
++						is_postgresql_auto_conf = (strcmp(&tarhdr[0], "postgresql.auto.conf") == 0);
+ 
+ 						filesz = read_tar_number(&tarhdr[124], 12);
++						file_padding_len = ((filesz + 511) & ~511) - filesz;
++
++						if (is_postgresql_auto_conf && writerecoveryconf)
++						{
++							/* replace tar header */
++							char		header[512];
+ 
+-						padding = ((filesz + 511) & ~511) - filesz;
+-						filesz += padding;
++							tarCreateHeader(header, "postgresql.auto.conf", NULL,
++											filesz + recoveryconfcontents->len,
++											pg_file_create_mode, 04000, 02000,
++											time(NULL));
++
++							WRITE_TAR_DATA(header, sizeof(header));
++						}
++						else
++						{
++							/* copy stream with padding */
++							filesz += file_padding_len;
++
++							if (!skip_file)
++							{
++								/*
++								 * If we're not skipping the file, write the
++								 * tar header unmodified.
++								 */
++								WRITE_TAR_DATA(tarhdr, 512);
++							}
++						}
+ 
+ 						/* Next part is the file, not the header */
+ 						in_tarhdr = false;
+-
+-						/*
+-						 * If we're not skipping the file, write the tar
+-						 * header unmodified.
+-						 */
+-						if (!skip_file)
+-							WRITE_TAR_DATA(tarhdr, 512);
+ 					}
+ 				}
+ 				else
+@@ -1281,6 +1313,32 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
+ 						pos += bytes2write;
+ 						filesz -= bytes2write;
+ 					}
++					else if (is_postgresql_auto_conf && writerecoveryconf)
++					{
++						/* append recovery config to postgresql.auto.conf */
++						int			padding;
++						int			tailsize;
++
++						tailsize = (512 - file_padding_len) + recoveryconfcontents->len;
++						padding = ((tailsize + 511) & ~511) - tailsize;
++
++						WRITE_TAR_DATA(recoveryconfcontents->data, recoveryconfcontents->len);
++
++						if (padding)
++						{
++							char		zerobuf[512];
++
++							MemSet(zerobuf, 0, sizeof(zerobuf));
++							WRITE_TAR_DATA(zerobuf, padding);
++						}
++
++						/* skip original file padding */
++						is_postgresql_auto_conf = false;
++						skip_file = true;
++						filesz += file_padding_len;
++
++						found_postgresql_auto_conf = true;
++					}
+ 					else
+ 					{
+ 						/*
+@@ -1289,6 +1347,7 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
+ 						 */
+ 						in_tarhdr = true;
+ 						skip_file = false;
++						is_postgresql_auto_conf = false;
+ 						tarhdrsz = 0;
+ 						filesz = 0;
+ 					}
+@@ -1614,7 +1673,7 @@ escape_quotes(const char *src)
+ }
+ 
+ /*
+- * Create a recovery.conf file in memory using a PQExpBuffer
++ * Create a configuration file in memory using a PQExpBuffer
+  */
+ static void
+ GenerateRecoveryConf(PGconn *conn)
+@@ -1638,8 +1697,6 @@ GenerateRecoveryConf(PGconn *conn)
+ 		disconnect_and_exit(1);
+ 	}
+ 
+-	appendPQExpBufferStr(recoveryconfcontents, "standby_mode = 'on'\n");
+-
+ 	initPQExpBuffer(&conninfo_buf);
+ 	for (option = connOptions; option && option->keyword; option++)
+ 	{
+@@ -1698,8 +1755,9 @@ GenerateRecoveryConf(PGconn *conn)
+ 
+ 
+ /*
+- * Write a recovery.conf file into the directory specified in basedir,
++ * Write the configuration file into the directory specified in basedir,
+  * with the contents already collected in memory.
++ * Then write the signal file into the basedir also.
+  */
+ static void
+ WriteRecoveryConf(void)
+@@ -1707,12 +1765,12 @@ WriteRecoveryConf(void)
+ 	char		filename[MAXPGPATH];
+ 	FILE	   *cf;
+ 
+-	sprintf(filename, "%s/recovery.conf", basedir);
++	snprintf(filename, MAXPGPATH, "%s/%s", basedir, "postgresql.auto.conf");
+ 
+-	cf = fopen(filename, "w");
++	cf = fopen(filename, "a");
+ 	if (cf == NULL)
+ 	{
+-		fprintf(stderr, _("%s: could not create file \"%s\": %s\n"), progname, filename, strerror(errno));
++		fprintf(stderr, _("%s: could not open file \"%s\": %s\n"), progname, filename, strerror(errno));
+ 		disconnect_and_exit(1);
+ 	}
+ 
+@@ -1725,6 +1783,16 @@ WriteRecoveryConf(void)
+ 	}
+ 
+ 	fclose(cf);
++
++	snprintf(filename, MAXPGPATH, "%s/%s", basedir, "standby.signal");
++	cf = fopen(filename, "w");
++	if (cf == NULL)
++	{
++		fprintf(stderr, _("%s: could not create file \"%s\": %s\n"), progname, filename, strerror(errno));
++		disconnect_and_exit(1);
++	}
++
++	fclose(cf);
+ }
+ 
+ 
+@@ -1780,7 +1848,7 @@ BaseBackup(void)
+ 	}
+ 
+ 	/*
+-	 * Build contents of recovery.conf if requested
++	 * Build contents of configuration file if requested
+ 	 */
+ 	if (writerecoveryconf)
+ 		GenerateRecoveryConf(conn);
+@@ -2094,7 +2162,7 @@ BaseBackup(void)
+ #endif
+ 	}
+ 
+-	/* Free the recovery.conf contents */
++	/* Free the configuration file contents */
+ 	destroyPQExpBuffer(recoveryconfcontents);
+ 
+ 	/*
+diff --git a/src/bin/pg_basebackup/t/010_pg_basebackup.pl b/src/bin/pg_basebackup/t/010_pg_basebackup.pl
+index 2211d90c6f97..3e1c3863c4fe 100644
+--- a/src/bin/pg_basebackup/t/010_pg_basebackup.pl
++++ b/src/bin/pg_basebackup/t/010_pg_basebackup.pl
+@@ -358,19 +358,16 @@
+ 
+ $node->command_ok([ 'pg_basebackup', '-D', "$tempdir/backupR", '-R' ],
+ 	'pg_basebackup -R runs');
+-ok(-f "$tempdir/backupR/recovery.conf", 'recovery.conf was created');
+-my $recovery_conf = slurp_file "$tempdir/backupR/recovery.conf";
++ok(-f "$tempdir/backupR/postgresql.auto.conf", 'postgresql.auto.conf exists');
++ok(-f "$tempdir/backupR/standby.signal", 'standby.signal was created');
++my $recovery_conf = slurp_file "$tempdir/backupR/postgresql.auto.conf";
+ rmtree("$tempdir/backupR");
+ 
+ my $port = $node->port;
+-like(
+-	$recovery_conf,
+-	qr/^standby_mode = 'on'\n/m,
+-	'recovery.conf sets standby_mode');
+ like(
+ 	$recovery_conf,
+ 	qr/^primary_conninfo = '.*port=$port.*'\n/m,
+-	'recovery.conf sets primary_conninfo');
++	'postgresql.auto.conf sets primary_conninfo');
+ 
+ $node->command_ok(
+ 	[ 'pg_basebackup', '-D', "$tempdir/backupxd" ],
+@@ -478,9 +475,9 @@
+ 	],
+ 	'pg_basebackup with replication slot and -R runs');
+ like(
+-	slurp_file("$tempdir/backupxs_sl_R/recovery.conf"),
++	slurp_file("$tempdir/backupxs_sl_R/postgresql.auto.conf"),
+ 	qr/^primary_slot_name = 'slot1'\n/m,
+-	'recovery.conf sets primary_slot_name');
++	'recovery conf file sets primary_slot_name');
+ 
+ my $checksum = $node->safe_psql('postgres', 'SHOW data_checksums;');
+ is($checksum, 'on', 'checksums are enabled');
+diff --git a/src/bin/pg_rewind/RewindTest.pm b/src/bin/pg_rewind/RewindTest.pm
+index 1dce56d0352e..3d07da5d9499 100644
+--- a/src/bin/pg_rewind/RewindTest.pm
++++ b/src/bin/pg_rewind/RewindTest.pm
+@@ -159,12 +159,13 @@ sub create_standby
+ 	my $connstr_master = $node_master->connstr();
+ 
+ 	$node_standby->append_conf(
+-		"recovery.conf", qq(
++		"postgresql.conf", qq(
+ primary_conninfo='$connstr_master application_name=rewind_standby'
+-standby_mode=on
+ recovery_target_timeline='latest'
+ ));
+ 
++	$node_standby->set_standby_mode();
++
+ 	# Start standby
+ 	$node_standby->start;
+ 
+@@ -270,12 +271,13 @@ sub run_pg_rewind
+ 	# Plug-in rewound node to the now-promoted standby node
+ 	my $port_standby = $node_standby->port;
+ 	$node_master->append_conf(
+-		'recovery.conf', qq(
++		'postgresql.conf', qq(
+ primary_conninfo='port=$port_standby'
+-standby_mode=on
+ recovery_target_timeline='latest'
+ ));
+ 
++	$node_master->set_standby_mode();
++
+ 	# Restart the master to check that rewind went correctly
+ 	$node_master->start;
+ 
+diff --git a/src/include/access/xlog.h b/src/include/access/xlog.h
+index e01d12eb7c8f..f3a7ba4d421a 100644
+--- a/src/include/access/xlog.h
++++ b/src/include/access/xlog.h
+@@ -75,7 +75,7 @@ extern HotStandbyState standbyState;
+ 
+ /*
+  * Recovery target type.
+- * Only set during a Point in Time recovery, not when standby_mode = on
++ * Only set during a Point in Time recovery, not when in standby mode.
+  */
+ typedef enum
+ {
+@@ -87,6 +87,16 @@ typedef enum
+ 	RECOVERY_TARGET_IMMEDIATE
+ } RecoveryTargetType;
+ 
++/*
++ * Recovery target TimeLine goal
++ */
++typedef enum
++{
++	RECOVERY_TARGET_TIMELINE_CONTROLFILE,
++	RECOVERY_TARGET_TIMELINE_LATEST,
++	RECOVERY_TARGET_TIMELINE_NUMERIC
++}			RecoveryTargetTimeLineGoal;
++
+ extern XLogRecPtr ProcLastRecPtr;
+ extern XLogRecPtr XactLastRecEnd;
+ extern PGDLLIMPORT XLogRecPtr XactLastCommitEnd;
+@@ -109,9 +119,32 @@ extern bool wal_compression;
+ extern bool *wal_consistency_checking;
+ extern char *wal_consistency_checking_string;
+ extern bool log_checkpoints;
++extern char *recoveryRestoreCommand;
++extern char *recoveryEndCommand;
++extern char *archiveCleanupCommand;
++extern bool recoveryTargetInclusive;
++extern int	recoveryTargetAction;
++extern int	recovery_min_apply_delay;
++extern char *PrimaryConnInfo;
++extern char *PrimarySlotName;
++
++/* indirectly set via GUC system */
++extern TransactionId recoveryTargetXid;
++extern TimestampTz recoveryTargetTime;
++extern char *recoveryTargetName;
++extern XLogRecPtr recoveryTargetLSN;
++extern RecoveryTargetType recoveryTarget;
++extern char *PromoteTriggerFile;
++extern RecoveryTargetTimeLineGoal recoveryTargetTimeLineGoal;
++extern TimeLineID recoveryTargetTLIRequested;
++extern TimeLineID recoveryTargetTLI;
+ 
+ extern int	CheckPointSegments;
+ 
++/* option set locally in startup process only when signal files exist */
++extern bool StandbyModeRequested;
++extern bool StandbyMode;
++
+ /* Archive modes */
+ typedef enum ArchiveMode
+ {
+@@ -319,8 +352,8 @@ extern void do_pg_abort_backup(void);
+ extern SessionBackupState get_backup_status(void);
+ 
+ /* File path names (all relative to $PGDATA) */
+-#define RECOVERY_COMMAND_FILE	"recovery.conf"
+-#define RECOVERY_COMMAND_DONE	"recovery.done"
++#define RECOVERY_SIGNAL_FILE	"recovery.signal"
++#define STANDBY_SIGNAL_FILE		"standby.signal"
+ #define BACKUP_LABEL_FILE		"backup_label"
+ #define BACKUP_LABEL_OLD		"backup_label.old"
+ 
+diff --git a/src/include/utils/guc_tables.h b/src/include/utils/guc_tables.h
+index 668d9efd357a..6f9fdb6a5fb0 100644
+--- a/src/include/utils/guc_tables.h
++++ b/src/include/utils/guc_tables.h
+@@ -69,6 +69,8 @@ enum config_group
+ 	WAL_SETTINGS,
+ 	WAL_CHECKPOINTS,
+ 	WAL_ARCHIVING,
++	WAL_ARCHIVE_RECOVERY,
++	WAL_RECOVERY_TARGET,
+ 	REPLICATION,
+ 	REPLICATION_SENDING,
+ 	REPLICATION_MASTER,
+diff --git a/src/port/quotes.c b/src/port/quotes.c
+index 29770c7a00ed..94b63b9bb64b 100644
+--- a/src/port/quotes.c
++++ b/src/port/quotes.c
+@@ -19,7 +19,7 @@
+  * Escape (by doubling) any single quotes or backslashes in given string
+  *
+  * Note: this is used to process postgresql.conf entries and to quote
+- * string literals in pg_basebackup for creating recovery.conf.
++ * string literals in pg_basebackup for writing the recovery configuration.
+  * Since postgresql.conf strings are defined to treat backslashes as escapes,
+  * we have to double backslashes here.
+  *
+diff --git a/src/test/perl/PostgresNode.pm b/src/test/perl/PostgresNode.pm
+index efdebc3877c6..8a2c6fc12216 100644
+--- a/src/test/perl/PostgresNode.pm
++++ b/src/test/perl/PostgresNode.pm
+@@ -635,8 +635,6 @@ of a backup previously created on that node with $node->backup.
+ 
+ Does not start the node after initializing it.
+ 
+-A recovery.conf is not created.
+-
+ Streaming replication can be enabled on this node by passing the keyword
+ parameter has_streaming => 1. This is disabled by default.
+ 
+@@ -834,10 +832,10 @@ sub enable_streaming
+ 
+ 	print "### Enabling streaming replication for node \"$name\"\n";
+ 	$self->append_conf(
+-		'recovery.conf', qq(
++		'postgresql.conf', qq(
+ primary_conninfo='$root_connstr application_name=$name'
+-standby_mode=on
+ ));
++	$self->set_standby_mode();
+ 	return;
+ }
+ 
+@@ -863,10 +861,26 @@ sub enable_restoring
+ 	  : qq{cp "$path/%f" "%p"};
+ 
+ 	$self->append_conf(
+-		'recovery.conf', qq(
++		'postgresql.conf', qq(
+ restore_command = '$copy_command'
+-standby_mode = on
+ ));
++	$self->set_standby_mode();
++	return;
++}
++
++=pod
++
++=item $node->set_standby_mode()
++
++Place standby.signal file.
++
++=cut
++
++sub set_standby_mode
++{
++	my ($self) = @_;
++
++	$self->append_conf('standby.signal', '');
+ 	return;
+ }
+ 
+diff --git a/src/test/recovery/t/001_stream_rep.pl b/src/test/recovery/t/001_stream_rep.pl
+index 8dff5fc7202f..beb45551a241 100644
+--- a/src/test/recovery/t/001_stream_rep.pl
++++ b/src/test/recovery/t/001_stream_rep.pl
+@@ -131,7 +131,7 @@ sub test_target_session_attrs
+ 		qq[SELECT pg_create_physical_replication_slot('$slotname_1');]),
+ 	0,
+ 	'physical slot created on master');
+-$node_standby_1->append_conf('recovery.conf',
++$node_standby_1->append_conf('postgresql.conf',
+ 	"primary_slot_name = $slotname_1");
+ $node_standby_1->append_conf('postgresql.conf',
+ 	"wal_receiver_status_interval = 1");
+@@ -142,7 +142,7 @@ sub test_target_session_attrs
+ 		qq[SELECT pg_create_physical_replication_slot('$slotname_2');]),
+ 	0,
+ 	'physical slot created on intermediate replica');
+-$node_standby_2->append_conf('recovery.conf',
++$node_standby_2->append_conf('postgresql.conf',
+ 	"primary_slot_name = $slotname_2");
+ $node_standby_2->append_conf('postgresql.conf',
+ 	"wal_receiver_status_interval = 1");
+diff --git a/src/test/recovery/t/003_recovery_targets.pl b/src/test/recovery/t/003_recovery_targets.pl
+index e867479f2061..f6f2e8b745b5 100644
+--- a/src/test/recovery/t/003_recovery_targets.pl
++++ b/src/test/recovery/t/003_recovery_targets.pl
+@@ -23,7 +23,7 @@ sub test_recovery_standby
+ 
+ 	foreach my $param_item (@$recovery_params)
+ 	{
+-		$node_standby->append_conf('recovery.conf', qq($param_item));
++		$node_standby->append_conf('postgresql.conf', qq($param_item));
+ 	}
+ 
+ 	$node_standby->start;
+diff --git a/src/test/recovery/t/004_timeline_switch.pl b/src/test/recovery/t/004_timeline_switch.pl
+index a7ccb7b4a3bb..79cbffb827b9 100644
+--- a/src/test/recovery/t/004_timeline_switch.pl
++++ b/src/test/recovery/t/004_timeline_switch.pl
+@@ -47,12 +47,10 @@
+ is($psql_out, 't', "promotion of standby with pg_promote");
+ 
+ # Switch standby 2 to replay from standby 1
+-rmtree($node_standby_2->data_dir . '/recovery.conf');
+ my $connstr_1 = $node_standby_1->connstr;
+ $node_standby_2->append_conf(
+-	'recovery.conf', qq(
++	'postgresql.conf', qq(
+ primary_conninfo='$connstr_1 application_name=@{[$node_standby_2->name]}'
+-standby_mode=on
+ recovery_target_timeline='latest'
+ ));
+ $node_standby_2->restart;
+diff --git a/src/test/recovery/t/005_replay_delay.pl b/src/test/recovery/t/005_replay_delay.pl
+index 8909c4548bf9..6c85c928c10e 100644
+--- a/src/test/recovery/t/005_replay_delay.pl
++++ b/src/test/recovery/t/005_replay_delay.pl
+@@ -25,7 +25,7 @@
+ $node_standby->init_from_backup($node_master, $backup_name,
+ 	has_streaming => 1);
+ $node_standby->append_conf(
+-	'recovery.conf', qq(
++	'postgresql.conf', qq(
+ recovery_min_apply_delay = '${delay}s'
+ ));
+ $node_standby->start;
+diff --git a/src/test/recovery/t/009_twophase.pl b/src/test/recovery/t/009_twophase.pl
+index 9ea3bd65fc1e..dac2d4ec0d63 100644
+--- a/src/test/recovery/t/009_twophase.pl
++++ b/src/test/recovery/t/009_twophase.pl
+@@ -230,7 +230,7 @@ sub configure_and_reload
+ # restart old master as new standby
+ $cur_standby->enable_streaming($cur_master);
+ $cur_standby->append_conf(
+-	'recovery.conf', qq(
++	'postgresql.conf', qq(
+ recovery_target_timeline='latest'
+ ));
+ $cur_standby->start;
+@@ -268,7 +268,7 @@ sub configure_and_reload
+ # restart old master as new standby
+ $cur_standby->enable_streaming($cur_master);
+ $cur_standby->append_conf(
+-	'recovery.conf', qq(
++	'postgresql.conf', qq(
+ recovery_target_timeline='latest'
+ ));
+ $cur_standby->start;
+@@ -308,7 +308,7 @@ sub configure_and_reload
+ # restart old master as new standby
+ $cur_standby->enable_streaming($cur_master);
+ $cur_standby->append_conf(
+-	'recovery.conf', qq(
++	'postgresql.conf', qq(
+ recovery_target_timeline='latest'
+ ));
+ $cur_standby->start;
+diff --git a/src/test/recovery/t/010_logical_decoding_timelines.pl b/src/test/recovery/t/010_logical_decoding_timelines.pl
+index a76eea86a5a0..4fbd386332ae 100644
+--- a/src/test/recovery/t/010_logical_decoding_timelines.pl
++++ b/src/test/recovery/t/010_logical_decoding_timelines.pl
+@@ -76,7 +76,7 @@
+ 	$node_master, $backup_name,
+ 	has_streaming => 1,
+ 	has_restoring => 1);
+-$node_replica->append_conf('recovery.conf',
++$node_replica->append_conf('postgresql.conf',
+ 	q[primary_slot_name = 'phys_slot']);
+ 
+ $node_replica->start;
+diff --git a/src/test/recovery/t/012_subtransactions.pl b/src/test/recovery/t/012_subtransactions.pl
+index efc23d055988..e26cc9c2ce12 100644
+--- a/src/test/recovery/t/012_subtransactions.pl
++++ b/src/test/recovery/t/012_subtransactions.pl
+@@ -120,7 +120,7 @@
+ ($node_master, $node_standby) = ($node_standby, $node_master);
+ $node_standby->enable_streaming($node_master);
+ $node_standby->append_conf(
+-	'recovery.conf', qq(
++	'postgresql.conf', qq(
+ recovery_target_timeline='latest'
+ ));
+ $node_standby->start;
+@@ -171,7 +171,7 @@
+ ($node_master, $node_standby) = ($node_standby, $node_master);
+ $node_standby->enable_streaming($node_master);
+ $node_standby->append_conf(
+-	'recovery.conf', qq(
++	'postgresql.conf', qq(
+ recovery_target_timeline='latest'
+ ));
+ $node_standby->start;
+@@ -212,7 +212,7 @@
+ ($node_master, $node_standby) = ($node_standby, $node_master);
+ $node_standby->enable_streaming($node_master);
+ $node_standby->append_conf(
+-	'recovery.conf', qq(
++	'postgresql.conf', qq(
+ recovery_target_timeline='latest'
+ ));
+ $node_standby->start;

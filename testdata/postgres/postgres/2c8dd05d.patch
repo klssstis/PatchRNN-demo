@@ -1,0 +1,208 @@
+From 2c8dd05d6cbc86b7ad21cfd7010e041bb4c3950b Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Sun, 17 May 2020 09:22:07 +0900
+Subject: [PATCH] Make pg_stat_wal_receiver consistent with the WAL receiver's
+ shmem info
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+d140f2f3 has renamed receivedUpto to flushedUpto, and has added
+writtenUpto to the WAL receiver's shared memory information, but
+pg_stat_wal_receiver was not consistent with that.  This commit renames
+received_lsn to flushed_lsn, and adds a new column called written_lsn.
+
+Bump catalog version.
+
+Author: Michael Paquier
+Reviewed-by: Álvaro Herrera
+Discussion: https://postgr.es/m/20200515090817.GA212736@paquier.xyz
+---
+ doc/src/sgml/monitoring.sgml          | 12 ++++++-
+ src/backend/catalog/system_views.sql  |  3 +-
+ src/backend/replication/walreceiver.c | 48 +++++++++++++++------------
+ src/include/catalog/catversion.h      |  2 +-
+ src/include/catalog/pg_proc.dat       |  6 ++--
+ src/test/regress/expected/rules.out   |  5 +--
+ 6 files changed, 47 insertions(+), 29 deletions(-)
+
+diff --git a/doc/src/sgml/monitoring.sgml b/doc/src/sgml/monitoring.sgml
+index be31ac48b130..cd526128983e 100644
+--- a/doc/src/sgml/monitoring.sgml
++++ b/doc/src/sgml/monitoring.sgml
+@@ -2541,7 +2541,17 @@ SELECT pid, wait_event_type, wait_event FROM pg_stat_activity WHERE wait_event i
+ 
+      <row>
+       <entry role="catalog_table_entry"><para role="column_definition">
+-       <structfield>received_lsn</structfield> <type>pg_lsn</type>
++       <structfield>written_lsn</structfield> <type>pg_lsn</type>
++      </para>
++      <para>
++       Last write-ahead log location already received and written to disk,
++       but not flushed. This should not be used for data integrity checks.
++      </para></entry>
++     </row>
++
++     <row>
++      <entry role="catalog_table_entry"><para role="column_definition">
++       <structfield>flushed_lsn</structfield> <type>pg_lsn</type>
+       </para>
+       <para>
+        Last write-ahead log location already received and flushed to
+diff --git a/src/backend/catalog/system_views.sql b/src/backend/catalog/system_views.sql
+index 2bd5f5ea14a9..56420bbc9d6f 100644
+--- a/src/backend/catalog/system_views.sql
++++ b/src/backend/catalog/system_views.sql
+@@ -812,7 +812,8 @@ CREATE VIEW pg_stat_wal_receiver AS
+             s.status,
+             s.receive_start_lsn,
+             s.receive_start_tli,
+-            s.received_lsn,
++            s.written_lsn,
++            s.flushed_lsn,
+             s.received_tli,
+             s.last_msg_send_time,
+             s.last_msg_receipt_time,
+diff --git a/src/backend/replication/walreceiver.c b/src/backend/replication/walreceiver.c
+index d69fb90132d1..d1ad75da87ae 100644
+--- a/src/backend/replication/walreceiver.c
++++ b/src/backend/replication/walreceiver.c
+@@ -1348,7 +1348,8 @@ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
+ 	WalRcvState state;
+ 	XLogRecPtr	receive_start_lsn;
+ 	TimeLineID	receive_start_tli;
+-	XLogRecPtr	received_lsn;
++	XLogRecPtr	written_lsn;
++	XLogRecPtr	flushed_lsn;
+ 	TimeLineID	received_tli;
+ 	TimestampTz last_send_time;
+ 	TimestampTz last_receipt_time;
+@@ -1366,7 +1367,8 @@ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
+ 	state = WalRcv->walRcvState;
+ 	receive_start_lsn = WalRcv->receiveStart;
+ 	receive_start_tli = WalRcv->receiveStartTLI;
+-	received_lsn = WalRcv->flushedUpto;
++	written_lsn = pg_atomic_read_u64(&WalRcv->writtenUpto);
++	flushed_lsn = WalRcv->flushedUpto;
+ 	received_tli = WalRcv->receivedTLI;
+ 	last_send_time = WalRcv->lastMsgSendTime;
+ 	last_receipt_time = WalRcv->lastMsgReceiptTime;
+@@ -1413,43 +1415,47 @@ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
+ 		else
+ 			values[2] = LSNGetDatum(receive_start_lsn);
+ 		values[3] = Int32GetDatum(receive_start_tli);
+-		if (XLogRecPtrIsInvalid(received_lsn))
++		if (XLogRecPtrIsInvalid(written_lsn))
+ 			nulls[4] = true;
+ 		else
+-			values[4] = LSNGetDatum(received_lsn);
+-		values[5] = Int32GetDatum(received_tli);
++			values[4] = LSNGetDatum(written_lsn);
++		if (XLogRecPtrIsInvalid(flushed_lsn))
++			nulls[5] = true;
++		else
++			values[5] = LSNGetDatum(flushed_lsn);
++		values[6] = Int32GetDatum(received_tli);
+ 		if (last_send_time == 0)
+-			nulls[6] = true;
++			nulls[7] = true;
+ 		else
+-			values[6] = TimestampTzGetDatum(last_send_time);
++			values[7] = TimestampTzGetDatum(last_send_time);
+ 		if (last_receipt_time == 0)
+-			nulls[7] = true;
++			nulls[8] = true;
+ 		else
+-			values[7] = TimestampTzGetDatum(last_receipt_time);
++			values[8] = TimestampTzGetDatum(last_receipt_time);
+ 		if (XLogRecPtrIsInvalid(latest_end_lsn))
+-			nulls[8] = true;
++			nulls[9] = true;
+ 		else
+-			values[8] = LSNGetDatum(latest_end_lsn);
++			values[9] = LSNGetDatum(latest_end_lsn);
+ 		if (latest_end_time == 0)
+-			nulls[9] = true;
++			nulls[10] = true;
+ 		else
+-			values[9] = TimestampTzGetDatum(latest_end_time);
++			values[10] = TimestampTzGetDatum(latest_end_time);
+ 		if (*slotname == '\0')
+-			nulls[10] = true;
++			nulls[11] = true;
+ 		else
+-			values[10] = CStringGetTextDatum(slotname);
++			values[11] = CStringGetTextDatum(slotname);
+ 		if (*sender_host == '\0')
+-			nulls[11] = true;
++			nulls[12] = true;
+ 		else
+-			values[11] = CStringGetTextDatum(sender_host);
++			values[12] = CStringGetTextDatum(sender_host);
+ 		if (sender_port == 0)
+-			nulls[12] = true;
++			nulls[13] = true;
+ 		else
+-			values[12] = Int32GetDatum(sender_port);
++			values[13] = Int32GetDatum(sender_port);
+ 		if (*conninfo == '\0')
+-			nulls[13] = true;
++			nulls[14] = true;
+ 		else
+-			values[13] = CStringGetTextDatum(conninfo);
++			values[14] = CStringGetTextDatum(conninfo);
+ 	}
+ 
+ 	/* Returns the record as Datum */
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 5a771e75912a..62815342abb1 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -53,6 +53,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202005121
++#define CATALOG_VERSION_NO	202005171
+ 
+ #endif
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index 9edae40ed895..61f2c2f5b490 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -5244,9 +5244,9 @@
+ { oid => '3317', descr => 'statistics: information about WAL receiver',
+   proname => 'pg_stat_get_wal_receiver', proisstrict => 'f', provolatile => 's',
+   proparallel => 'r', prorettype => 'record', proargtypes => '',
+-  proallargtypes => '{int4,text,pg_lsn,int4,pg_lsn,int4,timestamptz,timestamptz,pg_lsn,timestamptz,text,text,int4,text}',
+-  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+-  proargnames => '{pid,status,receive_start_lsn,receive_start_tli,received_lsn,received_tli,last_msg_send_time,last_msg_receipt_time,latest_end_lsn,latest_end_time,slot_name,sender_host,sender_port,conninfo}',
++  proallargtypes => '{int4,text,pg_lsn,int4,pg_lsn,pg_lsn,int4,timestamptz,timestamptz,pg_lsn,timestamptz,text,text,int4,text}',
++  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
++  proargnames => '{pid,status,receive_start_lsn,receive_start_tli,written_lsn,flushed_lsn,received_tli,last_msg_send_time,last_msg_receipt_time,latest_end_lsn,latest_end_time,slot_name,sender_host,sender_port,conninfo}',
+   prosrc => 'pg_stat_get_wal_receiver' },
+ { oid => '6118', descr => 'statistics: information about subscription',
+   proname => 'pg_stat_get_subscription', proisstrict => 'f', provolatile => 's',
+diff --git a/src/test/regress/expected/rules.out b/src/test/regress/expected/rules.out
+index 8876025aaa7c..b813e322153d 100644
+--- a/src/test/regress/expected/rules.out
++++ b/src/test/regress/expected/rules.out
+@@ -2124,7 +2124,8 @@ pg_stat_wal_receiver| SELECT s.pid,
+     s.status,
+     s.receive_start_lsn,
+     s.receive_start_tli,
+-    s.received_lsn,
++    s.written_lsn,
++    s.flushed_lsn,
+     s.received_tli,
+     s.last_msg_send_time,
+     s.last_msg_receipt_time,
+@@ -2134,7 +2135,7 @@ pg_stat_wal_receiver| SELECT s.pid,
+     s.sender_host,
+     s.sender_port,
+     s.conninfo
+-   FROM pg_stat_get_wal_receiver() s(pid, status, receive_start_lsn, receive_start_tli, received_lsn, received_tli, last_msg_send_time, last_msg_receipt_time, latest_end_lsn, latest_end_time, slot_name, sender_host, sender_port, conninfo)
++   FROM pg_stat_get_wal_receiver() s(pid, status, receive_start_lsn, receive_start_tli, written_lsn, flushed_lsn, received_tli, last_msg_send_time, last_msg_receipt_time, latest_end_lsn, latest_end_time, slot_name, sender_host, sender_port, conninfo)
+   WHERE (s.pid IS NOT NULL);
+ pg_stat_xact_all_tables| SELECT c.oid AS relid,
+     n.nspname AS schemaname,

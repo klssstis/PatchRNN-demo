@@ -1,0 +1,105 @@
+From 2b2bacdca0100f50ba4f79cda53514b6e5114e8f Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 25 Oct 2019 11:15:50 -0400
+Subject: [PATCH] Reset statement_timeout between queries of a multi-query
+ string.
+
+Historically, we started the timer (if StatementTimeout > 0) at the
+beginning of a simple-Query message and usually let it run until the
+end, so that the timeout limit applied to the entire query string,
+and intra-string changes of the statement_timeout GUC had no effect.
+But, confusingly, a COMMIT within the string would reset the state
+and allow a fresh timeout cycle to start with the current setting.
+
+Commit f8e5f156b changed the behavior of statement_timeout for extended
+query protocol, and as an apparently-unintended side effect, a change in
+the statement_timeout GUC during a multi-statement simple-Query message
+might have an effect immediately --- but only if it was going from
+"disabled" to "enabled".
+
+This is all pretty confusing, not to mention completely undocumented.
+Let's change things so that the timeout is always reset between queries
+of a multi-query string, whether they're transaction control commands
+or not.  Thus the active timeout setting is applied to each query in
+the string, separately.  This costs a few more cycles if statement_timeout
+is active, but it provides much more intuitive behavior, especially if one
+changes statement_timeout in one of the queries of the string.
+
+Also, add something to the documentation to explain all this.
+
+Per bug #16035 from Raj Mohite.  Although this is a bug fix, I'm hesitant
+to back-patch it; conceivably somebody has worked out the old behavior
+and is depending on it.  (But note that this change should make the
+behavior less restrictive in most cases, since the timeout will now
+be applied to shorter segments of code.)
+
+Discussion: https://postgr.es/m/16035-456e6e69ebfd4374@postgresql.org
+---
+ doc/src/sgml/config.sgml    | 23 ++++++++++++++++++-----
+ src/backend/tcop/postgres.c | 12 +++++++++++-
+ 2 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index 886632ff439e..c1da75fbab4b 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -7592,11 +7592,24 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
+       </term>
+       <listitem>
+        <para>
+-        Abort any statement that takes more than the specified duration
+-        (defaults to milliseconds), starting from the time the command arrives at the server
+-        from the client.  If <varname>log_min_error_statement</varname> is set to
+-        <literal>ERROR</literal> or lower, the statement that timed out will also be
+-        logged.  A value of zero (the default) turns this off.
++        Abort any statement that takes more than the specified duration.
++        If <varname>log_min_error_statement</varname> is set
++        to <literal>ERROR</literal> or lower, the statement that timed out
++        will also be logged.
++        If the value is specified without units, it is taken as milliseconds.
++        A value of zero (the default) disables the timeout.
++       </para>
++
++       <para>
++        The timeout is measured from the time a command arrives at the
++        server until it is completed by the server.  If multiple SQL
++        statements appear in a single simple-Query message, the timeout
++        is applied to each statement separately.
++        (<productname>PostgreSQL</productname> versions before 13 usually
++        treated the timeout as applying to the whole query string.)
++        In extended query protocol, the timeout starts running when any
++        query-related message (Parse, Bind, Execute, Describe) arrives, and
++        it is cancelled by completion of an Execute or Sync message.
+        </para>
+ 
+        <para>
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index e8d8e6f82851..1ecaba0d5749 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -1270,6 +1270,13 @@ exec_simple_query(const char *query_string)
+ 			 * those that start or end a transaction block.
+ 			 */
+ 			CommandCounterIncrement();
++
++			/*
++			 * Disable statement timeout between queries of a multi-query
++			 * string, so that the timeout applies separately to each query.
++			 * (Our next loop iteration will start a fresh timeout.)
++			 */
++			disable_statement_timeout();
+ 		}
+ 
+ 		/*
+@@ -2135,7 +2142,10 @@ exec_execute_message(const char *portal_name, long max_rows)
+ 			 */
+ 			CommandCounterIncrement();
+ 
+-			/* full command has been executed, reset timeout */
++			/*
++			 * Disable statement timeout whenever we complete an Execute
++			 * message.  The next protocol message will start a fresh timeout.
++			 */
+ 			disable_statement_timeout();
+ 		}
+ 
