@@ -1,0 +1,217 @@
+From 79b2e52615faa768d8436c1795e445541460e9d2 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Thu, 19 Apr 2018 16:46:53 -0300
+Subject: [PATCH] Remove quick path in ExecInitPartitionInfo for equal tupdescs
+
+I added this "optimization" on top of Amit Langote's 158b7bc6d779, but
+the quick path is never taken because the partition uses a different
+pg_type oid than its parent table (causing equalTupleDescs to return
+false).  Changing that requires more analysis and is too considered
+dangerous at this point in the cycle, so revert it.
+
+We might make it work someday, but not for pg11.
+
+Discussion: https://postgr.es/m/825031be-942c-8c24-6163-13c27f217a3d@lab.ntt.co.jp
+---
+ src/backend/executor/execPartition.c | 153 ++++++++++++---------------
+ 1 file changed, 68 insertions(+), 85 deletions(-)
+
+diff --git a/src/backend/executor/execPartition.c b/src/backend/executor/execPartition.c
+index 23a74bc3d98c..a2f6b29cd5de 100644
+--- a/src/backend/executor/execPartition.c
++++ b/src/backend/executor/execPartition.c
+@@ -313,7 +313,6 @@ ExecInitPartitionInfo(ModifyTableState *mtstate,
+ 	MemoryContext oldContext;
+ 	AttrNumber *part_attnos = NULL;
+ 	bool		found_whole_row;
+-	bool		equalTupdescs;
+ 
+ 	/*
+ 	 * We locked all the partitions in ExecSetupPartitionTupleRouting
+@@ -361,10 +360,6 @@ ExecInitPartitionInfo(ModifyTableState *mtstate,
+ 						(node != NULL &&
+ 						 node->onConflictAction != ONCONFLICT_NONE));
+ 
+-	/* if tuple descs are identical, we don't need to map the attrs */
+-	equalTupdescs = equalTupleDescs(RelationGetDescr(partrel),
+-									RelationGetDescr(firstResultRel));
+-
+ 	/*
+ 	 * Build WITH CHECK OPTION constraints for the partition.  Note that we
+ 	 * didn't build the withCheckOptionList for partitions within the planner,
+@@ -405,21 +400,18 @@ ExecInitPartitionInfo(ModifyTableState *mtstate,
+ 		/*
+ 		 * Convert Vars in it to contain this partition's attribute numbers.
+ 		 */
+-		if (!equalTupdescs)
+-		{
+-			part_attnos =
+-				convert_tuples_by_name_map(RelationGetDescr(partrel),
+-										   RelationGetDescr(firstResultRel),
+-										   gettext_noop("could not convert row type"));
+-			wcoList = (List *)
+-				map_variable_attnos((Node *) wcoList,
+-									firstVarno, 0,
+-									part_attnos,
+-									RelationGetDescr(firstResultRel)->natts,
+-									RelationGetForm(partrel)->reltype,
+-									&found_whole_row);
+-			/* We ignore the value of found_whole_row. */
+-		}
++		part_attnos =
++			convert_tuples_by_name_map(RelationGetDescr(partrel),
++									   RelationGetDescr(firstResultRel),
++									   gettext_noop("could not convert row type"));
++		wcoList = (List *)
++			map_variable_attnos((Node *) wcoList,
++								firstVarno, 0,
++								part_attnos,
++								RelationGetDescr(firstResultRel)->natts,
++								RelationGetForm(partrel)->reltype,
++								&found_whole_row);
++		/* We ignore the value of found_whole_row. */
+ 
+ 		foreach(ll, wcoList)
+ 		{
+@@ -464,25 +456,22 @@ ExecInitPartitionInfo(ModifyTableState *mtstate,
+ 		 */
+ 		returningList = linitial(node->returningLists);
+ 
+-		if (!equalTupdescs)
+-		{
+-			/*
+-			 * Convert Vars in it to contain this partition's attribute numbers.
+-			 */
+-			if (part_attnos == NULL)
+-				part_attnos =
+-					convert_tuples_by_name_map(RelationGetDescr(partrel),
+-											   RelationGetDescr(firstResultRel),
+-											   gettext_noop("could not convert row type"));
+-			returningList = (List *)
+-				map_variable_attnos((Node *) returningList,
+-									firstVarno, 0,
+-									part_attnos,
+-									RelationGetDescr(firstResultRel)->natts,
+-									RelationGetForm(partrel)->reltype,
+-									&found_whole_row);
+-			/* We ignore the value of found_whole_row. */
+-		}
++		/*
++		 * Convert Vars in it to contain this partition's attribute numbers.
++		 */
++		if (part_attnos == NULL)
++			part_attnos =
++				convert_tuples_by_name_map(RelationGetDescr(partrel),
++										   RelationGetDescr(firstResultRel),
++										   gettext_noop("could not convert row type"));
++		returningList = (List *)
++			map_variable_attnos((Node *) returningList,
++								firstVarno, 0,
++								part_attnos,
++								RelationGetDescr(firstResultRel)->natts,
++								RelationGetForm(partrel)->reltype,
++								&found_whole_row);
++		/* We ignore the value of found_whole_row. */
+ 
+ 		leaf_part_rri->ri_returningList = returningList;
+ 
+@@ -583,33 +572,30 @@ ExecInitPartitionInfo(ModifyTableState *mtstate,
+ 				 * target relation (firstVarno).
+ 				 */
+ 				onconflset = (List *) copyObject((Node *) node->onConflictSet);
+-				if (!equalTupdescs)
+-				{
+-					if (part_attnos == NULL)
+-						part_attnos =
+-							convert_tuples_by_name_map(RelationGetDescr(partrel),
+-													   RelationGetDescr(firstResultRel),
+-													   gettext_noop("could not convert row type"));
+-					onconflset = (List *)
+-						map_variable_attnos((Node *) onconflset,
+-											INNER_VAR, 0,
+-											part_attnos,
+-											RelationGetDescr(firstResultRel)->natts,
+-											RelationGetForm(partrel)->reltype,
+-											&found_whole_row);
+-					/* We ignore the value of found_whole_row. */
+-					onconflset = (List *)
+-						map_variable_attnos((Node *) onconflset,
+-											firstVarno, 0,
+-											part_attnos,
+-											RelationGetDescr(firstResultRel)->natts,
+-											RelationGetForm(partrel)->reltype,
+-											&found_whole_row);
+-					/* We ignore the value of found_whole_row. */
+-
+-					/* Finally, adjust this tlist to match the partition. */
+-					onconflset = adjust_partition_tlist(onconflset, map);
+-				}
++				if (part_attnos == NULL)
++					part_attnos =
++						convert_tuples_by_name_map(RelationGetDescr(partrel),
++												   RelationGetDescr(firstResultRel),
++												   gettext_noop("could not convert row type"));
++				onconflset = (List *)
++					map_variable_attnos((Node *) onconflset,
++										INNER_VAR, 0,
++										part_attnos,
++										RelationGetDescr(firstResultRel)->natts,
++										RelationGetForm(partrel)->reltype,
++										&found_whole_row);
++				/* We ignore the value of found_whole_row. */
++				onconflset = (List *)
++					map_variable_attnos((Node *) onconflset,
++										firstVarno, 0,
++										part_attnos,
++										RelationGetDescr(firstResultRel)->natts,
++										RelationGetForm(partrel)->reltype,
++										&found_whole_row);
++				/* We ignore the value of found_whole_row. */
++
++				/* Finally, adjust this tlist to match the partition. */
++				onconflset = adjust_partition_tlist(onconflset, map);
+ 
+ 				/*
+ 				 * Build UPDATE SET's projection info.  The user of this
+@@ -637,25 +623,22 @@ ExecInitPartitionInfo(ModifyTableState *mtstate,
+ 					List	   *clause;
+ 
+ 					clause = copyObject((List *) node->onConflictWhere);
+-					if (!equalTupdescs)
+-					{
+-						clause = (List *)
+-							map_variable_attnos((Node *) clause,
+-												INNER_VAR, 0,
+-												part_attnos,
+-												RelationGetDescr(firstResultRel)->natts,
+-												RelationGetForm(partrel)->reltype,
+-												&found_whole_row);
+-						/* We ignore the value of found_whole_row. */
+-						clause = (List *)
+-							map_variable_attnos((Node *) clause,
+-												firstVarno, 0,
+-												part_attnos,
+-												RelationGetDescr(firstResultRel)->natts,
+-												RelationGetForm(partrel)->reltype,
+-												&found_whole_row);
+-						/* We ignore the value of found_whole_row. */
+-					}
++					clause = (List *)
++						map_variable_attnos((Node *) clause,
++											INNER_VAR, 0,
++											part_attnos,
++											RelationGetDescr(firstResultRel)->natts,
++											RelationGetForm(partrel)->reltype,
++											&found_whole_row);
++					/* We ignore the value of found_whole_row. */
++					clause = (List *)
++						map_variable_attnos((Node *) clause,
++											firstVarno, 0,
++											part_attnos,
++											RelationGetDescr(firstResultRel)->natts,
++											RelationGetForm(partrel)->reltype,
++											&found_whole_row);
++					/* We ignore the value of found_whole_row. */
+ 					leaf_part_rri->ri_onConflict->oc_WhereClause =
+ 						ExecInitQual((List *) clause, &mtstate->ps);
+ 				}

@@ -1,0 +1,163 @@
+From 79b58c6f684315d39dfdbd721da7576d90bd9f99 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 12 May 2022 11:31:46 -0400
+Subject: [PATCH] Make pull_var_clause() handle GroupingFuncs exactly like
+ Aggrefs.
+
+This follows in the footsteps of commit 2591ee8ec by removing one more
+ill-advised shortcut from planning of GroupingFuncs.  It's true that
+we don't intend to execute the argument expression(s) at runtime, but
+we still have to process any Vars appearing within them, or we risk
+failure at setrefs.c time (or more fundamentally, in EXPLAIN trying
+to print such an expression).  Vars in upper plan nodes have to have
+referents in the next plan level, whether we ever execute 'em or not.
+
+Per bug #17479 from Michael J. Sullivan.  Back-patch to all supported
+branches.
+
+Richard Guo
+
+Discussion: https://postgr.es/m/17479-6260deceaf0ad304@postgresql.org
+---
+ src/backend/optimizer/util/var.c           | 10 +---
+ src/test/regress/expected/groupingsets.out | 64 ++++++++++++++++++++++
+ src/test/regress/sql/groupingsets.sql      | 23 ++++++++
+ 3 files changed, 89 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/optimizer/util/var.c b/src/backend/optimizer/util/var.c
+index 6d11d187a0c4..ebc6ce84b0bd 100644
+--- a/src/backend/optimizer/util/var.c
++++ b/src/backend/optimizer/util/var.c
+@@ -586,7 +586,7 @@ locate_var_of_level_walker(Node *node,
+  *	  Vars within a PHV's expression are included in the result only
+  *	  when PVC_RECURSE_PLACEHOLDERS is specified.
+  *
+- *	  GroupingFuncs are treated mostly like Aggrefs, and so do not need
++ *	  GroupingFuncs are treated exactly like Aggrefs, and so do not need
+  *	  their own flag bits.
+  *
+  *	  CurrentOfExpr nodes are ignored in all cases.
+@@ -661,13 +661,7 @@ pull_var_clause_walker(Node *node, pull_var_clause_context *context)
+ 		}
+ 		else if (context->flags & PVC_RECURSE_AGGREGATES)
+ 		{
+-			/*
+-			 * We do NOT descend into the contained expression, even if the
+-			 * caller asked for it, because we never actually evaluate it -
+-			 * the result is driven entirely off the associated GROUP BY
+-			 * clause, so we never need to extract the actual Vars here.
+-			 */
+-			return false;
++			/* fall through to recurse into the GroupingFunc's arguments */
+ 		}
+ 		else
+ 			elog(ERROR, "GROUPING found where not expected");
+diff --git a/src/test/regress/expected/groupingsets.out b/src/test/regress/expected/groupingsets.out
+index 6a56f0b09c42..fcad5c4093bc 100644
+--- a/src/test/regress/expected/groupingsets.out
++++ b/src/test/regress/expected/groupingsets.out
+@@ -466,6 +466,70 @@ where x = 1 and q1 = 123;
+ ---+----+-----
+ (0 rows)
+ 
++-- check handling of pulled-up SubPlan in GROUPING() argument (bug #17479)
++explain (verbose, costs off)
++select grouping(ss.x)
++from int8_tbl i1
++cross join lateral (select (select i1.q1) as x) ss
++group by ss.x;
++                   QUERY PLAN                   
++------------------------------------------------
++ GroupAggregate
++   Output: GROUPING((SubPlan 1)), ((SubPlan 2))
++   Group Key: ((SubPlan 2))
++   ->  Sort
++         Output: ((SubPlan 2)), i1.q1
++         Sort Key: ((SubPlan 2))
++         ->  Seq Scan on public.int8_tbl i1
++               Output: (SubPlan 2), i1.q1
++               SubPlan 2
++                 ->  Result
++                       Output: i1.q1
++(11 rows)
++
++select grouping(ss.x)
++from int8_tbl i1
++cross join lateral (select (select i1.q1) as x) ss
++group by ss.x;
++ grouping 
++----------
++        0
++        0
++(2 rows)
++
++explain (verbose, costs off)
++select (select grouping(ss.x))
++from int8_tbl i1
++cross join lateral (select (select i1.q1) as x) ss
++group by ss.x;
++                 QUERY PLAN                 
++--------------------------------------------
++ GroupAggregate
++   Output: (SubPlan 2), ((SubPlan 3))
++   Group Key: ((SubPlan 3))
++   ->  Sort
++         Output: ((SubPlan 3)), i1.q1
++         Sort Key: ((SubPlan 3))
++         ->  Seq Scan on public.int8_tbl i1
++               Output: (SubPlan 3), i1.q1
++               SubPlan 3
++                 ->  Result
++                       Output: i1.q1
++   SubPlan 2
++     ->  Result
++           Output: GROUPING((SubPlan 1))
++(14 rows)
++
++select (select grouping(ss.x))
++from int8_tbl i1
++cross join lateral (select (select i1.q1) as x) ss
++group by ss.x;
++ grouping 
++----------
++        0
++        0
++(2 rows)
++
+ -- simple rescan tests
+ select a, b, sum(v.x)
+   from (values (1),(2)) v(x), gstest_data(v.x)
+diff --git a/src/test/regress/sql/groupingsets.sql b/src/test/regress/sql/groupingsets.sql
+index 8050dbf2609f..90ba27257a9e 100644
+--- a/src/test/regress/sql/groupingsets.sql
++++ b/src/test/regress/sql/groupingsets.sql
+@@ -188,6 +188,29 @@ select * from (
+ ) ss
+ where x = 1 and q1 = 123;
+ 
++-- check handling of pulled-up SubPlan in GROUPING() argument (bug #17479)
++explain (verbose, costs off)
++select grouping(ss.x)
++from int8_tbl i1
++cross join lateral (select (select i1.q1) as x) ss
++group by ss.x;
++
++select grouping(ss.x)
++from int8_tbl i1
++cross join lateral (select (select i1.q1) as x) ss
++group by ss.x;
++
++explain (verbose, costs off)
++select (select grouping(ss.x))
++from int8_tbl i1
++cross join lateral (select (select i1.q1) as x) ss
++group by ss.x;
++
++select (select grouping(ss.x))
++from int8_tbl i1
++cross join lateral (select (select i1.q1) as x) ss
++group by ss.x;
++
+ -- simple rescan tests
+ 
+ select a, b, sum(v.x)

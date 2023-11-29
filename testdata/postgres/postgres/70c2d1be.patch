@@ -1,0 +1,150 @@
+From 70c2d1be2b1e1efa8ef38a92b443fa290a9558dd Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Wed, 11 Oct 2017 16:01:52 -0700
+Subject: [PATCH] Allow to avoid NUL-byte management for stringinfos and use in
+ format.c.
+
+In a lot of the places having appendBinaryStringInfo() maintain a
+trailing NUL byte wasn't actually meaningful, e.g. when appending an
+integer which can contain 0 in one of its bytes.
+
+Removing this yields some small speedup, but more importantly will be
+more consistent when providing faster variants of pq_sendint etc.
+
+Author: Andres Freund
+Discussion: https://postgr.es/m/20170914063418.sckdzgjfrsbekae4@alap3.anarazel.de
+---
+ src/backend/lib/stringinfo.c | 21 ++++++++++++++++++++-
+ src/backend/libpq/pqformat.c | 18 +++++++++---------
+ src/include/lib/stringinfo.h |  8 ++++++++
+ 3 files changed, 37 insertions(+), 10 deletions(-)
+
+diff --git a/src/backend/lib/stringinfo.c b/src/backend/lib/stringinfo.c
+index fd155671443b..cb2026c3b20c 100644
+--- a/src/backend/lib/stringinfo.c
++++ b/src/backend/lib/stringinfo.c
+@@ -202,7 +202,7 @@ appendStringInfoSpaces(StringInfo str, int count)
+  * appendBinaryStringInfo
+  *
+  * Append arbitrary binary data to a StringInfo, allocating more space
+- * if necessary.
++ * if necessary. Ensures that a trailing null byte is present.
+  */
+ void
+ appendBinaryStringInfo(StringInfo str, const char *data, int datalen)
+@@ -224,6 +224,25 @@ appendBinaryStringInfo(StringInfo str, const char *data, int datalen)
+ 	str->data[str->len] = '\0';
+ }
+ 
++/*
++ * appendBinaryStringInfoNT
++ *
++ * Append arbitrary binary data to a StringInfo, allocating more space
++ * if necessary. Does not ensure a trailing null-byte exists.
++ */
++void
++appendBinaryStringInfoNT(StringInfo str, const char *data, int datalen)
++{
++	Assert(str != NULL);
++
++	/* Make more room if needed */
++	enlargeStringInfo(str, datalen);
++
++	/* OK, append the data */
++	memcpy(str->data + str->len, data, datalen);
++	str->len += datalen;
++}
++
+ /*
+  * enlargeStringInfo
+  *
+diff --git a/src/backend/libpq/pqformat.c b/src/backend/libpq/pqformat.c
+index f27a04f8344e..2414d0d8e9ae 100644
+--- a/src/backend/libpq/pqformat.c
++++ b/src/backend/libpq/pqformat.c
+@@ -138,13 +138,13 @@ pq_sendcountedtext(StringInfo buf, const char *str, int slen,
+ 	{
+ 		slen = strlen(p);
+ 		pq_sendint(buf, slen + extra, 4);
+-		appendBinaryStringInfo(buf, p, slen);
++		appendBinaryStringInfoNT(buf, p, slen);
+ 		pfree(p);
+ 	}
+ 	else
+ 	{
+ 		pq_sendint(buf, slen + extra, 4);
+-		appendBinaryStringInfo(buf, str, slen);
++		appendBinaryStringInfoNT(buf, str, slen);
+ 	}
+ }
+ 
+@@ -191,11 +191,11 @@ pq_sendstring(StringInfo buf, const char *str)
+ 	if (p != str)				/* actual conversion has been done? */
+ 	{
+ 		slen = strlen(p);
+-		appendBinaryStringInfo(buf, p, slen + 1);
++		appendBinaryStringInfoNT(buf, p, slen + 1);
+ 		pfree(p);
+ 	}
+ 	else
+-		appendBinaryStringInfo(buf, str, slen + 1);
++		appendBinaryStringInfoNT(buf, str, slen + 1);
+ }
+ 
+ /* --------------------------------
+@@ -242,15 +242,15 @@ pq_sendint(StringInfo buf, int i, int b)
+ 	{
+ 		case 1:
+ 			n8 = (unsigned char) i;
+-			appendBinaryStringInfo(buf, (char *) &n8, 1);
++			appendBinaryStringInfoNT(buf, (char *) &n8, 1);
+ 			break;
+ 		case 2:
+ 			n16 = pg_hton16((uint16) i);
+-			appendBinaryStringInfo(buf, (char *) &n16, 2);
++			appendBinaryStringInfoNT(buf, (char *) &n16, 2);
+ 			break;
+ 		case 4:
+ 			n32 = pg_hton32((uint32) i);
+-			appendBinaryStringInfo(buf, (char *) &n32, 4);
++			appendBinaryStringInfoNT(buf, (char *) &n32, 4);
+ 			break;
+ 		default:
+ 			elog(ERROR, "unsupported integer size %d", b);
+@@ -271,7 +271,7 @@ pq_sendint64(StringInfo buf, int64 i)
+ {
+ 	uint64		n64 = pg_hton64(i);
+ 
+-	appendBinaryStringInfo(buf, (char *) &n64, sizeof(n64));
++	appendBinaryStringInfoNT(buf, (char *) &n64, sizeof(n64));
+ }
+ 
+ /* --------------------------------
+@@ -297,7 +297,7 @@ pq_sendfloat4(StringInfo buf, float4 f)
+ 	swap.f = f;
+ 	swap.i = pg_hton32(swap.i);
+ 
+-	appendBinaryStringInfo(buf, (char *) &swap.i, 4);
++	appendBinaryStringInfoNT(buf, (char *) &swap.i, 4);
+ }
+ 
+ /* --------------------------------
+diff --git a/src/include/lib/stringinfo.h b/src/include/lib/stringinfo.h
+index 9694ea3f2194..01b845db44bd 100644
+--- a/src/include/lib/stringinfo.h
++++ b/src/include/lib/stringinfo.h
+@@ -143,6 +143,14 @@ extern void appendStringInfoSpaces(StringInfo str, int count);
+ extern void appendBinaryStringInfo(StringInfo str,
+ 					   const char *data, int datalen);
+ 
++/*------------------------
++ * appendBinaryStringInfoNT
++ * Append arbitrary binary data to a StringInfo, allocating more space
++ * if necessary. Does not ensure a trailing null-byte exists.
++ */
++extern void appendBinaryStringInfoNT(StringInfo str,
++					   const char *data, int datalen);
++
+ /*------------------------
+  * enlargeStringInfo
+  * Make sure a StringInfo's buffer can hold at least 'needed' more bytes.

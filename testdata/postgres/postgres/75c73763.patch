@@ -1,0 +1,170 @@
+From 75c737636b8a1e9a110e580f1caee181023447e2 Mon Sep 17 00:00:00 2001
+From: Dean Rasheed <dean.a.rasheed@gmail.com>
+Date: Thu, 23 Feb 2023 10:53:01 +0000
+Subject: [PATCH] Fix multi-row DEFAULT handling for INSERT ... SELECT rules.
+
+Given an updatable view with a DO ALSO INSERT ... SELECT rule, a
+multi-row INSERT ... VALUES query on the view fails if the VALUES list
+contains any DEFAULTs that are not replaced by view defaults. This
+manifests as an "unrecognized node type" error, or an Assert failure,
+in an assert-enabled build.
+
+The reason is that when RewriteQuery() attempts to replace the
+remaining DEFAULT items with NULLs in any product queries, using
+rewriteValuesRTEToNulls(), it assumes that the VALUES RTE is located
+at the same rangetable index in each product query. However, if the
+product query is an INSERT ... SELECT, then the VALUES RTE is actually
+in the SELECT part of that query (at the same index), rather than the
+top-level product query itself.
+
+Fix, by descending to the SELECT in such cases. Note that we can't
+simply use getInsertSelectQuery() for this, since that expects to be
+given a raw rule action with OLD and NEW placeholder entries, so we
+duplicate its logic instead.
+
+While at it, beef up the checks in getInsertSelectQuery() by checking
+that the jointree->fromlist node is indeed a RangeTblRef, and that the
+RTE it points to has rtekind == RTE_SUBQUERY.
+
+Per bug #17803, from Alexander Lakhin. Back-patch to all supported
+branches.
+
+Dean Rasheed, reviewed by Tom Lane.
+
+Discussion: https://postgr.es/m/17803-53c63ed4ecb4eac6%40postgresql.org
+---
+ src/backend/rewrite/rewriteHandler.c          | 32 +++++++++++++++++--
+ src/backend/rewrite/rewriteManip.c            | 11 ++++---
+ src/test/regress/expected/updatable_views.out | 19 +++++++++++
+ src/test/regress/sql/updatable_views.sql      | 10 ++++++
+ 4 files changed, 65 insertions(+), 7 deletions(-)
+
+diff --git a/src/backend/rewrite/rewriteHandler.c b/src/backend/rewrite/rewriteHandler.c
+index c74bac20b133..b6452e9b36cc 100644
+--- a/src/backend/rewrite/rewriteHandler.c
++++ b/src/backend/rewrite/rewriteHandler.c
+@@ -1604,7 +1604,6 @@ rewriteValuesRTEToNulls(Query *parsetree, RangeTblEntry *rte)
+ 	List	   *newValues;
+ 	ListCell   *lc;
+ 
+-	Assert(rte->rtekind == RTE_VALUES);
+ 	newValues = NIL;
+ 	foreach(lc, rte->values_lists)
+ 	{
+@@ -3861,12 +3860,39 @@ RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length)
+ 			/*
+ 			 * Each product query has its own copy of the VALUES RTE at the
+ 			 * same index in the rangetable, so we must finalize each one.
++			 *
++			 * Note that if the product query is an INSERT ... SELECT, then
++			 * the VALUES RTE will be at the same index in the SELECT part of
++			 * the product query rather than the top-level product query
++			 * itself.
+ 			 */
+ 			foreach(n, product_queries)
+ 			{
+ 				Query	   *pt = (Query *) lfirst(n);
+-				RangeTblEntry *values_rte = rt_fetch(values_rte_index,
+-													 pt->rtable);
++				RangeTblEntry *values_rte;
++
++				if (pt->commandType == CMD_INSERT &&
++					pt->jointree && IsA(pt->jointree, FromExpr) &&
++					list_length(pt->jointree->fromlist) == 1)
++				{
++					Node	   *jtnode = (Node *) linitial(pt->jointree->fromlist);
++
++					if (IsA(jtnode, RangeTblRef))
++					{
++						int			rtindex = ((RangeTblRef *) jtnode)->rtindex;
++						RangeTblEntry *src_rte = rt_fetch(rtindex, pt->rtable);
++
++						if (src_rte->rtekind == RTE_SUBQUERY &&
++							src_rte->subquery &&
++							IsA(src_rte->subquery, Query) &&
++							src_rte->subquery->commandType == CMD_SELECT)
++							pt = src_rte->subquery;
++					}
++				}
++
++				values_rte = rt_fetch(values_rte_index, pt->rtable);
++				if (values_rte->rtekind != RTE_VALUES)
++					elog(ERROR, "failed to find VALUES RTE in product query");
+ 
+ 				rewriteValuesRTEToNulls(pt, values_rte);
+ 			}
+diff --git a/src/backend/rewrite/rewriteManip.c b/src/backend/rewrite/rewriteManip.c
+index 6f51c7ee7543..04718f66c0bc 100644
+--- a/src/backend/rewrite/rewriteManip.c
++++ b/src/backend/rewrite/rewriteManip.c
+@@ -1012,12 +1012,15 @@ getInsertSelectQuery(Query *parsetree, Query ***subquery_ptr)
+ 	if (list_length(parsetree->jointree->fromlist) != 1)
+ 		elog(ERROR, "expected to find SELECT subquery");
+ 	rtr = (RangeTblRef *) linitial(parsetree->jointree->fromlist);
+-	Assert(IsA(rtr, RangeTblRef));
++	if (!IsA(rtr, RangeTblRef))
++		elog(ERROR, "expected to find SELECT subquery");
+ 	selectrte = rt_fetch(rtr->rtindex, parsetree->rtable);
+-	selectquery = selectrte->subquery;
+-	if (!(selectquery && IsA(selectquery, Query) &&
+-		  selectquery->commandType == CMD_SELECT))
++	if (!(selectrte->rtekind == RTE_SUBQUERY &&
++		  selectrte->subquery &&
++		  IsA(selectrte->subquery, Query) &&
++		  selectrte->subquery->commandType == CMD_SELECT))
+ 		elog(ERROR, "expected to find SELECT subquery");
++	selectquery = selectrte->subquery;
+ 	if (list_length(selectquery->rtable) >= 2 &&
+ 		strcmp(rt_fetch(PRS2_OLD_VARNO, selectquery->rtable)->eref->aliasname,
+ 			   "old") == 0 &&
+diff --git a/src/test/regress/expected/updatable_views.out b/src/test/regress/expected/updatable_views.out
+index 2b578cced100..0cbedc657d24 100644
+--- a/src/test/regress/expected/updatable_views.out
++++ b/src/test/regress/expected/updatable_views.out
+@@ -3296,6 +3296,25 @@ select * from base_tab_def order by a, c NULLS LAST;
+     | View default  |               | View default | 
+ (22 rows)
+ 
++-- Test a DO ALSO INSERT ... SELECT rule
++drop rule base_tab_def_view_ins_rule on base_tab_def_view;
++create rule base_tab_def_view_ins_rule as on insert to base_tab_def_view
++  do also insert into base_tab_def (a, b, e) select new.a, new.b, 'xxx';
++truncate base_tab_def;
++insert into base_tab_def_view values (1, default, default, default, default);
++insert into base_tab_def_view values (2, default, default, default, default),
++                                     (3, default, default, default, default);
++select * from base_tab_def order by a, e nulls first;
++ a |      b       |       c       |      d       |  e  
++---+--------------+---------------+--------------+-----
++ 1 | View default | Table default | View default | 
++ 1 | View default | Table default |              | xxx
++ 2 | View default | Table default | View default | 
++ 2 | View default | Table default |              | xxx
++ 3 | View default | Table default | View default | 
++ 3 | View default | Table default |              | xxx
++(6 rows)
++
+ drop view base_tab_def_view;
+ drop table base_tab_def;
+ -- Test defaults with array assignments
+diff --git a/src/test/regress/sql/updatable_views.sql b/src/test/regress/sql/updatable_views.sql
+index a6aebbc13035..7739b3be76d7 100644
+--- a/src/test/regress/sql/updatable_views.sql
++++ b/src/test/regress/sql/updatable_views.sql
+@@ -1717,6 +1717,16 @@ insert into base_tab_def_view values (15, default, default, default, default),
+ insert into base_tab_def_view values (17), (default);
+ select * from base_tab_def order by a, c NULLS LAST;
+ 
++-- Test a DO ALSO INSERT ... SELECT rule
++drop rule base_tab_def_view_ins_rule on base_tab_def_view;
++create rule base_tab_def_view_ins_rule as on insert to base_tab_def_view
++  do also insert into base_tab_def (a, b, e) select new.a, new.b, 'xxx';
++truncate base_tab_def;
++insert into base_tab_def_view values (1, default, default, default, default);
++insert into base_tab_def_view values (2, default, default, default, default),
++                                     (3, default, default, default, default);
++select * from base_tab_def order by a, e nulls first;
++
+ drop view base_tab_def_view;
+ drop table base_tab_def;
+ 

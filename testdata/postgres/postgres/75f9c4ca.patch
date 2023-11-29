@@ -1,0 +1,130 @@
+From 75f9c4ca5a8047d7a9cfbc7d51a610933d04dc7f Mon Sep 17 00:00:00 2001
+From: Amit Kapila <akapila@postgresql.org>
+Date: Fri, 14 Sep 2018 09:36:30 +0530
+Subject: [PATCH] Don't allow LIMIT/OFFSET clause within sub-selects to be
+ pushed to workers.
+
+Allowing sub-select containing LIMIT/OFFSET in workers can lead to
+inconsistent results at the top-level as there is no guarantee that the
+row order will be fully deterministic.  The fix is to prohibit pushing
+LIMIT/OFFSET within sub-selects to workers.
+
+Reported-by: Andrew Fletcher
+Bug: 15324
+Author: Amit Kapila
+Reviewed-by: Dilip Kumar
+Backpatch-through: 9.6
+Discussion: https://postgr.es/m/153417684333.10284.11356259990921828616@wrigleys.postgresql.org
+---
+ src/backend/optimizer/path/allpaths.c         | 13 +++++++++++++
+ src/backend/optimizer/plan/planner.c          |  3 +--
+ src/include/optimizer/planner.h               |  2 ++
+ src/test/regress/expected/select_parallel.out | 19 +++++++++++++++++++
+ src/test/regress/sql/select_parallel.sql      |  5 +++++
+ 5 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend/optimizer/path/allpaths.c b/src/backend/optimizer/path/allpaths.c
+index 5db1688bf046..5f74d3b36d9c 100644
+--- a/src/backend/optimizer/path/allpaths.c
++++ b/src/backend/optimizer/path/allpaths.c
+@@ -620,7 +620,20 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
+ 			 * the SubqueryScanPath as not parallel-safe.  (Note that
+ 			 * set_subquery_pathlist() might push some of these quals down
+ 			 * into the subquery itself, but that doesn't change anything.)
++			 *
++			 * We can't push sub-select containing LIMIT/OFFSET to workers as
++			 * there is no guarantee that the row order will be fully
++			 * deterministic, and applying LIMIT/OFFSET will lead to
++			 * inconsistent results at the top-level.  (In some cases, where
++			 * the result is ordered, we could relax this restriction.  But it
++			 * doesn't currently seem worth expending extra effort to do so.)
+ 			 */
++			{
++				Query	   *subquery = castNode(Query, rte->subquery);
++
++				if (limit_needed(subquery))
++					return;
++			}
+ 			break;
+ 
+ 		case RTE_JOIN:
+diff --git a/src/backend/optimizer/plan/planner.c b/src/backend/optimizer/plan/planner.c
+index 96bf0601a8eb..e589471fee8b 100644
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -123,7 +123,6 @@ static void preprocess_rowmarks(PlannerInfo *root);
+ static double preprocess_limit(PlannerInfo *root,
+ 				 double tuple_fraction,
+ 				 int64 *offset_est, int64 *count_est);
+-static bool limit_needed(Query *parse);
+ static void remove_useless_groupby_columns(PlannerInfo *root);
+ static List *preprocess_groupclause(PlannerInfo *root, List *force);
+ static List *extract_rollup_sets(List *groupingSets);
+@@ -2870,7 +2869,7 @@ preprocess_limit(PlannerInfo *root, double tuple_fraction,
+  * a key distinction: here we need hard constants in OFFSET/LIMIT, whereas
+  * in preprocess_limit it's good enough to consider estimated values.
+  */
+-static bool
++bool
+ limit_needed(Query *parse)
+ {
+ 	Node	   *node;
+diff --git a/src/include/optimizer/planner.h b/src/include/optimizer/planner.h
+index c090396e139a..3e733b34ed97 100644
+--- a/src/include/optimizer/planner.h
++++ b/src/include/optimizer/planner.h
+@@ -47,6 +47,8 @@ extern bool is_dummy_plan(Plan *plan);
+ extern RowMarkType select_rowmark_type(RangeTblEntry *rte,
+ 					LockClauseStrength strength);
+ 
++extern bool limit_needed(Query *parse);
++
+ extern void mark_partial_aggref(Aggref *agg, AggSplit aggsplit);
+ 
+ extern Path *get_cheapest_fractional_path(RelOptInfo *rel,
+diff --git a/src/test/regress/expected/select_parallel.out b/src/test/regress/expected/select_parallel.out
+index 13cdd3d5cca3..26409d39aaaf 100644
+--- a/src/test/regress/expected/select_parallel.out
++++ b/src/test/regress/expected/select_parallel.out
+@@ -984,6 +984,25 @@ explain (costs off, verbose)
+                                  Output: b.unique1
+ (18 rows)
+ 
++-- LIMIT/OFFSET within sub-selects can't be pushed to workers.
++explain (costs off)
++  select * from tenk1 a where two in
++    (select two from tenk1 b where stringu1 like '%AAAA' limit 3);
++                          QUERY PLAN                           
++---------------------------------------------------------------
++ Hash Semi Join
++   Hash Cond: (a.two = b.two)
++   ->  Gather
++         Workers Planned: 4
++         ->  Parallel Seq Scan on tenk1 a
++   ->  Hash
++         ->  Limit
++               ->  Gather
++                     Workers Planned: 4
++                     ->  Parallel Seq Scan on tenk1 b
++                           Filter: (stringu1 ~~ '%AAAA'::text)
++(11 rows)
++
+ -- to increase the parallel query test coverage
+ SAVEPOINT settings;
+ SET LOCAL force_parallel_mode = 1;
+diff --git a/src/test/regress/sql/select_parallel.sql b/src/test/regress/sql/select_parallel.sql
+index 3d1dffe61d29..938c708d18fd 100644
+--- a/src/test/regress/sql/select_parallel.sql
++++ b/src/test/regress/sql/select_parallel.sql
+@@ -368,6 +368,11 @@ explain (costs off, verbose)
+     (select unique1, row_number() over() from tenk1 b);
+ 
+ 
++-- LIMIT/OFFSET within sub-selects can't be pushed to workers.
++explain (costs off)
++  select * from tenk1 a where two in
++    (select two from tenk1 b where stringu1 like '%AAAA' limit 3);
++
+ -- to increase the parallel query test coverage
+ SAVEPOINT settings;
+ SET LOCAL force_parallel_mode = 1;

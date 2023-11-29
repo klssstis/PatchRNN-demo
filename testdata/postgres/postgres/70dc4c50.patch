@@ -1,0 +1,900 @@
+From 70dc4c509b330fdd965d795e8d7f41f09d56c9ae Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Tue, 31 Mar 2020 11:14:30 -0400
+Subject: [PATCH] Fix lquery's NOT handling, and add ability to quantify
+ non-'*' items.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The existing implementation of the ltree ~ lquery match operator is
+sufficiently complex and undocumented that it's hard to tell exactly
+what it does.  But one thing it clearly gets wrong is the combination
+of NOT symbols (!) and '*' symbols.  A pattern such as '*.!foo.*'
+should, by any ordinary understanding of regular expression behavior,
+match any ltree that has at least one label that's not "foo".  As best
+we can tell by experimentation, what it's actually matching is any
+ltree in which *no* label is "foo".  That's surprising, and not at all
+what the documentation says.
+
+Now, that's arguably a useful behavior, so if we rewrite to fix the
+bug we should provide some other way to get it.  To do so, add the
+ability to attach lquery quantifiers to non-'*' items as well as '*'s.
+Then the pattern '!foo{,}' expresses "any ltree in which no label is
+foo".  For backwards compatibility, the default quantifier for non-'*'
+items has to be "{1}", although the default for '*' items is '{,}'.
+I wouldn't have done it like that in a green field, but it's not
+totally horrible.
+
+Armed with that, rewrite checkCond() from scratch.  Treating '*' and
+non-'*' items alike makes it simpler, not more complicated, so that
+the function actually gets a lot shorter than it was.
+
+Filip Rembiałkowski, Tom Lane, Nikita Glukhov, per a very
+ancient bug report from M. Palm
+
+Discussion: https://postgr.es/m/CAP_rww=waX2Oo6q+MbMSiZ9ktdj6eaJj0cQzNu=Ry2cCDij5fw@mail.gmail.com
+---
+ contrib/ltree/expected/ltree.out | 110 +++++++++--
+ contrib/ltree/lquery_op.c        | 304 +++++++++----------------------
+ contrib/ltree/ltree.h            |  11 +-
+ contrib/ltree/ltree_io.c         |  45 ++++-
+ contrib/ltree/sql/ltree.sql      |  14 ++
+ doc/src/sgml/ltree.sgml          |  38 ++--
+ 6 files changed, 262 insertions(+), 260 deletions(-)
+
+diff --git a/contrib/ltree/expected/ltree.out b/contrib/ltree/expected/ltree.out
+index 610cb6f3266f..5d9102cb6c97 100644
+--- a/contrib/ltree/expected/ltree.out
++++ b/contrib/ltree/expected/ltree.out
+@@ -445,6 +445,12 @@ SELECT '1.*.4|3|2.*{1}'::lquery;
+  1.*.4|3|2.*{1}
+ (1 row)
+ 
++SELECT 'foo.bar{,}.!a*|b{1,}.c{,44}.d{3,4}'::lquery;
++               lquery               
++------------------------------------
++ foo.bar{,}.!a*|b{1,}.c{,44}.d{3,4}
++(1 row)
++
+ SELECT 'qwerty%@*.tu'::lquery;
+     lquery    
+ --------------
+@@ -727,7 +733,7 @@ SELECT 'a.b.c.d.e'::ltree ~ '*.a.*.d.*';
+ SELECT 'a.b.c.d.e'::ltree ~ '*.!d.*';
+  ?column? 
+ ----------
+- f
++ t
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ '*.!d';
+@@ -757,7 +763,7 @@ SELECT 'a.b.c.d.e'::ltree ~ '*.!e';
+ SELECT 'a.b.c.d.e'::ltree ~ '*.!e.*';
+  ?column? 
+ ----------
+- f
++ t
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ 'a.*.!e';
+@@ -775,7 +781,7 @@ SELECT 'a.b.c.d.e'::ltree ~ 'a.*.!d';
+ SELECT 'a.b.c.d.e'::ltree ~ 'a.*.!d.*';
+  ?column? 
+ ----------
+- f
++ t
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ 'a.*.!f.*';
+@@ -793,7 +799,7 @@ SELECT 'a.b.c.d.e'::ltree ~ '*.a.*.!f.*';
+ SELECT 'a.b.c.d.e'::ltree ~ '*.a.*.!d.*';
+  ?column? 
+ ----------
+- f
++ t
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ '*.a.!d.*';
+@@ -817,13 +823,13 @@ SELECT 'a.b.c.d.e'::ltree ~ 'a.!d.*';
+ SELECT 'a.b.c.d.e'::ltree ~ '*.a.*.!d.*';
+  ?column? 
+ ----------
+- f
++ t
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ '*.!b.*';
+  ?column? 
+ ----------
+- f
++ t
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ '*.!b.c.*';
+@@ -835,7 +841,7 @@ SELECT 'a.b.c.d.e'::ltree ~ '*.!b.c.*';
+ SELECT 'a.b.c.d.e'::ltree ~ '*.!b.*.c.*';
+  ?column? 
+ ----------
+- f
++ t
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ '!b.*.c.*';
+@@ -883,31 +889,31 @@ SELECT 'a.b.c.d.e'::ltree ~ '*{1}.!b.*.!c.*.e';
+ SELECT 'a.b.c.d.e'::ltree ~ '*{1}.!b.*{1}.!c.*.e';
+  ?column? 
+ ----------
+- t
++ f
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ 'a.!b.*{1}.!c.*.e';
+  ?column? 
+ ----------
+- t
++ f
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ '!b.*{1}.!c.*.e';
+  ?column? 
+ ----------
+- t
++ f
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ '*.!b.*{1}.!c.*.e';
+  ?column? 
+ ----------
+- t
++ f
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ '*.!b.*.!c.*.e';
+  ?column? 
+ ----------
+- f
++ t
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ '!b.!c.*';
+@@ -937,19 +943,19 @@ SELECT 'a.b.c.d.e'::ltree ~ '*{1}.!b.*.!c.*';
+ SELECT 'a.b.c.d.e'::ltree ~ '*{1}.!b.*{1}.!c.*';
+  ?column? 
+ ----------
+- t
++ f
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ 'a.!b.*{1}.!c.*';
+  ?column? 
+ ----------
+- t
++ f
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ '!b.*{1}.!c.*';
+  ?column? 
+ ----------
+- t
++ f
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ '*.!b.*{1}.!c.*';
+@@ -961,7 +967,7 @@ SELECT 'a.b.c.d.e'::ltree ~ '*.!b.*{1}.!c.*';
+ SELECT 'a.b.c.d.e'::ltree ~ '*.!b.*.!c.*';
+  ?column? 
+ ----------
+- f
++ t
+ (1 row)
+ 
+ SELECT 'a.b.c.d.e'::ltree ~ 'a.*{2}.*{2}';
+@@ -988,6 +994,78 @@ SELECT 'a.b.c.d.e'::ltree ~ 'a.*{5}.*';
+  f
+ (1 row)
+ 
++SELECT '5.0.1.0'::ltree ~ '5.!0.!0.0';
++ ?column? 
++----------
++ f
++(1 row)
++
++SELECT 'a.b'::ltree ~ '!a.!a';
++ ?column? 
++----------
++ f
++(1 row)
++
++SELECT 'a.b.c.d.e'::ltree ~ 'a{,}';
++ ?column? 
++----------
++ f
++(1 row)
++
++SELECT 'a.b.c.d.e'::ltree ~ 'a{1,}.*';
++ ?column? 
++----------
++ t
++(1 row)
++
++SELECT 'a.b.c.d.e'::ltree ~ 'a{,}.!a{,}';
++ ?column? 
++----------
++ t
++(1 row)
++
++SELECT 'a.b.c.d.a'::ltree ~ 'a{,}.!a{,}';
++ ?column? 
++----------
++ f
++(1 row)
++
++SELECT 'a.b.c.d.a'::ltree ~ 'a{,2}.!a{1,}';
++ ?column? 
++----------
++ f
++(1 row)
++
++SELECT 'a.b.c.d.e'::ltree ~ 'a{,2}.!a{1,}';
++ ?column? 
++----------
++ t
++(1 row)
++
++SELECT 'a.b.c.d.e'::ltree ~ '!x{,}';
++ ?column? 
++----------
++ t
++(1 row)
++
++SELECT 'a.b.c.d.e'::ltree ~ '!c{,}';
++ ?column? 
++----------
++ f
++(1 row)
++
++SELECT 'a.b.c.d.e'::ltree ~ '!c{0,3}.!a{2,}';
++ ?column? 
++----------
++ t
++(1 row)
++
++SELECT 'a.b.c.d.e'::ltree ~ '!c{0,3}.!d{2,}.*';
++ ?column? 
++----------
++ t
++(1 row)
++
+ SELECT 'QWER_TY'::ltree ~ 'q%@*';
+  ?column? 
+ ----------
+diff --git a/contrib/ltree/lquery_op.c b/contrib/ltree/lquery_op.c
+index 5c7afe5d5416..ef86046fc4bc 100644
+--- a/contrib/ltree/lquery_op.c
++++ b/contrib/ltree/lquery_op.c
+@@ -9,6 +9,7 @@
+ 
+ #include "catalog/pg_collation.h"
+ #include "ltree.h"
++#include "miscadmin.h"
+ #include "utils/formatting.h"
+ 
+ PG_FUNCTION_INFO_V1(ltq_regex);
+@@ -19,16 +20,6 @@ PG_FUNCTION_INFO_V1(lt_q_rregex);
+ 
+ #define NEXTVAL(x) ( (lquery*)( (char*)(x) + INTALIGN( VARSIZE(x) ) ) )
+ 
+-typedef struct
+-{
+-	lquery_level *q;
+-	int			nq;
+-	ltree_level *t;
+-	int			nt;
+-	int			posq;
+-	int			post;
+-} FieldNot;
+-
+ static char *
+ getlexeme(char *start, char *end, int *len)
+ {
+@@ -99,238 +90,125 @@ ltree_strncasecmp(const char *a, const char *b, size_t s)
+ }
+ 
+ /*
+- * See if a (non-star) lquery_level matches an ltree_level
++ * See if an lquery_level matches an ltree_level
+  *
+- * Does not consider level's possible LQL_NOT flag.
++ * This accounts for all flags including LQL_NOT, but does not
++ * consider repetition counts.
+  */
+ static bool
+ checkLevel(lquery_level *curq, ltree_level *curt)
+ {
+-	int			(*cmpptr) (const char *, const char *, size_t);
+ 	lquery_variant *curvar = LQL_FIRST(curq);
+-	int			i;
++	bool		success;
++
++	success = (curq->flag & LQL_NOT) ? false : true;
++
++	/* numvar == 0 means '*' which matches anything */
++	if (curq->numvar == 0)
++		return success;
+ 
+-	for (i = 0; i < curq->numvar; i++)
++	for (int i = 0; i < curq->numvar; i++)
+ 	{
++		int			(*cmpptr) (const char *, const char *, size_t);
++
+ 		cmpptr = (curvar->flag & LVAR_INCASE) ? ltree_strncasecmp : strncmp;
+ 
+ 		if (curvar->flag & LVAR_SUBLEXEME)
+ 		{
+-			if (compare_subnode(curt, curvar->name, curvar->len, cmpptr, (curvar->flag & LVAR_ANYEND)))
+-				return true;
++			if (compare_subnode(curt, curvar->name, curvar->len, cmpptr,
++								(curvar->flag & LVAR_ANYEND)))
++				return success;
+ 		}
+ 		else if ((curvar->len == curt->len ||
+ 				  (curt->len > curvar->len && (curvar->flag & LVAR_ANYEND))) &&
+ 				 (*cmpptr) (curvar->name, curt->name, curvar->len) == 0)
+-		{
++			return success;
+ 
+-			return true;
+-		}
+ 		curvar = LVAR_NEXT(curvar);
+ 	}
+-	return false;
++	return !success;
+ }
+ 
+ /*
+-void
+-printFieldNot(FieldNot *fn ) {
+-	while(fn->q) {
+-		elog(NOTICE,"posQ:%d lenQ:%d posT:%d lenT:%d", fn->posq,fn->nq,fn->post,fn->nt);
+-		fn++;
+-	}
+-}
+-*/
+-
+-/*
+- * Try to match an lquery (of query_numlevel items) to an ltree (of
+- * tree_numlevel items)
+- *
+- * If the query contains any NOT flags, "ptr" must point to a FieldNot
+- * workspace initialized with ptr->q == NULL.  Otherwise it can be NULL.
+- * (LQL_NOT flags will be ignored if ptr == NULL.)
+- *
+- * high_pos is the last ltree position the first lquery item is allowed
+- * to match at; it should be zero for external calls.
+- *
+- * force_advance must be false except in internal recursive calls.
++ * Try to match an lquery (of qlen items) to an ltree (of tlen items)
+  */
+ static bool
+-checkCond(lquery_level *curq, int query_numlevel,
+-		  ltree_level *curt, int tree_numlevel,
+-		  FieldNot *ptr,
+-		  uint32 high_pos,
+-		  bool force_advance)
++checkCond(lquery_level *curq, int qlen,
++		  ltree_level *curt, int tlen)
+ {
+-	uint32		low_pos = 0,	/* first allowed ltree position for match */
+-				cur_tpos = 0;	/* ltree position of curt */
+-	int			tlen = tree_numlevel,	/* counts of remaining items */
+-				qlen = query_numlevel;
+-	lquery_level *prevq = NULL;
+-
+-	/* advance curq (setting up prevq) if requested */
+-	if (force_advance)
+-	{
+-		Assert(qlen > 0);
+-		prevq = curq;
+-		curq = LQL_NEXT(curq);
+-		qlen--;
+-	}
++	/* Since this function recurses, it could be driven to stack overflow */
++	check_stack_depth();
+ 
+-	while (tlen > 0 && qlen > 0)
+-	{
+-		if (curq->numvar)
+-		{
+-			/* Current query item is not '*' */
+-			ltree_level *prevt = curt;
+-
+-			/* skip tree items that must be ignored due to prior * items */
+-			while (cur_tpos < low_pos)
+-			{
+-				curt = LEVEL_NEXT(curt);
+-				tlen--;
+-				cur_tpos++;
+-				if (tlen == 0)
+-					return false;
+-				if (ptr && ptr->q)
+-					ptr->nt++;
+-			}
++	/* Pathological patterns could take awhile, too */
++	CHECK_FOR_INTERRUPTS();
+ 
+-			if (ptr && (curq->flag & LQL_NOT))
+-			{
+-				/* Deal with a NOT item */
+-				if (!(prevq && prevq->numvar == 0))
+-					prevq = curq;
+-				if (ptr->q == NULL)
+-				{
+-					ptr->t = prevt;
+-					ptr->q = prevq;
+-					ptr->nt = 1;
+-					ptr->nq = 1 + ((prevq == curq) ? 0 : 1);
+-					ptr->posq = query_numlevel - qlen - ((prevq == curq) ? 0 : 1);
+-					ptr->post = cur_tpos;
+-				}
+-				else
+-				{
+-					ptr->nt++;
+-					ptr->nq++;
+-				}
+-
+-				if (qlen == 1 && ptr->q->numvar == 0)
+-					ptr->nt = tree_numlevel - ptr->post;
+-				curt = LEVEL_NEXT(curt);
+-				tlen--;
+-				cur_tpos++;
+-				if (high_pos < cur_tpos)
+-					high_pos++;
+-			}
+-			else
+-			{
+-				/* Not a NOT item, check for normal match */
+-				bool		isok = false;
+-
+-				while (cur_tpos <= high_pos && tlen > 0 && !isok)
+-				{
+-					isok = checkLevel(curq, curt);
+-					curt = LEVEL_NEXT(curt);
+-					tlen--;
+-					cur_tpos++;
+-					if (isok && prevq && prevq->numvar == 0 &&
+-						tlen > 0 && cur_tpos <= high_pos)
+-					{
+-						FieldNot	tmpptr;
+-
+-						if (ptr)
+-							memcpy(&tmpptr, ptr, sizeof(FieldNot));
+-						if (checkCond(prevq, qlen + 1,
+-									  curt, tlen,
+-									  (ptr) ? &tmpptr : NULL,
+-									  high_pos - cur_tpos,
+-									  true))
+-							return true;
+-					}
+-					if (!isok && ptr && ptr->q)
+-						ptr->nt++;
+-				}
+-				if (!isok)
+-					return false;
+-
+-				if (ptr && ptr->q)
+-				{
+-					if (checkCond(ptr->q, ptr->nq,
+-								  ptr->t, ptr->nt,
+-								  NULL,
+-								  0,
+-								  false))
+-						return false;
+-					ptr->q = NULL;
+-				}
+-				low_pos = cur_tpos;
+-				high_pos = cur_tpos;
+-			}
+-		}
++	/* Loop while we have query items to consider */
++	while (qlen > 0)
++	{
++		int			low,
++					high;
++		lquery_level *nextq;
++
++		/*
++		 * Get min and max repetition counts for this query item, dealing with
++		 * the backwards-compatibility hack that the low/high fields aren't
++		 * meaningful for non-'*' items unless LQL_COUNT is set.
++		 */
++		if ((curq->flag & LQL_COUNT) || curq->numvar == 0)
++			low = curq->low, high = curq->high;
+ 		else
+-		{
+-			/* Current query item is '*' */
+-			low_pos += curq->low;
+-
+-			if (low_pos > tree_numlevel)
+-				return false;
++			low = high = 1;
+ 
+-			high_pos = Min(high_pos + curq->high, tree_numlevel);
++		/*
++		 * We may limit "high" to the remaining text length; this avoids
++		 * separate tests below.
++		 */
++		if (high > tlen)
++			high = tlen;
+ 
+-			if (ptr && ptr->q)
+-			{
+-				ptr->nq++;
+-				if (qlen == 1)
+-					ptr->nt = tree_numlevel - ptr->post;
+-			}
+-		}
++		/* Fail if a match of required number of items is impossible */
++		if (high < low)
++			return false;
+ 
+-		prevq = curq;
+-		curq = LQL_NEXT(curq);
++		/*
++		 * Recursively check the rest of the pattern against each possible
++		 * start point following some of this item's match(es).
++		 */
++		nextq = LQL_NEXT(curq);
+ 		qlen--;
+-	}
+ 
+-	/* Fail if we've already run out of ltree items */
+-	if (low_pos > tree_numlevel || tree_numlevel > high_pos)
+-		return false;
+-
+-	/* Remaining lquery items must be NOT or '*' items */
+-	while (qlen > 0)
+-	{
+-		if (curq->numvar)
+-		{
+-			if (!(curq->flag & LQL_NOT))
+-				return false;
+-		}
+-		else
++		for (int matchcnt = 0; matchcnt < high; matchcnt++)
+ 		{
+-			low_pos += curq->low;
++			/*
++			 * If we've consumed an acceptable number of matches of this item,
++			 * and the rest of the pattern matches beginning here, we're good.
++			 */
++			if (matchcnt >= low && checkCond(nextq, qlen, curt, tlen))
++				return true;
+ 
+-			if (low_pos > tree_numlevel)
++			/*
++			 * Otherwise, try to match one more text item to this query item.
++			 */
++			if (!checkLevel(curq, curt))
+ 				return false;
+ 
+-			high_pos = Min(high_pos + curq->high, tree_numlevel);
++			curt = LEVEL_NEXT(curt);
++			tlen--;
+ 		}
+ 
+-		curq = LQL_NEXT(curq);
+-		qlen--;
++		/*
++		 * Once we've consumed "high" matches, we can succeed only if the rest
++		 * of the pattern matches beginning here.  Loop around (if you prefer,
++		 * think of this as tail recursion).
++		 */
++		curq = nextq;
+ 	}
+ 
+-	/* Fail if trailing '*'s require more ltree items than we have */
+-	if (low_pos > tree_numlevel || tree_numlevel > high_pos)
+-		return false;
+-
+-	/* Finish pending NOT check, if any */
+-	if (ptr && ptr->q &&
+-		checkCond(ptr->q, ptr->nq,
+-				  ptr->t, ptr->nt,
+-				  NULL,
+-				  0,
+-				  false))
+-		return false;
+-
+-	return true;
++	/*
++	 * Once we're out of query items, we match only if there's no remaining
++	 * text either.
++	 */
++	return (tlen == 0);
+ }
+ 
+ Datum
+@@ -338,28 +216,10 @@ ltq_regex(PG_FUNCTION_ARGS)
+ {
+ 	ltree	   *tree = PG_GETARG_LTREE_P(0);
+ 	lquery	   *query = PG_GETARG_LQUERY_P(1);
+-	bool		res = false;
+-
+-	if (query->flag & LQUERY_HASNOT)
+-	{
+-		FieldNot	fn;
+-
+-		fn.q = NULL;
++	bool		res;
+ 
+-		res = checkCond(LQUERY_FIRST(query), query->numlevel,
+-						LTREE_FIRST(tree), tree->numlevel,
+-						&fn,
+-						0,
+-						false);
+-	}
+-	else
+-	{
+-		res = checkCond(LQUERY_FIRST(query), query->numlevel,
+-						LTREE_FIRST(tree), tree->numlevel,
+-						NULL,
+-						0,
+-						false);
+-	}
++	res = checkCond(LQUERY_FIRST(query), query->numlevel,
++					LTREE_FIRST(tree), tree->numlevel);
+ 
+ 	PG_FREE_IF_COPY(tree, 0);
+ 	PG_FREE_IF_COPY(query, 1);
+diff --git a/contrib/ltree/ltree.h b/contrib/ltree/ltree.h
+index 429cdc813179..7eac7c945283 100644
+--- a/contrib/ltree/ltree.h
++++ b/contrib/ltree/ltree.h
+@@ -65,14 +65,20 @@ typedef struct
+ /*
+  * In an lquery_level, "flag" contains the union of the variants' flags
+  * along with possible LQL_xxx flags; so those bit sets can't overlap.
++ *
++ * "low" and "high" are nominally the minimum and maximum number of matches.
++ * However, for backwards compatibility with pre-v13 on-disk lqueries,
++ * non-'*' levels (those with numvar > 0) only have valid low/high if the
++ * LQL_COUNT flag is set; otherwise those fields are zero, but the behavior
++ * is as if they were both 1.
+  */
+ typedef struct
+ {
+ 	uint16		totallen;		/* total length of this level, in bytes */
+ 	uint16		flag;			/* see LQL_xxx and LVAR_xxx flags */
+ 	uint16		numvar;			/* number of variants; 0 means '*' */
+-	uint16		low;			/* minimum repeat count for '*' */
+-	uint16		high;			/* maximum repeat count for '*' */
++	uint16		low;			/* minimum repeat count */
++	uint16		high;			/* maximum repeat count */
+ 	/* Array of maxalign'd lquery_variant structs follows: */
+ 	char		variants[FLEXIBLE_ARRAY_MEMBER];
+ } lquery_level;
+@@ -82,6 +88,7 @@ typedef struct
+ #define LQL_FIRST(x)	( (lquery_variant*)( ((char*)(x))+LQL_HDRSIZE ) )
+ 
+ #define LQL_NOT		0x10		/* level has '!' (NOT) prefix */
++#define LQL_COUNT	0x20		/* level is non-'*' and has repeat counts */
+ 
+ #ifdef LOWER_NODE
+ #define FLG_CANLOOKSIGN(x) ( ( (x) & ( LQL_NOT | LVAR_ANYEND | LVAR_SUBLEXEME ) ) == 0 )
+diff --git a/contrib/ltree/ltree_io.c b/contrib/ltree/ltree_io.c
+index e806a1449604..c6ea5dec8c94 100644
+--- a/contrib/ltree/ltree_io.c
++++ b/contrib/ltree/ltree_io.c
+@@ -317,6 +317,23 @@ lquery_in(PG_FUNCTION_ARGS)
+ 
+ 				state = LQPRS_WAITVAR;
+ 			}
++			else if (charlen == 1 && t_iseq(ptr, '{'))
++			{
++				lptr->len = ptr - lptr->start -
++					((lptr->flag & LVAR_SUBLEXEME) ? 1 : 0) -
++					((lptr->flag & LVAR_INCASE) ? 1 : 0) -
++					((lptr->flag & LVAR_ANYEND) ? 1 : 0);
++				if (lptr->wlen > LTREE_LABEL_MAX_CHARS)
++					ereport(ERROR,
++							(errcode(ERRCODE_NAME_TOO_LONG),
++							 errmsg("label string is too long"),
++							 errdetail("Label length is %d, must be at most %d, at character %d.",
++									   lptr->wlen, LTREE_LABEL_MAX_CHARS,
++									   pos)));
++
++				curqlevel->flag |= LQL_COUNT;
++				state = LQPRS_WAITFNUM;
++			}
+ 			else if (charlen == 1 && t_iseq(ptr, '.'))
+ 			{
+ 				lptr->len = ptr - lptr->start -
+@@ -348,6 +365,7 @@ lquery_in(PG_FUNCTION_ARGS)
+ 				state = LQPRS_WAITFNUM;
+ 			else if (charlen == 1 && t_iseq(ptr, '.'))
+ 			{
++				/* We only get here for '*', so these are correct defaults */
+ 				curqlevel->low = 0;
+ 				curqlevel->high = LTREE_MAX_LEVELS;
+ 				curqlevel = NEXTLEV(curqlevel);
+@@ -567,7 +585,11 @@ lquery_out(PG_FUNCTION_ARGS)
+ 	{
+ 		totallen++;
+ 		if (curqlevel->numvar)
++		{
+ 			totallen += 1 + (curqlevel->numvar * 4) + curqlevel->totallen;
++			if (curqlevel->flag & LQL_COUNT)
++				totallen += 2 * 11 + 3;
++		}
+ 		else
+ 			totallen += 2 * 11 + 4;
+ 		curqlevel = LQL_NEXT(curqlevel);
+@@ -618,27 +640,38 @@ lquery_out(PG_FUNCTION_ARGS)
+ 			}
+ 		}
+ 		else
++		{
++			*ptr = '*';
++			ptr++;
++		}
++
++		if ((curqlevel->flag & LQL_COUNT) || curqlevel->numvar == 0)
+ 		{
+ 			if (curqlevel->low == curqlevel->high)
+ 			{
+-				sprintf(ptr, "*{%d}", curqlevel->low);
++				sprintf(ptr, "{%d}", curqlevel->low);
+ 			}
+ 			else if (curqlevel->low == 0)
+ 			{
+ 				if (curqlevel->high == LTREE_MAX_LEVELS)
+ 				{
+-					*ptr = '*';
+-					*(ptr + 1) = '\0';
++					if (curqlevel->numvar == 0)
++					{
++						/* This is default for '*', so print nothing */
++						*ptr = '\0';
++					}
++					else
++						sprintf(ptr, "{,}");
+ 				}
+ 				else
+-					sprintf(ptr, "*{,%d}", curqlevel->high);
++					sprintf(ptr, "{,%d}", curqlevel->high);
+ 			}
+ 			else if (curqlevel->high == LTREE_MAX_LEVELS)
+ 			{
+-				sprintf(ptr, "*{%d,}", curqlevel->low);
++				sprintf(ptr, "{%d,}", curqlevel->low);
+ 			}
+ 			else
+-				sprintf(ptr, "*{%d,%d}", curqlevel->low, curqlevel->high);
++				sprintf(ptr, "{%d,%d}", curqlevel->low, curqlevel->high);
+ 			ptr = strchr(ptr, '\0');
+ 		}
+ 
+diff --git a/contrib/ltree/sql/ltree.sql b/contrib/ltree/sql/ltree.sql
+index f6d73b8aa65e..0cf3dd613663 100644
+--- a/contrib/ltree/sql/ltree.sql
++++ b/contrib/ltree/sql/ltree.sql
+@@ -87,6 +87,7 @@ SELECT '1.*.4|3|2.*{1,4}'::lquery;
+ SELECT '1.*.4|3|2.*{,4}'::lquery;
+ SELECT '1.*.4|3|2.*{1,}'::lquery;
+ SELECT '1.*.4|3|2.*{1}'::lquery;
++SELECT 'foo.bar{,}.!a*|b{1,}.c{,44}.d{3,4}'::lquery;
+ SELECT 'qwerty%@*.tu'::lquery;
+ 
+ SELECT nlevel('1.2.3.4');
+@@ -184,6 +185,19 @@ SELECT 'a.b.c.d.e'::ltree ~ 'a.*{2}.*{2}';
+ SELECT 'a.b.c.d.e'::ltree ~ 'a.*{1}.*{2}.e';
+ SELECT 'a.b.c.d.e'::ltree ~ 'a.*{1}.*{4}';
+ SELECT 'a.b.c.d.e'::ltree ~ 'a.*{5}.*';
++SELECT '5.0.1.0'::ltree ~ '5.!0.!0.0';
++SELECT 'a.b'::ltree ~ '!a.!a';
++
++SELECT 'a.b.c.d.e'::ltree ~ 'a{,}';
++SELECT 'a.b.c.d.e'::ltree ~ 'a{1,}.*';
++SELECT 'a.b.c.d.e'::ltree ~ 'a{,}.!a{,}';
++SELECT 'a.b.c.d.a'::ltree ~ 'a{,}.!a{,}';
++SELECT 'a.b.c.d.a'::ltree ~ 'a{,2}.!a{1,}';
++SELECT 'a.b.c.d.e'::ltree ~ 'a{,2}.!a{1,}';
++SELECT 'a.b.c.d.e'::ltree ~ '!x{,}';
++SELECT 'a.b.c.d.e'::ltree ~ '!c{,}';
++SELECT 'a.b.c.d.e'::ltree ~ '!c{0,3}.!a{2,}';
++SELECT 'a.b.c.d.e'::ltree ~ '!c{0,3}.!d{2,}.*';
+ 
+ SELECT 'QWER_TY'::ltree ~ 'q%@*';
+ SELECT 'QWER_TY'::ltree ~ 'Q_t%@*';
+diff --git a/doc/src/sgml/ltree.sgml b/doc/src/sgml/ltree.sgml
+index ae4b33ec85ee..d7dd55540a80 100644
+--- a/doc/src/sgml/ltree.sgml
++++ b/doc/src/sgml/ltree.sgml
+@@ -60,7 +60,8 @@
+      <type>lquery</type> represents a regular-expression-like pattern
+      for matching <type>ltree</type> values.  A simple word matches that
+      label within a path.  A star symbol (<literal>*</literal>) matches zero
+-     or more labels.  For example:
++     or more labels.  These can be joined with dots to form a pattern that
++     must match the whole label path.  For example:
+ <synopsis>
+ foo         <lineannotation>Match the exact label path <literal>foo</literal></lineannotation>
+ *.foo.*     <lineannotation>Match any label path containing the label <literal>foo</literal></lineannotation>
+@@ -69,19 +70,25 @@ foo         <lineannotation>Match the exact label path <literal>foo</literal></l
+     </para>
+ 
+     <para>
+-     Star symbols can also be quantified to restrict how many labels
+-     they can match:
++     Both star symbols and simple words can be quantified to restrict how many
++     labels they can match:
+ <synopsis>
+ *{<replaceable>n</replaceable>}        <lineannotation>Match exactly <replaceable>n</replaceable> labels</lineannotation>
+ *{<replaceable>n</replaceable>,}       <lineannotation>Match at least <replaceable>n</replaceable> labels</lineannotation>
+ *{<replaceable>n</replaceable>,<replaceable>m</replaceable>}      <lineannotation>Match at least <replaceable>n</replaceable> but not more than <replaceable>m</replaceable> labels</lineannotation>
+-*{,<replaceable>m</replaceable>}       <lineannotation>Match at most <replaceable>m</replaceable> labels &mdash; same as </lineannotation> *{0,<replaceable>m</replaceable>}
++*{,<replaceable>m</replaceable>}       <lineannotation>Match at most <replaceable>m</replaceable> labels &mdash; same as </lineannotation>*{0,<replaceable>m</replaceable>}
++foo{<replaceable>n</replaceable>,<replaceable>m</replaceable>}    <lineannotation>Match at least <replaceable>n</replaceable> but not more than <replaceable>m</replaceable> occurrences of <literal>foo</literal></lineannotation>
++foo{,}      <lineannotation>Match any number of occurrences of <literal>foo</literal>, including zero</lineannotation>
+ </synopsis>
++     In the absence of any explicit quantifier, the default for a star symbol
++     is to match any number of labels (that is, <literal>{,}</literal>) while
++     the default for a non-star item is to match exactly once (that
++     is, <literal>{1}</literal>).
+     </para>
+ 
+     <para>
+      There are several modifiers that can be put at the end of a non-star
+-     label in <type>lquery</type> to make it match more than just the exact match:
++     <type>lquery</type> item to make it match more than just the exact match:
+ <synopsis>
+ @           <lineannotation>Match case-insensitively, for example <literal>a@</literal> matches <literal>A</literal></lineannotation>
+ *           <lineannotation>Match any label with this prefix, for example <literal>foo*</literal> matches <literal>foobar</literal></lineannotation>
+@@ -97,17 +104,20 @@ foo         <lineannotation>Match the exact label path <literal>foo</literal></l
+     </para>
+ 
+     <para>
+-     Also, you can write several possibly-modified labels separated with
+-     <literal>|</literal> (OR) to match any of those labels, and you can put
+-     <literal>!</literal> (NOT) at the start to match any label that doesn't
+-     match any of the alternatives.
++     Also, you can write several possibly-modified non-star items separated with
++     <literal>|</literal> (OR) to match any of those items, and you can put
++     <literal>!</literal> (NOT) at the start of a non-star group to match any
++     label that doesn't match any of the alternatives.  A quantifier, if any,
++     goes at the end of the group; it means some number of matches for the
++     group as a whole (that is, some number of labels matching or not matching
++     any of the alternatives).
+     </para>
+ 
+     <para>
+      Here's an annotated example of <type>lquery</type>:
+ <programlisting>
+-Top.*{0,2}.sport*@.!football|tennis.Russ*|Spain
+-a.  b.     c.      d.               e.
++Top.*{0,2}.sport*@.!football|tennis{1,}.Russ*|Spain
++a.  b.     c.      d.                   e.
+ </programlisting>
+      This query will match any label path that:
+     </para>
+@@ -129,8 +139,8 @@ a.  b.     c.      d.               e.
+      </listitem>
+      <listitem>
+       <para>
+-       then a label not matching <literal>football</literal> nor
+-       <literal>tennis</literal>
++       then has one or more labels, none of which
++       match <literal>football</literal> nor <literal>tennis</literal>
+       </para>
+      </listitem>
+      <listitem>
+@@ -632,7 +642,7 @@ ltreetest=&gt; SELECT path FROM test WHERE path ~ '*.Astronomy.*';
+  Top.Collections.Pictures.Astronomy.Astronauts
+ (7 rows)
+ 
+-ltreetest=&gt; SELECT path FROM test WHERE path ~ '*.!pictures@.*.Astronomy.*';
++ltreetest=&gt; SELECT path FROM test WHERE path ~ '*.!pictures@.Astronomy.*';
+                 path
+ ------------------------------------
+  Top.Science.Astronomy

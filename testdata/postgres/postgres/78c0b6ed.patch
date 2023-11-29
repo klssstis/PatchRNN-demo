@@ -1,0 +1,251 @@
+From 78c0b6ed273a1262f96efe94004bc92d99865005 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Mon, 12 Oct 2020 17:09:50 -0400
+Subject: [PATCH] Re-allow testing of GiST buffered builds.
+
+Commit 16fa9b2b3 broke the ability to reliably test GiST buffered builds,
+because it caused sorted builds to be done instead if sortsupport is
+available, regardless of any attempt to override that.  While a would-be
+test case could try to work around that by choosing an opclass that has
+no sortsupport function, coverage would be silently lost the moment
+someone decides it'd be a good idea to add a sortsupport function.
+
+Hence, rearrange the logic in gistbuild() so that if "buffering = on"
+is specified in CREATE INDEX, we will use that method, sortsupport or no.
+
+Also document the interaction between sorting and the buffering
+parameter, as 16fa9b2b3 failed to do.
+
+(Note that in fact we still lack any test coverage of buffered builds,
+but this is a prerequisite to adding a non-fragile test.)
+
+Discussion: https://postgr.es/m/3249980.1602532990@sss.pgh.pa.us
+---
+ doc/src/sgml/gist.sgml              | 58 ++++++++++++++++++----------
+ doc/src/sgml/ref/create_index.sgml  | 12 ++++--
+ src/backend/access/gist/gistbuild.c | 60 +++++++++++++++--------------
+ 3 files changed, 77 insertions(+), 53 deletions(-)
+
+diff --git a/doc/src/sgml/gist.sgml b/doc/src/sgml/gist.sgml
+index 192338be8810..1bf5f0965913 100644
+--- a/doc/src/sgml/gist.sgml
++++ b/doc/src/sgml/gist.sgml
+@@ -975,7 +975,7 @@ static char *str_param_default = "default";
+ /*
+  * Sample validator: checks that string is not longer than 8 bytes.
+  */
+-static void 
++static void
+ validate_my_string_relopt(const char *value)
+ {
+     if (strlen(value) > 8)
+@@ -987,7 +987,7 @@ validate_my_string_relopt(const char *value)
+ /*
+  * Sample filler: switches characters to lower case.
+  */
+-static Size 
++static Size
+ fill_my_string_relopt(const char *value, void *ptr)
+ {
+     char   *tmp = str_tolower(value, strlen(value), DEFAULT_COLLATION_OID);
+@@ -1157,23 +1157,38 @@ my_sortsupport(PG_FUNCTION_ARGS)
+  <title>Implementation</title>
+ 
+  <sect2 id="gist-buffering-build">
+-  <title>GiST Buffering Build</title>
++  <title>GiST Index Build Methods</title>
++
++  <para>
++   The simplest way to build a GiST index is just to insert all the entries,
++   one by one.  This tends to be slow for large indexes, because if the
++   index tuples are scattered across the index and the index is large enough
++   to not fit in cache, a lot of random I/O will be
++   needed.  <productname>PostgreSQL</productname> supports two alternative
++   methods for initial build of a GiST index: <firstterm>sorted</firstterm>
++   and <firstterm>buffered</firstterm> modes.
++  </para>
++
++  <para>
++   The sorted method is only available if each of the opclasses used by the
++   index provides a <function>sortsupport</function> function, as described
++   in <xref linkend="gist-extensibility"/>.  If they do, this method is
++   usually the best, so it is used by default.
++  </para>
++
+   <para>
+-   Building large GiST indexes by simply inserting all the tuples tends to be
+-   slow, because if the index tuples are scattered across the index and the
+-   index is large enough to not fit in cache, the insertions need to perform
+-   a lot of random I/O.  Beginning in version 9.2, PostgreSQL supports a more
+-   efficient method to build GiST indexes based on buffering, which can
+-   dramatically reduce the number of random I/Os needed for non-ordered data
+-   sets. For well-ordered data sets the benefit is smaller or non-existent,
+-   because only a small number of pages receive new tuples at a time, and
+-   those pages fit in cache even if the index as whole does not.
++   The buffered method works by not inserting tuples directly into the index
++   right away.  It can dramatically reduce the amount of random I/O needed
++   for non-ordered data sets.  For well-ordered data sets the benefit is
++   smaller or non-existent, because only a small number of pages receive new
++   tuples at a time, and those pages fit in cache even if the index as a
++   whole does not.
+   </para>
+ 
+   <para>
+-   However, buffering index build needs to call the <function>penalty</function>
+-   function more often, which consumes some extra CPU resources. Also, the
+-   buffers used in the buffering build need temporary disk space, up to
++   The buffered method needs to call the <function>penalty</function>
++   function more often than the simple method does, which consumes some
++   extra CPU resources. Also, the buffers need temporary disk space, up to
+    the size of the resulting index. Buffering can also influence the quality
+    of the resulting index, in both positive and negative directions. That
+    influence depends on various factors, like the distribution of the input
+@@ -1181,12 +1196,13 @@ my_sortsupport(PG_FUNCTION_ARGS)
+   </para>
+ 
+   <para>
+-   By default, a GiST index build switches to the buffering method when the
+-   index size reaches <xref linkend="guc-effective-cache-size"/>. It can
+-   be manually turned on or off by the <literal>buffering</literal> parameter
+-   to the CREATE INDEX command. The default behavior is good for most cases,
+-   but turning buffering off might speed up the build somewhat if the input
+-   data is ordered.
++   If sorting is not possible, then by default a GiST index build switches
++   to the buffering method when the index size reaches
++   <xref linkend="guc-effective-cache-size"/>.  Buffering can be manually
++   forced or prevented by the <literal>buffering</literal> parameter to the
++   CREATE INDEX command.  The default behavior is good for most cases, but
++   turning buffering off might speed up the build somewhat if the input data
++   is ordered.
+   </para>
+ 
+  </sect2>
+diff --git a/doc/src/sgml/ref/create_index.sgml b/doc/src/sgml/ref/create_index.sgml
+index 847b8efcf4d8..749db2845e8c 100644
+--- a/doc/src/sgml/ref/create_index.sgml
++++ b/doc/src/sgml/ref/create_index.sgml
+@@ -463,11 +463,15 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ [ IF NOT EXISTS ] <replaceable class=
+     </term>
+     <listitem>
+     <para>
+-     Determines whether the buffering build technique described in
++     Determines whether the buffered build technique described in
+      <xref linkend="gist-buffering-build"/> is used to build the index. With
+-     <literal>OFF</literal> it is disabled, with <literal>ON</literal> it is enabled, and
+-     with <literal>AUTO</literal> it is initially disabled, but turned on
+-     on-the-fly once the index size reaches <xref linkend="guc-effective-cache-size"/>. The default is <literal>AUTO</literal>.
++     <literal>OFF</literal> buffering is disabled, with <literal>ON</literal>
++     it is enabled, and with <literal>AUTO</literal> it is initially disabled,
++     but is turned on on-the-fly once the index size reaches
++     <xref linkend="guc-effective-cache-size"/>.  The default
++     is <literal>AUTO</literal>.
++     Note that if sorted build is possible, it will be used instead of
++     buffered build unless <literal>buffering=ON</literal> is specified.
+     </para>
+     </listitem>
+    </varlistentry>
+diff --git a/src/backend/access/gist/gistbuild.c b/src/backend/access/gist/gistbuild.c
+index 28bc5855ad9f..9d3fa9c3b75b 100644
+--- a/src/backend/access/gist/gistbuild.c
++++ b/src/backend/access/gist/gistbuild.c
+@@ -180,9 +180,7 @@ gistbuild(Relation heap, Relation index, IndexInfo *indexInfo)
+ 	MemoryContext oldcxt = CurrentMemoryContext;
+ 	int			fillfactor;
+ 	Oid			SortSupportFnOids[INDEX_MAX_KEYS];
+-	bool		hasallsortsupports;
+-	int			keyscount = IndexRelationGetNumberOfKeyAttributes(index);
+-	GiSTOptions *options = NULL;
++	GiSTOptions *options = (GiSTOptions *) index->rd_options;
+ 
+ 	/*
+ 	 * We expect to be called exactly once for any index relation. If that's
+@@ -192,9 +190,6 @@ gistbuild(Relation heap, Relation index, IndexInfo *indexInfo)
+ 		elog(ERROR, "index \"%s\" already contains data",
+ 			 RelationGetRelationName(index));
+ 
+-	if (index->rd_options)
+-		options = (GiSTOptions *) index->rd_options;
+-
+ 	buildstate.indexrel = index;
+ 	buildstate.heaprel = heap;
+ 	buildstate.sortstate = NULL;
+@@ -208,33 +203,17 @@ gistbuild(Relation heap, Relation index, IndexInfo *indexInfo)
+ 	buildstate.giststate->tempCxt = createTempGistContext();
+ 
+ 	/*
+-	 * Choose build strategy. If all keys support sorting, do that. Otherwise
+-	 * the default strategy is switch to buffering mode when the index grows
+-	 * too large to fit in cache.
++	 * Choose build strategy.  First check whether the user specified to use
++	 * buffering mode.  (The use-case for that in the field is somewhat
++	 * questionable perhaps, but it's important for testing purposes.)
+ 	 */
+-	hasallsortsupports = true;
+-	for (int i = 0; i < keyscount; i++)
+-	{
+-		SortSupportFnOids[i] = index_getprocid(index, i + 1,
+-											   GIST_SORTSUPPORT_PROC);
+-		if (!OidIsValid(SortSupportFnOids[i]))
+-		{
+-			hasallsortsupports = false;
+-			break;
+-		}
+-	}
+-
+-	if (hasallsortsupports)
+-	{
+-		buildstate.buildMode = GIST_SORTED_BUILD;
+-	}
+-	else if (options)
++	if (options)
+ 	{
+ 		if (options->buffering_mode == GIST_OPTION_BUFFERING_ON)
+ 			buildstate.buildMode = GIST_BUFFERING_STATS;
+ 		else if (options->buffering_mode == GIST_OPTION_BUFFERING_OFF)
+ 			buildstate.buildMode = GIST_BUFFERING_DISABLED;
+-		else
++		else					/* must be "auto" */
+ 			buildstate.buildMode = GIST_BUFFERING_AUTO;
+ 	}
+ 	else
+@@ -242,6 +221,28 @@ gistbuild(Relation heap, Relation index, IndexInfo *indexInfo)
+ 		buildstate.buildMode = GIST_BUFFERING_AUTO;
+ 	}
+ 
++	/*
++	 * Unless buffering mode was forced, see if we can use sorting instead.
++	 */
++	if (buildstate.buildMode != GIST_BUFFERING_STATS)
++	{
++		bool		hasallsortsupports = true;
++		int			keyscount = IndexRelationGetNumberOfKeyAttributes(index);
++
++		for (int i = 0; i < keyscount; i++)
++		{
++			SortSupportFnOids[i] = index_getprocid(index, i + 1,
++												   GIST_SORTSUPPORT_PROC);
++			if (!OidIsValid(SortSupportFnOids[i]))
++			{
++				hasallsortsupports = false;
++				break;
++			}
++		}
++		if (hasallsortsupports)
++			buildstate.buildMode = GIST_SORTED_BUILD;
++	}
++
+ 	/*
+ 	 * Calculate target amount of free space to leave on pages.
+ 	 */
+@@ -852,7 +853,10 @@ gistBuildCallback(Relation index,
+ 	 * and switch to buffering mode if it has.
+ 	 *
+ 	 * To avoid excessive calls to smgrnblocks(), only check this every
+-	 * BUFFERING_MODE_SWITCH_CHECK_STEP index tuples
++	 * BUFFERING_MODE_SWITCH_CHECK_STEP index tuples.
++	 *
++	 * In 'stats' state, switch as soon as we have seen enough tuples to have
++	 * some idea of the average tuple size.
+ 	 */
+ 	if ((buildstate->buildMode == GIST_BUFFERING_AUTO &&
+ 		 buildstate->indtuples % BUFFERING_MODE_SWITCH_CHECK_STEP == 0 &&

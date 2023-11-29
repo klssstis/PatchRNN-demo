@@ -1,0 +1,201 @@
+From 79d4bf4eff14d8967b10ad4c60039c1b9b0cf66e Mon Sep 17 00:00:00 2001
+From: Peter Geoghegan <pg@bowt.ie>
+Date: Tue, 3 Jan 2023 11:22:36 -0800
+Subject: [PATCH] Delay commit status checks until freezing executes.
+
+pg_xact lookups are relatively expensive.  Move the xmin/xmax commit
+status checks from the point that freeze plans are prepared to the point
+that they're actually executed.  Otherwise we'll repeat many commit
+status checks whenever multiple successive VACUUM operations scan the
+same pages and decide against freezing each time, which is a waste of
+cycles.
+
+Oversight in commit 1de58df4, which added page-level freezing.
+
+Author: Peter Geoghegan <pg@bowt.ie>
+Discussion: https://postgr.es/m/CAH2-WzkZpe4K6qMfEt8H4qYJCKc2R7TPvKsBva7jc9w7iGXQSw@mail.gmail.com
+---
+ src/backend/access/heap/heapam.c | 89 ++++++++++++++++++++++----------
+ src/include/access/heapam.h      |  9 ++++
+ 2 files changed, 71 insertions(+), 27 deletions(-)
+
+diff --git a/src/backend/access/heap/heapam.c b/src/backend/access/heap/heapam.c
+index 85533e12a151..bad2a89e4fbb 100644
+--- a/src/backend/access/heap/heapam.c
++++ b/src/backend/access/heap/heapam.c
+@@ -6208,10 +6208,10 @@ FreezeMultiXactId(MultiXactId multi, uint16 t_infomask,
+ 			 * been pruned away instead, since updater XID is < OldestXmin).
+ 			 * Just remove xmax.
+ 			 */
+-			if (TransactionIdDidCommit(update_xact))
++			if (!TransactionIdDidAbort(update_xact))
+ 				ereport(ERROR,
+ 						(errcode(ERRCODE_DATA_CORRUPTED),
+-						 errmsg_internal("multixact %u contains committed update XID %u from before removable cutoff %u",
++						 errmsg_internal("multixact %u contains non-aborted update XID %u from before removable cutoff %u",
+ 										 multi, update_xact,
+ 										 cutoffs->OldestXmin)));
+ 			*flags |= FRM_INVALIDATE_XMAX;
+@@ -6500,10 +6500,11 @@ heap_prepare_freeze_tuple(HeapTupleHeader tuple,
+ 				freeze_xmax = false;
+ 	TransactionId xid;
+ 
+-	frz->frzflags = 0;
++	frz->xmax = HeapTupleHeaderGetRawXmax(tuple);
+ 	frz->t_infomask2 = tuple->t_infomask2;
+ 	frz->t_infomask = tuple->t_infomask;
+-	frz->xmax = HeapTupleHeaderGetRawXmax(tuple);
++	frz->frzflags = 0;
++	frz->checkflags = 0;
+ 
+ 	/*
+ 	 * Process xmin, while keeping track of whether it's already frozen, or
+@@ -6521,14 +6522,12 @@ heap_prepare_freeze_tuple(HeapTupleHeader tuple,
+ 					 errmsg_internal("found xmin %u from before relfrozenxid %u",
+ 									 xid, cutoffs->relfrozenxid)));
+ 
++		/* Will set freeze_xmin flags in freeze plan below */
+ 		freeze_xmin = TransactionIdPrecedes(xid, cutoffs->OldestXmin);
+-		if (freeze_xmin && !TransactionIdDidCommit(xid))
+-			ereport(ERROR,
+-					(errcode(ERRCODE_DATA_CORRUPTED),
+-					 errmsg_internal("uncommitted xmin %u from before xid cutoff %u needs to be frozen",
+-									 xid, cutoffs->OldestXmin)));
+ 
+-		/* Will set freeze_xmin flags in freeze plan below */
++		/* Verify that xmin committed if and when freeze plan is executed */
++		if (freeze_xmin)
++			frz->checkflags |= HEAP_FREEZE_CHECK_XMIN_COMMITTED;
+ 	}
+ 
+ 	/*
+@@ -6551,7 +6550,7 @@ heap_prepare_freeze_tuple(HeapTupleHeader tuple,
+ 	}
+ 
+ 	/* Now process xmax */
+-	xid = HeapTupleHeaderGetRawXmax(tuple);
++	xid = frz->xmax;
+ 	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)
+ 	{
+ 		/* Raw xmax is a MultiXactId */
+@@ -6662,21 +6661,16 @@ heap_prepare_freeze_tuple(HeapTupleHeader tuple,
+ 					 errmsg_internal("found xmax %u from before relfrozenxid %u",
+ 									 xid, cutoffs->relfrozenxid)));
+ 
+-		if (TransactionIdPrecedes(xid, cutoffs->OldestXmin))
+-			freeze_xmax = true;
++		/* Will set freeze_xmax flags in freeze plan below */
++		freeze_xmax = TransactionIdPrecedes(xid, cutoffs->OldestXmin);
+ 
+ 		/*
+-		 * If we freeze xmax, make absolutely sure that it's not an XID that
+-		 * is important.  (Note, a lock-only xmax can be removed independent
+-		 * of committedness, since a committed lock holder has released the
+-		 * lock).
++		 * Verify that xmax aborted if and when freeze plan is executed,
++		 * provided it's from an update. (A lock-only xmax can be removed
++		 * independent of this, since the lock is released at xact end.)
+ 		 */
+-		if (freeze_xmax && !HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask) &&
+-			TransactionIdDidCommit(xid))
+-			ereport(ERROR,
+-					(errcode(ERRCODE_DATA_CORRUPTED),
+-					 errmsg_internal("cannot freeze committed xmax %u",
+-									 xid)));
++		if (freeze_xmax && !HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
++			frz->checkflags |= HEAP_FREEZE_CHECK_XMAX_ABORTED;
+ 	}
+ 	else if (!TransactionIdIsValid(xid))
+ 	{
+@@ -6804,19 +6798,60 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
+ 
+ 	Assert(ntuples > 0);
+ 
+-	START_CRIT_SECTION();
++	/*
++	 * Perform xmin/xmax XID status sanity checks before critical section.
++	 *
++	 * heap_prepare_freeze_tuple doesn't perform these checks directly because
++	 * pg_xact lookups are relatively expensive.  They shouldn't be repeated
++	 * by successive VACUUMs that each decide against freezing the same page.
++	 */
++	for (int i = 0; i < ntuples; i++)
++	{
++		HeapTupleFreeze *frz = tuples + i;
++		ItemId		itemid = PageGetItemId(page, frz->offset);
++		HeapTupleHeader htup;
+ 
+-	MarkBufferDirty(buffer);
++		htup = (HeapTupleHeader) PageGetItem(page, itemid);
++
++		/* Deliberately avoid relying on tuple hint bits here */
++		if (frz->checkflags & HEAP_FREEZE_CHECK_XMIN_COMMITTED)
++		{
++			TransactionId xmin = HeapTupleHeaderGetRawXmin(htup);
++
++			Assert(!HeapTupleHeaderXminFrozen(htup));
++			if (unlikely(!TransactionIdDidCommit(xmin)))
++				ereport(ERROR,
++						(errcode(ERRCODE_DATA_CORRUPTED),
++						 errmsg_internal("uncommitted xmin %u needs to be frozen",
++										 xmin)));
++		}
++		if (frz->checkflags & HEAP_FREEZE_CHECK_XMAX_ABORTED)
++		{
++			TransactionId xmax = HeapTupleHeaderGetRawXmax(htup);
++
++			Assert(TransactionIdIsNormal(xmax));
++			if (unlikely(!TransactionIdDidAbort(xmax)))
++				ereport(ERROR,
++						(errcode(ERRCODE_DATA_CORRUPTED),
++						 errmsg_internal("cannot freeze non-aborted xmax %u",
++										 xmax)));
++		}
++	}
++
++	START_CRIT_SECTION();
+ 
+ 	for (int i = 0; i < ntuples; i++)
+ 	{
++		HeapTupleFreeze *frz = tuples + i;
++		ItemId		itemid = PageGetItemId(page, frz->offset);
+ 		HeapTupleHeader htup;
+-		ItemId		itemid = PageGetItemId(page, tuples[i].offset);
+ 
+ 		htup = (HeapTupleHeader) PageGetItem(page, itemid);
+-		heap_execute_freeze_tuple(htup, &tuples[i]);
++		heap_execute_freeze_tuple(htup, frz);
+ 	}
+ 
++	MarkBufferDirty(buffer);
++
+ 	/* Now WAL-log freezing if necessary */
+ 	if (RelationNeedsWAL(rel))
+ 	{
+diff --git a/src/include/access/heapam.h b/src/include/access/heapam.h
+index 4a69b6dd0431..417108f1e01c 100644
+--- a/src/include/access/heapam.h
++++ b/src/include/access/heapam.h
+@@ -100,6 +100,13 @@ typedef enum
+ 	HEAPTUPLE_DELETE_IN_PROGRESS	/* deleting xact is still in progress */
+ } HTSV_Result;
+ 
++/*
++ * heap_prepare_freeze_tuple may request that heap_freeze_execute_prepared
++ * check any tuple's to-be-frozen xmin and/or xmax status using pg_xact
++ */
++#define		HEAP_FREEZE_CHECK_XMIN_COMMITTED	0x01
++#define		HEAP_FREEZE_CHECK_XMAX_ABORTED		0x02
++
+ /* heap_prepare_freeze_tuple state describing how to freeze a tuple */
+ typedef struct HeapTupleFreeze
+ {
+@@ -109,6 +116,8 @@ typedef struct HeapTupleFreeze
+ 	uint16		t_infomask;
+ 	uint8		frzflags;
+ 
++	/* xmin/xmax check flags */
++	uint8		checkflags;
+ 	/* Page offset number for tuple */
+ 	OffsetNumber offset;
+ } HeapTupleFreeze;

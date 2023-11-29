@@ -1,0 +1,258 @@
+From 74b35eb468dcf353e25afd4acfc7ee2b2022d6b6 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 31 Jan 2020 17:03:55 -0500
+Subject: [PATCH] Fix CheckAttributeType's handling of collations for ranges.
+
+Commit fc7695891 changed CheckAttributeType to recurse into ranges,
+but made it pass down the wrong collation (always InvalidOid, since
+ranges as such have no collation).  This would result in guaranteed
+failure when considering a range type whose subtype is collatable.
+
+Embarrassingly, we lack any regression tests that would expose such
+a problem (but fortunately, somebody noticed before we shipped this
+bug in any release).
+
+Fix it to pass down the range's subtype collation property instead,
+and add some regression test cases to exercise collatable-subtype
+ranges a bit more.  Back-patch to all supported branches, as the
+previous patch was.
+
+Report and patch by Julien Rouhaud, test cases tweaked by me
+
+Discussion: https://postgr.es/m/CAOBaU_aBWqNweiGUFX0guzBKkcfJ8mnnyyGC_KBQmO12Mj5f_A@mail.gmail.com
+---
+ src/backend/catalog/heap.c                 |  3 +-
+ src/backend/utils/cache/lsyscache.c        | 26 +++++++
+ src/include/utils/lsyscache.h              |  1 +
+ src/test/regress/expected/rangetypes.out   | 89 +++++++++++++++++++++-
+ src/test/regress/expected/sanity_check.out |  2 +
+ src/test/regress/sql/rangetypes.sql        | 30 +++++++-
+ 6 files changed, 148 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/catalog/heap.c b/src/backend/catalog/heap.c
+index 709df9035fb2..046b3d37cedf 100644
+--- a/src/backend/catalog/heap.c
++++ b/src/backend/catalog/heap.c
+@@ -672,7 +672,8 @@ CheckAttributeType(const char *attname,
+ 		/*
+ 		 * If it's a range, recurse to check its subtype.
+ 		 */
+-		CheckAttributeType(attname, get_range_subtype(atttypid), attcollation,
++		CheckAttributeType(attname, get_range_subtype(atttypid),
++						   get_range_collation(atttypid),
+ 						   containing_rowtypes,
+ 						   flags);
+ 	}
+diff --git a/src/backend/utils/cache/lsyscache.c b/src/backend/utils/cache/lsyscache.c
+index 1e3e6d3a7e7e..fb0599f7f13f 100644
+--- a/src/backend/utils/cache/lsyscache.c
++++ b/src/backend/utils/cache/lsyscache.c
+@@ -3150,6 +3150,32 @@ get_range_subtype(Oid rangeOid)
+ 		return InvalidOid;
+ }
+ 
++/*
++ * get_range_collation
++ *		Returns the collation of a given range type
++ *
++ * Returns InvalidOid if the type is not a range type,
++ * or if its subtype is not collatable.
++ */
++Oid
++get_range_collation(Oid rangeOid)
++{
++	HeapTuple	tp;
++
++	tp = SearchSysCache1(RANGETYPE, ObjectIdGetDatum(rangeOid));
++	if (HeapTupleIsValid(tp))
++	{
++		Form_pg_range rngtup = (Form_pg_range) GETSTRUCT(tp);
++		Oid			result;
++
++		result = rngtup->rngcollation;
++		ReleaseSysCache(tp);
++		return result;
++	}
++	else
++		return InvalidOid;
++}
++
+ /*				---------- PG_INDEX CACHE ----------				 */
+ 
+ /*
+diff --git a/src/include/utils/lsyscache.h b/src/include/utils/lsyscache.h
+index a216d6793df5..370f62a13340 100644
+--- a/src/include/utils/lsyscache.h
++++ b/src/include/utils/lsyscache.h
+@@ -179,6 +179,7 @@ extern void free_attstatsslot(AttStatsSlot *sslot);
+ extern char *get_namespace_name(Oid nspid);
+ extern char *get_namespace_name_or_temp(Oid nspid);
+ extern Oid	get_range_subtype(Oid rangeOid);
++extern Oid	get_range_collation(Oid rangeOid);
+ extern Oid	get_index_column_opclass(Oid index_oid, int attno);
+ 
+ #define type_is_array(typid)  (get_element_type(typid) != InvalidOid)
+diff --git a/src/test/regress/expected/rangetypes.out b/src/test/regress/expected/rangetypes.out
+index 5ed6ae47ec3c..220f2d96cbf9 100644
+--- a/src/test/regress/expected/rangetypes.out
++++ b/src/test/regress/expected/rangetypes.out
+@@ -582,8 +582,95 @@ select * from numrange_test natural join numrange_test2 order by nr;
+ set enable_nestloop to default;
+ set enable_hashjoin to default;
+ set enable_mergejoin to default;
+-DROP TABLE numrange_test;
++-- keep numrange_test around to help exercise dump/reload
+ DROP TABLE numrange_test2;
++--
++-- Apply a subset of the above tests on a collatable type, too
++--
++CREATE TABLE textrange_test (tr textrange);
++create index textrange_test_btree on textrange_test(tr);
++INSERT INTO textrange_test VALUES('[,)');
++INSERT INTO textrange_test VALUES('["a",]');
++INSERT INTO textrange_test VALUES('[,"q")');
++INSERT INTO textrange_test VALUES(textrange('b', 'g'));
++INSERT INTO textrange_test VALUES('empty');
++INSERT INTO textrange_test VALUES(textrange('d', 'd', '[]'));
++SELECT tr, isempty(tr), lower(tr), upper(tr) FROM textrange_test;
++  tr   | isempty | lower | upper 
++-------+---------+-------+-------
++ (,)   | f       |       | 
++ [a,)  | f       | a     | 
++ (,q)  | f       |       | q
++ [b,g) | f       | b     | g
++ empty | t       |       | 
++ [d,d] | f       | d     | d
++(6 rows)
++
++SELECT tr, lower_inc(tr), lower_inf(tr), upper_inc(tr), upper_inf(tr) FROM textrange_test;
++  tr   | lower_inc | lower_inf | upper_inc | upper_inf 
++-------+-----------+-----------+-----------+-----------
++ (,)   | f         | t         | f         | t
++ [a,)  | t         | f         | f         | t
++ (,q)  | f         | t         | f         | f
++ [b,g) | t         | f         | f         | f
++ empty | f         | f         | f         | f
++ [d,d] | t         | f         | t         | f
++(6 rows)
++
++SELECT * FROM textrange_test WHERE range_contains(tr, textrange('f', 'fx'));
++  tr   
++-------
++ (,)
++ [a,)
++ (,q)
++ [b,g)
++(4 rows)
++
++SELECT * FROM textrange_test WHERE tr @> textrange('a', 'z');
++  tr  
++------
++ (,)
++ [a,)
++(2 rows)
++
++SELECT * FROM textrange_test WHERE range_contained_by(textrange('0','9'), tr);
++  tr  
++------
++ (,)
++ (,q)
++(2 rows)
++
++SELECT * FROM textrange_test WHERE 'e'::text <@ tr;
++  tr   
++-------
++ (,)
++ [a,)
++ (,q)
++ [b,g)
++(4 rows)
++
++select * from textrange_test where tr = 'empty';
++  tr   
++-------
++ empty
++(1 row)
++
++select * from textrange_test where tr = '("b","g")';
++ tr 
++----
++(0 rows)
++
++select * from textrange_test where tr = '["b","g")';
++  tr   
++-------
++ [b,g)
++(1 row)
++
++select * from textrange_test where tr < 'empty';
++ tr 
++----
++(0 rows)
++
+ -- test canonical form for int4range
+ select int4range(1, 10, '[]');
+  int4range 
+diff --git a/src/test/regress/expected/sanity_check.out b/src/test/regress/expected/sanity_check.out
+index f0cd40b6607a..45b421b747a1 100644
+--- a/src/test/regress/expected/sanity_check.out
++++ b/src/test/regress/expected/sanity_check.out
+@@ -92,6 +92,7 @@ num_exp_sqrt|t
+ num_exp_sub|t
+ num_input_test|f
+ num_result|f
++numrange_test|t
+ onek|t
+ onek2|t
+ path_tbl|f
+@@ -201,6 +202,7 @@ test_range_spgist|t
+ test_tsvector|f
+ testjsonb|f
+ text_tbl|f
++textrange_test|t
+ time_tbl|f
+ timestamp_tbl|f
+ timestamptz_tbl|f
+diff --git a/src/test/regress/sql/rangetypes.sql b/src/test/regress/sql/rangetypes.sql
+index 2d0ec8964e67..72d80bc9d466 100644
+--- a/src/test/regress/sql/rangetypes.sql
++++ b/src/test/regress/sql/rangetypes.sql
+@@ -148,9 +148,37 @@ set enable_nestloop to default;
+ set enable_hashjoin to default;
+ set enable_mergejoin to default;
+ 
+-DROP TABLE numrange_test;
++-- keep numrange_test around to help exercise dump/reload
+ DROP TABLE numrange_test2;
+ 
++--
++-- Apply a subset of the above tests on a collatable type, too
++--
++
++CREATE TABLE textrange_test (tr textrange);
++create index textrange_test_btree on textrange_test(tr);
++
++INSERT INTO textrange_test VALUES('[,)');
++INSERT INTO textrange_test VALUES('["a",]');
++INSERT INTO textrange_test VALUES('[,"q")');
++INSERT INTO textrange_test VALUES(textrange('b', 'g'));
++INSERT INTO textrange_test VALUES('empty');
++INSERT INTO textrange_test VALUES(textrange('d', 'd', '[]'));
++
++SELECT tr, isempty(tr), lower(tr), upper(tr) FROM textrange_test;
++SELECT tr, lower_inc(tr), lower_inf(tr), upper_inc(tr), upper_inf(tr) FROM textrange_test;
++
++SELECT * FROM textrange_test WHERE range_contains(tr, textrange('f', 'fx'));
++SELECT * FROM textrange_test WHERE tr @> textrange('a', 'z');
++SELECT * FROM textrange_test WHERE range_contained_by(textrange('0','9'), tr);
++SELECT * FROM textrange_test WHERE 'e'::text <@ tr;
++
++select * from textrange_test where tr = 'empty';
++select * from textrange_test where tr = '("b","g")';
++select * from textrange_test where tr = '["b","g")';
++select * from textrange_test where tr < 'empty';
++
++
+ -- test canonical form for int4range
+ select int4range(1, 10, '[]');
+ select int4range(1, 10, '[)');

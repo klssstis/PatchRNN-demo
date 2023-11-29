@@ -1,0 +1,580 @@
+From 076f4d9539e9687d68ada32353c0c16d9bfa3cfb Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Wed, 16 Mar 2022 11:19:39 +0900
+Subject: [PATCH] pageinspect: Fix handling of page sizes and AM types
+
+This commit fixes a set of issues related to the use of the SQL
+functions in this module when the caller is able to pass down raw page
+data as input argument:
+- The page size check was fuzzy in a couple of places, sometimes
+looking after only a sub-range, but what we are looking for is an exact
+match on BLCKSZ.  After considering a few options here, I have settled
+down to do a generalization of get_page_from_raw().  Most of the SQL
+functions already used that, and this is not strictly required if not
+accessing an 8-byte-wide value from a raw page, but this feels safer in
+the long run for alignment-picky environment, particularly if a code
+path begins to access such values.  This also reduces the number of
+strings that need to be translated.
+- The BRIN function brin_page_items() uses a Relation but it did not
+check the access method of the opened index, potentially leading to
+crashes.  All the other functions in need of a Relation already did
+that.
+- Some code paths could fail on elog(), but we should to use ereport()
+for failures that can be triggered by the user.
+
+Tests are added to stress all the cases that are fixed as of this
+commit, with some junk raw pages (\set VERBOSITY ensures that this works
+across all page sizes) and unexpected index types when functions open
+relations.
+
+Author: Michael Paquier, Justin Prysby
+Discussion: https://postgr.es/m/20220218030020.GA1137@telsasoft.com
+Backpatch-through: 10
+---
+ contrib/pageinspect/brinfuncs.c        | 36 ++++++++++----------------
+ contrib/pageinspect/btreefuncs.c       | 28 ++++++++++----------
+ contrib/pageinspect/expected/brin.out  |  4 +++
+ contrib/pageinspect/expected/btree.out | 15 +++++++++++
+ contrib/pageinspect/expected/gin.out   | 11 ++++++++
+ contrib/pageinspect/expected/gist.out  | 15 +++++++++++
+ contrib/pageinspect/expected/hash.out  | 17 ++++++++++++
+ contrib/pageinspect/expected/page.out  | 11 ++++++++
+ contrib/pageinspect/fsmfuncs.c         |  4 ++-
+ contrib/pageinspect/gistfuncs.c        |  9 +++++++
+ contrib/pageinspect/hashfuncs.c        |  6 +++--
+ contrib/pageinspect/rawpage.c          | 29 +++------------------
+ contrib/pageinspect/sql/brin.sql       |  4 +++
+ contrib/pageinspect/sql/btree.sql      | 13 ++++++++++
+ contrib/pageinspect/sql/gin.sql        |  9 +++++++
+ contrib/pageinspect/sql/gist.sql       | 13 ++++++++++
+ contrib/pageinspect/sql/hash.sql       | 13 ++++++++++
+ contrib/pageinspect/sql/page.sql       |  9 +++++++
+ 18 files changed, 179 insertions(+), 67 deletions(-)
+
+diff --git a/contrib/pageinspect/brinfuncs.c b/contrib/pageinspect/brinfuncs.c
+index b7c83652180d..bd0ea8b18c1a 100644
+--- a/contrib/pageinspect/brinfuncs.c
++++ b/contrib/pageinspect/brinfuncs.c
+@@ -16,6 +16,7 @@
+ #include "access/brin_tuple.h"
+ #include "access/htup_details.h"
+ #include "catalog/index.h"
++#include "catalog/pg_am_d.h"
+ #include "catalog/pg_type.h"
+ #include "funcapi.h"
+ #include "lib/stringinfo.h"
+@@ -31,6 +32,8 @@ PG_FUNCTION_INFO_V1(brin_page_items);
+ PG_FUNCTION_INFO_V1(brin_metapage_info);
+ PG_FUNCTION_INFO_V1(brin_revmap_data);
+ 
++#define IS_BRIN(r) ((r)->rd_rel->relam == BRIN_AM_OID)
++
+ typedef struct brin_column_state
+ {
+ 	int			nstored;
+@@ -45,8 +48,7 @@ Datum
+ brin_page_type(PG_FUNCTION_ARGS)
+ {
+ 	bytea	   *raw_page = PG_GETARG_BYTEA_P(0);
+-	Page		page = VARDATA(raw_page);
+-	int			raw_page_size;
++	Page		page;
+ 	char	   *type;
+ 
+ 	if (!superuser())
+@@ -54,14 +56,7 @@ brin_page_type(PG_FUNCTION_ARGS)
+ 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 				 errmsg("must be superuser to use raw page functions")));
+ 
+-	raw_page_size = VARSIZE(raw_page) - VARHDRSZ;
+-
+-	if (raw_page_size != BLCKSZ)
+-		ereport(ERROR,
+-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-				 errmsg("input page too small"),
+-				 errdetail("Expected size %d, got %d",
+-						   BLCKSZ, raw_page_size)));
++	page = get_page_from_raw(raw_page);
+ 
+ 	switch (BrinPageType(page))
+ 	{
+@@ -89,19 +84,7 @@ brin_page_type(PG_FUNCTION_ARGS)
+ static Page
+ verify_brin_page(bytea *raw_page, uint16 type, const char *strtype)
+ {
+-	Page		page;
+-	int			raw_page_size;
+-
+-	raw_page_size = VARSIZE(raw_page) - VARHDRSZ;
+-
+-	if (raw_page_size != BLCKSZ)
+-		ereport(ERROR,
+-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-				 errmsg("input page too small"),
+-				 errdetail("Expected size %d, got %d",
+-						   BLCKSZ, raw_page_size)));
+-
+-	page = VARDATA(raw_page);
++	Page		page = get_page_from_raw(raw_page);
+ 
+ 	/* verify the special space says this page is what we want */
+ 	if (BrinPageType(page) != type)
+@@ -143,6 +126,13 @@ brin_page_items(PG_FUNCTION_ARGS)
+ 	SetSingleFuncCall(fcinfo, 0);
+ 
+ 	indexRel = index_open(indexRelid, AccessShareLock);
++
++	if (!IS_BRIN(indexRel))
++		ereport(ERROR,
++				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++				 errmsg("\"%s\" is not a %s index",
++						RelationGetRelationName(indexRel), "BRIN")));
++
+ 	bdesc = brin_build_desc(indexRel);
+ 
+ 	/* minimally verify the page we got */
+diff --git a/contrib/pageinspect/btreefuncs.c b/contrib/pageinspect/btreefuncs.c
+index 03debe336baa..d9628dd664dc 100644
+--- a/contrib/pageinspect/btreefuncs.c
++++ b/contrib/pageinspect/btreefuncs.c
+@@ -206,8 +206,10 @@ bt_page_stats_internal(PG_FUNCTION_ARGS, enum pageinspect_version ext_version)
+ 	rel = relation_openrv(relrv, AccessShareLock);
+ 
+ 	if (!IS_INDEX(rel) || !IS_BTREE(rel))
+-		elog(ERROR, "relation \"%s\" is not a btree index",
+-			 RelationGetRelationName(rel));
++		ereport(ERROR,
++				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++				 errmsg("\"%s\" is not a %s index",
++						RelationGetRelationName(rel), "btree")));
+ 
+ 	/*
+ 	 * Reject attempts to read non-local temporary relations; we would be
+@@ -476,8 +478,10 @@ bt_page_items_internal(PG_FUNCTION_ARGS, enum pageinspect_version ext_version)
+ 		rel = relation_openrv(relrv, AccessShareLock);
+ 
+ 		if (!IS_INDEX(rel) || !IS_BTREE(rel))
+-			elog(ERROR, "relation \"%s\" is not a btree index",
+-				 RelationGetRelationName(rel));
++			ereport(ERROR,
++					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++					 errmsg("\"%s\" is not a %s index",
++							RelationGetRelationName(rel), "btree")));
+ 
+ 		/*
+ 		 * Reject attempts to read non-local temporary relations; we would be
+@@ -588,7 +592,6 @@ bt_page_items_bytea(PG_FUNCTION_ARGS)
+ 	Datum		result;
+ 	FuncCallContext *fctx;
+ 	struct user_args *uargs;
+-	int			raw_page_size;
+ 
+ 	if (!superuser())
+ 		ereport(ERROR,
+@@ -601,19 +604,12 @@ bt_page_items_bytea(PG_FUNCTION_ARGS)
+ 		MemoryContext mctx;
+ 		TupleDesc	tupleDesc;
+ 
+-		raw_page_size = VARSIZE(raw_page) - VARHDRSZ;
+-
+-		if (raw_page_size < SizeOfPageHeaderData)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-					 errmsg("input page too small (%d bytes)", raw_page_size)));
+-
+ 		fctx = SRF_FIRSTCALL_INIT();
+ 		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
+ 
+ 		uargs = palloc(sizeof(struct user_args));
+ 
+-		uargs->page = VARDATA(raw_page);
++		uargs->page = get_page_from_raw(raw_page);
+ 
+ 		uargs->offset = FirstOffsetNumber;
+ 
+@@ -698,8 +694,10 @@ bt_metap(PG_FUNCTION_ARGS)
+ 	rel = relation_openrv(relrv, AccessShareLock);
+ 
+ 	if (!IS_INDEX(rel) || !IS_BTREE(rel))
+-		elog(ERROR, "relation \"%s\" is not a btree index",
+-			 RelationGetRelationName(rel));
++		ereport(ERROR,
++				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++				 errmsg("\"%s\" is not a %s index",
++						RelationGetRelationName(rel), "btree")));
+ 
+ 	/*
+ 	 * Reject attempts to read non-local temporary relations; we would be
+diff --git a/contrib/pageinspect/expected/brin.out b/contrib/pageinspect/expected/brin.out
+index 71eb190380cf..10cd36c1778c 100644
+--- a/contrib/pageinspect/expected/brin.out
++++ b/contrib/pageinspect/expected/brin.out
+@@ -48,4 +48,8 @@ SELECT * FROM brin_page_items(get_raw_page('test1_a_idx', 2), 'test1_a_idx')
+           1 |      0 |      1 | f        | f        | f           | {1 .. 1}
+ (1 row)
+ 
++-- Failure for non-BRIN index.
++CREATE INDEX test1_a_btree ON test1 (a);
++SELECT brin_page_items(get_raw_page('test1_a_btree', 0), 'test1_a_btree');
++ERROR:  "test1_a_btree" is not a BRIN index
+ DROP TABLE test1;
+diff --git a/contrib/pageinspect/expected/btree.out b/contrib/pageinspect/expected/btree.out
+index c60bc88560cc..80b3dfe861c5 100644
+--- a/contrib/pageinspect/expected/btree.out
++++ b/contrib/pageinspect/expected/btree.out
+@@ -70,4 +70,19 @@ tids       |
+ 
+ SELECT * FROM bt_page_items(get_raw_page('test1_a_idx', 2));
+ ERROR:  block number 2 is out of range for relation "test1_a_idx"
++-- Failure when using a non-btree index.
++CREATE INDEX test1_a_hash ON test1 USING hash(a);
++SELECT bt_metap('test1_a_hash');
++ERROR:  "test1_a_hash" is not a btree index
++SELECT bt_page_stats('test1_a_hash', 0);
++ERROR:  "test1_a_hash" is not a btree index
++SELECT bt_page_items('test1_a_hash', 0);
++ERROR:  "test1_a_hash" is not a btree index
++-- Failure with incorrect page size
++-- Suppress the DETAIL message, to allow the tests to work across various
++-- page sizes.
++\set VERBOSITY terse
++SELECT bt_page_items('aaa'::bytea);
++ERROR:  invalid page size
++\set VERBOSITY default
+ DROP TABLE test1;
+diff --git a/contrib/pageinspect/expected/gin.out b/contrib/pageinspect/expected/gin.out
+index ef7570b9723b..802f48284bfa 100644
+--- a/contrib/pageinspect/expected/gin.out
++++ b/contrib/pageinspect/expected/gin.out
+@@ -36,3 +36,14 @@ FROM gin_leafpage_items(get_raw_page('test1_y_idx',
+ ?column? | t
+ 
+ DROP TABLE test1;
++-- Failure with incorrect page size
++-- Suppress the DETAIL message, to allow the tests to work across various
++-- page sizes.
++\set VERBOSITY terse
++SELECT gin_leafpage_items('aaa'::bytea);
++ERROR:  invalid page size
++SELECT gin_metapage_info('bbb'::bytea);
++ERROR:  invalid page size
++SELECT gin_page_opaque_info('ccc'::bytea);
++ERROR:  invalid page size
++\set VERBOSITY default
+diff --git a/contrib/pageinspect/expected/gist.out b/contrib/pageinspect/expected/gist.out
+index 93abfcdd5e1d..3f33e040661b 100644
+--- a/contrib/pageinspect/expected/gist.out
++++ b/contrib/pageinspect/expected/gist.out
+@@ -64,4 +64,19 @@ SELECT itemoffset, ctid, itemlen FROM gist_page_items_bytea(get_raw_page('test_g
+           6 | (6,65535) |      40
+ (6 rows)
+ 
++-- Failure with non-GiST index.
++CREATE INDEX test_gist_btree on test_gist(t);
++SELECT gist_page_items(get_raw_page('test_gist_btree', 0), 'test_gist_btree');
++ERROR:  "test_gist_btree" is not a GiST index
++-- Failure with incorrect page size
++-- Suppress the DETAIL message, to allow the tests to work across various
++-- page sizes.
++\set VERBOSITY terse
++SELECT gist_page_items_bytea('aaa'::bytea);
++ERROR:  invalid page size
++SELECT gist_page_items('aaa'::bytea, 'test_gist_idx'::regclass);
++ERROR:  invalid page size
++SELECT gist_page_opaque_info('aaa'::bytea);
++ERROR:  invalid page size
++\set VERBOSITY default
+ DROP TABLE test_gist;
+diff --git a/contrib/pageinspect/expected/hash.out b/contrib/pageinspect/expected/hash.out
+index bd0628d01369..6c606630dd71 100644
+--- a/contrib/pageinspect/expected/hash.out
++++ b/contrib/pageinspect/expected/hash.out
+@@ -163,4 +163,21 @@ SELECT * FROM hash_page_items(get_raw_page('test_hash_a_idx', 4));
+ 
+ SELECT * FROM hash_page_items(get_raw_page('test_hash_a_idx', 5));
+ ERROR:  page is not a hash bucket or overflow page
++-- Failure with non-hash index
++CREATE INDEX test_hash_a_btree ON test_hash USING btree (a);
++SELECT hash_bitmap_info('test_hash_a_btree', 0);
++ERROR:  "test_hash_a_btree" is not a hash index
++-- Failure with incorrect page size
++-- Suppress the DETAIL message, to allow the tests to work across various
++-- page sizes.
++\set VERBOSITY terse
++SELECT hash_metapage_info('aaa'::bytea);
++ERROR:  invalid page size
++SELECT hash_page_items('bbb'::bytea);
++ERROR:  invalid page size
++SELECT hash_page_stats('ccc'::bytea);
++ERROR:  invalid page size
++SELECT hash_page_type('ddd'::bytea);
++ERROR:  invalid page size
++\set VERBOSITY default
+ DROP TABLE test_hash;
+diff --git a/contrib/pageinspect/expected/page.out b/contrib/pageinspect/expected/page.out
+index 4e325ae56dd8..9bbdda7f1803 100644
+--- a/contrib/pageinspect/expected/page.out
++++ b/contrib/pageinspect/expected/page.out
+@@ -207,3 +207,14 @@ select tuple_data_split('test8'::regclass, t_data, t_infomask, t_infomask2, t_bi
+ (1 row)
+ 
+ drop table test8;
++-- Failure with incorrect page size
++-- Suppress the DETAIL message, to allow the tests to work across various
++-- page sizes.
++\set VERBOSITY terse
++SELECT fsm_page_contents('aaa'::bytea);
++ERROR:  invalid page size
++SELECT page_checksum('bbb'::bytea, 0);
++ERROR:  invalid page size
++SELECT page_header('ccc'::bytea);
++ERROR:  invalid page size
++\set VERBOSITY default
+diff --git a/contrib/pageinspect/fsmfuncs.c b/contrib/pageinspect/fsmfuncs.c
+index dadd62aa20a6..b914da1d4a9d 100644
+--- a/contrib/pageinspect/fsmfuncs.c
++++ b/contrib/pageinspect/fsmfuncs.c
+@@ -36,6 +36,7 @@ fsm_page_contents(PG_FUNCTION_ARGS)
+ {
+ 	bytea	   *raw_page = PG_GETARG_BYTEA_P(0);
+ 	StringInfoData sinfo;
++	Page		page;
+ 	FSMPage		fsmpage;
+ 	int			i;
+ 
+@@ -44,7 +45,8 @@ fsm_page_contents(PG_FUNCTION_ARGS)
+ 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 				 errmsg("must be superuser to use raw page functions")));
+ 
+-	fsmpage = (FSMPage) PageGetContents(VARDATA(raw_page));
++	page = get_page_from_raw(raw_page);
++	fsmpage = (FSMPage) PageGetContents(page);
+ 
+ 	initStringInfo(&sinfo);
+ 
+diff --git a/contrib/pageinspect/gistfuncs.c b/contrib/pageinspect/gistfuncs.c
+index 10d6dd44d4e0..a31cff47fea5 100644
+--- a/contrib/pageinspect/gistfuncs.c
++++ b/contrib/pageinspect/gistfuncs.c
+@@ -14,6 +14,7 @@
+ #include "access/htup.h"
+ #include "access/relation.h"
+ #include "catalog/namespace.h"
++#include "catalog/pg_am_d.h"
+ #include "funcapi.h"
+ #include "miscadmin.h"
+ #include "pageinspect.h"
+@@ -28,6 +29,8 @@ PG_FUNCTION_INFO_V1(gist_page_opaque_info);
+ PG_FUNCTION_INFO_V1(gist_page_items);
+ PG_FUNCTION_INFO_V1(gist_page_items_bytea);
+ 
++#define IS_GIST(r) ((r)->rd_rel->relam == GIST_AM_OID)
++
+ #define ItemPointerGetDatum(X)	 PointerGetDatum(X)
+ 
+ 
+@@ -174,6 +177,12 @@ gist_page_items(PG_FUNCTION_ARGS)
+ 	/* Open the relation */
+ 	indexRel = index_open(indexRelid, AccessShareLock);
+ 
++	if (!IS_GIST(indexRel))
++		ereport(ERROR,
++				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++				 errmsg("\"%s\" is not a %s index",
++						RelationGetRelationName(indexRel), "GiST")));
++
+ 	page = get_page_from_raw(raw_page);
+ 
+ 	/* Avoid bogus PageGetMaxOffsetNumber() call with deleted pages */
+diff --git a/contrib/pageinspect/hashfuncs.c b/contrib/pageinspect/hashfuncs.c
+index 090eba4a93de..ff73c363fc82 100644
+--- a/contrib/pageinspect/hashfuncs.c
++++ b/contrib/pageinspect/hashfuncs.c
+@@ -417,8 +417,10 @@ hash_bitmap_info(PG_FUNCTION_ARGS)
+ 	indexRel = index_open(indexRelid, AccessShareLock);
+ 
+ 	if (!IS_HASH(indexRel))
+-		elog(ERROR, "relation \"%s\" is not a hash index",
+-			 RelationGetRelationName(indexRel));
++		ereport(ERROR,
++				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++				 errmsg("\"%s\" is not a %s index",
++						RelationGetRelationName(indexRel), "hash")));
+ 
+ 	if (RELATION_IS_OTHER_TEMP(indexRel))
+ 		ereport(ERROR,
+diff --git a/contrib/pageinspect/rawpage.c b/contrib/pageinspect/rawpage.c
+index 7e41af045f34..92ffb2d930e4 100644
+--- a/contrib/pageinspect/rawpage.c
++++ b/contrib/pageinspect/rawpage.c
+@@ -246,7 +246,6 @@ Datum
+ page_header(PG_FUNCTION_ARGS)
+ {
+ 	bytea	   *raw_page = PG_GETARG_BYTEA_P(0);
+-	int			raw_page_size;
+ 
+ 	TupleDesc	tupdesc;
+ 
+@@ -263,18 +262,7 @@ page_header(PG_FUNCTION_ARGS)
+ 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 				 errmsg("must be superuser to use raw page functions")));
+ 
+-	raw_page_size = VARSIZE(raw_page) - VARHDRSZ;
+-
+-	/*
+-	 * Check that enough data was supplied, so that we don't try to access
+-	 * fields outside the supplied buffer.
+-	 */
+-	if (raw_page_size < SizeOfPageHeaderData)
+-		ereport(ERROR,
+-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-				 errmsg("input page too small (%d bytes)", raw_page_size)));
+-
+-	page = (PageHeader) VARDATA(raw_page);
++	page = (PageHeader) get_page_from_raw(raw_page);
+ 
+ 	/* Build a tuple descriptor for our result type */
+ 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+@@ -350,8 +338,7 @@ page_checksum_internal(PG_FUNCTION_ARGS, enum pageinspect_version ext_version)
+ {
+ 	bytea	   *raw_page = PG_GETARG_BYTEA_P(0);
+ 	int64		blkno = (ext_version == PAGEINSPECT_V1_8 ? PG_GETARG_UINT32(1) : PG_GETARG_INT64(1));
+-	int			raw_page_size;
+-	PageHeader	page;
++	Page		page;
+ 
+ 	if (!superuser())
+ 		ereport(ERROR,
+@@ -363,17 +350,7 @@ page_checksum_internal(PG_FUNCTION_ARGS, enum pageinspect_version ext_version)
+ 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+ 				 errmsg("invalid block number")));
+ 
+-	raw_page_size = VARSIZE(raw_page) - VARHDRSZ;
+-
+-	/*
+-	 * Check that the supplied page is of the right size.
+-	 */
+-	if (raw_page_size != BLCKSZ)
+-		ereport(ERROR,
+-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-				 errmsg("incorrect size of input page (%d bytes)", raw_page_size)));
+-
+-	page = (PageHeader) VARDATA(raw_page);
++	page = get_page_from_raw(raw_page);
+ 
+ 	PG_RETURN_INT16(pg_checksum_page((char *) page, blkno));
+ }
+diff --git a/contrib/pageinspect/sql/brin.sql b/contrib/pageinspect/sql/brin.sql
+index 735bc3b6733d..8717229c5d2f 100644
+--- a/contrib/pageinspect/sql/brin.sql
++++ b/contrib/pageinspect/sql/brin.sql
+@@ -15,4 +15,8 @@ SELECT * FROM brin_revmap_data(get_raw_page('test1_a_idx', 1)) LIMIT 5;
+ SELECT * FROM brin_page_items(get_raw_page('test1_a_idx', 2), 'test1_a_idx')
+     ORDER BY blknum, attnum LIMIT 5;
+ 
++-- Failure for non-BRIN index.
++CREATE INDEX test1_a_btree ON test1 (a);
++SELECT brin_page_items(get_raw_page('test1_a_btree', 0), 'test1_a_btree');
++
+ DROP TABLE test1;
+diff --git a/contrib/pageinspect/sql/btree.sql b/contrib/pageinspect/sql/btree.sql
+index 963591795973..fdda777b9ef6 100644
+--- a/contrib/pageinspect/sql/btree.sql
++++ b/contrib/pageinspect/sql/btree.sql
+@@ -21,4 +21,17 @@ SELECT * FROM bt_page_items(get_raw_page('test1_a_idx', 0));
+ SELECT * FROM bt_page_items(get_raw_page('test1_a_idx', 1));
+ SELECT * FROM bt_page_items(get_raw_page('test1_a_idx', 2));
+ 
++-- Failure when using a non-btree index.
++CREATE INDEX test1_a_hash ON test1 USING hash(a);
++SELECT bt_metap('test1_a_hash');
++SELECT bt_page_stats('test1_a_hash', 0);
++SELECT bt_page_items('test1_a_hash', 0);
++
++-- Failure with incorrect page size
++-- Suppress the DETAIL message, to allow the tests to work across various
++-- page sizes.
++\set VERBOSITY terse
++SELECT bt_page_items('aaa'::bytea);
++\set VERBOSITY default
++
+ DROP TABLE test1;
+diff --git a/contrib/pageinspect/sql/gin.sql b/contrib/pageinspect/sql/gin.sql
+index 423f5c574999..aadb07856d43 100644
+--- a/contrib/pageinspect/sql/gin.sql
++++ b/contrib/pageinspect/sql/gin.sql
+@@ -19,3 +19,12 @@ FROM gin_leafpage_items(get_raw_page('test1_y_idx',
+                          current_setting('block_size')::bigint)::int - 1));
+ 
+ DROP TABLE test1;
++
++-- Failure with incorrect page size
++-- Suppress the DETAIL message, to allow the tests to work across various
++-- page sizes.
++\set VERBOSITY terse
++SELECT gin_leafpage_items('aaa'::bytea);
++SELECT gin_metapage_info('bbb'::bytea);
++SELECT gin_page_opaque_info('ccc'::bytea);
++\set VERBOSITY default
+diff --git a/contrib/pageinspect/sql/gist.sql b/contrib/pageinspect/sql/gist.sql
+index 3e83239a9d0a..8abeb1914029 100644
+--- a/contrib/pageinspect/sql/gist.sql
++++ b/contrib/pageinspect/sql/gist.sql
+@@ -26,4 +26,17 @@ SELECT * FROM gist_page_items(get_raw_page('test_gist_idx', 1), 'test_gist_idx')
+ -- platform-dependent (endianness), so omit the actual key data from the output.
+ SELECT itemoffset, ctid, itemlen FROM gist_page_items_bytea(get_raw_page('test_gist_idx', 0));
+ 
++-- Failure with non-GiST index.
++CREATE INDEX test_gist_btree on test_gist(t);
++SELECT gist_page_items(get_raw_page('test_gist_btree', 0), 'test_gist_btree');
++
++-- Failure with incorrect page size
++-- Suppress the DETAIL message, to allow the tests to work across various
++-- page sizes.
++\set VERBOSITY terse
++SELECT gist_page_items_bytea('aaa'::bytea);
++SELECT gist_page_items('aaa'::bytea, 'test_gist_idx'::regclass);
++SELECT gist_page_opaque_info('aaa'::bytea);
++\set VERBOSITY default
++
+ DROP TABLE test_gist;
+diff --git a/contrib/pageinspect/sql/hash.sql b/contrib/pageinspect/sql/hash.sql
+index 64f33f1d52fd..fcddd706ae42 100644
+--- a/contrib/pageinspect/sql/hash.sql
++++ b/contrib/pageinspect/sql/hash.sql
+@@ -78,5 +78,18 @@ SELECT * FROM hash_page_items(get_raw_page('test_hash_a_idx', 3));
+ SELECT * FROM hash_page_items(get_raw_page('test_hash_a_idx', 4));
+ SELECT * FROM hash_page_items(get_raw_page('test_hash_a_idx', 5));
+ 
++-- Failure with non-hash index
++CREATE INDEX test_hash_a_btree ON test_hash USING btree (a);
++SELECT hash_bitmap_info('test_hash_a_btree', 0);
++
++-- Failure with incorrect page size
++-- Suppress the DETAIL message, to allow the tests to work across various
++-- page sizes.
++\set VERBOSITY terse
++SELECT hash_metapage_info('aaa'::bytea);
++SELECT hash_page_items('bbb'::bytea);
++SELECT hash_page_stats('ccc'::bytea);
++SELECT hash_page_type('ddd'::bytea);
++\set VERBOSITY default
+ 
+ DROP TABLE test_hash;
+diff --git a/contrib/pageinspect/sql/page.sql b/contrib/pageinspect/sql/page.sql
+index d333b763d709..38b16815412d 100644
+--- a/contrib/pageinspect/sql/page.sql
++++ b/contrib/pageinspect/sql/page.sql
+@@ -82,3 +82,12 @@ select t_bits, t_data from heap_page_items(get_raw_page('test8', 0));
+ select tuple_data_split('test8'::regclass, t_data, t_infomask, t_infomask2, t_bits)
+     from heap_page_items(get_raw_page('test8', 0));
+ drop table test8;
++
++-- Failure with incorrect page size
++-- Suppress the DETAIL message, to allow the tests to work across various
++-- page sizes.
++\set VERBOSITY terse
++SELECT fsm_page_contents('aaa'::bytea);
++SELECT page_checksum('bbb'::bytea, 0);
++SELECT page_header('ccc'::bytea);
++\set VERBOSITY default

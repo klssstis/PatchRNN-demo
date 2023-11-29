@@ -1,0 +1,124 @@
+From 71d84efba714db3b8a330a54be15c4d385719ad6 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Mon, 26 Aug 2019 11:14:18 +0900
+Subject: [PATCH] Fix error handling of vacuumdb and reindexdb when running out
+ of fds
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When trying to use a high number of jobs, vacuumdb (and more recently
+reindexdb) has only checked for a maximum number of jobs used, causing
+confusing failures when running out of file descriptors when the jobs
+open connections to Postgres.  This commit changes the error handling so
+as we do not check anymore for a maximum number of allowed jobs when
+parsing the option value with FD_SETSIZE, but check instead if a file
+descriptor is within the supported range when opening the connections
+for the jobs so as this is detected at the earliest time possible.
+
+Also, improve the error message to give a hint about the number of jobs
+recommended, using a wording given by the reviewers of the patch.
+
+Reported-by: Andres Freund
+Author: Michael Paquier
+Reviewed-by: Andres Freund, Álvaro Herrera, Tom Lane
+Discussion: https://postgr.es/m/20190818001858.ho3ev4z57fqhs7a5@alap3.anarazel.de
+Backpatch-through: 9.5
+---
+ src/bin/scripts/reindexdb.c        |  6 ------
+ src/bin/scripts/scripts_parallel.c | 26 ++++++++++++--------------
+ src/bin/scripts/scripts_parallel.h |  2 --
+ src/bin/scripts/vacuumdb.c         |  6 ------
+ 4 files changed, 12 insertions(+), 28 deletions(-)
+
+diff --git a/src/bin/scripts/reindexdb.c b/src/bin/scripts/reindexdb.c
+index f93f7dd5fec7..f00aec15de35 100644
+--- a/src/bin/scripts/reindexdb.c
++++ b/src/bin/scripts/reindexdb.c
+@@ -153,12 +153,6 @@ main(int argc, char *argv[])
+ 					pg_log_error("number of parallel jobs must be at least 1");
+ 					exit(1);
+ 				}
+-				if (concurrentCons > ParallelSlotsMax())
+-				{
+-					pg_log_error("too many parallel jobs requested (maximum: %d)",
+-								 ParallelSlotsMax());
+-					exit(1);
+-				}
+ 				break;
+ 			case 'v':
+ 				verbose = true;
+diff --git a/src/bin/scripts/scripts_parallel.c b/src/bin/scripts/scripts_parallel.c
+index 10379a1f99bd..55bda9044b4d 100644
+--- a/src/bin/scripts/scripts_parallel.c
++++ b/src/bin/scripts/scripts_parallel.c
+@@ -94,20 +94,6 @@ select_loop(int maxFd, fd_set *workerset, bool *aborting)
+ 	return i;
+ }
+ 
+-/*
+- * ParallelSlotsMax
+- *		Returns the maximum number of parallel slots supported.
+- *
+- * Note that this is included here as FD_SETSIZE is declared in sys/select.h
+- * per POSIX.
+- */
+-int
+-ParallelSlotsMax(void)
+-{
+-	/* leave some room for pre-existing fds */
+-	return FD_SETSIZE - 10;
+-}
+-
+ /*
+  * ParallelSlotsGetIdle
+  *		Return a connection slot that is ready to execute a command.
+@@ -246,6 +232,18 @@ ParallelSlotsSetup(const char *dbname, const char *host, const char *port,
+ 		{
+ 			conn = connectDatabase(dbname, host, port, username, prompt_password,
+ 								   progname, echo, false, true);
++
++			/*
++			 * Fail and exit immediately if trying to use a socket in an
++			 * unsupported range.  POSIX requires open(2) to use the lowest
++			 * unused file descriptor and the hint given relies on that.
++			 */
++			if (PQsocket(conn) >= FD_SETSIZE)
++			{
++				pg_log_fatal("too many jobs for this platform -- try %d", i);
++				exit(1);
++			}
++
+ 			init_slot(slots + i, conn);
+ 		}
+ 	}
+diff --git a/src/bin/scripts/scripts_parallel.h b/src/bin/scripts/scripts_parallel.h
+index 8042345072a5..ab82c5e6a962 100644
+--- a/src/bin/scripts/scripts_parallel.h
++++ b/src/bin/scripts/scripts_parallel.h
+@@ -21,8 +21,6 @@ typedef struct ParallelSlot
+ 	bool		isFree;			/* Is it known to be idle? */
+ } ParallelSlot;
+ 
+-extern int	ParallelSlotsMax(void);
+-
+ extern ParallelSlot *ParallelSlotsGetIdle(ParallelSlot *slots, int numslots);
+ 
+ extern ParallelSlot *ParallelSlotsSetup(const char *dbname, const char *host,
+diff --git a/src/bin/scripts/vacuumdb.c b/src/bin/scripts/vacuumdb.c
+index c5c38692edea..2c7219239f98 100644
+--- a/src/bin/scripts/vacuumdb.c
++++ b/src/bin/scripts/vacuumdb.c
+@@ -181,12 +181,6 @@ main(int argc, char *argv[])
+ 					pg_log_error("number of parallel jobs must be at least 1");
+ 					exit(1);
+ 				}
+-				if (concurrentCons > ParallelSlotsMax())
+-				{
+-					pg_log_error("too many parallel jobs requested (maximum: %d)",
+-								 ParallelSlotsMax());
+-					exit(1);
+-				}
+ 				break;
+ 			case 2:
+ 				maintenance_db = pg_strdup(optarg);

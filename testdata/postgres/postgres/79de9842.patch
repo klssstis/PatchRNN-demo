@@ -1,0 +1,174 @@
+From 79de9842ab03259325ee4055fb0a7ebd2e4372ff Mon Sep 17 00:00:00 2001
+From: Robert Haas <rhaas@postgresql.org>
+Date: Mon, 28 Mar 2022 13:38:13 -0400
+Subject: [PATCH] Remove the ability of a role to administer itself.
+
+Commit f9fd1764615ed5d85fab703b0ffb0c323fe7dfd5 effectively gave
+every role ADMIN OPTION on itself. However, this appears to be
+something that happened accidentally as a result of refactoring
+work rather than an intentional decision. Almost a decade later,
+it was discovered that this was a security vulnerability. As a
+result, commit fea164a72a7bfd50d77ba5fb418d357f8f2bb7d0 restricted
+this implicit ADMIN OPTION privilege to be exercisable only when
+the role being administered is the same as the session user and
+when no security-restricted operation is in progress. That
+commit also documented the existence of this implicit privilege
+for what seems to be the first time.
+
+The effect of the privilege is to allow a login role to grant
+the privileges of that role, and optionally ADMIN OPTION on it,
+to some other role. That's an unusual thing to do, because generally
+membership is granted in roles used as groups, rather than roles
+used as users. Therefore, it does not seem likely that removing
+the privilege will break things for many PostgreSQL users.
+
+However, it will make it easier to reason about the permissions
+system. This is the only case where a user who has not been given any
+special permission (superuser, or ADMIN OPTION on some role) can
+modify role membership, so removing it makes things more consistent.
+For example, if a superuser sets up role A and B and grants A to B
+but no other privileges to anyone, she can now be sure that no one
+else will be able to revoke that grant. Without this change, that
+would have been true only if A was a non-login role.
+
+Patch by me. Reviewed by Tom Lane and Stephen Frost.
+
+Discussion: http://postgr.es/m/CA+Tgmoawdt03kbA+dNyBcNWJpRxu0f4X=69Y3+DkXXZqmwMDLg@mail.gmail.com
+---
+ doc/src/sgml/ref/grant.sgml              |  9 +++---
+ src/backend/commands/user.c              |  5 ----
+ src/backend/utils/adt/acl.c              | 38 ++----------------------
+ src/test/regress/expected/privileges.out |  8 +----
+ src/test/regress/sql/privileges.sql      |  6 +---
+ 5 files changed, 8 insertions(+), 58 deletions(-)
+
+diff --git a/doc/src/sgml/ref/grant.sgml b/doc/src/sgml/ref/grant.sgml
+index a897712de2e5..8c4edd9b0a72 100644
+--- a/doc/src/sgml/ref/grant.sgml
++++ b/doc/src/sgml/ref/grant.sgml
+@@ -251,11 +251,10 @@ GRANT <replaceable class="parameter">role_name</replaceable> [, ...] TO <replace
+    in turn grant membership in the role to others, and revoke membership
+    in the role as well.  Without the admin option, ordinary users cannot
+    do that.  A role is not considered to hold <literal>WITH ADMIN
+-   OPTION</literal> on itself, but it may grant or revoke membership in
+-   itself from a database session where the session user matches the
+-   role.  Database superusers can grant or revoke membership in any role
+-   to anyone.  Roles having <literal>CREATEROLE</literal> privilege can grant
+-   or revoke membership in any role that is not a superuser.
++   OPTION</literal> on itself.  Database superusers can grant or revoke
++   membership in any role to anyone.  Roles having
++   <literal>CREATEROLE</literal> privilege can grant or revoke membership
++   in any role that is not a superuser.
+   </para>
+ 
+   <para>
+diff --git a/src/backend/commands/user.c b/src/backend/commands/user.c
+index f9d3c1246bb2..c263f6c8b9f1 100644
+--- a/src/backend/commands/user.c
++++ b/src/backend/commands/user.c
+@@ -1425,11 +1425,6 @@ AddRoleMems(const char *rolename, Oid roleid,
+ 	 * The role membership grantor of record has little significance at
+ 	 * present.  Nonetheless, inasmuch as users might look to it for a crude
+ 	 * audit trail, let only superusers impute the grant to a third party.
+-	 *
+-	 * Before lifting this restriction, give the member == role case of
+-	 * is_admin_of_role() a fresh look.  Ensure that the current role cannot
+-	 * use an explicit grantor specification to take advantage of the session
+-	 * user's self-admin right.
+ 	 */
+ 	if (grantorId != GetUserId() && !superuser())
+ 		ereport(ERROR,
+diff --git a/src/backend/utils/adt/acl.c b/src/backend/utils/adt/acl.c
+index 0a16f8156cb4..5d939de3da72 100644
+--- a/src/backend/utils/adt/acl.c
++++ b/src/backend/utils/adt/acl.c
+@@ -4619,11 +4619,6 @@ pg_role_aclcheck(Oid role_oid, Oid roleid, AclMode mode)
+ {
+ 	if (mode & ACL_GRANT_OPTION_FOR(ACL_CREATE))
+ 	{
+-		/*
+-		 * XXX For roleid == role_oid, is_admin_of_role() also examines the
+-		 * session and call stack.  That suits two-argument pg_has_role(), but
+-		 * it gives the three-argument version a lamentable whimsy.
+-		 */
+ 		if (is_admin_of_role(roleid, role_oid))
+ 			return ACLCHECK_OK;
+ 	}
+@@ -4935,38 +4930,9 @@ is_admin_of_role(Oid member, Oid role)
+ 	if (superuser_arg(member))
+ 		return true;
+ 
++	/* By policy, a role cannot have WITH ADMIN OPTION on itself. */
+ 	if (member == role)
+-
+-		/*
+-		 * A role can admin itself when it matches the session user and we're
+-		 * outside any security-restricted operation, SECURITY DEFINER or
+-		 * similar context.  SQL-standard roles cannot self-admin.  However,
+-		 * SQL-standard users are distinct from roles, and they are not
+-		 * grantable like roles: PostgreSQL's role-user duality extends the
+-		 * standard.  Checking for a session user match has the effect of
+-		 * letting a role self-admin only when it's conspicuously behaving
+-		 * like a user.  Note that allowing self-admin under a mere SET ROLE
+-		 * would make WITH ADMIN OPTION largely irrelevant; any member could
+-		 * SET ROLE to issue the otherwise-forbidden command.
+-		 *
+-		 * Withholding self-admin in a security-restricted operation prevents
+-		 * object owners from harnessing the session user identity during
+-		 * administrative maintenance.  Suppose Alice owns a database, has
+-		 * issued "GRANT alice TO bob", and runs a daily ANALYZE.  Bob creates
+-		 * an alice-owned SECURITY DEFINER function that issues "REVOKE alice
+-		 * FROM carol".  If he creates an expression index calling that
+-		 * function, Alice will attempt the REVOKE during each ANALYZE.
+-		 * Checking InSecurityRestrictedOperation() thwarts that attack.
+-		 *
+-		 * Withholding self-admin in SECURITY DEFINER functions makes their
+-		 * behavior independent of the calling user.  There's no security or
+-		 * SQL-standard-conformance need for that restriction, though.
+-		 *
+-		 * A role cannot have actual WITH ADMIN OPTION on itself, because that
+-		 * would imply a membership loop.  Therefore, we're done either way.
+-		 */
+-		return member == GetSessionUserId() &&
+-			!InLocalUserIdChange() && !InSecurityRestrictedOperation();
++		return false;
+ 
+ 	(void) roles_is_member_of(member, ROLERECURSE_MEMBERS, role, &result);
+ 	return result;
+diff --git a/src/test/regress/expected/privileges.out b/src/test/regress/expected/privileges.out
+index 8b4b039c6a6d..14bc497c21c0 100644
+--- a/src/test/regress/expected/privileges.out
++++ b/src/test/regress/expected/privileges.out
+@@ -1653,14 +1653,8 @@ SET ROLE regress_priv_group2;
+ GRANT regress_priv_group2 TO regress_priv_user5; -- fails: SET ROLE did not help
+ ERROR:  must have admin option on role "regress_priv_group2"
+ SET SESSION AUTHORIZATION regress_priv_group2;
+-GRANT regress_priv_group2 TO regress_priv_user5; -- ok: a role can self-admin
+-NOTICE:  role "regress_priv_user5" is already a member of role "regress_priv_group2"
+-CREATE FUNCTION dogrant_fails() RETURNS void LANGUAGE sql SECURITY DEFINER AS
+-	'GRANT regress_priv_group2 TO regress_priv_user5';
+-SELECT dogrant_fails();			-- fails: no self-admin in SECURITY DEFINER
++GRANT regress_priv_group2 TO regress_priv_user5; -- fails: no self-admin
+ ERROR:  must have admin option on role "regress_priv_group2"
+-CONTEXT:  SQL function "dogrant_fails" statement 1
+-DROP FUNCTION dogrant_fails();
+ SET SESSION AUTHORIZATION regress_priv_user4;
+ DROP FUNCTION dogrant_ok();
+ REVOKE regress_priv_group2 FROM regress_priv_user5;
+diff --git a/src/test/regress/sql/privileges.sql b/src/test/regress/sql/privileges.sql
+index 32285728808f..a26c0e17fcd9 100644
+--- a/src/test/regress/sql/privileges.sql
++++ b/src/test/regress/sql/privileges.sql
+@@ -1089,11 +1089,7 @@ SET ROLE regress_priv_group2;
+ GRANT regress_priv_group2 TO regress_priv_user5; -- fails: SET ROLE did not help
+ 
+ SET SESSION AUTHORIZATION regress_priv_group2;
+-GRANT regress_priv_group2 TO regress_priv_user5; -- ok: a role can self-admin
+-CREATE FUNCTION dogrant_fails() RETURNS void LANGUAGE sql SECURITY DEFINER AS
+-	'GRANT regress_priv_group2 TO regress_priv_user5';
+-SELECT dogrant_fails();			-- fails: no self-admin in SECURITY DEFINER
+-DROP FUNCTION dogrant_fails();
++GRANT regress_priv_group2 TO regress_priv_user5; -- fails: no self-admin
+ 
+ SET SESSION AUTHORIZATION regress_priv_user4;
+ DROP FUNCTION dogrant_ok();

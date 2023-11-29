@@ -1,0 +1,217 @@
+From 78e73e87548a1e0b71b6f2425f76ea6e9c85b2eb Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 31 Jul 2020 11:43:12 -0400
+Subject: [PATCH] Fix recently-introduced performance problem in ts_headline().
+
+The new hlCover() algorithm that I introduced in commit c9b0c678d
+turns out to potentially take O(N^2) or worse time on long documents,
+if there are many occurrences of individual query words but few or no
+substrings that actually satisfy the query.  (One way to hit this
+behavior is with a "common_word & rare_word" type of query.)  This
+seems unavoidable given the original goal of checking every substring
+of the document, so we have to back off that idea.  Fortunately, it
+seems unlikely that anyone would really want headlines spanning all of
+a long document, so we can avoid the worse-than-linear behavior by
+imposing a maximum length of substring that we'll consider.
+
+For now, just hard-wire that maximum length as a multiple of max_words
+times max_fragments.  Perhaps at some point somebody will argue for
+exposing it as a ts_headline parameter, but I'm hesitant to make such
+a feature addition in a back-patched bug fix.
+
+I also noted that the hlFirstIndex() function I'd added in that
+commit was unnecessarily stupid: it really only needs to check whether
+a HeadlineWordEntry's item pointer is null or not.  This wouldn't make
+all that much difference in typical cases with queries having just
+a few terms, but a cycle shaved is a cycle earned.
+
+In addition, add a CHECK_FOR_INTERRUPTS call in TS_execute_recurse.
+This ensures that hlCover's loop is cancellable if it manages to take
+a long time, and it may protect some other TS_execute callers as well.
+
+Back-patch to 9.6 as the previous commit was.  I also chose to add the
+CHECK_FOR_INTERRUPTS call to 9.5.  The old hlCover() algorithm seems
+to avoid the O(N^2) behavior, at least on the test case I tried, but
+nonetheless it's not very quick on a long document.
+
+Per report from Stephen Frost.
+
+Discussion: https://postgr.es/m/20200724160535.GW12375@tamriel.snowman.net
+---
+ src/backend/tsearch/wparser_def.c   | 57 ++++++++++++++++-------------
+ src/backend/utils/adt/tsvector_op.c |  3 ++
+ 2 files changed, 35 insertions(+), 25 deletions(-)
+
+diff --git a/src/backend/tsearch/wparser_def.c b/src/backend/tsearch/wparser_def.c
+index 76b6f9aef03c..7b29062a97ea 100644
+--- a/src/backend/tsearch/wparser_def.c
++++ b/src/backend/tsearch/wparser_def.c
+@@ -2003,24 +2003,14 @@ checkcondition_HL(void *opaque, QueryOperand *val, ExecPhraseData *data)
+  * Returns -1 if no such index
+  */
+ static int
+-hlFirstIndex(HeadlineParsedText *prs, TSQuery query, int pos)
++hlFirstIndex(HeadlineParsedText *prs, int pos)
+ {
+ 	int			i;
+ 
+-	/* For each word ... */
+ 	for (i = pos; i < prs->curwords; i++)
+ 	{
+-		/* ... scan the query to see if this word matches any operand */
+-		QueryItem  *item = GETQUERY(query);
+-		int			j;
+-
+-		for (j = 0; j < query->size; j++)
+-		{
+-			if (item->type == QI_VAL &&
+-				prs->words[i].item == &item->qoperand)
+-				return i;
+-			item++;
+-		}
++		if (prs->words[i].item != NULL)
++			return i;
+ 	}
+ 	return -1;
+ }
+@@ -2028,8 +2018,14 @@ hlFirstIndex(HeadlineParsedText *prs, TSQuery query, int pos)
+ /*
+  * hlCover: try to find a substring of prs' word list that satisfies query
+  *
+- * At entry, *p must be the first word index to consider (initialize this to
+- * zero, or to the next index after a previous successful search).
++ * At entry, *p must be the first word index to consider (initialize this
++ * to zero, or to the next index after a previous successful search).
++ * We will consider all substrings starting at or after that word, and
++ * containing no more than max_cover words.  (We need a length limit to
++ * keep this from taking O(N^2) time for a long document with many query
++ * words but few complete matches.  Actually, since checkcondition_HL is
++ * roughly O(N) in the length of the substring being checked, it's even
++ * worse than that.)
+  *
+  * On success, sets *p to first word index and *q to last word index of the
+  * cover substring, and returns true.
+@@ -2038,7 +2034,8 @@ hlFirstIndex(HeadlineParsedText *prs, TSQuery query, int pos)
+  * words used in the query.
+  */
+ static bool
+-hlCover(HeadlineParsedText *prs, TSQuery query, int *p, int *q)
++hlCover(HeadlineParsedText *prs, TSQuery query, int max_cover,
++		int *p, int *q)
+ {
+ 	int			pmin,
+ 				pmax,
+@@ -2052,7 +2049,7 @@ hlCover(HeadlineParsedText *prs, TSQuery query, int *p, int *q)
+ 	 * appearing in the query; there's no point in trying endpoints in between
+ 	 * such points.
+ 	 */
+-	pmin = hlFirstIndex(prs, query, *p);
++	pmin = hlFirstIndex(prs, *p);
+ 	while (pmin >= 0)
+ 	{
+ 		/* This useless assignment just keeps stupider compilers quiet */
+@@ -2073,7 +2070,7 @@ hlCover(HeadlineParsedText *prs, TSQuery query, int *p, int *q)
+ 				return true;
+ 			}
+ 			/* Nope, so advance pmax to next feasible endpoint */
+-			nextpmax = hlFirstIndex(prs, query, pmax + 1);
++			nextpmax = hlFirstIndex(prs, pmax + 1);
+ 
+ 			/*
+ 			 * If this is our first advance past pmin, then the result is also
+@@ -2084,7 +2081,7 @@ hlCover(HeadlineParsedText *prs, TSQuery query, int *p, int *q)
+ 				nextpmin = nextpmax;
+ 			pmax = nextpmax;
+ 		}
+-		while (pmax >= 0);
++		while (pmax >= 0 && pmax - pmin < max_cover);
+ 		/* No luck here, so try next feasible startpoint */
+ 		pmin = nextpmin;
+ 	}
+@@ -2186,7 +2183,7 @@ get_next_fragment(HeadlineParsedText *prs, int *startpos, int *endpos,
+ static void
+ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, bool highlightall,
+ 				  int shortword, int min_words,
+-				  int max_words, int max_fragments)
++				  int max_words, int max_fragments, int max_cover)
+ {
+ 	int32		poslen,
+ 				curlen,
+@@ -2213,7 +2210,7 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, bool highlightall,
+ 	covers = palloc(maxcovers * sizeof(CoverPos));
+ 
+ 	/* get all covers */
+-	while (hlCover(prs, query, &p, &q))
++	while (hlCover(prs, query, max_cover, &p, &q))
+ 	{
+ 		startpos = p;
+ 		endpos = q;
+@@ -2368,7 +2365,7 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, bool highlightall,
+  */
+ static void
+ mark_hl_words(HeadlineParsedText *prs, TSQuery query, bool highlightall,
+-			  int shortword, int min_words, int max_words)
++			  int shortword, int min_words, int max_words, int max_cover)
+ {
+ 	int			p = 0,
+ 				q = 0;
+@@ -2386,7 +2383,7 @@ mark_hl_words(HeadlineParsedText *prs, TSQuery query, bool highlightall,
+ 	if (!highlightall)
+ 	{
+ 		/* examine all covers, select a headline using the best one */
+-		while (hlCover(prs, query, &p, &q))
++		while (hlCover(prs, query, max_cover, &p, &q))
+ 		{
+ 			/*
+ 			 * Count words (curlen) and interesting words (poslen) within
+@@ -2542,6 +2539,7 @@ prsd_headline(PG_FUNCTION_ARGS)
+ 	int			shortword = 3;
+ 	int			max_fragments = 0;
+ 	bool		highlightall = false;
++	int			max_cover;
+ 	ListCell   *l;
+ 
+ 	/* Extract configuration option values */
+@@ -2581,6 +2579,15 @@ prsd_headline(PG_FUNCTION_ARGS)
+ 							defel->defname)));
+ 	}
+ 
++	/*
++	 * We might eventually make max_cover a user-settable parameter, but for
++	 * now, just compute a reasonable value based on max_words and
++	 * max_fragments.
++	 */
++	max_cover = Max(max_words * 10, 100);
++	if (max_fragments > 0)
++		max_cover *= max_fragments;
++
+ 	/* in HighlightAll mode these parameters are ignored */
+ 	if (!highlightall)
+ 	{
+@@ -2605,10 +2612,10 @@ prsd_headline(PG_FUNCTION_ARGS)
+ 	/* Apply appropriate headline selector */
+ 	if (max_fragments == 0)
+ 		mark_hl_words(prs, query, highlightall, shortword,
+-					  min_words, max_words);
++					  min_words, max_words, max_cover);
+ 	else
+ 		mark_hl_fragments(prs, query, highlightall, shortword,
+-						  min_words, max_words, max_fragments);
++						  min_words, max_words, max_fragments, max_cover);
+ 
+ 	/* Fill in default values for string options */
+ 	if (!prs->startsel)
+diff --git a/src/backend/utils/adt/tsvector_op.c b/src/backend/utils/adt/tsvector_op.c
+index f01b1ee25377..756a48a167ad 100644
+--- a/src/backend/utils/adt/tsvector_op.c
++++ b/src/backend/utils/adt/tsvector_op.c
+@@ -1868,6 +1868,9 @@ TS_execute_recurse(QueryItem *curitem, void *arg, uint32 flags,
+ 	/* since this function recurses, it could be driven to stack overflow */
+ 	check_stack_depth();
+ 
++	/* ... and let's check for query cancel while we're at it */
++	CHECK_FOR_INTERRUPTS();
++
+ 	if (curitem->type == QI_VAL)
+ 		return chkcond(arg, (QueryOperand *) curitem,
+ 					   NULL /* don't need position info */ );
