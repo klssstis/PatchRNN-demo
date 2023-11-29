@@ -1,0 +1,359 @@
+From 093e5c57d506783a95dd8feddd9a3f2651e1aeba Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Wed, 17 May 2023 11:18:35 -0700
+Subject: [PATCH] Add writeback to pg_stat_io
+
+28e626bde00 added the concept of IOOps but neglected to include writeback
+operations. ac8d53dae5 added time spent doing these I/O operations. Without
+counting writeback, checkpointer write time in the log often differed
+substantially from that in pg_stat_io. To fix this, add IOOp IOOP_WRITEBACK
+and track writeback in pg_stat_io.
+
+Bumps catversion.
+
+Author: Melanie Plageman <melanieplageman@gmail.com>
+Reviewed-by: Kyotaro Horiguchi <horikyota.ntt@gmail.com>
+Reported-by: Andres Freund <andres@anarazel.de>
+Discussion: https://postgr.es/m/20230419172326.dhgyo4wrrhulovt6%40awork3.anarazel.de
+---
+ doc/src/sgml/monitoring.sgml           | 26 +++++++++++++++++++++
+ src/backend/catalog/system_views.sql   |  2 ++
+ src/backend/storage/buffer/bufmgr.c    | 32 ++++++++++++++++++++------
+ src/backend/utils/activity/pgstat_io.c | 14 ++++++-----
+ src/backend/utils/adt/pgstatfuncs.c    |  5 ++++
+ src/include/catalog/catversion.h       |  2 +-
+ src/include/catalog/pg_proc.dat        |  6 ++---
+ src/include/pgstat.h                   |  3 ++-
+ src/include/storage/buf_internals.h    |  5 ++--
+ src/test/regress/expected/rules.out    |  4 +++-
+ src/test/regress/expected/stats.out    |  4 ++--
+ src/test/regress/sql/stats.sql         |  4 ++--
+ 12 files changed, 82 insertions(+), 25 deletions(-)
+
+diff --git a/doc/src/sgml/monitoring.sgml b/doc/src/sgml/monitoring.sgml
+index 9842f8209156..df5242fa80fc 100644
+--- a/doc/src/sgml/monitoring.sgml
++++ b/doc/src/sgml/monitoring.sgml
+@@ -3867,6 +3867,32 @@ SELECT pid, wait_event_type, wait_event FROM pg_stat_activity WHERE wait_event i
+       </entry>
+      </row>
+ 
++     <row>
++      <entry role="catalog_table_entry">
++       <para role="column_definition">
++        <structfield>writebacks</structfield> <type>bigint</type>
++       </para>
++       <para>
++        Number of units of size <varname>op_bytes</varname> which the process
++        requested the kernel write out to permanent storage.
++       </para>
++      </entry>
++     </row>
++
++     <row>
++      <entry role="catalog_table_entry">
++       <para role="column_definition">
++        <structfield>writeback_time</structfield> <type>double precision</type>
++       </para>
++       <para>
++        Time spent in writeback operations in milliseconds (if
++        <xref linkend="guc-track-io-timing"/> is enabled, otherwise zero). This
++        includes the time spent queueing write-out requests and, potentially,
++        the time spent to write out the dirty data.
++       </para>
++      </entry>
++     </row>
++
+      <row>
+       <entry role="catalog_table_entry">
+        <para role="column_definition">
+diff --git a/src/backend/catalog/system_views.sql b/src/backend/catalog/system_views.sql
+index 48aacf66eefe..d0c932ad0e3a 100644
+--- a/src/backend/catalog/system_views.sql
++++ b/src/backend/catalog/system_views.sql
+@@ -1131,6 +1131,8 @@ SELECT
+        b.read_time,
+        b.writes,
+        b.write_time,
++       b.writebacks,
++       b.writeback_time,
+        b.extends,
+        b.extend_time,
+        b.op_bytes,
+diff --git a/src/backend/storage/buffer/bufmgr.c b/src/backend/storage/buffer/bufmgr.c
+index 31f63c180b8a..0bbf09564acc 100644
+--- a/src/backend/storage/buffer/bufmgr.c
++++ b/src/backend/storage/buffer/bufmgr.c
+@@ -1685,7 +1685,7 @@ GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context)
+ 		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context);
+ 		LWLockRelease(content_lock);
+ 
+-		ScheduleBufferTagForWriteback(&BackendWritebackContext,
++		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
+ 									  &buf_hdr->tag);
+ 	}
+ 
+@@ -2725,8 +2725,11 @@ BufferSync(int flags)
+ 		CheckpointWriteDelay(flags, (double) num_processed / num_to_scan);
+ 	}
+ 
+-	/* issue all pending flushes */
+-	IssuePendingWritebacks(&wb_context);
++	/*
++	 * Issue all pending flushes. Only checkpointer calls BufferSync(), so
++	 * IOContext will always be IOCONTEXT_NORMAL.
++	 */
++	IssuePendingWritebacks(&wb_context, IOCONTEXT_NORMAL);
+ 
+ 	pfree(per_ts_stat);
+ 	per_ts_stat = NULL;
+@@ -3110,7 +3113,11 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
+ 
+ 	UnpinBuffer(bufHdr);
+ 
+-	ScheduleBufferTagForWriteback(wb_context, &tag);
++	/*
++	 * SyncOneBuffer() is only called by checkpointer and bgwriter, so
++	 * IOContext will always be IOCONTEXT_NORMAL.
++	 */
++	ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag);
+ 
+ 	return result | BUF_WRITTEN;
+ }
+@@ -5445,7 +5452,8 @@ WritebackContextInit(WritebackContext *context, int *max_pending)
+  * Add buffer to list of pending writeback requests.
+  */
+ void
+-ScheduleBufferTagForWriteback(WritebackContext *wb_context, BufferTag *tag)
++ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context,
++							  BufferTag *tag)
+ {
+ 	PendingWriteback *pending;
+ 
+@@ -5471,7 +5479,7 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, BufferTag *tag)
+ 	 * is now disabled.
+ 	 */
+ 	if (wb_context->nr_pending >= *wb_context->max_pending)
+-		IssuePendingWritebacks(wb_context);
++		IssuePendingWritebacks(wb_context, io_context);
+ }
+ 
+ #define ST_SORT sort_pending_writebacks
+@@ -5489,8 +5497,9 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, BufferTag *tag)
+  * error out - it's just a hint.
+  */
+ void
+-IssuePendingWritebacks(WritebackContext *wb_context)
++IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
+ {
++	instr_time	io_start;
+ 	int			i;
+ 
+ 	if (wb_context->nr_pending == 0)
+@@ -5503,6 +5512,8 @@ IssuePendingWritebacks(WritebackContext *wb_context)
+ 	sort_pending_writebacks(wb_context->pending_writebacks,
+ 							wb_context->nr_pending);
+ 
++	io_start = pgstat_prepare_io_time();
++
+ 	/*
+ 	 * Coalesce neighbouring writes, but nothing else. For that we iterate
+ 	 * through the, now sorted, array of pending flushes, and look forward to
+@@ -5556,6 +5567,13 @@ IssuePendingWritebacks(WritebackContext *wb_context)
+ 		smgrwriteback(reln, BufTagGetForkNum(&tag), tag.blockNum, nblocks);
+ 	}
+ 
++	/*
++	 * Assume that writeback requests are only issued for buffers containing
++	 * blocks of permanent relations.
++	 */
++	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
++							IOOP_WRITEBACK, io_start, wb_context->nr_pending);
++
+ 	wb_context->nr_pending = 0;
+ }
+ 
+diff --git a/src/backend/utils/activity/pgstat_io.c b/src/backend/utils/activity/pgstat_io.c
+index 25735eb6c045..eb7d35d4225a 100644
+--- a/src/backend/utils/activity/pgstat_io.c
++++ b/src/backend/utils/activity/pgstat_io.c
+@@ -424,6 +424,14 @@ pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
+ 		 bktype == B_CHECKPOINTER) && io_op == IOOP_EXTEND)
+ 		return false;
+ 
++	/*
++	 * Temporary tables are not logged and thus do not require fsync'ing.
++	 * Writeback is not requested for temporary tables.
++	 */
++	if (io_object == IOOBJECT_TEMP_RELATION &&
++		(io_op == IOOP_FSYNC || io_op == IOOP_WRITEBACK))
++		return false;
++
+ 	/*
+ 	 * Some IOOps are not valid in certain IOContexts and some IOOps are only
+ 	 * valid in certain contexts.
+@@ -448,12 +456,6 @@ pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
+ 	if (strategy_io_context && io_op == IOOP_FSYNC)
+ 		return false;
+ 
+-	/*
+-	 * Temporary tables are not logged and thus do not require fsync'ing.
+-	 */
+-	if (io_context == IOCONTEXT_NORMAL &&
+-		io_object == IOOBJECT_TEMP_RELATION && io_op == IOOP_FSYNC)
+-		return false;
+ 
+ 	return true;
+ }
+diff --git a/src/backend/utils/adt/pgstatfuncs.c b/src/backend/utils/adt/pgstatfuncs.c
+index 0d57b6a7c057..70da0a2de152 100644
+--- a/src/backend/utils/adt/pgstatfuncs.c
++++ b/src/backend/utils/adt/pgstatfuncs.c
+@@ -1268,6 +1268,8 @@ typedef enum io_stat_col
+ 	IO_COL_READ_TIME,
+ 	IO_COL_WRITES,
+ 	IO_COL_WRITE_TIME,
++	IO_COL_WRITEBACKS,
++	IO_COL_WRITEBACK_TIME,
+ 	IO_COL_EXTENDS,
+ 	IO_COL_EXTEND_TIME,
+ 	IO_COL_CONVERSION,
+@@ -1303,6 +1305,8 @@ pgstat_get_io_op_index(IOOp io_op)
+ 			return IO_COL_REUSES;
+ 		case IOOP_WRITE:
+ 			return IO_COL_WRITES;
++		case IOOP_WRITEBACK:
++			return IO_COL_WRITEBACKS;
+ 	}
+ 
+ 	elog(ERROR, "unrecognized IOOp value: %d", io_op);
+@@ -1322,6 +1326,7 @@ pgstat_get_io_time_index(IOOp io_op)
+ 	{
+ 		case IOOP_READ:
+ 		case IOOP_WRITE:
++		case IOOP_WRITEBACK:
+ 		case IOOP_EXTEND:
+ 		case IOOP_FSYNC:
+ 			return pgstat_get_io_op_index(io_op) + 1;
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 1afcfaf5ac4e..65e2e7e99c8d 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -57,6 +57,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202305172
++#define CATALOG_VERSION_NO	202305173
+ 
+ #endif
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index d7a60b39b584..e39d3b2b7124 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -5734,9 +5734,9 @@
+   proname => 'pg_stat_get_io', provolatile => 'v',
+   prorows => '30', proretset => 't',
+   proparallel => 'r', prorettype => 'record', proargtypes => '',
+-  proallargtypes => '{text,text,text,int8,float8,int8,float8,int8,float8,int8,int8,int8,int8,int8,float8,timestamptz}',
+-  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+-  proargnames => '{backend_type,object,context,reads,read_time,writes,write_time,extends,extend_time,op_bytes,hits,evictions,reuses,fsyncs,fsync_time,stats_reset}',
++  proallargtypes => '{text,text,text,int8,float8,int8,float8,int8,float8,int8,float8,int8,int8,int8,int8,int8,float8,timestamptz}',
++  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
++  proargnames => '{backend_type,object,context,reads,read_time,writes,write_time,writebacks,writeback_time,extends,extend_time,op_bytes,hits,evictions,reuses,fsyncs,fsync_time,stats_reset}',
+   prosrc => 'pg_stat_get_io' },
+ 
+ { oid => '1136', descr => 'statistics: information about WAL activity',
+diff --git a/src/include/pgstat.h b/src/include/pgstat.h
+index fff4ad5b6dd9..57a2c0866a2f 100644
+--- a/src/include/pgstat.h
++++ b/src/include/pgstat.h
+@@ -300,9 +300,10 @@ typedef enum IOOp
+ 	IOOP_READ,
+ 	IOOP_REUSE,
+ 	IOOP_WRITE,
++	IOOP_WRITEBACK,
+ } IOOp;
+ 
+-#define IOOP_NUM_TYPES (IOOP_WRITE + 1)
++#define IOOP_NUM_TYPES (IOOP_WRITEBACK + 1)
+ 
+ typedef struct PgStat_BktypeIO
+ {
+diff --git a/src/include/storage/buf_internals.h b/src/include/storage/buf_internals.h
+index f8ac811379b5..30807d5d97ea 100644
+--- a/src/include/storage/buf_internals.h
++++ b/src/include/storage/buf_internals.h
+@@ -388,8 +388,9 @@ extern PGDLLIMPORT CkptSortItem *CkptBufferIds;
+  */
+ /* bufmgr.c */
+ extern void WritebackContextInit(WritebackContext *context, int *max_pending);
+-extern void IssuePendingWritebacks(WritebackContext *wb_context);
+-extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context, BufferTag *tag);
++extern void IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context);
++extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
++										  IOContext io_context, BufferTag *tag);
+ 
+ /* freelist.c */
+ extern IOContext IOContextForStrategy(BufferAccessStrategy strategy);
+diff --git a/src/test/regress/expected/rules.out b/src/test/regress/expected/rules.out
+index 764b827372d6..fa9e1bd5e418 100644
+--- a/src/test/regress/expected/rules.out
++++ b/src/test/regress/expected/rules.out
+@@ -1887,6 +1887,8 @@ pg_stat_io| SELECT backend_type,
+     read_time,
+     writes,
+     write_time,
++    writebacks,
++    writeback_time,
+     extends,
+     extend_time,
+     op_bytes,
+@@ -1896,7 +1898,7 @@ pg_stat_io| SELECT backend_type,
+     fsyncs,
+     fsync_time,
+     stats_reset
+-   FROM pg_stat_get_io() b(backend_type, object, context, reads, read_time, writes, write_time, extends, extend_time, op_bytes, hits, evictions, reuses, fsyncs, fsync_time, stats_reset);
++   FROM pg_stat_get_io() b(backend_type, object, context, reads, read_time, writes, write_time, writebacks, writeback_time, extends, extend_time, op_bytes, hits, evictions, reuses, fsyncs, fsync_time, stats_reset);
+ pg_stat_progress_analyze| SELECT s.pid,
+     s.datid,
+     d.datname,
+diff --git a/src/test/regress/expected/stats.out b/src/test/regress/expected/stats.out
+index ef5608e1d29c..8e6334078291 100644
+--- a/src/test/regress/expected/stats.out
++++ b/src/test/regress/expected/stats.out
+@@ -1445,7 +1445,7 @@ SELECT pg_stat_have_stats('io', 0, 0);
+  t
+ (1 row)
+ 
+-SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(hits) AS io_stats_pre_reset
++SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS io_stats_pre_reset
+   FROM pg_stat_io \gset
+ SELECT pg_stat_reset_shared('io');
+  pg_stat_reset_shared 
+@@ -1453,7 +1453,7 @@ SELECT pg_stat_reset_shared('io');
+  
+ (1 row)
+ 
+-SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(hits) AS io_stats_post_reset
++SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS io_stats_post_reset
+   FROM pg_stat_io \gset
+ SELECT :io_stats_post_reset < :io_stats_pre_reset;
+  ?column? 
+diff --git a/src/test/regress/sql/stats.sql b/src/test/regress/sql/stats.sql
+index 0a5d04c22f48..fddf5a8277d4 100644
+--- a/src/test/regress/sql/stats.sql
++++ b/src/test/regress/sql/stats.sql
+@@ -716,10 +716,10 @@ SELECT :io_sum_bulkwrite_strategy_extends_after > :io_sum_bulkwrite_strategy_ext
+ 
+ -- Test IO stats reset
+ SELECT pg_stat_have_stats('io', 0, 0);
+-SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(hits) AS io_stats_pre_reset
++SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS io_stats_pre_reset
+   FROM pg_stat_io \gset
+ SELECT pg_stat_reset_shared('io');
+-SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(hits) AS io_stats_post_reset
++SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS io_stats_post_reset
+   FROM pg_stat_io \gset
+ SELECT :io_stats_post_reset < :io_stats_pre_reset;
+ 

@@ -1,0 +1,185 @@
+From 88bdbd3f746049834ae3cc972e6e650586ec3c9d Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Thu, 29 Nov 2018 18:42:53 -0300
+Subject: [PATCH] Add log_statement_sample_rate parameter
+
+This allows to set a lower log_min_duration_statement value without
+incurring excessive log traffic (which reduces performance).  This can
+be useful to analyze workloads with lots of short queries.
+
+Author: Adrien Nayrat
+Reviewed-by: David Rowley, Vik Fearing
+Discussion: https://postgr.es/m/c30ee535-ee1e-db9f-fa97-146b9f62caed@anayrat.info
+---
+ doc/src/sgml/config.sgml                      | 30 +++++++++++++++----
+ src/backend/tcop/postgres.c                   | 16 ++++++++--
+ src/backend/utils/misc/guc.c                  | 15 +++++++++-
+ src/backend/utils/misc/postgresql.conf.sample | 13 ++++----
+ src/include/utils/guc.h                       |  1 +
+ 5 files changed, 62 insertions(+), 13 deletions(-)
+
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index 1e6e13c91c24..2e5a5cd331ba 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -5721,11 +5721,11 @@ local0.*    /var/log/postgresql
+         <para>
+          Causes the duration of each completed statement to be logged
+          if the statement ran for at least the specified number of
+-         milliseconds.  Setting this to zero prints all statement durations.
+-         Minus-one (the default) disables logging statement durations.
+-         For example, if you set it to <literal>250ms</literal>
+-         then all SQL statements that run 250ms or longer will be
+-         logged.  Enabling this parameter can be helpful in tracking down
++         milliseconds, modulated by <varname>log_statement_sample_rate</varname>.
++         Setting this to zero prints all statement durations. Minus-one (the default)
++         disables logging statement durations. For example, if you set it to
++         <literal>250ms</literal> then all SQL statements that run 250ms or longer
++         will be logged. Enabling this parameter can be helpful in tracking down
+          unoptimized queries in your applications.
+          Only superusers can change this setting.
+         </para>
+@@ -5752,6 +5752,26 @@ local0.*    /var/log/postgresql
+        </listitem>
+       </varlistentry>
+ 
++     <varlistentry id="guc-log-statement-sample-rate" xreflabel="log_statement_sample_rate">
++      <term><varname>log_statement_sample_rate</varname> (<type>real</type>)
++      <indexterm>
++       <primary><varname>log_statement_sample_rate</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++       <listitem>
++        <para>
++         Determines the fraction of the statements that exceed
++         <xref linkend="guc-log-min-duration-statement"/> which to log.
++         The default is <literal>1</literal>, meaning log to all such
++         statements.
++         Setting this to zero disables logging, same as setting
++         <varname>log_min_duration_statement</varname>
++         to minus-one. <varname>log_statement_sample_rate</varname>
++         is helpful when the traffic is too high to log all queries.
++        </para>
++       </listitem>
++      </varlistentry>
++
+      </variablelist>
+ 
+     <para>
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index a3b9757565e7..9a948f825df7 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -2201,7 +2201,8 @@ check_log_statement(List *stmt_list)
+ 
+ /*
+  * check_log_duration
+- *		Determine whether current command's duration should be logged
++ *		Determine whether current command's duration should be logged.
++ *		If log_statement_sample_rate < 1.0, log only a sample.
+  *
+  * Returns:
+  *		0 if no logging is needed
+@@ -2223,6 +2224,7 @@ check_log_duration(char *msec_str, bool was_logged)
+ 		int			usecs;
+ 		int			msecs;
+ 		bool		exceeded;
++		bool		in_sample;
+ 
+ 		TimestampDifference(GetCurrentStatementStartTimestamp(),
+ 							GetCurrentTimestamp(),
+@@ -2239,7 +2241,17 @@ check_log_duration(char *msec_str, bool was_logged)
+ 					 (secs > log_min_duration_statement / 1000 ||
+ 					  secs * 1000 + msecs >= log_min_duration_statement)));
+ 
+-		if (exceeded || log_duration)
++		/*
++		 * Do not log if log_statement_sample_rate = 0. Log a sample if
++		 * log_statement_sample_rate <= 1 and avoid unecessary random() call
++		 * if log_statement_sample_rate = 1.
++		 */
++		if (exceeded)
++			in_sample = log_statement_sample_rate != 0 &&
++				(log_statement_sample_rate == 1 ||
++				 random() <= log_statement_sample_rate * MAX_RANDOM_VALUE);
++
++		if ((exceeded && in_sample) || log_duration)
+ 		{
+ 			snprintf(msec_str, 32, "%ld.%03d",
+ 					 secs * 1000 + msecs, usecs % 1000);
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index d469de73e974..03594e77feec 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -486,6 +486,7 @@ int			log_min_messages = WARNING;
+ int			client_min_messages = NOTICE;
+ int			log_min_duration_statement = -1;
+ int			log_temp_files = -1;
++double		log_statement_sample_rate = 1.0;
+ int			trace_recovery_messages = LOG;
+ 
+ int			temp_file_limit = -1;
+@@ -2642,7 +2643,8 @@ static struct config_int ConfigureNamesInt[] =
+ 		{"log_min_duration_statement", PGC_SUSET, LOGGING_WHEN,
+ 			gettext_noop("Sets the minimum execution time above which "
+ 						 "statements will be logged."),
+-			gettext_noop("Zero prints all queries. -1 turns this feature off."),
++			gettext_noop("Zero prints all queries, subject to log_statement_sample_rate. "
++						 "-1 turns this feature off."),
+ 			GUC_UNIT_MS
+ 		},
+ 		&log_min_duration_statement,
+@@ -3319,6 +3321,17 @@ static struct config_real ConfigureNamesReal[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"log_statement_sample_rate", PGC_SUSET, LOGGING_WHEN,
++			gettext_noop("Fraction of statements over log_min_duration_statement to log."),
++			gettext_noop("If you only want a sample, use a value between 0 (never "
++						 "log) and 1.0 (always log).")
++		},
++		&log_statement_sample_rate,
++		1.0, 0.0, 1.0,
++		NULL, NULL, NULL
++	},
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, 0.0, 0.0, 0.0, NULL, NULL, NULL
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index ee9ec6a12003..1fa02d2c9381 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -483,11 +483,14 @@
+ 					#   fatal
+ 					#   panic (effectively off)
+ 
+-#log_min_duration_statement = -1	# -1 is disabled, 0 logs all statements
+-					# and their durations, > 0 logs only
+-					# statements running at least this number
+-					# of milliseconds
+-
++#log_min_duration_statement = -1	# logs statements and their durations
++					# according to log_statement_sample_rate. -1 is disabled,
++					# 0 logs all statement, > 0 logs only statements running at
++					# least this number of milliseconds.
++
++#log_statement_sample_rate = 1	# Fraction of logged statements over
++					# log_min_duration_statement. 1.0 logs all statements,
++					# 0 never logs.
+ 
+ # - What to Log -
+ 
+diff --git a/src/include/utils/guc.h b/src/include/utils/guc.h
+index df2e556b0219..64457c792a80 100644
+--- a/src/include/utils/guc.h
++++ b/src/include/utils/guc.h
+@@ -251,6 +251,7 @@ extern PGDLLIMPORT int log_min_messages;
+ extern PGDLLIMPORT int client_min_messages;
+ extern int	log_min_duration_statement;
+ extern int	log_temp_files;
++extern double log_statement_sample_rate;
+ 
+ extern int	temp_file_limit;
+ 

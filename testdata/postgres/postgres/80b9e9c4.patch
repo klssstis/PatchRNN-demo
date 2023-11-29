@@ -1,0 +1,152 @@
+From 80b9e9c4664a020ebd14889046bd8d22a17d1ca6 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sun, 3 Mar 2019 16:57:14 -0500
+Subject: [PATCH] Improve performance of index-only scans with many index
+ columns.
+
+StoreIndexTuple was a loop over index_getattr, which is O(N^2)
+if the index columns are variable-width, and the performance
+impact is already quite visible at ten columns.  The obvious
+move is to replace that with a call to index_deform_tuple ...
+but that's *also* a loop over index_getattr.  Improve it to
+be essentially a clone of heap_deform_tuple.
+
+(There are a few other places that loop over all index columns
+with index_getattr, and perhaps should be changed likewise,
+but most of them don't seem performance-critical.  Anyway, the
+rest would mostly only be interested in the index key columns,
+which there aren't likely to be so many of.  Wide index tuples
+are a new thing with INCLUDE.)
+
+Konstantin Knizhnik
+
+Discussion: https://postgr.es/m/e06b2d27-04fc-5c0e-bb8c-ecd72aa24959@postgrespro.ru
+---
+ src/backend/access/common/indextuple.c   | 69 ++++++++++++++++++++++--
+ src/backend/executor/nodeIndexonlyscan.c | 20 +++----
+ 2 files changed, 72 insertions(+), 17 deletions(-)
+
+diff --git a/src/backend/access/common/indextuple.c b/src/backend/access/common/indextuple.c
+index 6a22b172036b..32c0ebb93a4a 100644
+--- a/src/backend/access/common/indextuple.c
++++ b/src/backend/access/common/indextuple.c
+@@ -418,19 +418,80 @@ nocache_index_getattr(IndexTuple tup,
+  *
+  * The caller must allocate sufficient storage for the output arrays.
+  * (INDEX_MAX_KEYS entries should be enough.)
++ *
++ * This is nearly the same as heap_deform_tuple(), but for IndexTuples.
++ * One difference is that the tuple should never have any missing columns.
+  */
+ void
+ index_deform_tuple(IndexTuple tup, TupleDesc tupleDescriptor,
+ 				   Datum *values, bool *isnull)
+ {
+-	int			i;
++	int			hasnulls = IndexTupleHasNulls(tup);
++	int			natts = tupleDescriptor->natts; /* number of atts to extract */
++	int			attnum;
++	char	   *tp;				/* ptr to tuple data */
++	int			off;			/* offset in tuple data */
++	bits8	   *bp;				/* ptr to null bitmap in tuple */
++	bool		slow = false;	/* can we use/set attcacheoff? */
+ 
+ 	/* Assert to protect callers who allocate fixed-size arrays */
+-	Assert(tupleDescriptor->natts <= INDEX_MAX_KEYS);
++	Assert(natts <= INDEX_MAX_KEYS);
++
++	/* XXX "knows" t_bits are just after fixed tuple header! */
++	bp = (bits8 *) ((char *) tup + sizeof(IndexTupleData));
+ 
+-	for (i = 0; i < tupleDescriptor->natts; i++)
++	tp = (char *) tup + IndexInfoFindDataOffset(tup->t_info);
++	off = 0;
++
++	for (attnum = 0; attnum < natts; attnum++)
+ 	{
+-		values[i] = index_getattr(tup, i + 1, tupleDescriptor, &isnull[i]);
++		Form_pg_attribute thisatt = TupleDescAttr(tupleDescriptor, attnum);
++
++		if (hasnulls && att_isnull(attnum, bp))
++		{
++			values[attnum] = (Datum) 0;
++			isnull[attnum] = true;
++			slow = true;		/* can't use attcacheoff anymore */
++			continue;
++		}
++
++		isnull[attnum] = false;
++
++		if (!slow && thisatt->attcacheoff >= 0)
++			off = thisatt->attcacheoff;
++		else if (thisatt->attlen == -1)
++		{
++			/*
++			 * We can only cache the offset for a varlena attribute if the
++			 * offset is already suitably aligned, so that there would be no
++			 * pad bytes in any case: then the offset will be valid for either
++			 * an aligned or unaligned value.
++			 */
++			if (!slow &&
++				off == att_align_nominal(off, thisatt->attalign))
++				thisatt->attcacheoff = off;
++			else
++			{
++				off = att_align_pointer(off, thisatt->attalign, -1,
++										tp + off);
++				slow = true;
++			}
++		}
++		else
++		{
++			/* not varlena, so safe to use att_align_nominal */
++			off = att_align_nominal(off, thisatt->attalign);
++
++			if (!slow)
++				thisatt->attcacheoff = off;
++		}
++
++		values[attnum] = fetchatt(thisatt, tp + off);
++
++		off = att_addlength_pointer(off, thisatt->attlen, tp + off);
++
++		if (thisatt->attlen <= 0)
++			slow = true;		/* can't use attcacheoff anymore */
+ 	}
+ }
+ 
+diff --git a/src/backend/executor/nodeIndexonlyscan.c b/src/backend/executor/nodeIndexonlyscan.c
+index 72c04b528f52..26758e770390 100644
+--- a/src/backend/executor/nodeIndexonlyscan.c
++++ b/src/backend/executor/nodeIndexonlyscan.c
+@@ -269,23 +269,17 @@ IndexOnlyNext(IndexOnlyScanState *node)
+ static void
+ StoreIndexTuple(TupleTableSlot *slot, IndexTuple itup, TupleDesc itupdesc)
+ {
+-	int			nindexatts = itupdesc->natts;
+-	Datum	   *values = slot->tts_values;
+-	bool	   *isnull = slot->tts_isnull;
+-	int			i;
+-
+ 	/*
+-	 * Note: we must use the tupdesc supplied by the AM in index_getattr, not
+-	 * the slot's tupdesc, in case the latter has different datatypes (this
+-	 * happens for btree name_ops in particular).  They'd better have the same
+-	 * number of columns though, as well as being datatype-compatible which is
+-	 * something we can't so easily check.
++	 * Note: we must use the tupdesc supplied by the AM in index_deform_tuple,
++	 * not the slot's tupdesc, in case the latter has different datatypes
++	 * (this happens for btree name_ops in particular).  They'd better have
++	 * the same number of columns though, as well as being datatype-compatible
++	 * which is something we can't so easily check.
+ 	 */
+-	Assert(slot->tts_tupleDescriptor->natts == nindexatts);
++	Assert(slot->tts_tupleDescriptor->natts == itupdesc->natts);
+ 
+ 	ExecClearTuple(slot);
+-	for (i = 0; i < nindexatts; i++)
+-		values[i] = index_getattr(itup, i + 1, itupdesc, &isnull[i]);
++	index_deform_tuple(itup, itupdesc, slot->tts_values, slot->tts_isnull);
+ 	ExecStoreVirtualTuple(slot);
+ }
+ 

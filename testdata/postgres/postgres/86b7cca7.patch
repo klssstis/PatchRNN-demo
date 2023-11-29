@@ -1,0 +1,190 @@
+From 86b7cca72d4d0a4e043fac0a2cdd56218ff2f258 Mon Sep 17 00:00:00 2001
+From: Tomas Vondra <tomas.vondra@postgresql.org>
+Date: Mon, 21 Dec 2020 18:29:46 +0100
+Subject: [PATCH] Check parallel safety in generate_useful_gather_paths
+
+Commit ebb7ae839d ensured we ignore pathkeys with volatile expressions
+when considering adding a sort below a Gather Merge. Turns out we need
+to care about parallel safety of the pathkeys too, otherwise we might
+try sorting e.g. on results of a correlated subquery (as demonstrated
+by a report from Luis Roberto).
+
+Initial investigation by Tom Lane, patch by James Coleman. Backpatch
+to 13, where the code was instroduced (as part of Incremental Sort).
+
+Reported-by: Luis Roberto
+Author: James Coleman
+Reviewed-by: Tomas Vondra
+Backpatch-through: 13
+Discussion: https://postgr.es/m/622580997.37108180.1604080457319.JavaMail.zimbra%40siscobra.com.br
+Discussion: https://postgr.es/m/CAAaqYe8cK3g5CfLC4w7bs=hC0mSksZC=H5M8LSchj5e5OxpTAg@mail.gmail.com
+---
+ src/backend/optimizer/path/allpaths.c         | 13 ++++--
+ src/backend/optimizer/path/equivclass.c       |  9 ++++-
+ src/include/optimizer/paths.h                 |  5 ++-
+ .../regress/expected/incremental_sort.out     | 40 +++++++++++++++++++
+ src/test/regress/sql/incremental_sort.sql     | 11 +++++
+ 5 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/src/backend/optimizer/path/allpaths.c b/src/backend/optimizer/path/allpaths.c
+index a1b3e4b82158..627d08b78a48 100644
+--- a/src/backend/optimizer/path/allpaths.c
++++ b/src/backend/optimizer/path/allpaths.c
+@@ -2802,6 +2802,9 @@ generate_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_rows)
+  * This allows us to do incremental sort on top of an index scan under a gather
+  * merge node, i.e. parallelized.
+  *
++ * If the require_parallel_safe is true, we also require the expressions to
++ * be parallel safe (which allows pushing the sort below Gather Merge).
++ *
+  * XXX At the moment this can only ever return a list with a single element,
+  * because it looks at query_pathkeys only. So we might return the pathkeys
+  * directly, but it seems plausible we'll want to consider other orderings
+@@ -2809,7 +2812,8 @@ generate_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_rows)
+  * merge joins.
+  */
+ static List *
+-get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
++get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel,
++								 bool require_parallel_safe)
+ {
+ 	List	   *useful_pathkeys_list = NIL;
+ 
+@@ -2839,8 +2843,11 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
+ 			 * meet criteria of EC membership in the current relation, we
+ 			 * enable not just an incremental sort on the entirety of
+ 			 * query_pathkeys but also incremental sort below a JOIN.
++			 *
++			 * If requested, ensure the expression is parallel safe too.
+ 			 */
+-			if (!find_em_expr_usable_for_sorting_rel(pathkey_ec, rel))
++			if (!find_em_expr_usable_for_sorting_rel(root, pathkey_ec, rel,
++													 require_parallel_safe))
+ 				break;
+ 
+ 			npathkeys++;
+@@ -2894,7 +2901,7 @@ generate_useful_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_r
+ 	generate_gather_paths(root, rel, override_rows);
+ 
+ 	/* consider incremental sort for interesting orderings */
+-	useful_pathkeys_list = get_useful_pathkeys_for_relation(root, rel);
++	useful_pathkeys_list = get_useful_pathkeys_for_relation(root, rel, true);
+ 
+ 	/* used for explicit (full) sort paths */
+ 	cheapest_partial_path = linitial(rel->partial_pathlist);
+diff --git a/src/backend/optimizer/path/equivclass.c b/src/backend/optimizer/path/equivclass.c
+index f98fd7b3eb8b..b49ee52cbad8 100644
+--- a/src/backend/optimizer/path/equivclass.c
++++ b/src/backend/optimizer/path/equivclass.c
+@@ -803,7 +803,8 @@ find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
+  * applied in prepare_sort_from_pathkeys.
+  */
+ Expr *
+-find_em_expr_usable_for_sorting_rel(EquivalenceClass *ec, RelOptInfo *rel)
++find_em_expr_usable_for_sorting_rel(PlannerInfo *root, EquivalenceClass *ec,
++									RelOptInfo *rel, bool require_parallel_safe)
+ {
+ 	ListCell   *lc_em;
+ 
+@@ -833,6 +834,12 @@ find_em_expr_usable_for_sorting_rel(EquivalenceClass *ec, RelOptInfo *rel)
+ 		if (!bms_is_subset(em->em_relids, rel->relids))
+ 			continue;
+ 
++		/*
++		 * If requested, reject expressions that are not parallel-safe.
++		 */
++		if (require_parallel_safe && !is_parallel_safe(root, (Node *) em_expr))
++			continue;
++
+ 		/*
+ 		 * As long as the expression isn't volatile then
+ 		 * prepare_sort_from_pathkeys is able to generate a new target entry,
+diff --git a/src/include/optimizer/paths.h b/src/include/optimizer/paths.h
+index 8a4c6f8b59ca..bf6c16b8040c 100644
+--- a/src/include/optimizer/paths.h
++++ b/src/include/optimizer/paths.h
+@@ -135,7 +135,10 @@ extern EquivalenceClass *get_eclass_for_sort_expr(PlannerInfo *root,
+ 												  Relids rel,
+ 												  bool create_it);
+ extern Expr *find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
+-extern Expr *find_em_expr_usable_for_sorting_rel(EquivalenceClass *ec, RelOptInfo *rel);
++extern Expr *find_em_expr_usable_for_sorting_rel(PlannerInfo *root,
++												 EquivalenceClass *ec,
++												 RelOptInfo *rel,
++												 bool require_parallel_safe);
+ extern void generate_base_implied_equalities(PlannerInfo *root);
+ extern List *generate_join_implied_equalities(PlannerInfo *root,
+ 											  Relids join_relids,
+diff --git a/src/test/regress/expected/incremental_sort.out b/src/test/regress/expected/incremental_sort.out
+index 51471ae92de9..d316a7c4b909 100644
+--- a/src/test/regress/expected/incremental_sort.out
++++ b/src/test/regress/expected/incremental_sort.out
+@@ -1551,6 +1551,46 @@ order by 1, 2;
+    ->  Function Scan on generate_series
+ (7 rows)
+ 
++-- Parallel sort but with expression (correlated subquery) that
++-- is prohibited in parallel plans.
++explain (costs off) select distinct
++  unique1,
++  (select t.unique1 from tenk1 where tenk1.unique1 = t.unique1)
++from tenk1 t, generate_series(1, 1000);
++                                   QUERY PLAN                                    
++---------------------------------------------------------------------------------
++ Unique
++   ->  Sort
++         Sort Key: t.unique1, ((SubPlan 1))
++         ->  Gather
++               Workers Planned: 2
++               ->  Nested Loop
++                     ->  Parallel Index Only Scan using tenk1_unique1 on tenk1 t
++                     ->  Function Scan on generate_series
++               SubPlan 1
++                 ->  Index Only Scan using tenk1_unique1 on tenk1
++                       Index Cond: (unique1 = t.unique1)
++(11 rows)
++
++explain (costs off) select
++  unique1,
++  (select t.unique1 from tenk1 where tenk1.unique1 = t.unique1)
++from tenk1 t, generate_series(1, 1000)
++order by 1, 2;
++                                QUERY PLAN                                 
++---------------------------------------------------------------------------
++ Sort
++   Sort Key: t.unique1, ((SubPlan 1))
++   ->  Gather
++         Workers Planned: 2
++         ->  Nested Loop
++               ->  Parallel Index Only Scan using tenk1_unique1 on tenk1 t
++               ->  Function Scan on generate_series
++         SubPlan 1
++           ->  Index Only Scan using tenk1_unique1 on tenk1
++                 Index Cond: (unique1 = t.unique1)
++(10 rows)
++
+ -- Parallel sort but with expression not available until the upper rel.
+ explain (costs off) select distinct sub.unique1, stringu1 || random()::text
+ from tenk1, lateral (select tenk1.unique1 from generate_series(1, 1000)) as sub;
+diff --git a/src/test/regress/sql/incremental_sort.sql b/src/test/regress/sql/incremental_sort.sql
+index cb48f200ce55..ff3af0fd165d 100644
+--- a/src/test/regress/sql/incremental_sort.sql
++++ b/src/test/regress/sql/incremental_sort.sql
+@@ -250,6 +250,17 @@ from tenk1, lateral (select tenk1.unique1 from generate_series(1, 1000)) as sub;
+ explain (costs off) select sub.unique1, md5(stringu1)
+ from tenk1, lateral (select tenk1.unique1 from generate_series(1, 1000)) as sub
+ order by 1, 2;
++-- Parallel sort but with expression (correlated subquery) that
++-- is prohibited in parallel plans.
++explain (costs off) select distinct
++  unique1,
++  (select t.unique1 from tenk1 where tenk1.unique1 = t.unique1)
++from tenk1 t, generate_series(1, 1000);
++explain (costs off) select
++  unique1,
++  (select t.unique1 from tenk1 where tenk1.unique1 = t.unique1)
++from tenk1 t, generate_series(1, 1000)
++order by 1, 2;
+ -- Parallel sort but with expression not available until the upper rel.
+ explain (costs off) select distinct sub.unique1, stringu1 || random()::text
+ from tenk1, lateral (select tenk1.unique1 from generate_series(1, 1000)) as sub;

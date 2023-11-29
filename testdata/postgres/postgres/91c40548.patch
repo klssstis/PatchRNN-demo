@@ -1,0 +1,45 @@
+From 91c40548d5f7a9241d9fa344fae8069cfdb92bf2 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Mon, 6 Apr 2020 21:28:55 -0700
+Subject: [PATCH] Fix XLogReader FD leak that makes backends unusable after 2PC
+ usage.
+
+Before the fix every 2PC commit/abort leaked a file descriptor. As the
+files are opened using BasicOpenFile(), that quickly leads to the
+backend running out of file descriptors.
+
+Once enough 2PC abort/commit have caused enough FDs to leak, any IO
+in the backend will fail with "Too many open files", as
+BasicOpenFilePerm() will have triggered all open files known to fd.c
+to be closed.
+
+The leak causing the problem at hand is a consequence of 0dc8ead46,
+but is only exascerbated by it. Previously most XLogPageReadCB
+callbacks used static variables to cache one open file, but after the
+commit the cache is private to each XLogReader instance. There never
+was infrastructure to close FDs at the time of XLogReaderFree, but the
+way XLogReader was used limited the leak to one FD.
+
+This commit just closes the during XLogReaderFree() if the FD is
+stored in XLogReaderState.seg.ws_segno. This may not be the way to
+solve this medium/long term, but at least unbreaks 2PC.
+
+Discussion: https://postgr.es/m/20200406025651.fpzdb5yyb7qyhqko@alap3.anarazel.de
+---
+ src/backend/access/transam/xlogreader.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/backend/access/transam/xlogreader.c b/src/backend/access/transam/xlogreader.c
+index f3fea5132fe9..79ff976474c7 100644
+--- a/src/backend/access/transam/xlogreader.c
++++ b/src/backend/access/transam/xlogreader.c
+@@ -136,6 +136,9 @@ XLogReaderFree(XLogReaderState *state)
+ {
+ 	int			block_id;
+ 
++	if (state->seg.ws_file != -1)
++		close(state->seg.ws_file);
++
+ 	for (block_id = 0; block_id <= XLR_MAX_BLOCK_ID; block_id++)
+ 	{
+ 		if (state->blocks[block_id].data)

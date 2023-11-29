@@ -1,0 +1,185 @@
+From 84ad4b036d975ad1be0f52251bac3a06463c9811 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Sun, 8 Oct 2017 15:08:25 -0700
+Subject: [PATCH] Reduce memory usage of targetlist SRFs.
+
+Previously nodeProjectSet only released memory once per input tuple,
+rather than once per returned tuple. If the computation of an
+individual returned tuple requires a lot of memory, that can lead to
+problems.
+
+Instead change things so that the expression context can be reset once
+per output tuple, which requires a new memory context to store SRF
+arguments in.
+
+This is a longstanding issue, but was hard to fix before 9.6, due to
+the way tSRFs where evaluated. But it's fairly easy to fix now. We
+could backpatch this into 10, but given there've been fewc omplaints
+that doesn't seem worth the risk so far.
+
+Reported-By: Lucas Fairchild
+Author: Andres Freund, per discussion with Tom Lane
+Discussion: https://postgr.es/m/4514.1507318623@sss.pgh.pa.us
+---
+ src/backend/executor/execSRF.c        | 31 +++++++++++++++++++++++---
+ src/backend/executor/nodeProjectSet.c | 32 ++++++++++++++++++++++-----
+ src/include/executor/executor.h       |  1 +
+ src/include/nodes/execnodes.h         |  1 +
+ 4 files changed, 57 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/executor/execSRF.c b/src/backend/executor/execSRF.c
+index 1be683db83d3..cce771d4bea7 100644
+--- a/src/backend/executor/execSRF.c
++++ b/src/backend/executor/execSRF.c
+@@ -467,13 +467,16 @@ ExecInitFunctionResultSet(Expr *expr,
+  * function itself.  The argument expressions may not contain set-returning
+  * functions (the planner is supposed to have separated evaluation for those).
+  *
+- * This should be called in a short-lived (per-tuple) context.
++ * This should be called in a short-lived (per-tuple) context, argContext
++ * needs to live until all rows have been returned (i.e. *isDone set to
++ * ExprEndResult or ExprSingleResult).
+  *
+  * This is used by nodeProjectSet.c.
+  */
+ Datum
+ ExecMakeFunctionResultSet(SetExprState *fcache,
+ 						  ExprContext *econtext,
++						  MemoryContext argContext,
+ 						  bool *isNull,
+ 						  ExprDoneCond *isDone)
+ {
+@@ -497,8 +500,21 @@ ExecMakeFunctionResultSet(SetExprState *fcache,
+ 	 */
+ 	if (fcache->funcResultStore)
+ 	{
+-		if (tuplestore_gettupleslot(fcache->funcResultStore, true, false,
+-									fcache->funcResultSlot))
++		TupleTableSlot *slot = fcache->funcResultSlot;
++		MemoryContext oldContext;
++		bool foundTup;
++
++		/*
++		 * Have to make sure tuple in slot lives long enough, otherwise
++		 * clearing the slot could end up trying to free something already
++		 * freed.
++		 */
++		oldContext = MemoryContextSwitchTo(slot->tts_mcxt);
++		foundTup = tuplestore_gettupleslot(fcache->funcResultStore, true, false,
++										   fcache->funcResultSlot);
++		MemoryContextSwitchTo(oldContext);
++
++		if (foundTup)
+ 		{
+ 			*isDone = ExprMultipleResult;
+ 			if (fcache->funcReturnsTuple)
+@@ -526,11 +542,20 @@ ExecMakeFunctionResultSet(SetExprState *fcache,
+ 	 * function manager.  We skip the evaluation if it was already done in the
+ 	 * previous call (ie, we are continuing the evaluation of a set-valued
+ 	 * function).  Otherwise, collect the current argument values into fcinfo.
++	 *
++	 * The arguments have to live in a context that lives at least until all
++	 * rows from this SRF have been returned, otherwise ValuePerCall SRFs
++	 * would reference freed memory after the first returned row.
+ 	 */
+ 	fcinfo = &fcache->fcinfo_data;
+ 	arguments = fcache->args;
+ 	if (!fcache->setArgsValid)
++	{
++		MemoryContext oldContext = MemoryContextSwitchTo(argContext);
++
+ 		ExecEvalFuncArgs(fcinfo, arguments, econtext);
++		MemoryContextSwitchTo(oldContext);
++	}
+ 	else
+ 	{
+ 		/* Reset flag (we may set it again below) */
+diff --git a/src/backend/executor/nodeProjectSet.c b/src/backend/executor/nodeProjectSet.c
+index 68981296f90a..30789bcce4df 100644
+--- a/src/backend/executor/nodeProjectSet.c
++++ b/src/backend/executor/nodeProjectSet.c
+@@ -52,6 +52,13 @@ ExecProjectSet(PlanState *pstate)
+ 
+ 	econtext = node->ps.ps_ExprContext;
+ 
++	/*
++	 * Reset per-tuple context to free expression-evaluation storage allocated
++	 * for a potentially previously returned tuple. Note that the SRF argument
++	 * context has a different lifetime and is reset below.
++	 */
++	ResetExprContext(econtext);
++
+ 	/*
+ 	 * Check to see if we're still projecting out tuples from a previous scan
+ 	 * tuple (because there is a function-returning-set in the projection
+@@ -66,11 +73,13 @@ ExecProjectSet(PlanState *pstate)
+ 	}
+ 
+ 	/*
+-	 * Reset per-tuple memory context to free any expression evaluation
+-	 * storage allocated in the previous tuple cycle.  Note this can't happen
+-	 * until we're done projecting out tuples from a scan tuple.
++	 * Reset argument context to free any expression evaluation storage
++	 * allocated in the previous tuple cycle.  Note this can't happen until
++	 * we're done projecting out tuples from a scan tuple, as ValuePerCall
++	 * functions are allowed to reference the arguments for each returned
++	 * tuple.
+ 	 */
+-	ResetExprContext(econtext);
++	MemoryContextReset(node->argcontext);
+ 
+ 	/*
+ 	 * Get another input tuple and project SRFs from it.
+@@ -164,7 +173,8 @@ ExecProjectSRF(ProjectSetState *node, bool continuing)
+ 			 * Evaluate SRF - possibly continuing previously started output.
+ 			 */
+ 			*result = ExecMakeFunctionResultSet((SetExprState *) elem,
+-												econtext, isnull, isdone);
++												econtext, node->argcontext,
++												isnull, isdone);
+ 
+ 			if (*isdone != ExprEndResult)
+ 				hasresult = true;
+@@ -291,6 +301,18 @@ ExecInitProjectSet(ProjectSet *node, EState *estate, int eflags)
+ 		off++;
+ 	}
+ 
++
++	/*
++	 * Create a memory context that ExecMakeFunctionResult can use to evaluate
++	 * function arguments in.  We can't use the per-tuple context for this
++	 * because it gets reset too often; but we don't want to leak evaluation
++	 * results into the query-lifespan context either.  We use one context for
++	 * the arguments of all tSRFs, as they have roughly equivalent lifetimes.
++	 */
++	state->argcontext = AllocSetContextCreate(CurrentMemoryContext,
++											  "tSRF function arguments",
++											  ALLOCSET_DEFAULT_SIZES);
++
+ 	return state;
+ }
+ 
+diff --git a/src/include/executor/executor.h b/src/include/executor/executor.h
+index 770881849cfa..37fd6b2700a9 100644
+--- a/src/include/executor/executor.h
++++ b/src/include/executor/executor.h
+@@ -400,6 +400,7 @@ extern SetExprState *ExecInitFunctionResultSet(Expr *expr,
+ 						  ExprContext *econtext, PlanState *parent);
+ extern Datum ExecMakeFunctionResultSet(SetExprState *fcache,
+ 						  ExprContext *econtext,
++						  MemoryContext argContext,
+ 						  bool *isNull,
+ 						  ExprDoneCond *isDone);
+ 
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index c6d3021c859f..c46113444fa8 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -946,6 +946,7 @@ typedef struct ProjectSetState
+ 	ExprDoneCond *elemdone;		/* array of per-SRF is-done states */
+ 	int			nelems;			/* length of elemdone[] array */
+ 	bool		pending_srf_tuples; /* still evaluating srfs in tlist? */
++	MemoryContext argcontext;	/* context for SRF arguments */
+ } ProjectSetState;
+ 
+ /* ----------------

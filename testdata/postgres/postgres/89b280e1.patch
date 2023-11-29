@@ -1,0 +1,335 @@
+From 89b280e139c463c98eb33592216a123e89052d08 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sun, 23 Sep 2018 16:05:45 -0400
+Subject: [PATCH] Fix failure in WHERE CURRENT OF after rewinding the
+ referenced cursor.
+
+In a case where we have multiple relation-scan nodes in a cursor plan,
+such as a scan of an inheritance tree, it's possible to fetch from a
+given scan node, then rewind the cursor and fetch some row from an
+earlier scan node.  In such a case, execCurrent.c mistakenly thought
+that the later scan node was still active, because ExecReScan hadn't
+done anything to make it look not-active.  We'd get some sort of
+failure in the case of a SeqScan node, because the node's scan tuple
+slot would be pointing at a HeapTuple whose t_self gets reset to
+invalid by heapam.c.  But it seems possible that for other relation
+scan node types we'd actually return a valid tuple TID to the caller,
+resulting in updating or deleting a tuple that shouldn't have been
+considered current.  To fix, forcibly clear the ScanTupleSlot in
+ExecScanReScan.
+
+Another issue here, which seems only latent at the moment but could
+easily become a live bug in future, is that rewinding a cursor does
+not necessarily lead to *immediately* applying ExecReScan to every
+scan-level node in the plan tree.  Upper-level nodes will think that
+they can postpone that call if their child node is already marked
+with chgParam flags.  I don't see a way for that to happen today in
+a plan tree that's simple enough for execCurrent.c's search_plan_tree
+to understand, but that's one heck of a fragile assumption.  So, add
+some logic in search_plan_tree to detect chgParam flags being set on
+nodes that it descended to/through, and assume that that means we
+should consider lower scan nodes to be logically reset even if their
+ReScan call hasn't actually happened yet.
+
+Per bug #15395 from Matvey Arye.  This has been broken for a long time,
+so back-patch to all supported branches.
+
+Discussion: https://postgr.es/m/153764171023.14986.280404050547008575@wrigleys.postgresql.org
+---
+ src/backend/executor/execCurrent.c    | 62 ++++++++++++++++++------
+ src/backend/executor/execScan.c       |  6 +++
+ src/test/regress/expected/portals.out | 70 +++++++++++++++++++++++++++
+ src/test/regress/sql/portals.sql      | 24 +++++++++
+ 4 files changed, 146 insertions(+), 16 deletions(-)
+
+diff --git a/src/backend/executor/execCurrent.c b/src/backend/executor/execCurrent.c
+index f70e54fe2af1..7480cf50ad03 100644
+--- a/src/backend/executor/execCurrent.c
++++ b/src/backend/executor/execCurrent.c
+@@ -23,7 +23,8 @@
+ 
+ 
+ static char *fetch_cursor_param_value(ExprContext *econtext, int paramId);
+-static ScanState *search_plan_tree(PlanState *node, Oid table_oid);
++static ScanState *search_plan_tree(PlanState *node, Oid table_oid,
++				 bool *pending_rescan);
+ 
+ 
+ /*
+@@ -156,8 +157,10 @@ execCurrentOf(CurrentOfExpr *cexpr,
+ 		 * aggregation.
+ 		 */
+ 		ScanState  *scanstate;
++		bool		pending_rescan = false;
+ 
+-		scanstate = search_plan_tree(queryDesc->planstate, table_oid);
++		scanstate = search_plan_tree(queryDesc->planstate, table_oid,
++									 &pending_rescan);
+ 		if (!scanstate)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INVALID_CURSOR_STATE),
+@@ -177,8 +180,12 @@ execCurrentOf(CurrentOfExpr *cexpr,
+ 					 errmsg("cursor \"%s\" is not positioned on a row",
+ 							cursor_name)));
+ 
+-		/* Now OK to return false if we found an inactive scan */
+-		if (TupIsNull(scanstate->ss_ScanTupleSlot))
++		/*
++		 * Now OK to return false if we found an inactive scan.  It is
++		 * inactive either if it's not positioned on a row, or there's a
++		 * rescan pending for it.
++		 */
++		if (TupIsNull(scanstate->ss_ScanTupleSlot) || pending_rescan)
+ 			return false;
+ 
+ 		/*
+@@ -291,10 +298,20 @@ fetch_cursor_param_value(ExprContext *econtext, int paramId)
+  *
+  * Search through a PlanState tree for a scan node on the specified table.
+  * Return NULL if not found or multiple candidates.
++ *
++ * If a candidate is found, set *pending_rescan to true if that candidate
++ * or any node above it has a pending rescan action, i.e. chgParam != NULL.
++ * That indicates that we shouldn't consider the node to be positioned on a
++ * valid tuple, even if its own state would indicate that it is.  (Caller
++ * must initialize *pending_rescan to false, and should not trust its state
++ * if multiple candidates are found.)
+  */
+ static ScanState *
+-search_plan_tree(PlanState *node, Oid table_oid)
++search_plan_tree(PlanState *node, Oid table_oid,
++				 bool *pending_rescan)
+ {
++	ScanState  *result = NULL;
++
+ 	if (node == NULL)
+ 		return NULL;
+ 	switch (nodeTag(node))
+@@ -314,7 +331,7 @@ search_plan_tree(PlanState *node, Oid table_oid)
+ 				ScanState  *sstate = (ScanState *) node;
+ 
+ 				if (RelationGetRelid(sstate->ss_currentRelation) == table_oid)
+-					return sstate;
++					result = sstate;
+ 				break;
+ 			}
+ 
+@@ -325,13 +342,13 @@ search_plan_tree(PlanState *node, Oid table_oid)
+ 		case T_AppendState:
+ 			{
+ 				AppendState *astate = (AppendState *) node;
+-				ScanState  *result = NULL;
+ 				int			i;
+ 
+ 				for (i = 0; i < astate->as_nplans; i++)
+ 				{
+ 					ScanState  *elem = search_plan_tree(astate->appendplans[i],
+-														table_oid);
++														table_oid,
++														pending_rescan);
+ 
+ 					if (!elem)
+ 						continue;
+@@ -339,7 +356,7 @@ search_plan_tree(PlanState *node, Oid table_oid)
+ 						return NULL;	/* multiple matches */
+ 					result = elem;
+ 				}
+-				return result;
++				break;
+ 			}
+ 
+ 			/*
+@@ -348,13 +365,13 @@ search_plan_tree(PlanState *node, Oid table_oid)
+ 		case T_MergeAppendState:
+ 			{
+ 				MergeAppendState *mstate = (MergeAppendState *) node;
+-				ScanState  *result = NULL;
+ 				int			i;
+ 
+ 				for (i = 0; i < mstate->ms_nplans; i++)
+ 				{
+ 					ScanState  *elem = search_plan_tree(mstate->mergeplans[i],
+-														table_oid);
++														table_oid,
++														pending_rescan);
+ 
+ 					if (!elem)
+ 						continue;
+@@ -362,7 +379,7 @@ search_plan_tree(PlanState *node, Oid table_oid)
+ 						return NULL;	/* multiple matches */
+ 					result = elem;
+ 				}
+-				return result;
++				break;
+ 			}
+ 
+ 			/*
+@@ -371,18 +388,31 @@ search_plan_tree(PlanState *node, Oid table_oid)
+ 			 */
+ 		case T_ResultState:
+ 		case T_LimitState:
+-			return search_plan_tree(node->lefttree, table_oid);
++			result = search_plan_tree(node->lefttree,
++									  table_oid,
++									  pending_rescan);
++			break;
+ 
+ 			/*
+ 			 * SubqueryScan too, but it keeps the child in a different place
+ 			 */
+ 		case T_SubqueryScanState:
+-			return search_plan_tree(((SubqueryScanState *) node)->subplan,
+-									table_oid);
++			result = search_plan_tree(((SubqueryScanState *) node)->subplan,
++									  table_oid,
++									  pending_rescan);
++			break;
+ 
+ 		default:
+ 			/* Otherwise, assume we can't descend through it */
+ 			break;
+ 	}
+-	return NULL;
++
++	/*
++	 * If we found a candidate at or below this node, then this node's
++	 * chgParam indicates a pending rescan that will affect the candidate.
++	 */
++	if (result && node->chgParam != NULL)
++		*pending_rescan = true;
++
++	return result;
+ }
+diff --git a/src/backend/executor/execScan.c b/src/backend/executor/execScan.c
+index caf91730ce10..f84a3fb0dbc8 100644
+--- a/src/backend/executor/execScan.c
++++ b/src/backend/executor/execScan.c
+@@ -263,6 +263,12 @@ ExecScanReScan(ScanState *node)
+ {
+ 	EState	   *estate = node->ps.state;
+ 
++	/*
++	 * We must clear the scan tuple so that observers (e.g., execCurrent.c)
++	 * can tell that this plan node is not positioned on a tuple.
++	 */
++	ExecClearTuple(node->ss_ScanTupleSlot);
++
+ 	/* Rescan EvalPlanQual tuple if we're inside an EvalPlanQual recheck */
+ 	if (estate->es_epqScanDone != NULL)
+ 	{
+diff --git a/src/test/regress/expected/portals.out b/src/test/regress/expected/portals.out
+index 048b2fc3e3a0..dc0d2ef7dd81 100644
+--- a/src/test/regress/expected/portals.out
++++ b/src/test/regress/expected/portals.out
+@@ -1269,6 +1269,76 @@ SELECT stringu1 FROM onek WHERE stringu1 = 'DZAAAA';
+ ----------
+ (0 rows)
+ 
++ROLLBACK;
++-- Check behavior with rewinding to a previous child scan node,
++-- as per bug #15395
++BEGIN;
++CREATE TABLE current_check (currentid int, payload text);
++CREATE TABLE current_check_1 () INHERITS (current_check);
++CREATE TABLE current_check_2 () INHERITS (current_check);
++INSERT INTO current_check_1 SELECT i, 'p' || i FROM generate_series(1,9) i;
++INSERT INTO current_check_2 SELECT i, 'P' || i FROM generate_series(10,19) i;
++DECLARE c1 SCROLL CURSOR FOR SELECT * FROM current_check;
++-- This tests the fetch-backwards code path
++FETCH ABSOLUTE 12 FROM c1;
++ currentid | payload 
++-----------+---------
++        12 | P12
++(1 row)
++
++FETCH ABSOLUTE 8 FROM c1;
++ currentid | payload 
++-----------+---------
++         8 | p8
++(1 row)
++
++DELETE FROM current_check WHERE CURRENT OF c1 RETURNING *;
++ currentid | payload 
++-----------+---------
++         8 | p8
++(1 row)
++
++-- This tests the ExecutorRewind code path
++FETCH ABSOLUTE 13 FROM c1;
++ currentid | payload 
++-----------+---------
++        13 | P13
++(1 row)
++
++FETCH ABSOLUTE 1 FROM c1;
++ currentid | payload 
++-----------+---------
++         1 | p1
++(1 row)
++
++DELETE FROM current_check WHERE CURRENT OF c1 RETURNING *;
++ currentid | payload 
++-----------+---------
++         1 | p1
++(1 row)
++
++SELECT * FROM current_check;
++ currentid | payload 
++-----------+---------
++         2 | p2
++         3 | p3
++         4 | p4
++         5 | p5
++         6 | p6
++         7 | p7
++         9 | p9
++        10 | P10
++        11 | P11
++        12 | P12
++        13 | P13
++        14 | P14
++        15 | P15
++        16 | P16
++        17 | P17
++        18 | P18
++        19 | P19
++(17 rows)
++
+ ROLLBACK;
+ -- Make sure snapshot management works okay, per bug report in
+ -- 235395b90909301035v7228ce63q392931f15aa74b31@mail.gmail.com
+diff --git a/src/test/regress/sql/portals.sql b/src/test/regress/sql/portals.sql
+index d1a589094ead..52560ac02751 100644
+--- a/src/test/regress/sql/portals.sql
++++ b/src/test/regress/sql/portals.sql
+@@ -472,6 +472,30 @@ DELETE FROM onek WHERE CURRENT OF c1;
+ SELECT stringu1 FROM onek WHERE stringu1 = 'DZAAAA';
+ ROLLBACK;
+ 
++-- Check behavior with rewinding to a previous child scan node,
++-- as per bug #15395
++BEGIN;
++CREATE TABLE current_check (currentid int, payload text);
++CREATE TABLE current_check_1 () INHERITS (current_check);
++CREATE TABLE current_check_2 () INHERITS (current_check);
++INSERT INTO current_check_1 SELECT i, 'p' || i FROM generate_series(1,9) i;
++INSERT INTO current_check_2 SELECT i, 'P' || i FROM generate_series(10,19) i;
++
++DECLARE c1 SCROLL CURSOR FOR SELECT * FROM current_check;
++
++-- This tests the fetch-backwards code path
++FETCH ABSOLUTE 12 FROM c1;
++FETCH ABSOLUTE 8 FROM c1;
++DELETE FROM current_check WHERE CURRENT OF c1 RETURNING *;
++
++-- This tests the ExecutorRewind code path
++FETCH ABSOLUTE 13 FROM c1;
++FETCH ABSOLUTE 1 FROM c1;
++DELETE FROM current_check WHERE CURRENT OF c1 RETURNING *;
++
++SELECT * FROM current_check;
++ROLLBACK;
++
+ -- Make sure snapshot management works okay, per bug report in
+ -- 235395b90909301035v7228ce63q392931f15aa74b31@mail.gmail.com
+ BEGIN;

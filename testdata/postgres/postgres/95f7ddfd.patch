@@ -1,0 +1,316 @@
+From 95f7ddfdad99c5ea0500d90ce52075814e10ed8c Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sat, 28 Mar 2020 17:09:51 -0400
+Subject: [PATCH] Protect against overflow of ltree.numlevel and
+ lquery.numlevel.
+
+These uint16 fields could be overflowed by excessively long input,
+producing strange results.  Complain for invalid input.
+
+Likewise check for out-of-range values of the repeat counts in lquery.
+(We don't try too hard on that one, notably not bothering to detect
+if atoi's result has overflowed.)
+
+Also detect length overflow in ltree_concat.
+
+In passing, be more consistent about whether "syntax error" messages
+include the type name.  Also, clarify the documentation about what
+the size limit is.
+
+This has been broken for a long time, so back-patch to all supported
+branches.
+
+Nikita Glukhov, reviewed by Benjie Gillam and Tomas Vondra
+
+Discussion: https://postgr.es/m/CAP_rww=waX2Oo6q+MbMSiZ9ktdj6eaJj0cQzNu=Ry2cCDij5fw@mail.gmail.com
+---
+ contrib/ltree/expected/ltree.out | 46 +++++++++++++++++++++++++++
+ contrib/ltree/ltree.h            |  2 ++
+ contrib/ltree/ltree_io.c         | 54 +++++++++++++++++++++-----------
+ contrib/ltree/ltree_op.c         |  9 +++++-
+ contrib/ltree/sql/ltree.sql      | 11 +++++++
+ doc/src/sgml/ltree.sgml          |  3 +-
+ 6 files changed, 104 insertions(+), 21 deletions(-)
+
+diff --git a/contrib/ltree/expected/ltree.out b/contrib/ltree/expected/ltree.out
+index 822693090567..41e7f947875b 100644
+--- a/contrib/ltree/expected/ltree.out
++++ b/contrib/ltree/expected/ltree.out
+@@ -457,6 +457,52 @@ SELECT nlevel('1.2.3.4');
+       4
+ (1 row)
+ 
++SELECT nlevel(('1' || repeat('.1', 65534))::ltree);
++ nlevel 
++--------
++  65535
++(1 row)
++
++SELECT nlevel(('1' || repeat('.1', 65535))::ltree);
++ERROR:  number of ltree levels (65536) exceeds the maximum allowed (65535)
++SELECT nlevel(('1' || repeat('.1', 65534))::ltree || '1');
++ERROR:  number of ltree levels (65536) exceeds the maximum allowed (65535)
++SELECT ('1' || repeat('.1', 65534))::lquery IS NULL;
++ ?column? 
++----------
++ f
++(1 row)
++
++SELECT ('1' || repeat('.1', 65535))::lquery IS NULL;
++ERROR:  number of lquery levels (65536) exceeds the maximum allowed (65535)
++SELECT '*{65535}'::lquery;
++  lquery  
++----------
++ *{65535}
++(1 row)
++
++SELECT '*{65536}'::lquery;
++ERROR:  lquery syntax error
++LINE 1: SELECT '*{65536}'::lquery;
++               ^
++DETAIL:  Low limit (65536) exceeds the maximum allowed (65535).
++SELECT '*{,65534}'::lquery;
++  lquery   
++-----------
++ *{,65534}
++(1 row)
++
++SELECT '*{,65535}'::lquery;
++ lquery 
++--------
++ *
++(1 row)
++
++SELECT '*{,65536}'::lquery;
++ERROR:  lquery syntax error
++LINE 1: SELECT '*{,65536}'::lquery;
++               ^
++DETAIL:  High limit (65536) exceeds the maximum allowed (65535).
+ SELECT '1.2'::ltree  < '2.2'::ltree;
+  ?column? 
+ ----------
+diff --git a/contrib/ltree/ltree.h b/contrib/ltree/ltree.h
+index 366e58004c72..a5608ca1f6de 100644
+--- a/contrib/ltree/ltree.h
++++ b/contrib/ltree/ltree.h
+@@ -25,6 +25,7 @@ typedef struct
+ 
+ #define LTREE_HDRSIZE	MAXALIGN( offsetof(ltree, data) )
+ #define LTREE_FIRST(x)	( (ltree_level*)( ((char*)(x))+LTREE_HDRSIZE ) )
++#define LTREE_MAX_LEVELS	PG_UINT16_MAX	/* ltree.numlevel is uint16 */
+ 
+ 
+ /* lquery */
+@@ -77,6 +78,7 @@ typedef struct
+ 
+ #define LQUERY_HDRSIZE	 MAXALIGN( offsetof(lquery, data) )
+ #define LQUERY_FIRST(x)   ( (lquery_level*)( ((char*)(x))+LQUERY_HDRSIZE ) )
++#define LQUERY_MAX_LEVELS	PG_UINT16_MAX	/* lquery.numlevel is uint16 */
+ 
+ #define LQUERY_HASNOT		0x01
+ 
+diff --git a/contrib/ltree/ltree_io.c b/contrib/ltree/ltree_io.c
+index 900a46a9e7d0..3ae7dc0d069d 100644
+--- a/contrib/ltree/ltree_io.c
++++ b/contrib/ltree/ltree_io.c
+@@ -58,11 +58,11 @@ ltree_in(PG_FUNCTION_ARGS)
+ 		ptr += charlen;
+ 	}
+ 
+-	if (num + 1 > MaxAllocSize / sizeof(nodeitem))
++	if (num + 1 > LTREE_MAX_LEVELS)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+-				 errmsg("number of levels (%d) exceeds the maximum allowed (%d)",
+-						num + 1, (int) (MaxAllocSize / sizeof(nodeitem)))));
++				 errmsg("number of ltree levels (%d) exceeds the maximum allowed (%d)",
++						num + 1, LTREE_MAX_LEVELS)));
+ 	list = lptr = (nodeitem *) palloc(sizeof(nodeitem) * (num + 1));
+ 	ptr = buf;
+ 	while (*ptr)
+@@ -227,11 +227,11 @@ lquery_in(PG_FUNCTION_ARGS)
+ 	}
+ 
+ 	num++;
+-	if (num > MaxAllocSize / ITEMSIZE)
++	if (num > LQUERY_MAX_LEVELS)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+-				 errmsg("number of levels (%d) exceeds the maximum allowed (%d)",
+-						num, (int) (MaxAllocSize / ITEMSIZE))));
++				 errmsg("number of lquery levels (%d) exceeds the maximum allowed (%d)",
++						num, LQUERY_MAX_LEVELS)));
+ 	curqlevel = tmpql = (lquery_level *) palloc0(ITEMSIZE * num);
+ 	ptr = buf;
+ 	while (*ptr)
+@@ -344,7 +344,7 @@ lquery_in(PG_FUNCTION_ARGS)
+ 			else if (charlen == 1 && t_iseq(ptr, '.'))
+ 			{
+ 				curqlevel->low = 0;
+-				curqlevel->high = 0xffff;
++				curqlevel->high = LTREE_MAX_LEVELS;
+ 				curqlevel = NEXTLEV(curqlevel);
+ 				state = LQPRS_WAITLEVEL;
+ 			}
+@@ -357,7 +357,16 @@ lquery_in(PG_FUNCTION_ARGS)
+ 				state = LQPRS_WAITSNUM;
+ 			else if (t_isdigit(ptr))
+ 			{
+-				curqlevel->low = atoi(ptr);
++				int			low = atoi(ptr);
++
++				if (low < 0 || low > LTREE_MAX_LEVELS)
++					ereport(ERROR,
++							(errcode(ERRCODE_SYNTAX_ERROR),
++							 errmsg("lquery syntax error"),
++							 errdetail("Low limit (%d) exceeds the maximum allowed (%d).",
++									   low, LTREE_MAX_LEVELS)));
++
++				curqlevel->low = (uint16) low;
+ 				state = LQPRS_WAITND;
+ 			}
+ 			else
+@@ -367,12 +376,21 @@ lquery_in(PG_FUNCTION_ARGS)
+ 		{
+ 			if (t_isdigit(ptr))
+ 			{
+-				curqlevel->high = atoi(ptr);
++				int			high = atoi(ptr);
++
++				if (high < 0 || high > LTREE_MAX_LEVELS)
++					ereport(ERROR,
++							(errcode(ERRCODE_SYNTAX_ERROR),
++							 errmsg("lquery syntax error"),
++							 errdetail("High limit (%d) exceeds the maximum allowed (%d).",
++									   high, LTREE_MAX_LEVELS)));
++
++				curqlevel->high = (uint16) high;
+ 				state = LQPRS_WAITCLOSE;
+ 			}
+ 			else if (charlen == 1 && t_iseq(ptr, '}'))
+ 			{
+-				curqlevel->high = 0xffff;
++				curqlevel->high = LTREE_MAX_LEVELS;
+ 				state = LQPRS_WAITEND;
+ 			}
+ 			else
+@@ -422,7 +440,7 @@ lquery_in(PG_FUNCTION_ARGS)
+ 		if (lptr->start == ptr)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_SYNTAX_ERROR),
+-					 errmsg("syntax error"),
++					 errmsg("lquery syntax error"),
+ 					 errdetail("Unexpected end of line.")));
+ 
+ 		lptr->len = ptr - lptr->start -
+@@ -432,7 +450,7 @@ lquery_in(PG_FUNCTION_ARGS)
+ 		if (lptr->len == 0)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_SYNTAX_ERROR),
+-					 errmsg("syntax error"),
++					 errmsg("lquery syntax error"),
+ 					 errdetail("Unexpected end of line.")));
+ 
+ 		if (lptr->wlen > 255)
+@@ -444,11 +462,11 @@ lquery_in(PG_FUNCTION_ARGS)
+ 							   lptr->wlen, pos)));
+ 	}
+ 	else if (state == LQPRS_WAITOPEN)
+-		curqlevel->high = 0xffff;
++		curqlevel->high = LTREE_MAX_LEVELS;
+ 	else if (state != LQPRS_WAITEND)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_SYNTAX_ERROR),
+-				 errmsg("syntax error"),
++				 errmsg("lquery syntax error"),
+ 				 errdetail("Unexpected end of line.")));
+ 
+ 	curqlevel = tmpql;
+@@ -468,8 +486,8 @@ lquery_in(PG_FUNCTION_ARGS)
+ 		else if (curqlevel->low > curqlevel->high)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_SYNTAX_ERROR),
+-					 errmsg("syntax error"),
+-					 errdetail("Low limit(%d) is greater than upper(%d).",
++					 errmsg("lquery syntax error"),
++					 errdetail("Low limit (%d) is greater than upper (%d).",
+ 							   curqlevel->low, curqlevel->high)));
+ 
+ 		curqlevel = NEXTLEV(curqlevel);
+@@ -593,7 +611,7 @@ lquery_out(PG_FUNCTION_ARGS)
+ 			}
+ 			else if (curqlevel->low == 0)
+ 			{
+-				if (curqlevel->high == 0xffff)
++				if (curqlevel->high == LTREE_MAX_LEVELS)
+ 				{
+ 					*ptr = '*';
+ 					*(ptr + 1) = '\0';
+@@ -601,7 +619,7 @@ lquery_out(PG_FUNCTION_ARGS)
+ 				else
+ 					sprintf(ptr, "*{,%d}", curqlevel->high);
+ 			}
+-			else if (curqlevel->high == 0xffff)
++			else if (curqlevel->high == LTREE_MAX_LEVELS)
+ 			{
+ 				sprintf(ptr, "*{%d,}", curqlevel->low);
+ 			}
+diff --git a/contrib/ltree/ltree_op.c b/contrib/ltree/ltree_op.c
+index 070868f25af9..34e6e4b2aaa8 100644
+--- a/contrib/ltree/ltree_op.c
++++ b/contrib/ltree/ltree_op.c
+@@ -274,10 +274,17 @@ static ltree *
+ ltree_concat(ltree *a, ltree *b)
+ {
+ 	ltree	   *r;
++	int			numlevel = (int) a->numlevel + b->numlevel;
++
++	if (numlevel > LTREE_MAX_LEVELS)
++		ereport(ERROR,
++				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++				 errmsg("number of ltree levels (%d) exceeds the maximum allowed (%d)",
++						numlevel, LTREE_MAX_LEVELS)));
+ 
+ 	r = (ltree *) palloc0(VARSIZE(a) + VARSIZE(b) - LTREE_HDRSIZE);
+ 	SET_VARSIZE(r, VARSIZE(a) + VARSIZE(b) - LTREE_HDRSIZE);
+-	r->numlevel = a->numlevel + b->numlevel;
++	r->numlevel = (uint16) numlevel;
+ 
+ 	memcpy(LTREE_FIRST(r), LTREE_FIRST(a), VARSIZE(a) - LTREE_HDRSIZE);
+ 	memcpy(((char *) LTREE_FIRST(r)) + VARSIZE(a) - LTREE_HDRSIZE,
+diff --git a/contrib/ltree/sql/ltree.sql b/contrib/ltree/sql/ltree.sql
+index 846b04e48eef..fca3ae645d24 100644
+--- a/contrib/ltree/sql/ltree.sql
++++ b/contrib/ltree/sql/ltree.sql
+@@ -90,6 +90,17 @@ SELECT '1.*.4|3|2.*{1}'::lquery;
+ SELECT 'qwerty%@*.tu'::lquery;
+ 
+ SELECT nlevel('1.2.3.4');
++SELECT nlevel(('1' || repeat('.1', 65534))::ltree);
++SELECT nlevel(('1' || repeat('.1', 65535))::ltree);
++SELECT nlevel(('1' || repeat('.1', 65534))::ltree || '1');
++SELECT ('1' || repeat('.1', 65534))::lquery IS NULL;
++SELECT ('1' || repeat('.1', 65535))::lquery IS NULL;
++SELECT '*{65535}'::lquery;
++SELECT '*{65536}'::lquery;
++SELECT '*{,65534}'::lquery;
++SELECT '*{,65535}'::lquery;
++SELECT '*{,65536}'::lquery;
++
+ SELECT '1.2'::ltree  < '2.2'::ltree;
+ SELECT '1.2'::ltree  <= '2.2'::ltree;
+ SELECT '2.2'::ltree  = '2.2'::ltree;
+diff --git a/doc/src/sgml/ltree.sgml b/doc/src/sgml/ltree.sgml
+index b4e07f651097..0c74aa705e96 100644
+--- a/doc/src/sgml/ltree.sgml
++++ b/doc/src/sgml/ltree.sgml
+@@ -37,8 +37,7 @@
+    A <firstterm>label path</firstterm> is a sequence of zero or more
+    labels separated by dots, for example <literal>L1.L2.L3</literal>, representing
+    a path from the root of a hierarchical tree to a particular node.  The
+-   length of a label path must be less than 65kB, but keeping it under 2kB is
+-   preferable.
++   length of a label path cannot exceed 65535 labels.
+   </para>
+ 
+   <para>

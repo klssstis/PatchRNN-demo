@@ -1,0 +1,417 @@
+From 83dec5a712af251af15effbf781ddaedc3bf6b3b Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Thu, 12 Nov 2015 18:05:23 -0300
+Subject: [PATCH] vacuumdb: don't prompt for passwords over and over
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Having the script prompt for passwords over and over was a preexisting
+problem when it processed multiple databases or when it processed
+multiple analyze stages, but the parallel mode introduced in commit
+a179232047 made it worse.
+
+Fix the annoyance by keeping a copy of the password used by the first
+connection that requires one.  Since users can (currently) only have a
+single password, there's no need for more complex arrangements (such as
+remembering one password per database).
+
+Per bug #13741 reported by Eric Brown.  Patch authored and
+cross-reviewed by Haribabu Kommi and Michael Paquier, slightly tweaked
+by Álvaro Herrera.
+
+Discussion: http://www.postgresql.org/message-id/20151027193919.931.54948@wrigleys.postgresql.org
+Backpatch to 9.5, where parallel vacuumdb was introduced.
+---
+ src/bin/scripts/clusterdb.c  |  2 +-
+ src/bin/scripts/common.c     | 39 +++++++++++++--------
+ src/bin/scripts/common.h     |  4 +--
+ src/bin/scripts/createlang.c |  8 ++---
+ src/bin/scripts/createuser.c |  4 +--
+ src/bin/scripts/droplang.c   |  8 ++---
+ src/bin/scripts/dropuser.c   |  4 +--
+ src/bin/scripts/reindexdb.c  |  8 ++---
+ src/bin/scripts/vacuumdb.c   | 66 ++++++++++++++++++++++++++++++------
+ 9 files changed, 98 insertions(+), 45 deletions(-)
+
+diff --git a/src/bin/scripts/clusterdb.c b/src/bin/scripts/clusterdb.c
+index 8c0e7cfab28d..2f15c82273f8 100644
+--- a/src/bin/scripts/clusterdb.c
++++ b/src/bin/scripts/clusterdb.c
+@@ -203,7 +203,7 @@ cluster_one_database(const char *dbname, bool verbose, const char *table,
+ 		appendPQExpBuffer(&sql, " %s", table);
+ 	appendPQExpBufferChar(&sql, ';');
+ 
+-	conn = connectDatabase(dbname, host, port, username, prompt_password,
++	conn = connectDatabase(dbname, host, port, username, NULL, prompt_password,
+ 						   progname, false);
+ 	if (!executeMaintenanceCommand(conn, sql.data, echo))
+ 	{
+diff --git a/src/bin/scripts/common.c b/src/bin/scripts/common.c
+index 0deadec09756..d26a4edbb68e 100644
+--- a/src/bin/scripts/common.c
++++ b/src/bin/scripts/common.c
+@@ -52,19 +52,24 @@ handle_help_version_opts(int argc, char *argv[],
+ 
+ 
+ /*
+- * Make a database connection with the given parameters.  An
+- * interactive password prompt is automatically issued if required.
++ * Make a database connection with the given parameters.
++ *
++ * A password can be given, but if not (or if user forces us to) we prompt
++ * interactively for one, unless caller prohibited us from doing so.
+  */
+ PGconn *
+ connectDatabase(const char *dbname, const char *pghost, const char *pgport,
+-				const char *pguser, enum trivalue prompt_password,
+-				const char *progname, bool fail_ok)
++				const char *pguser, const char *pgpassword,
++				enum trivalue prompt_password, const char *progname,
++				bool fail_ok)
+ {
+ 	PGconn	   *conn;
+-	char	   *password = NULL;
++	char	   *password;
+ 	bool		new_pass;
+ 
+-	if (prompt_password == TRI_YES)
++	password = pgpassword ? strdup(pgpassword) : NULL;
++
++	if (prompt_password == TRI_YES && !pgpassword)
+ 		password = simple_prompt("Password: ", 100, false);
+ 
+ 	/*
+@@ -95,22 +100,26 @@ connectDatabase(const char *dbname, const char *pghost, const char *pgport,
+ 		new_pass = false;
+ 		conn = PQconnectdbParams(keywords, values, true);
+ 
+-		free(keywords);
+-		free(values);
+-
+ 		if (!conn)
+ 		{
+-			fprintf(stderr, _("%s: could not connect to database %s\n"),
++			fprintf(stderr, _("%s: could not connect to database %s: out of memory\n"),
+ 					progname, dbname);
+ 			exit(1);
+ 		}
+ 
++		pg_free(keywords);
++		pg_free(values);
++
++		/*
++		 * No luck?  Trying asking (again) for a password.
++		 */
+ 		if (PQstatus(conn) == CONNECTION_BAD &&
+ 			PQconnectionNeedsPassword(conn) &&
+-			password == NULL &&
+ 			prompt_password != TRI_NO)
+ 		{
+ 			PQfinish(conn);
++			if (password)
++				free(password);
+ 			password = simple_prompt("Password: ", 100, false);
+ 			new_pass = true;
+ 		}
+@@ -148,14 +157,14 @@ connectMaintenanceDatabase(const char *maintenance_db, const char *pghost,
+ 
+ 	/* If a maintenance database name was specified, just connect to it. */
+ 	if (maintenance_db)
+-		return connectDatabase(maintenance_db, pghost, pgport, pguser,
++		return connectDatabase(maintenance_db, pghost, pgport, pguser, NULL,
+ 							   prompt_password, progname, false);
+ 
+ 	/* Otherwise, try postgres first and then template1. */
+-	conn = connectDatabase("postgres", pghost, pgport, pguser, prompt_password,
+-						   progname, true);
++	conn = connectDatabase("postgres", pghost, pgport, pguser, NULL,
++						   prompt_password, progname, true);
+ 	if (!conn)
+-		conn = connectDatabase("template1", pghost, pgport, pguser,
++		conn = connectDatabase("template1", pghost, pgport, pguser, NULL,
+ 							   prompt_password, progname, false);
+ 
+ 	return conn;
+diff --git a/src/bin/scripts/common.h b/src/bin/scripts/common.h
+index b5ce1ed74440..dafd58f42255 100644
+--- a/src/bin/scripts/common.h
++++ b/src/bin/scripts/common.h
+@@ -31,8 +31,8 @@ extern void handle_help_version_opts(int argc, char *argv[],
+ 
+ extern PGconn *connectDatabase(const char *dbname, const char *pghost,
+ 				const char *pgport, const char *pguser,
+-				enum trivalue prompt_password, const char *progname,
+-				bool fail_ok);
++				const char *pgpassword, enum trivalue prompt_password,
++				const char *progname, bool fail_ok);
+ 
+ extern PGconn *connectMaintenanceDatabase(const char *maintenance_db,
+ 				  const char *pghost, const char *pgport, const char *pguser,
+diff --git a/src/bin/scripts/createlang.c b/src/bin/scripts/createlang.c
+index 228215c73870..38cc20d9d4f1 100644
+--- a/src/bin/scripts/createlang.c
++++ b/src/bin/scripts/createlang.c
+@@ -140,8 +140,8 @@ main(int argc, char *argv[])
+ 		printQueryOpt popt;
+ 		static const bool translate_columns[] = {false, true};
+ 
+-		conn = connectDatabase(dbname, host, port, username, prompt_password,
+-							   progname, false);
++		conn = connectDatabase(dbname, host, port, username, NULL,
++							   prompt_password, progname, false);
+ 
+ 		printfPQExpBuffer(&sql, "SELECT lanname as \"%s\", "
+ 				"(CASE WHEN lanpltrusted THEN '%s' ELSE '%s' END) as \"%s\" "
+@@ -180,8 +180,8 @@ main(int argc, char *argv[])
+ 		if (*p >= 'A' && *p <= 'Z')
+ 			*p += ('a' - 'A');
+ 
+-	conn = connectDatabase(dbname, host, port, username, prompt_password,
+-						   progname, false);
++	conn = connectDatabase(dbname, host, port, username, NULL,
++						   prompt_password, progname, false);
+ 
+ 	/*
+ 	 * Make sure the language isn't already installed
+diff --git a/src/bin/scripts/createuser.c b/src/bin/scripts/createuser.c
+index c8bcf0d0b2e6..9e7f84d9d543 100644
+--- a/src/bin/scripts/createuser.c
++++ b/src/bin/scripts/createuser.c
+@@ -250,8 +250,8 @@ main(int argc, char *argv[])
+ 	if (login == 0)
+ 		login = TRI_YES;
+ 
+-	conn = connectDatabase("postgres", host, port, username, prompt_password,
+-						   progname, false);
++	conn = connectDatabase("postgres", host, port, username, NULL,
++						   prompt_password, progname, false);
+ 
+ 	initPQExpBuffer(&sql);
+ 
+diff --git a/src/bin/scripts/droplang.c b/src/bin/scripts/droplang.c
+index 746732825c0f..502ec6475e85 100644
+--- a/src/bin/scripts/droplang.c
++++ b/src/bin/scripts/droplang.c
+@@ -139,8 +139,8 @@ main(int argc, char *argv[])
+ 		printQueryOpt popt;
+ 		static const bool translate_columns[] = {false, true};
+ 
+-		conn = connectDatabase(dbname, host, port, username, prompt_password,
+-							   progname, false);
++		conn = connectDatabase(dbname, host, port, username, NULL,
++							   prompt_password, progname, false);
+ 
+ 		printfPQExpBuffer(&sql, "SELECT lanname as \"%s\", "
+ 				"(CASE WHEN lanpltrusted THEN '%s' ELSE '%s' END) as \"%s\" "
+@@ -181,8 +181,8 @@ main(int argc, char *argv[])
+ 		if (*p >= 'A' && *p <= 'Z')
+ 			*p += ('a' - 'A');
+ 
+-	conn = connectDatabase(dbname, host, port, username, prompt_password,
+-						   progname, false);
++	conn = connectDatabase(dbname, host, port, username, NULL,
++						   prompt_password, progname, false);
+ 
+ 	/*
+ 	 * Force schema search path to be just pg_catalog, so that we don't have
+diff --git a/src/bin/scripts/dropuser.c b/src/bin/scripts/dropuser.c
+index 916056662b6e..10d0691c6772 100644
+--- a/src/bin/scripts/dropuser.c
++++ b/src/bin/scripts/dropuser.c
+@@ -128,8 +128,8 @@ main(int argc, char *argv[])
+ 	appendPQExpBuffer(&sql, "DROP ROLE %s%s;",
+ 					  (if_exists ? "IF EXISTS " : ""), fmtId(dropuser));
+ 
+-	conn = connectDatabase("postgres", host, port, username, prompt_password,
+-						   progname, false);
++	conn = connectDatabase("postgres", host, port, username, NULL,
++						   prompt_password, progname, false);
+ 
+ 	if (echo)
+ 		printf("%s\n", sql.data);
+diff --git a/src/bin/scripts/reindexdb.c b/src/bin/scripts/reindexdb.c
+index decb7538db5b..fbf436c6d597 100644
+--- a/src/bin/scripts/reindexdb.c
++++ b/src/bin/scripts/reindexdb.c
+@@ -297,8 +297,8 @@ reindex_one_database(const char *name, const char *dbname, const char *type,
+ 		appendPQExpBuffer(&sql, " DATABASE %s", fmtId(name));
+ 	appendPQExpBufferChar(&sql, ';');
+ 
+-	conn = connectDatabase(dbname, host, port, username, prompt_password,
+-						   progname, false);
++	conn = connectDatabase(dbname, host, port, username, NULL,
++						   prompt_password, progname, false);
+ 
+ 	if (!executeMaintenanceCommand(conn, sql.data, echo))
+ 	{
+@@ -372,8 +372,8 @@ reindex_system_catalogs(const char *dbname, const char *host, const char *port,
+ 
+ 	appendPQExpBuffer(&sql, " SYSTEM %s;", dbname);
+ 
+-	conn = connectDatabase(dbname, host, port, username, prompt_password,
+-						   progname, false);
++	conn = connectDatabase(dbname, host, port, username, NULL,
++						   prompt_password, progname, false);
+ 	if (!executeMaintenanceCommand(conn, sql.data, echo))
+ 	{
+ 		fprintf(stderr, _("%s: reindexing of system catalogs failed: %s"),
+diff --git a/src/bin/scripts/vacuumdb.c b/src/bin/scripts/vacuumdb.c
+index 4ce27b78c54b..6c67263f3c6b 100644
+--- a/src/bin/scripts/vacuumdb.c
++++ b/src/bin/scripts/vacuumdb.c
+@@ -43,7 +43,8 @@ static void vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
+ 					const char *host, const char *port,
+ 					const char *username, enum trivalue prompt_password,
+ 					int concurrentCons,
+-					const char *progname, bool echo, bool quiet);
++					const char *progname, bool echo, bool quiet,
++					char **password);
+ 
+ static void vacuum_all_databases(vacuumingOptions *vacopts,
+ 					 bool analyze_in_stages,
+@@ -275,6 +276,8 @@ main(int argc, char *argv[])
+ 	}
+ 	else
+ 	{
++		char *password = NULL;
++
+ 		if (dbname == NULL)
+ 		{
+ 			if (getenv("PGDATABASE"))
+@@ -296,7 +299,8 @@ main(int argc, char *argv[])
+ 									&tables,
+ 									host, port, username, prompt_password,
+ 									concurrentCons,
+-									progname, echo, quiet);
++									progname, echo, quiet,
++									&password);
+ 			}
+ 		}
+ 		else
+@@ -305,7 +309,10 @@ main(int argc, char *argv[])
+ 								&tables,
+ 								host, port, username, prompt_password,
+ 								concurrentCons,
+-								progname, echo, quiet);
++								progname, echo, quiet,
++								&password);
++
++		pg_free(password);
+ 	}
+ 
+ 	exit(0);
+@@ -323,15 +330,21 @@ main(int argc, char *argv[])
+  * If concurrentCons is > 1, multiple connections are used to vacuum tables
+  * in parallel.  In this case and if the table list is empty, we first obtain
+  * a list of tables from the database.
++ *
++ * 'password' is both an input and output parameter.  If one is not passed,
++ * then whatever is used in a connection is returned so that caller can
++ * reuse it in future connections.
+  */
+ static void
+ vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
+ 					int stage,
+ 					SimpleStringList *tables,
+ 					const char *host, const char *port,
+-					const char *username, enum trivalue prompt_password,
++					const char *username,
++					enum trivalue prompt_password,
+ 					int concurrentCons,
+-					const char *progname, bool echo, bool quiet)
++					const char *progname, bool echo, bool quiet,
++					char **password)
+ {
+ 	PQExpBufferData sql;
+ 	PGconn	   *conn;
+@@ -365,8 +378,15 @@ vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
+ 		fflush(stdout);
+ 	}
+ 
+-	conn = connectDatabase(dbname, host, port, username, prompt_password,
+-						   progname, false);
++	conn = connectDatabase(dbname, host, port, username, *password,
++						   prompt_password, progname, false);
++
++	/*
++	 * If no password was not specified by caller and the connection required
++	 * one, remember it; this suppresses further password prompts.
++	 */
++	if (PQconnectionUsedPassword(conn) && *password == NULL)
++		*password = pg_strdup(PQpass(conn));
+ 
+ 	initPQExpBuffer(&sql);
+ 
+@@ -424,10 +444,20 @@ vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
+ 	init_slot(slots, conn);
+ 	if (parallel)
+ 	{
++		const char *pqpass;
++
++		/*
++		 * If a password was supplied for the initial connection, use it for
++		 * subsequent ones too.  (Note that since we're connecting to the same
++		 * database with the same user, there's no need to update the stored
++		 * password any further.)
++		 */
++		pqpass = PQpass(conn);
++
+ 		for (i = 1; i < concurrentCons; i++)
+ 		{
+-			conn = connectDatabase(dbname, host, port, username, prompt_password,
+-								   progname, false);
++			conn = connectDatabase(dbname, host, port, username, pqpass,
++								   prompt_password, progname, false);
+ 			init_slot(slots + i, conn);
+ 		}
+ 	}
+@@ -542,12 +572,23 @@ vacuum_all_databases(vacuumingOptions *vacopts,
+ 	PGresult   *result;
+ 	int			stage;
+ 	int			i;
++	char	   *password = NULL;
+ 
+ 	conn = connectMaintenanceDatabase(maintenance_db, host, port,
+ 									  username, prompt_password, progname);
++
+ 	result = executeQuery(conn,
+ 			"SELECT datname FROM pg_database WHERE datallowconn ORDER BY 1;",
+ 						  progname, echo);
++
++	/*
++	 * Remember the password for further connections.  If no password was
++	 * required for the maintenance db connection, this gets updated for the
++	 * first connection that does.
++	 */
++	if (PQconnectionUsedPassword(conn))
++		password = pg_strdup(PQpass(conn));
++
+ 	PQfinish(conn);
+ 
+ 	if (analyze_in_stages)
+@@ -572,7 +613,8 @@ vacuum_all_databases(vacuumingOptions *vacopts,
+ 									NULL,
+ 									host, port, username, prompt_password,
+ 									concurrentCons,
+-									progname, echo, quiet);
++									progname, echo, quiet,
++									&password);
+ 			}
+ 		}
+ 	}
+@@ -588,11 +630,13 @@ vacuum_all_databases(vacuumingOptions *vacopts,
+ 								NULL,
+ 								host, port, username, prompt_password,
+ 								concurrentCons,
+-								progname, echo, quiet);
++								progname, echo, quiet,
++								&password);
+ 		}
+ 	}
+ 
+ 	PQclear(result);
++	pg_free(password);
+ }
+ 
+ /*

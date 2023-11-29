@@ -1,0 +1,250 @@
+From 93a8c6fd6c5eeb61c12402f616a327d998a731c4 Mon Sep 17 00:00:00 2001
+From: Dean Rasheed <dean.a.rasheed@gmail.com>
+Date: Fri, 6 May 2016 12:45:36 +0100
+Subject: [PATCH] Move and rename fmtReloptionsArray().
+
+Move fmtReloptionsArray() from pg_dump.c to string_utils.c so that it
+is available to other frontend code. In particular psql's \ev and \sv
+commands need it to handle view reloptions. Also rename the function
+to appendReloptionsArray(), which is a more accurate description of
+what it does.
+
+Author: Dean Rasheed
+Reviewed-by: Peter Eisentraut
+Discussion: http://www.postgresql.org/message-id/CAEZATCWZjCgKRyM-agE0p8ax15j9uyQoF=qew7D2xB6cF76T8A@mail.gmail.com
+---
+ src/bin/pg_dump/pg_dump.c           | 77 ++++++-----------------------
+ src/fe_utils/string_utils.c         | 72 +++++++++++++++++++++++++++
+ src/include/fe_utils/string_utils.h |  3 ++
+ 3 files changed, 89 insertions(+), 63 deletions(-)
+
+diff --git a/src/bin/pg_dump/pg_dump.c b/src/bin/pg_dump/pg_dump.c
+index d3f515716d7e..582509396bb7 100644
+--- a/src/bin/pg_dump/pg_dump.c
++++ b/src/bin/pg_dump/pg_dump.c
+@@ -261,8 +261,8 @@ static void binary_upgrade_extension_member(PQExpBuffer upgrade_buffer,
+ static const char *getAttrName(int attrnum, TableInfo *tblInfo);
+ static const char *fmtCopyColumnList(const TableInfo *ti, PQExpBuffer buffer);
+ static bool nonemptyReloptions(const char *reloptions);
+-static void fmtReloptionsArray(Archive *fout, PQExpBuffer buffer,
+-				   const char *reloptions, const char *prefix);
++static void appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
++						const char *prefix, Archive *fout);
+ static char *get_synchronized_snapshot(Archive *fout);
+ static PGresult *ExecuteSqlQueryForSingleRow(Archive *fout, char *query);
+ static void setupDumpWorker(Archive *AHX);
+@@ -15046,7 +15046,7 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 		if (nonemptyReloptions(tbinfo->reloptions))
+ 		{
+ 			appendPQExpBufferStr(q, " WITH (");
+-			fmtReloptionsArray(fout, q, tbinfo->reloptions, "");
++			appendReloptionsArrayAH(q, tbinfo->reloptions, "", fout);
+ 			appendPQExpBufferChar(q, ')');
+ 		}
+ 		result = createViewAsClause(fout, tbinfo);
+@@ -15301,13 +15301,14 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
+ 			if (nonemptyReloptions(tbinfo->reloptions))
+ 			{
+ 				addcomma = true;
+-				fmtReloptionsArray(fout, q, tbinfo->reloptions, "");
++				appendReloptionsArrayAH(q, tbinfo->reloptions, "", fout);
+ 			}
+ 			if (nonemptyReloptions(tbinfo->toast_reloptions))
+ 			{
+ 				if (addcomma)
+ 					appendPQExpBufferStr(q, ", ");
+-				fmtReloptionsArray(fout, q, tbinfo->toast_reloptions, "toast.");
++				appendReloptionsArrayAH(q, tbinfo->toast_reloptions, "toast.",
++										fout);
+ 			}
+ 			appendPQExpBufferChar(q, ')');
+ 		}
+@@ -15908,7 +15909,7 @@ dumpConstraint(Archive *fout, ConstraintInfo *coninfo)
+ 			if (nonemptyReloptions(indxinfo->indreloptions))
+ 			{
+ 				appendPQExpBufferStr(q, " WITH (");
+-				fmtReloptionsArray(fout, q, indxinfo->indreloptions, "");
++				appendReloptionsArrayAH(q, indxinfo->indreloptions, "", fout);
+ 				appendPQExpBufferChar(q, ')');
+ 			}
+ 
+@@ -16809,7 +16810,7 @@ dumpRule(Archive *fout, RuleInfo *rinfo)
+ 	{
+ 		appendPQExpBuffer(cmd, "ALTER VIEW %s SET (",
+ 						  fmtId(tbinfo->dobj.name));
+-		fmtReloptionsArray(fout, cmd, rinfo->reloptions, "");
++		appendReloptionsArrayAH(cmd, rinfo->reloptions, "", fout);
+ 		appendPQExpBufferStr(cmd, ");\n");
+ 	}
+ 
+@@ -17707,67 +17708,17 @@ nonemptyReloptions(const char *reloptions)
+  * Format a reloptions array and append it to the given buffer.
+  *
+  * "prefix" is prepended to the option names; typically it's "" or "toast.".
+- *
+- * Note: this logic should generally match the backend's flatten_reloptions()
+- * (in adt/ruleutils.c).
+  */
+ static void
+-fmtReloptionsArray(Archive *fout, PQExpBuffer buffer, const char *reloptions,
+-				   const char *prefix)
++appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
++						const char *prefix, Archive *fout)
+ {
+-	char	  **options;
+-	int			noptions;
+-	int			i;
++	bool		res;
+ 
+-	if (!parsePGArray(reloptions, &options, &noptions))
+-	{
++	res = appendReloptionsArray(buffer, reloptions, prefix, fout->encoding,
++								fout->std_strings);
++	if (!res)
+ 		write_msg(NULL, "WARNING: could not parse reloptions array\n");
+-		if (options)
+-			free(options);
+-		return;
+-	}
+-
+-	for (i = 0; i < noptions; i++)
+-	{
+-		char	   *option = options[i];
+-		char	   *name;
+-		char	   *separator;
+-		char	   *value;
+-
+-		/*
+-		 * Each array element should have the form name=value.  If the "=" is
+-		 * missing for some reason, treat it like an empty value.
+-		 */
+-		name = option;
+-		separator = strchr(option, '=');
+-		if (separator)
+-		{
+-			*separator = '\0';
+-			value = separator + 1;
+-		}
+-		else
+-			value = "";
+-
+-		if (i > 0)
+-			appendPQExpBufferStr(buffer, ", ");
+-		appendPQExpBuffer(buffer, "%s%s=", prefix, fmtId(name));
+-
+-		/*
+-		 * In general we need to quote the value; but to avoid unnecessary
+-		 * clutter, do not quote if it is an identifier that would not need
+-		 * quoting.  (We could also allow numbers, but that is a bit trickier
+-		 * than it looks --- for example, are leading zeroes significant?  We
+-		 * don't want to assume very much here about what custom reloptions
+-		 * might mean.)
+-		 */
+-		if (strcmp(fmtId(value), value) == 0)
+-			appendPQExpBufferStr(buffer, value);
+-		else
+-			appendStringLiteralAH(buffer, value, fout);
+-	}
+-
+-	if (options)
+-		free(options);
+ }
+ 
+ /*
+diff --git a/src/fe_utils/string_utils.c b/src/fe_utils/string_utils.c
+index c57d8366379b..aeef12c3df66 100644
+--- a/src/fe_utils/string_utils.c
++++ b/src/fe_utils/string_utils.c
+@@ -461,6 +461,78 @@ parsePGArray(const char *atext, char ***itemarray, int *nitems)
+ }
+ 
+ 
++/*
++ * Format a reloptions array and append it to the given buffer.
++ *
++ * "prefix" is prepended to the option names; typically it's "" or "toast.".
++ *
++ * Returns false if the reloptions array could not be parsed (in which case
++ * nothing will have been appended to the buffer), or true on success.
++ *
++ * Note: this logic should generally match the backend's flatten_reloptions()
++ * (in adt/ruleutils.c).
++ */
++bool
++appendReloptionsArray(PQExpBuffer buffer, const char *reloptions,
++					  const char *prefix, int encoding, bool std_strings)
++{
++	char	  **options;
++	int			noptions;
++	int			i;
++
++	if (!parsePGArray(reloptions, &options, &noptions))
++	{
++		if (options)
++			free(options);
++		return false;
++	}
++
++	for (i = 0; i < noptions; i++)
++	{
++		char	   *option = options[i];
++		char	   *name;
++		char	   *separator;
++		char	   *value;
++
++		/*
++		 * Each array element should have the form name=value.  If the "=" is
++		 * missing for some reason, treat it like an empty value.
++		 */
++		name = option;
++		separator = strchr(option, '=');
++		if (separator)
++		{
++			*separator = '\0';
++			value = separator + 1;
++		}
++		else
++			value = "";
++
++		if (i > 0)
++			appendPQExpBufferStr(buffer, ", ");
++		appendPQExpBuffer(buffer, "%s%s=", prefix, fmtId(name));
++
++		/*
++		 * In general we need to quote the value; but to avoid unnecessary
++		 * clutter, do not quote if it is an identifier that would not need
++		 * quoting.  (We could also allow numbers, but that is a bit trickier
++		 * than it looks --- for example, are leading zeroes significant?  We
++		 * don't want to assume very much here about what custom reloptions
++		 * might mean.)
++		 */
++		if (strcmp(fmtId(value), value) == 0)
++			appendPQExpBufferStr(buffer, value);
++		else
++			appendStringLiteral(buffer, value, encoding, std_strings);
++	}
++
++	if (options)
++		free(options);
++
++	return true;
++}
++
++
+ /*
+  * processSQLNamePattern
+  *
+diff --git a/src/include/fe_utils/string_utils.h b/src/include/fe_utils/string_utils.h
+index 5d3fcc24271e..733e337910b3 100644
+--- a/src/include/fe_utils/string_utils.h
++++ b/src/include/fe_utils/string_utils.h
+@@ -42,6 +42,9 @@ extern void appendByteaLiteral(PQExpBuffer buf,
+ 
+ extern bool parsePGArray(const char *atext, char ***itemarray, int *nitems);
+ 
++extern bool appendReloptionsArray(PQExpBuffer buffer, const char *reloptions,
++					  const char *prefix, int encoding, bool std_strings);
++
+ extern bool processSQLNamePattern(PGconn *conn, PQExpBuffer buf,
+ 					  const char *pattern,
+ 					  bool have_where, bool force_escape,

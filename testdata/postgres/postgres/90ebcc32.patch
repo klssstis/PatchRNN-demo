@@ -1,0 +1,105 @@
+From 90ebcc32d9829204bfd15db82ece3aacd84f40d6 Mon Sep 17 00:00:00 2001
+From: Noah Misch <noah@leadboat.com>
+Date: Sat, 14 Oct 2023 15:54:46 -0700
+Subject: [PATCH] Don't spuriously report FD_SETSIZE exhaustion on Windows.
+
+Starting on 2023-08-03, this intermittently terminated a "pgbench -C"
+test in CI.  It could affect a high-client-count "pgbench" without "-C".
+While parallel reindexdb and vacuumdb reach the same problematic check,
+sufficient client count and/or connection turnover is less plausible for
+them.  Given the lack of examples from the buildfarm or from manual
+builds, reproducing this must entail rare operating system
+configurations.  Also correct the associated error message, which was
+wrong for non-Windows.  Back-patch to v12, where the pgbench check first
+appeared.  While v11 vacuumdb has the problematic check, reaching it
+with typical vacuumdb usage is implausible.
+
+Reviewed by Thomas Munro.
+
+Discussion: https://postgr.es/m/CA+hUKG+JwvTNdcyJTriy9BbtzF1veSRQ=9M_ZKFn9_LqE7Kp7Q@mail.gmail.com
+---
+ src/bin/pgbench/pgbench.c    | 19 +++++++++++++-----
+ src/fe_utils/parallel_slot.c | 37 ++++++++++++++++++++++++++++++++++--
+ 2 files changed, 49 insertions(+), 7 deletions(-)
+
+diff --git a/src/bin/pgbench/pgbench.c b/src/bin/pgbench/pgbench.c
+index e3919395eacc..e86c653cd220 100644
+--- a/src/bin/pgbench/pgbench.c
++++ b/src/bin/pgbench/pgbench.c
+@@ -7837,14 +7837,23 @@ clear_socket_set(socket_set *sa)
+ static void
+ add_socket_to_set(socket_set *sa, int fd, int idx)
+ {
++	/* See connect_slot() for background on this code. */
++#ifdef WIN32
++	if (sa->fds.fd_count + 1 >= FD_SETSIZE)
++	{
++		pg_log_error("too many concurrent database clients for this platform: %d",
++					 sa->fds.fd_count + 1);
++		exit(1);
++	}
++#else
+ 	if (fd < 0 || fd >= FD_SETSIZE)
+ 	{
+-		/*
+-		 * Doing a hard exit here is a bit grotty, but it doesn't seem worth
+-		 * complicating the API to make it less grotty.
+-		 */
+-		pg_fatal("too many client connections for select()");
++		pg_log_error("socket file descriptor out of range for select(): %d",
++					 fd);
++		pg_log_error_hint("Try fewer concurrent database clients.");
++		exit(1);
+ 	}
++#endif
+ 	FD_SET(fd, &sa->fds);
+ 	if (fd > sa->maxfd)
+ 		sa->maxfd = fd;
+diff --git a/src/fe_utils/parallel_slot.c b/src/fe_utils/parallel_slot.c
+index aca238bce9f5..2be83b70f68c 100644
+--- a/src/fe_utils/parallel_slot.c
++++ b/src/fe_utils/parallel_slot.c
+@@ -295,8 +295,41 @@ connect_slot(ParallelSlotArray *sa, int slotno, const char *dbname)
+ 	slot->connection = connectDatabase(sa->cparams, sa->progname, sa->echo, false, true);
+ 	sa->cparams->override_dbname = old_override;
+ 
+-	if (PQsocket(slot->connection) >= FD_SETSIZE)
+-		pg_fatal("too many jobs for this platform");
++	/*
++	 * POSIX defines FD_SETSIZE as the highest file descriptor acceptable to
++	 * FD_SET() and allied macros.  Windows defines it as a ceiling on the
++	 * count of file descriptors in the set, not a ceiling on the value of
++	 * each file descriptor; see
++	 * https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-select
++	 * and
++	 * https://learn.microsoft.com/en-us/windows/win32/api/winsock/ns-winsock-fd_set.
++	 * We can't ignore that, because Windows starts file descriptors at a
++	 * higher value, delays reuse, and skips values.  With less than ten
++	 * concurrent file descriptors, opened and closed rapidly, one can reach
++	 * file descriptor 1024.
++	 *
++	 * Doing a hard exit here is a bit grotty, but it doesn't seem worth
++	 * complicating the API to make it less grotty.
++	 */
++#ifdef WIN32
++	if (slotno >= FD_SETSIZE)
++	{
++		pg_log_error("too many jobs for this platform: %d", slotno);
++		exit(1);
++	}
++#else
++	{
++		int			fd = PQsocket(slot->connection);
++
++		if (fd >= FD_SETSIZE)
++		{
++			pg_log_error("socket file descriptor out of range for select(): %d",
++						 fd);
++			pg_log_error_hint("Try fewer jobs.");
++			exit(1);
++		}
++	}
++#endif
+ 
+ 	/* Setup the connection using the supplied command, if any. */
+ 	if (sa->initcmd)

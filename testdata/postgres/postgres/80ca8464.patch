@@ -1,0 +1,195 @@
+From 80ca8464fe02296c8efefd53746e6d6a3f456d1e Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 25 Feb 2021 20:47:32 -0500
+Subject: [PATCH] Fix list-manipulation bug in WITH RECURSIVE processing.
+
+makeDependencyGraphWalker and checkWellFormedRecursionWalker
+thought they could hold onto a pointer to a list's first
+cons cell while the list was modified by recursive calls.
+That was okay when the cons cell was actually separately
+palloc'd ... but since commit 1cff1b95a, it's quite unsafe,
+leading to core dumps or incorrect complaints of faulty
+WITH nesting.
+
+In the field this'd require at least a seven-deep WITH nest
+to cause an issue, but enabling DEBUG_LIST_MEMORY_USAGE
+allows the bug to be seen with lesser nesting depths.
+
+Per bug #16801 from Alexander Lakhin.  Back-patch to v13.
+
+Michael Paquier and Tom Lane
+
+Discussion: https://postgr.es/m/16801-393c7922143eaa4d@postgresql.org
+---
+ src/backend/parser/parse_cte.c     | 12 +++---
+ src/test/regress/expected/with.out | 59 ++++++++++++++++++++++++++++++
+ src/test/regress/sql/with.sql      | 44 ++++++++++++++++++++++
+ 3 files changed, 109 insertions(+), 6 deletions(-)
+
+diff --git a/src/backend/parser/parse_cte.c b/src/backend/parser/parse_cte.c
+index f4f7041ead09..f46d63d45131 100644
+--- a/src/backend/parser/parse_cte.c
++++ b/src/backend/parser/parse_cte.c
+@@ -730,15 +730,15 @@ makeDependencyGraphWalker(Node *node, CteState *cstate)
+ 				 * In the non-RECURSIVE case, query names are visible to the
+ 				 * WITH items after them and to the main query.
+ 				 */
+-				ListCell   *cell1;
+-
+ 				cstate->innerwiths = lcons(NIL, cstate->innerwiths);
+-				cell1 = list_head(cstate->innerwiths);
+ 				foreach(lc, stmt->withClause->ctes)
+ 				{
+ 					CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
++					ListCell   *cell1;
+ 
+ 					(void) makeDependencyGraphWalker(cte->ctequery, cstate);
++					/* note that recursion could mutate innerwiths list */
++					cell1 = list_head(cstate->innerwiths);
+ 					lfirst(cell1) = lappend((List *) lfirst(cell1), cte);
+ 				}
+ 				(void) raw_expression_tree_walker(node,
+@@ -1006,15 +1006,15 @@ checkWellFormedRecursionWalker(Node *node, CteState *cstate)
+ 				 * In the non-RECURSIVE case, query names are visible to the
+ 				 * WITH items after them and to the main query.
+ 				 */
+-				ListCell   *cell1;
+-
+ 				cstate->innerwiths = lcons(NIL, cstate->innerwiths);
+-				cell1 = list_head(cstate->innerwiths);
+ 				foreach(lc, stmt->withClause->ctes)
+ 				{
+ 					CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
++					ListCell   *cell1;
+ 
+ 					(void) checkWellFormedRecursionWalker(cte->ctequery, cstate);
++					/* note that recursion could mutate innerwiths list */
++					cell1 = list_head(cstate->innerwiths);
+ 					lfirst(cell1) = lappend((List *) lfirst(cell1), cte);
+ 				}
+ 				checkWellFormedSelectStmt(stmt, cstate);
+diff --git a/src/test/regress/expected/with.out b/src/test/regress/expected/with.out
+index c519a61c4fe7..a7a652822c91 100644
+--- a/src/test/regress/expected/with.out
++++ b/src/test/regress/expected/with.out
+@@ -176,6 +176,65 @@ ERROR:  operator does not exist: text + integer
+ LINE 4:     SELECT n+1 FROM t WHERE n < 10
+                     ^
+ HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
++-- Deeply nested WITH caused a list-munging problem in v13
++-- Detection of cross-references and self-references
++WITH RECURSIVE w1(c1) AS
++ (WITH w2(c2) AS
++  (WITH w3(c3) AS
++   (WITH w4(c4) AS
++    (WITH w5(c5) AS
++     (WITH RECURSIVE w6(c6) AS
++      (WITH w6(c6) AS
++       (WITH w8(c8) AS
++        (SELECT 1)
++        SELECT * FROM w8)
++       SELECT * FROM w6)
++      SELECT * FROM w6)
++     SELECT * FROM w5)
++    SELECT * FROM w4)
++   SELECT * FROM w3)
++  SELECT * FROM w2)
++SELECT * FROM w1;
++ c1 
++----
++  1
++(1 row)
++
++-- Detection of invalid self-references
++WITH RECURSIVE outermost(x) AS (
++ SELECT 1
++ UNION (WITH innermost1 AS (
++  SELECT 2
++  UNION (WITH innermost2 AS (
++   SELECT 3
++   UNION (WITH innermost3 AS (
++    SELECT 4
++    UNION (WITH innermost4 AS (
++     SELECT 5
++     UNION (WITH innermost5 AS (
++      SELECT 6
++      UNION (WITH innermost6 AS
++       (SELECT 7)
++       SELECT * FROM innermost6))
++      SELECT * FROM innermost5))
++     SELECT * FROM innermost4))
++    SELECT * FROM innermost3))
++   SELECT * FROM innermost2))
++  SELECT * FROM outermost
++  UNION SELECT * FROM innermost1)
++ )
++ SELECT * FROM outermost ORDER BY 1;
++ x 
++---
++ 1
++ 2
++ 3
++ 4
++ 5
++ 6
++ 7
++(7 rows)
++
+ --
+ -- Some examples with a tree
+ --
+diff --git a/src/test/regress/sql/with.sql b/src/test/regress/sql/with.sql
+index f4ba0d8e3994..85a671c6300a 100644
+--- a/src/test/regress/sql/with.sql
++++ b/src/test/regress/sql/with.sql
+@@ -95,6 +95,50 @@ UNION ALL
+ )
+ SELECT n, pg_typeof(n) FROM t;
+ 
++-- Deeply nested WITH caused a list-munging problem in v13
++-- Detection of cross-references and self-references
++WITH RECURSIVE w1(c1) AS
++ (WITH w2(c2) AS
++  (WITH w3(c3) AS
++   (WITH w4(c4) AS
++    (WITH w5(c5) AS
++     (WITH RECURSIVE w6(c6) AS
++      (WITH w6(c6) AS
++       (WITH w8(c8) AS
++        (SELECT 1)
++        SELECT * FROM w8)
++       SELECT * FROM w6)
++      SELECT * FROM w6)
++     SELECT * FROM w5)
++    SELECT * FROM w4)
++   SELECT * FROM w3)
++  SELECT * FROM w2)
++SELECT * FROM w1;
++-- Detection of invalid self-references
++WITH RECURSIVE outermost(x) AS (
++ SELECT 1
++ UNION (WITH innermost1 AS (
++  SELECT 2
++  UNION (WITH innermost2 AS (
++   SELECT 3
++   UNION (WITH innermost3 AS (
++    SELECT 4
++    UNION (WITH innermost4 AS (
++     SELECT 5
++     UNION (WITH innermost5 AS (
++      SELECT 6
++      UNION (WITH innermost6 AS
++       (SELECT 7)
++       SELECT * FROM innermost6))
++      SELECT * FROM innermost5))
++     SELECT * FROM innermost4))
++    SELECT * FROM innermost3))
++   SELECT * FROM innermost2))
++  SELECT * FROM outermost
++  UNION SELECT * FROM innermost1)
++ )
++ SELECT * FROM outermost ORDER BY 1;
++
+ --
+ -- Some examples with a tree
+ --

@@ -1,0 +1,117 @@
+From 098c134556664d37b78ae87853a82f4a9d23a2c8 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Thu, 11 Nov 2021 15:00:59 +0900
+Subject: [PATCH] Fix buffer overrun in unicode string normalization with empty
+ input
+
+PostgreSQL 13 and newer versions are directly impacted by that through
+the SQL function normalize(), which would cause a call of this function
+to write one byte past its allocation if using in input an empty
+string after recomposing the string with NFC and NFKC.  Older versions
+(v10~v12) are not directly affected by this problem as the only code
+path using normalization is SASLprep in SCRAM authentication that
+forbids the case of an empty string, but let's make the code more robust
+anyway there so as any out-of-core callers of this function are covered.
+
+The solution chosen to fix this issue is simple, with the addition of a
+fast-exit path if the decomposed string is found as empty.  This would
+only happen for an empty string as at its lowest level a codepoint would
+be decomposed as itself if it has no entry in the decomposition table or
+if it has a decomposition size of 0.
+
+Some tests are added to cover this issue in v13~.  Note that an empty
+string has always been considered as normalized (grammar "IS NF[K]{C,D}
+NORMALIZED", through the SQL function is_normalized()) for all the
+operations allowed (NFC, NFD, NFKC and NFKD) since this feature has been
+introduced as of 2991ac5.  This behavior is unchanged but some tests are
+added in v13~ to check after that.
+
+I have also checked "make normalization-check" in src/common/unicode/,
+while on it (works in 13~, and breaks in older stable branches
+independently of this commit).
+
+The release notes should just mention this commit for v13~.
+
+Reported-by: Matthijs van der Vleuten
+Discussion: https://postgr.es/m/17277-0c527a373794e802@postgresql.org
+Backpatch-through: 10
+---
+ src/common/unicode_norm.c             |  4 ++++
+ src/test/regress/expected/unicode.out | 12 ++++++++++--
+ src/test/regress/sql/unicode.sql      |  4 +++-
+ 3 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/common/unicode_norm.c b/src/common/unicode_norm.c
+index 36ff2aab218e..06bf921e4586 100644
+--- a/src/common/unicode_norm.c
++++ b/src/common/unicode_norm.c
+@@ -439,6 +439,10 @@ unicode_normalize(UnicodeNormalizationForm form, const pg_wchar *input)
+ 	decomp_chars[decomp_size] = '\0';
+ 	Assert(decomp_size == current_size);
+ 
++	/* Leave if there is nothing to decompose */
++	if (decomp_size == 0)
++		return decomp_chars;
++
+ 	/*
+ 	 * Now apply canonical ordering.
+ 	 */
+diff --git a/src/test/regress/expected/unicode.out b/src/test/regress/expected/unicode.out
+index 2a1e90369668..f2713a232688 100644
+--- a/src/test/regress/expected/unicode.out
++++ b/src/test/regress/expected/unicode.out
+@@ -8,6 +8,12 @@ SELECT U&'\0061\0308bc' <> U&'\00E4bc' COLLATE "C" AS sanity_check;
+  t
+ (1 row)
+ 
++SELECT normalize('');
++ normalize 
++-----------
++ 
++(1 row)
++
+ SELECT normalize(U&'\0061\0308\24D1c') = U&'\00E4\24D1c' COLLATE "C" AS test_default;
+  test_default 
+ --------------
+@@ -67,7 +73,8 @@ FROM
+   (VALUES (1, U&'\00E4bc'),
+           (2, U&'\0061\0308bc'),
+           (3, U&'\00E4\24D1c'),
+-          (4, U&'\0061\0308\24D1c')) vals (num, val)
++          (4, U&'\0061\0308\24D1c'),
++          (5, '')) vals (num, val)
+ ORDER BY num;
+  num | val | nfc | nfd | nfkc | nfkd 
+ -----+-----+-----+-----+------+------
+@@ -75,7 +82,8 @@ ORDER BY num;
+    2 | äbc | f   | t   | f    | t
+    3 | äⓑc | t   | f   | f    | f
+    4 | äⓑc | f   | t   | f    | f
+-(4 rows)
++   5 |     | t   | t   | t    | t
++(5 rows)
+ 
+ SELECT is_normalized('abc', 'def');  -- run-time error
+ ERROR:  invalid normalization form: def
+diff --git a/src/test/regress/sql/unicode.sql b/src/test/regress/sql/unicode.sql
+index ccfc6fa77ab4..63cd523f85f7 100644
+--- a/src/test/regress/sql/unicode.sql
++++ b/src/test/regress/sql/unicode.sql
+@@ -5,6 +5,7 @@ SELECT getdatabaseencoding() <> 'UTF8' AS skip_test \gset
+ 
+ SELECT U&'\0061\0308bc' <> U&'\00E4bc' COLLATE "C" AS sanity_check;
+ 
++SELECT normalize('');
+ SELECT normalize(U&'\0061\0308\24D1c') = U&'\00E4\24D1c' COLLATE "C" AS test_default;
+ SELECT normalize(U&'\0061\0308\24D1c', NFC) = U&'\00E4\24D1c' COLLATE "C" AS test_nfc;
+ SELECT normalize(U&'\00E4bc', NFC) = U&'\00E4bc' COLLATE "C" AS test_nfc_idem;
+@@ -26,7 +27,8 @@ FROM
+   (VALUES (1, U&'\00E4bc'),
+           (2, U&'\0061\0308bc'),
+           (3, U&'\00E4\24D1c'),
+-          (4, U&'\0061\0308\24D1c')) vals (num, val)
++          (4, U&'\0061\0308\24D1c'),
++          (5, '')) vals (num, val)
+ ORDER BY num;
+ 
+ SELECT is_normalized('abc', 'def');  -- run-time error

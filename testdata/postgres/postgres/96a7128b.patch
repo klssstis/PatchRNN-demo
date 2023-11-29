@@ -1,0 +1,387 @@
+From 96a7128b7b4c9ce4fb51df8c8b216dfab6340766 Mon Sep 17 00:00:00 2001
+From: Andrew Dunstan <andrew@dunslane.net>
+Date: Wed, 22 Mar 2017 10:00:30 -0400
+Subject: [PATCH] Sync pg_dump and pg_dumpall output
+
+Before exiting any files are fsync'ed. A --no-sync option is also
+provided for a faster exit if desired.
+
+Michael Paquier.
+
+Reviewed by Albe Laurenz
+
+Discussion: https://postgr.es/m/CAB7nPqS1uZ=Ov+UruW6jr3vB-S_DLVMPc0dQpV-fTDjmm0ZQMg@mail.gmail.com
+---
+ doc/src/sgml/ref/pg_dump.sgml         | 14 ++++++++++++++
+ doc/src/sgml/ref/pg_dumpall.sgml      | 14 ++++++++++++++
+ src/bin/pg_dump/pg_backup.h           |  2 +-
+ src/bin/pg_dump/pg_backup_archiver.c  | 15 ++++++++++-----
+ src/bin/pg_dump/pg_backup_archiver.h  |  1 +
+ src/bin/pg_dump/pg_backup_custom.c    |  5 +++++
+ src/bin/pg_dump/pg_backup_directory.c |  8 ++++++++
+ src/bin/pg_dump/pg_backup_tar.c       |  5 +++++
+ src/bin/pg_dump/pg_dump.c             | 12 ++++++++++--
+ src/bin/pg_dump/pg_dumpall.c          | 15 +++++++++++++++
+ src/common/file_utils.c               | 19 +++++++++++++++++++
+ src/include/common/file_utils.h       |  1 +
+ 12 files changed, 103 insertions(+), 8 deletions(-)
+
+diff --git a/doc/src/sgml/ref/pg_dump.sgml b/doc/src/sgml/ref/pg_dump.sgml
+index a1e03c481d11..bb32fb12e0b4 100644
+--- a/doc/src/sgml/ref/pg_dump.sgml
++++ b/doc/src/sgml/ref/pg_dump.sgml
+@@ -859,6 +859,20 @@ PostgreSQL documentation
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry>
++      <term><option>--no-sync</option></term>
++      <listitem>
++       <para>
++        By default, <command>pg_dump</command> will wait for all files
++        to be written safely to disk.  This option causes
++        <command>pg_dump</command> to return without waiting, which is
++        faster, but means that a subsequent operating system crash can leave
++        the dump corrupt.  Generally, this option is useful for testing
++        but should not be used when dumping data from production installation.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry>
+       <term><option>--quote-all-identifiers</></term>
+       <listitem>
+diff --git a/doc/src/sgml/ref/pg_dumpall.sgml b/doc/src/sgml/ref/pg_dumpall.sgml
+index afbadce24764..070b90248720 100644
+--- a/doc/src/sgml/ref/pg_dumpall.sgml
++++ b/doc/src/sgml/ref/pg_dumpall.sgml
+@@ -354,6 +354,20 @@ PostgreSQL documentation
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry>
++      <term><option>--no-sync</option></term>
++      <listitem>
++       <para>
++        By default, <command>pg_dumpall</command> will wait for all files
++        to be written safely to disk.  This option causes
++        <command>pg_dumpall</command> to return without waiting, which is
++        faster, but means that a subsequent operating system crash can leave
++        the dump corrupt.  Generally, this option is useful for testing
++        but should not be used when dumping data from production installation.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry>
+       <term><option>--no-tablespaces</option></term>
+       <listitem>
+diff --git a/src/bin/pg_dump/pg_backup.h b/src/bin/pg_dump/pg_backup.h
+index 983a999fcdca..610bed531c4b 100644
+--- a/src/bin/pg_dump/pg_backup.h
++++ b/src/bin/pg_dump/pg_backup.h
+@@ -276,7 +276,7 @@ extern Archive *OpenArchive(const char *FileSpec, const ArchiveFormat fmt);
+ 
+ /* Create a new archive */
+ extern Archive *CreateArchive(const char *FileSpec, const ArchiveFormat fmt,
+-			  const int compression, ArchiveMode mode,
++			  const int compression, bool dosync, ArchiveMode mode,
+ 			  SetupWorkerPtr setupDumpWorker);
+ 
+ /* The --list option */
+diff --git a/src/bin/pg_dump/pg_backup_archiver.c b/src/bin/pg_dump/pg_backup_archiver.c
+index 734373beaa50..dd0892539a3c 100644
+--- a/src/bin/pg_dump/pg_backup_archiver.c
++++ b/src/bin/pg_dump/pg_backup_archiver.c
+@@ -54,7 +54,8 @@ static const char *modulename = gettext_noop("archiver");
+ 
+ 
+ static ArchiveHandle *_allocAH(const char *FileSpec, const ArchiveFormat fmt,
+-	 const int compression, ArchiveMode mode, SetupWorkerPtr setupWorkerPtr);
++	 const int compression, bool dosync, ArchiveMode mode,
++	 SetupWorkerPtr setupWorkerPtr);
+ static void _getObjectDescription(PQExpBuffer buf, TocEntry *te,
+ 					  ArchiveHandle *AH);
+ static void _printTocEntry(ArchiveHandle *AH, TocEntry *te, bool isData, bool acl_pass);
+@@ -202,10 +203,12 @@ setupRestoreWorker(Archive *AHX)
+ /* Public */
+ Archive *
+ CreateArchive(const char *FileSpec, const ArchiveFormat fmt,
+-	 const int compression, ArchiveMode mode, SetupWorkerPtr setupDumpWorker)
++			  const int compression, bool dosync, ArchiveMode mode,
++			  SetupWorkerPtr setupDumpWorker)
+ 
+ {
+-	ArchiveHandle *AH = _allocAH(FileSpec, fmt, compression, mode, setupDumpWorker);
++	ArchiveHandle *AH = _allocAH(FileSpec, fmt, compression, dosync,
++								 mode, setupDumpWorker);
+ 
+ 	return (Archive *) AH;
+ }
+@@ -215,7 +218,7 @@ CreateArchive(const char *FileSpec, const ArchiveFormat fmt,
+ Archive *
+ OpenArchive(const char *FileSpec, const ArchiveFormat fmt)
+ {
+-	ArchiveHandle *AH = _allocAH(FileSpec, fmt, 0, archModeRead, setupRestoreWorker);
++	ArchiveHandle *AH = _allocAH(FileSpec, fmt, 0, true, archModeRead, setupRestoreWorker);
+ 
+ 	return (Archive *) AH;
+ }
+@@ -2269,7 +2272,8 @@ _discoverArchiveFormat(ArchiveHandle *AH)
+  */
+ static ArchiveHandle *
+ _allocAH(const char *FileSpec, const ArchiveFormat fmt,
+-	  const int compression, ArchiveMode mode, SetupWorkerPtr setupWorkerPtr)
++		 const int compression, bool dosync, ArchiveMode mode,
++		 SetupWorkerPtr setupWorkerPtr)
+ {
+ 	ArchiveHandle *AH;
+ 
+@@ -2323,6 +2327,7 @@ _allocAH(const char *FileSpec, const ArchiveFormat fmt,
+ 
+ 	AH->mode = mode;
+ 	AH->compression = compression;
++	AH->dosync = dosync;
+ 
+ 	memset(&(AH->sqlparse), 0, sizeof(AH->sqlparse));
+ 
+diff --git a/src/bin/pg_dump/pg_backup_archiver.h b/src/bin/pg_dump/pg_backup_archiver.h
+index a44e16ee45a7..b00a7ede9731 100644
+--- a/src/bin/pg_dump/pg_backup_archiver.h
++++ b/src/bin/pg_dump/pg_backup_archiver.h
+@@ -312,6 +312,7 @@ struct _archiveHandle
+ 								 * values for compression: -1
+ 								 * Z_DEFAULT_COMPRESSION 0	COMPRESSION_NONE
+ 								 * 1-9 levels for gzip compression */
++	bool		dosync;			/* data requested to be synced on sight */
+ 	ArchiveMode mode;			/* File mode - r or w */
+ 	void	   *formatData;		/* Header data specific to file format */
+ 
+diff --git a/src/bin/pg_dump/pg_backup_custom.c b/src/bin/pg_dump/pg_backup_custom.c
+index 5737608f9e13..a1f4cb1fea53 100644
+--- a/src/bin/pg_dump/pg_backup_custom.c
++++ b/src/bin/pg_dump/pg_backup_custom.c
+@@ -28,6 +28,7 @@
+ #include "compress_io.h"
+ #include "parallel.h"
+ #include "pg_backup_utils.h"
++#include "common/file_utils.h"
+ 
+ /*--------
+  * Routines in the format interface
+@@ -721,6 +722,10 @@ _CloseArchive(ArchiveHandle *AH)
+ 	if (fclose(AH->FH) != 0)
+ 		exit_horribly(modulename, "could not close archive file: %s\n", strerror(errno));
+ 
++	/* Sync the output file if one is defined */
++	if (AH->dosync && AH->mode == archModeWrite && AH->fSpec)
++		(void) fsync_fname(AH->fSpec, false, progname);
++
+ 	AH->FH = NULL;
+ }
+ 
+diff --git a/src/bin/pg_dump/pg_backup_directory.c b/src/bin/pg_dump/pg_backup_directory.c
+index 0d7322f73a7d..79922da8ba36 100644
+--- a/src/bin/pg_dump/pg_backup_directory.c
++++ b/src/bin/pg_dump/pg_backup_directory.c
+@@ -37,6 +37,7 @@
+ #include "compress_io.h"
+ #include "parallel.h"
+ #include "pg_backup_utils.h"
++#include "common/file_utils.h"
+ 
+ #include <dirent.h>
+ #include <sys/stat.h>
+@@ -593,6 +594,13 @@ _CloseArchive(ArchiveHandle *AH)
+ 		WriteDataChunks(AH, ctx->pstate);
+ 
+ 		ParallelBackupEnd(AH, ctx->pstate);
++
++		/*
++		 * In directory mode, there is no need to sync all the entries
++		 * individually. Just recurse once through all the files generated.
++		 */
++		if (AH->dosync)
++			fsync_dir_recurse(ctx->directory, progname);
+ 	}
+ 	AH->FH = NULL;
+ }
+diff --git a/src/bin/pg_dump/pg_backup_tar.c b/src/bin/pg_dump/pg_backup_tar.c
+index 9cadd0c4a459..a2b320f3710c 100644
+--- a/src/bin/pg_dump/pg_backup_tar.c
++++ b/src/bin/pg_dump/pg_backup_tar.c
+@@ -33,6 +33,7 @@
+ #include "pg_backup_tar.h"
+ #include "pg_backup_utils.h"
+ #include "pgtar.h"
++#include "common/file_utils.h"
+ #include "fe_utils/string_utils.h"
+ 
+ #include <sys/stat.h>
+@@ -901,6 +902,10 @@ _CloseArchive(ArchiveHandle *AH)
+ 			if (fputc(0, ctx->tarFH) == EOF)
+ 				WRITE_ERROR_EXIT;
+ 		}
++
++		/* Sync the output file if one is defined */
++		if (AH->dosync && AH->fSpec)
++			(void) fsync_fname(AH->fSpec, false, progname);
+ 	}
+ 
+ 	AH->FH = NULL;
+diff --git a/src/bin/pg_dump/pg_dump.c b/src/bin/pg_dump/pg_dump.c
+index 52fa6f33e3d1..2b5a52656c96 100644
+--- a/src/bin/pg_dump/pg_dump.c
++++ b/src/bin/pg_dump/pg_dump.c
+@@ -89,6 +89,8 @@ typedef enum OidOptions
+ /* global decls */
+ bool		g_verbose;			/* User wants verbose narration of our
+ 								 * activities. */
++static bool dosync = true;		/* Issue fsync() to make dump durable
++								 * on disk. */
+ 
+ /* subquery used to convert user ID (eg, datdba) to user name */
+ static const char *username_subquery;
+@@ -353,6 +355,7 @@ main(int argc, char **argv)
+ 		{"no-security-labels", no_argument, &dopt.no_security_labels, 1},
+ 		{"no-synchronized-snapshots", no_argument, &dopt.no_synchronized_snapshots, 1},
+ 		{"no-unlogged-table-data", no_argument, &dopt.no_unlogged_table_data, 1},
++		{"no-sync", no_argument, NULL, 7},
+ 
+ 		{NULL, 0, NULL, 0}
+ 	};
+@@ -533,6 +536,10 @@ main(int argc, char **argv)
+ 				dumpsnapshot = pg_strdup(optarg);
+ 				break;
+ 
++			case 7:				/* no-sync */
++				dosync = false;
++				break;
++
+ 			default:
+ 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+ 				exit_nicely(1);
+@@ -632,8 +639,8 @@ main(int argc, char **argv)
+ 		exit_horribly(NULL, "parallel backup only supported by the directory format\n");
+ 
+ 	/* Open the output file */
+-	fout = CreateArchive(filename, archiveFormat, compressLevel, archiveMode,
+-						 setupDumpWorker);
++	fout = CreateArchive(filename, archiveFormat, compressLevel, dosync,
++						 archiveMode, setupDumpWorker);
+ 
+ 	/* Make dump options accessible right away */
+ 	SetArchiveOptions(fout, &dopt, NULL);
+@@ -914,6 +921,7 @@ help(const char *progname)
+ 	printf(_("  -V, --version                output version information, then exit\n"));
+ 	printf(_("  -Z, --compress=0-9           compression level for compressed formats\n"));
+ 	printf(_("  --lock-wait-timeout=TIMEOUT  fail after waiting TIMEOUT for a table lock\n"));
++	printf(_("  --no-sync                    do not wait for changes to be written safely to disk\n"));
+ 	printf(_("  -?, --help                   show this help, then exit\n"));
+ 
+ 	printf(_("\nOptions controlling the output content:\n"));
+diff --git a/src/bin/pg_dump/pg_dumpall.c b/src/bin/pg_dump/pg_dumpall.c
+index 81ed924b9f3f..d598d100163e 100644
+--- a/src/bin/pg_dump/pg_dumpall.c
++++ b/src/bin/pg_dump/pg_dumpall.c
+@@ -22,6 +22,7 @@
+ 
+ #include "dumputils.h"
+ #include "pg_backup.h"
++#include "common/file_utils.h"
+ #include "fe_utils/string_utils.h"
+ 
+ /* version string we expect back from pg_dump */
+@@ -63,6 +64,7 @@ static PQExpBuffer pgdumpopts;
+ static char *connstr = "";
+ static bool skip_acls = false;
+ static bool verbose = false;
++static bool dosync = true;
+ 
+ static int	binary_upgrade = 0;
+ static int	column_inserts = 0;
+@@ -127,6 +129,7 @@ main(int argc, char *argv[])
+ 		{"role", required_argument, NULL, 3},
+ 		{"use-set-session-authorization", no_argument, &use_setsessauth, 1},
+ 		{"no-security-labels", no_argument, &no_security_labels, 1},
++		{"no-sync", no_argument, NULL, 4},
+ 		{"no-unlogged-table-data", no_argument, &no_unlogged_table_data, 1},
+ 		{"no-role-passwords", no_argument, &no_role_passwords, 1},
+ 
+@@ -297,6 +300,11 @@ main(int argc, char *argv[])
+ 				appendShellString(pgdumpopts, use_role);
+ 				break;
+ 
++			case 4:
++				dosync = false;
++				appendPQExpBufferStr(pgdumpopts, " --no-sync");
++				break;
++
+ 			default:
+ 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+ 				exit_nicely(1);
+@@ -549,8 +557,14 @@ main(int argc, char *argv[])
+ 	fprintf(OPF, "--\n-- PostgreSQL database cluster dump complete\n--\n\n");
+ 
+ 	if (filename)
++	{
+ 		fclose(OPF);
+ 
++		/* sync the resulting file, errors are not fatal */
++		if (dosync)
++			(void) fsync_fname(filename, false, progname);
++	}
++
+ 	exit_nicely(0);
+ }
+ 
+@@ -586,6 +600,7 @@ help(void)
+ 	printf(_("  --if-exists                  use IF EXISTS when dropping objects\n"));
+ 	printf(_("  --inserts                    dump data as INSERT commands, rather than COPY\n"));
+ 	printf(_("  --no-security-labels         do not dump security label assignments\n"));
++	printf(_("  --no-sync                    do not wait for changes to be written safely to disk\n"));
+ 	printf(_("  --no-tablespaces             do not dump tablespace assignments\n"));
+ 	printf(_("  --no-unlogged-table-data     do not dump unlogged table data\n"));
+ 	printf(_("  --no-role-passwords          do not dump passwords for roles\n"));
+diff --git a/src/common/file_utils.c b/src/common/file_utils.c
+index a978e64f5a15..72b0565c7100 100644
+--- a/src/common/file_utils.c
++++ b/src/common/file_utils.c
+@@ -115,6 +115,25 @@ fsync_pgdata(const char *pg_data,
+ 	walkdir(pg_tblspc, fsync_fname, true, progname);
+ }
+ 
++/*
++ * Issue fsync recursively on the given directory and all its contents.
++ *
++ * This is a convenient wrapper on top of walkdir().
++ */
++void
++fsync_dir_recurse(const char *dir, const char *progname)
++{
++	/*
++	 * If possible, hint to the kernel that we're soon going to fsync the data
++	 * directory and its contents.
++	 */
++#ifdef PG_FLUSH_DATA_WORKS
++	walkdir(dir, pre_sync_fname, false, progname);
++#endif
++
++	walkdir(dir, fsync_fname, false, progname);
++}
++
+ /*
+  * walkdir: recursively walk a directory, applying the action to each
+  * regular file and directory (including the named directory itself).
+diff --git a/src/include/common/file_utils.h b/src/include/common/file_utils.h
+index 07c25c244d02..48cc97a4096e 100644
+--- a/src/include/common/file_utils.h
++++ b/src/include/common/file_utils.h
+@@ -19,6 +19,7 @@ extern int fsync_fname(const char *fname, bool isdir,
+ 					   const char *progname);
+ extern void fsync_pgdata(const char *pg_data, const char *progname,
+ 						 int serverVersion);
++extern void fsync_dir_recurse(const char *dir, const char *progname);
+ extern int durable_rename(const char *oldfile, const char *newfile,
+ 						  const char *progname);
+ extern int fsync_parent_path(const char *fname, const char *progname);
