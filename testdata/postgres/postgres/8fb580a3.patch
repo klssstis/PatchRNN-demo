@@ -1,0 +1,628 @@
+From 8fb580a35ce358063dfdd10991d017498283c767 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Wed, 6 Apr 2022 17:56:19 -0700
+Subject: [PATCH] pgstat: prepare APIs used by pgstatfuncs for shared memory
+ stats.
+
+With the introduction of PgStat_Kind PgStat_Single_Reset_Type,
+PgStat_Shared_Reset_Target don't make sense anymore. Replace them with
+PgStat_Kind.
+
+Instead of having dedicated reset functions for different kinds of stats, use
+two generic helper routines (one to reset all stats of a kind, one to reset
+one stats entry).
+
+A number of reset functions were named pgstat_reset_*_counter(), despite
+affecting multiple counters. The generic helper routines get rid of
+pgstat_reset_single_counter(), pgstat_reset_subscription_counter().
+
+Rename pgstat_reset_slru_counter(), pgstat_reset_replslot_counter() to
+pgstat_reset_slru(), pgstat_reset_replslot() respectively, and have them only
+deal with a single SLRU/slot. Resetting all SLRUs/slots goes through the
+generic pgstat_reset_of_kind().
+
+Previously pg_stat_reset_replication_slot() used SearchNamedReplicationSlot()
+to check if a slot exists. API wise it seems better to move that to
+pgstat_replslot.c.
+
+This is done separately from the - quite large - shared memory statistics
+patch to make review easier.
+
+Reviewed-By: Kyotaro Horiguchi <horikyota.ntt@gmail.com>
+Discussion: https://postgr.es/m/20220404041516.cctrvpadhuriawlq@alap3.anarazel.de
+---
+ src/backend/postmaster/pgstat.c               | 128 +++++++++++++-----
+ src/backend/utils/activity/pgstat_replslot.c  |  37 +++--
+ src/backend/utils/activity/pgstat_slru.c      |   8 +-
+ .../utils/activity/pgstat_subscription.c      |  21 ---
+ src/backend/utils/adt/pgstatfuncs.c           |  68 +++++-----
+ src/include/pgstat.h                          |  28 +---
+ src/tools/pgindent/typedefs.list              |   2 -
+ 7 files changed, 161 insertions(+), 131 deletions(-)
+
+diff --git a/src/backend/postmaster/pgstat.c b/src/backend/postmaster/pgstat.c
+index 586dd710ef0c..6a98e6ddd777 100644
+--- a/src/backend/postmaster/pgstat.c
++++ b/src/backend/postmaster/pgstat.c
+@@ -124,7 +124,7 @@ static bool pgstat_write_statsfile_needed(void);
+ static bool pgstat_db_requested(Oid databaseid);
+ 
+ static PgStat_StatReplSlotEntry *pgstat_get_replslot_entry(NameData name, bool create_it);
+-static void pgstat_reset_replslot(PgStat_StatReplSlotEntry *slotstats, TimestampTz ts);
++static void pgstat_reset_replslot_entry(PgStat_StatReplSlotEntry *slotstats, TimestampTz ts);
+ 
+ static HTAB *pgstat_collect_oids(Oid catalogid, AttrNumber anum_oid);
+ 
+@@ -1084,55 +1084,110 @@ pgstat_reset_counters(void)
+ }
+ 
+ /*
+- * Reset a single counter.
++ * Reset a single variable-numbered entry.
++ *
++ * If the stats kind is within a database, also reset the database's
++ * stat_reset_timestamp.
+  *
+  * Permission checking for this function is managed through the normal
+  * GRANT system.
+  */
+ void
+-pgstat_reset_single_counter(Oid objoid, PgStat_Single_Reset_Type type)
++pgstat_reset(PgStat_Kind kind, Oid dboid, Oid objoid)
+ {
+-	PgStat_MsgResetsinglecounter msg;
+ 
+ 	if (pgStatSock == PGINVALID_SOCKET)
+ 		return;
+ 
+-	pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETSINGLECOUNTER);
+-	msg.m_databaseid = MyDatabaseId;
+-	msg.m_resettype = type;
+-	msg.m_objectid = objoid;
++	switch (kind)
++	{
++		case PGSTAT_KIND_FUNCTION:
++		case PGSTAT_KIND_RELATION:
++			{
++				PgStat_MsgResetsinglecounter msg;
+ 
+-	pgstat_send(&msg, sizeof(msg));
++				pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETSINGLECOUNTER);
++				msg.m_databaseid = dboid;
++				msg.m_resettype = kind;
++				msg.m_objectid = objoid;
++				pgstat_send(&msg, sizeof(msg));
++			}
++			break;
++
++		case PGSTAT_KIND_SUBSCRIPTION:
++			{
++				PgStat_MsgResetsubcounter msg;
++
++				Assert(dboid == InvalidOid);
++				msg.m_subid = objoid;
++				pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETSUBCOUNTER);
++			}
++			break;
++
++		default:
++			elog(ERROR, "unexpected");
++	}
+ }
+ 
+ /*
+- * Reset cluster-wide shared counters.
++ * Reset stats for all entries of a kind.
+  *
+  * Permission checking for this function is managed through the normal
+  * GRANT system.
+  */
+ void
+-pgstat_reset_shared_counters(const char *target)
++pgstat_reset_of_kind(PgStat_Kind kind)
+ {
+-	PgStat_MsgResetsharedcounter msg;
+-
+ 	if (pgStatSock == PGINVALID_SOCKET)
+ 		return;
+ 
+-	if (strcmp(target, "archiver") == 0)
+-		msg.m_resettarget = RESET_ARCHIVER;
+-	else if (strcmp(target, "bgwriter") == 0)
+-		msg.m_resettarget = RESET_BGWRITER;
+-	else if (strcmp(target, "wal") == 0)
+-		msg.m_resettarget = RESET_WAL;
+-	else
+-		ereport(ERROR,
+-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-				 errmsg("unrecognized reset target: \"%s\"", target),
+-				 errhint("Target must be \"archiver\", \"bgwriter\", or \"wal\".")));
++	switch (kind)
++	{
++		case PGSTAT_KIND_ARCHIVER:
++		case PGSTAT_KIND_BGWRITER:
++		case PGSTAT_KIND_CHECKPOINTER:
++		case PGSTAT_KIND_WAL:
++			{
++				PgStat_MsgResetsharedcounter msg;
+ 
+-	pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETSHAREDCOUNTER);
+-	pgstat_send(&msg, sizeof(msg));
++				pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETSHAREDCOUNTER);
++				msg.m_resettarget = kind;
++				pgstat_send(&msg, sizeof(msg));
++			}
++			break;
++		case PGSTAT_KIND_SLRU:
++			{
++				PgStat_MsgResetslrucounter msg;
++
++				pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETSLRUCOUNTER);
++				msg.m_index = -1;
++				pgstat_send(&msg, sizeof(msg));
++			}
++			break;
++		case PGSTAT_KIND_REPLSLOT:
++			{
++				PgStat_MsgResetreplslotcounter msg;
++
++				pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETREPLSLOTCOUNTER);
++				msg.clearall = true;
++				pgstat_send(&msg, sizeof(msg));
++			}
++			break;
++
++		case PGSTAT_KIND_SUBSCRIPTION:
++			{
++				PgStat_MsgResetsubcounter msg;
++
++				msg.m_subid = InvalidOid;
++				pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETSUBCOUNTER);
++
++				pgstat_send(&msg, sizeof(msg));
++			}
++			break;
++
++		default:
++			elog(ERROR, "unexpected");
++	}
+ }
+ 
+ /*
+@@ -1954,7 +2009,7 @@ pgstat_get_replslot_entry(NameData name, bool create)
+ 	if (create && !found)
+ 	{
+ 		namestrcpy(&(slotent->slotname), NameStr(name));
+-		pgstat_reset_replslot(slotent, 0);
++		pgstat_reset_replslot_entry(slotent, 0);
+ 	}
+ 
+ 	return slotent;
+@@ -1964,7 +2019,7 @@ pgstat_get_replslot_entry(NameData name, bool create)
+  * Reset the given replication slot stats.
+  */
+ static void
+-pgstat_reset_replslot(PgStat_StatReplSlotEntry *slotent, TimestampTz ts)
++pgstat_reset_replslot_entry(PgStat_StatReplSlotEntry *slotent, TimestampTz ts)
+ {
+ 	/* reset only counters. Don't clear slot name */
+ 	slotent->spill_txns = 0;
+@@ -3528,7 +3583,8 @@ pgstat_recv_resetcounter(PgStat_MsgResetcounter *msg, int len)
+ static void
+ pgstat_recv_resetsharedcounter(PgStat_MsgResetsharedcounter *msg, int len)
+ {
+-	if (msg->m_resettarget == RESET_BGWRITER)
++	if (msg->m_resettarget == PGSTAT_KIND_BGWRITER ||
++		msg->m_resettarget == PGSTAT_KIND_CHECKPOINTER)
+ 	{
+ 		/*
+ 		 * Reset the global, bgwriter and checkpointer statistics for the
+@@ -3537,13 +3593,13 @@ pgstat_recv_resetsharedcounter(PgStat_MsgResetsharedcounter *msg, int len)
+ 		memset(&globalStats, 0, sizeof(globalStats));
+ 		globalStats.bgwriter.stat_reset_timestamp = GetCurrentTimestamp();
+ 	}
+-	else if (msg->m_resettarget == RESET_ARCHIVER)
++	else if (msg->m_resettarget == PGSTAT_KIND_ARCHIVER)
+ 	{
+ 		/* Reset the archiver statistics for the cluster. */
+ 		memset(&archiverStats, 0, sizeof(archiverStats));
+ 		archiverStats.stat_reset_timestamp = GetCurrentTimestamp();
+ 	}
+-	else if (msg->m_resettarget == RESET_WAL)
++	else if (msg->m_resettarget == PGSTAT_KIND_WAL)
+ 	{
+ 		/* Reset the WAL statistics for the cluster. */
+ 		memset(&walStats, 0, sizeof(walStats));
+@@ -3577,10 +3633,10 @@ pgstat_recv_resetsinglecounter(PgStat_MsgResetsinglecounter *msg, int len)
+ 	dbentry->stat_reset_timestamp = GetCurrentTimestamp();
+ 
+ 	/* Remove object if it exists, ignore it if not */
+-	if (msg->m_resettype == RESET_TABLE)
++	if (msg->m_resettype == PGSTAT_KIND_RELATION)
+ 		(void) hash_search(dbentry->tables, (void *) &(msg->m_objectid),
+ 						   HASH_REMOVE, NULL);
+-	else if (msg->m_resettype == RESET_FUNCTION)
++	else if (msg->m_resettype == PGSTAT_KIND_FUNCTION)
+ 		(void) hash_search(dbentry->functions, (void *) &(msg->m_objectid),
+ 						   HASH_REMOVE, NULL);
+ }
+@@ -3626,7 +3682,7 @@ pgstat_recv_resetreplslotcounter(PgStat_MsgResetreplslotcounter *msg,
+ 
+ 		hash_seq_init(&sstat, replSlotStatHash);
+ 		while ((slotent = (PgStat_StatReplSlotEntry *) hash_seq_search(&sstat)) != NULL)
+-			pgstat_reset_replslot(slotent, ts);
++			pgstat_reset_replslot_entry(slotent, ts);
+ 	}
+ 	else
+ 	{
+@@ -3643,7 +3699,7 @@ pgstat_recv_resetreplslotcounter(PgStat_MsgResetreplslotcounter *msg,
+ 			return;
+ 
+ 		/* Reset the stats for the requested replication slot */
+-		pgstat_reset_replslot(slotent, ts);
++		pgstat_reset_replslot_entry(slotent, ts);
+ 	}
+ }
+ 
+@@ -3963,7 +4019,7 @@ pgstat_recv_replslot(PgStat_MsgReplSlot *msg, int len)
+ 			 * lost, slotent has stats for the old slot. So we initialize all
+ 			 * counters at slot creation.
+ 			 */
+-			pgstat_reset_replslot(slotent, 0);
++			pgstat_reset_replslot_entry(slotent, 0);
+ 		}
+ 		else
+ 		{
+diff --git a/src/backend/utils/activity/pgstat_replslot.c b/src/backend/utils/activity/pgstat_replslot.c
+index 35078ad73c8e..cfaf8d546c55 100644
+--- a/src/backend/utils/activity/pgstat_replslot.c
++++ b/src/backend/utils/activity/pgstat_replslot.c
+@@ -23,30 +23,45 @@
+ 
+ 
+ /*
+- * Reset counters for a single replication slot, or all replication slots
+- * (when name is null).
++ * Reset counters for a single replication slot.
+  *
+  * Permission checking for this function is managed through the normal
+  * GRANT system.
+  */
+ void
+-pgstat_reset_replslot_counter(const char *name)
++pgstat_reset_replslot(const char *name)
+ {
++	ReplicationSlot *slot;
+ 	PgStat_MsgResetreplslotcounter msg;
+ 
++	AssertArg(name != NULL);
++
+ 	if (pgStatSock == PGINVALID_SOCKET)
+ 		return;
+ 
+-	if (name)
+-	{
+-		namestrcpy(&msg.m_slotname, name);
+-		msg.clearall = false;
+-	}
+-	else
+-		msg.clearall = true;
++	/*
++	 * Check if the slot exists with the given name. It is possible that by
++	 * the time this message is executed the slot is dropped but at least this
++	 * check will ensure that the given name is for a valid slot.
++	 */
++	slot = SearchNamedReplicationSlot(name, true);
+ 
+-	pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETREPLSLOTCOUNTER);
++	if (!slot)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("replication slot \"%s\" does not exist",
++						name)));
+ 
++	/*
++	 * Nothing to do for physical slots as we collect stats only for logical
++	 * slots.
++	 */
++	if (SlotIsPhysical(slot))
++		return;
++
++	pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETREPLSLOTCOUNTER);
++	namestrcpy(&msg.m_slotname, name);
++	msg.clearall = false;
+ 	pgstat_send(&msg, sizeof(msg));
+ }
+ 
+diff --git a/src/backend/utils/activity/pgstat_slru.c b/src/backend/utils/activity/pgstat_slru.c
+index 6dae3a5dc665..1f2d2c3bbb74 100644
+--- a/src/backend/utils/activity/pgstat_slru.c
++++ b/src/backend/utils/activity/pgstat_slru.c
+@@ -33,21 +33,23 @@ static PgStat_MsgSLRU SLRUStats[SLRU_NUM_ELEMENTS];
+ 
+ 
+ /*
+- * Reset counters for a single SLRU, or all SLRUs (when name is null).
++ * Reset counters for a single SLRU.
+  *
+  * Permission checking for this function is managed through the normal
+  * GRANT system.
+  */
+ void
+-pgstat_reset_slru_counter(const char *name)
++pgstat_reset_slru(const char *name)
+ {
+ 	PgStat_MsgResetslrucounter msg;
+ 
++	AssertArg(name != NULL);
++
+ 	if (pgStatSock == PGINVALID_SOCKET)
+ 		return;
+ 
+ 	pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETSLRUCOUNTER);
+-	msg.m_index = (name) ? pgstat_slru_index(name) : -1;
++	msg.m_index = pgstat_slru_index(name);
+ 
+ 	pgstat_send(&msg, sizeof(msg));
+ }
+diff --git a/src/backend/utils/activity/pgstat_subscription.c b/src/backend/utils/activity/pgstat_subscription.c
+index 2ee23d5ae2c6..503dcabd2041 100644
+--- a/src/backend/utils/activity/pgstat_subscription.c
++++ b/src/backend/utils/activity/pgstat_subscription.c
+@@ -20,27 +20,6 @@
+ #include "utils/pgstat_internal.h"
+ 
+ 
+-/*
+- * Reset counters for a single subscription, or all subscriptions (when subid
+- * is InvalidOid).
+- *
+- * Permission checking for this function is managed through the normal
+- * GRANT system.
+- */
+-void
+-pgstat_reset_subscription_counter(Oid subid)
+-{
+-	PgStat_MsgResetsubcounter msg;
+-
+-	if (pgStatSock == PGINVALID_SOCKET)
+-		return;
+-
+-	msg.m_subid = subid;
+-	pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESETSUBCOUNTER);
+-
+-	pgstat_send(&msg, sizeof(msg));
+-}
+-
+ /*
+  * Report a subscription error.
+  */
+diff --git a/src/backend/utils/adt/pgstatfuncs.c b/src/backend/utils/adt/pgstatfuncs.c
+index fd4276fbc671..709dd5548ac5 100644
+--- a/src/backend/utils/adt/pgstatfuncs.c
++++ b/src/backend/utils/adt/pgstatfuncs.c
+@@ -24,7 +24,6 @@
+ #include "pgstat.h"
+ #include "postmaster/bgworker_internals.h"
+ #include "postmaster/postmaster.h"
+-#include "replication/slot.h"
+ #include "storage/proc.h"
+ #include "storage/procarray.h"
+ #include "utils/acl.h"
+@@ -2075,7 +2074,24 @@ pg_stat_reset_shared(PG_FUNCTION_ARGS)
+ {
+ 	char	   *target = text_to_cstring(PG_GETARG_TEXT_PP(0));
+ 
+-	pgstat_reset_shared_counters(target);
++	if (strcmp(target, "archiver") == 0)
++		pgstat_reset_of_kind(PGSTAT_KIND_ARCHIVER);
++	else if (strcmp(target, "bgwriter") == 0)
++	{
++		/*
++		 * Historically checkpointer was part of bgwriter, continue to reset
++		 * both for now.
++		 */
++		pgstat_reset_of_kind(PGSTAT_KIND_BGWRITER);
++		pgstat_reset_of_kind(PGSTAT_KIND_CHECKPOINTER);
++	}
++	else if (strcmp(target, "wal") == 0)
++		pgstat_reset_of_kind(PGSTAT_KIND_WAL);
++	else
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("unrecognized reset target: \"%s\"", target),
++				 errhint("Target must be \"archiver\", \"bgwriter\", or \"wal\".")));
+ 
+ 	PG_RETURN_VOID();
+ }
+@@ -2086,7 +2102,7 @@ pg_stat_reset_single_table_counters(PG_FUNCTION_ARGS)
+ {
+ 	Oid			taboid = PG_GETARG_OID(0);
+ 
+-	pgstat_reset_single_counter(taboid, RESET_TABLE);
++	pgstat_reset(PGSTAT_KIND_RELATION, MyDatabaseId, taboid);
+ 
+ 	PG_RETURN_VOID();
+ }
+@@ -2096,7 +2112,7 @@ pg_stat_reset_single_function_counters(PG_FUNCTION_ARGS)
+ {
+ 	Oid			funcoid = PG_GETARG_OID(0);
+ 
+-	pgstat_reset_single_counter(funcoid, RESET_FUNCTION);
++	pgstat_reset(PGSTAT_KIND_FUNCTION, MyDatabaseId, funcoid);
+ 
+ 	PG_RETURN_VOID();
+ }
+@@ -2107,10 +2123,13 @@ pg_stat_reset_slru(PG_FUNCTION_ARGS)
+ {
+ 	char	   *target = NULL;
+ 
+-	if (!PG_ARGISNULL(0))
++	if (PG_ARGISNULL(0))
++		pgstat_reset_of_kind(PGSTAT_KIND_SLRU);
++	else
++	{
+ 		target = text_to_cstring(PG_GETARG_TEXT_PP(0));
+-
+-	pgstat_reset_slru_counter(target);
++		pgstat_reset_slru(target);
++	}
+ 
+ 	PG_RETURN_VOID();
+ }
+@@ -2121,36 +2140,14 @@ pg_stat_reset_replication_slot(PG_FUNCTION_ARGS)
+ {
+ 	char	   *target = NULL;
+ 
+-	if (!PG_ARGISNULL(0))
++	if (PG_ARGISNULL(0))
++		pgstat_reset_of_kind(PGSTAT_KIND_REPLSLOT);
++	else
+ 	{
+-		ReplicationSlot *slot;
+-
+ 		target = text_to_cstring(PG_GETARG_TEXT_PP(0));
+-
+-		/*
+-		 * Check if the slot exists with the given name. It is possible that
+-		 * by the time this message is executed the slot is dropped but at
+-		 * least this check will ensure that the given name is for a valid
+-		 * slot.
+-		 */
+-		slot = SearchNamedReplicationSlot(target, true);
+-
+-		if (!slot)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+-					 errmsg("replication slot \"%s\" does not exist",
+-							target)));
+-
+-		/*
+-		 * Nothing to do for physical slots as we collect stats only for
+-		 * logical slots.
+-		 */
+-		if (SlotIsPhysical(slot))
+-			PG_RETURN_VOID();
++		pgstat_reset_replslot(target);
+ 	}
+ 
+-	pgstat_reset_replslot_counter(target);
+-
+ 	PG_RETURN_VOID();
+ }
+ 
+@@ -2163,7 +2160,7 @@ pg_stat_reset_subscription_stats(PG_FUNCTION_ARGS)
+ 	if (PG_ARGISNULL(0))
+ 	{
+ 		/* Clear all subscription stats */
+-		subid = InvalidOid;
++		pgstat_reset_of_kind(PGSTAT_KIND_SUBSCRIPTION);
+ 	}
+ 	else
+ 	{
+@@ -2173,10 +2170,9 @@ pg_stat_reset_subscription_stats(PG_FUNCTION_ARGS)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+ 					 errmsg("invalid subscription OID %u", subid)));
++		pgstat_reset(PGSTAT_KIND_SUBSCRIPTION, InvalidOid, subid);
+ 	}
+ 
+-	pgstat_reset_subscription_counter(subid);
+-
+ 	PG_RETURN_VOID();
+ }
+ 
+diff --git a/src/include/pgstat.h b/src/include/pgstat.h
+index 1bd1c5cf7b0c..9235f4dc4ce3 100644
+--- a/src/include/pgstat.h
++++ b/src/include/pgstat.h
+@@ -82,21 +82,6 @@ typedef enum SessionEndType
+  */
+ typedef int64 PgStat_Counter;
+ 
+-/* Possible targets for resetting cluster-wide shared values */
+-typedef enum PgStat_Shared_Reset_Target
+-{
+-	RESET_ARCHIVER,
+-	RESET_BGWRITER,
+-	RESET_WAL
+-} PgStat_Shared_Reset_Target;
+-
+-/* Possible object types for resetting single counters */
+-typedef enum PgStat_Single_Reset_Type
+-{
+-	RESET_TABLE,
+-	RESET_FUNCTION
+-} PgStat_Single_Reset_Type;
+-
+ 
+ /* ------------------------------------------------------------
+  * Structures kept in backend local memory while accumulating counts
+@@ -415,7 +400,7 @@ typedef struct PgStat_MsgResetcounter
+ typedef struct PgStat_MsgResetsharedcounter
+ {
+ 	PgStat_MsgHdr m_hdr;
+-	PgStat_Shared_Reset_Target m_resettarget;
++	PgStat_Kind m_resettarget;
+ } PgStat_MsgResetsharedcounter;
+ 
+ /* ----------
+@@ -427,7 +412,7 @@ typedef struct PgStat_MsgResetsinglecounter
+ {
+ 	PgStat_MsgHdr m_hdr;
+ 	Oid			m_databaseid;
+-	PgStat_Single_Reset_Type m_resettype;
++	PgStat_Kind m_resettype;
+ 	Oid			m_objectid;
+ } PgStat_MsgResetsinglecounter;
+ 
+@@ -999,8 +984,8 @@ extern void pgstat_vacuum_stat(void);
+ extern void pgstat_ping(void);
+ 
+ extern void pgstat_reset_counters(void);
+-extern void pgstat_reset_single_counter(Oid objectid, PgStat_Single_Reset_Type type);
+-extern void pgstat_reset_shared_counters(const char *);
++extern void pgstat_reset(PgStat_Kind kind, Oid dboid, Oid objectid);
++extern void pgstat_reset_of_kind(PgStat_Kind kind);
+ 
+ /* stats accessors */
+ extern void pgstat_clear_snapshot(void);
+@@ -1146,7 +1131,7 @@ extern PgStat_TableStatus *find_tabstat_entry(Oid rel_id);
+  * Functions in pgstat_replslot.c
+  */
+ 
+-extern void pgstat_reset_replslot_counter(const char *name);
++extern void pgstat_reset_replslot(const char *name);
+ extern void pgstat_report_replslot(const PgStat_StatReplSlotEntry *repSlotStat);
+ extern void pgstat_report_replslot_create(const char *slotname);
+ extern void pgstat_report_replslot_drop(const char *slotname);
+@@ -1156,7 +1141,7 @@ extern void pgstat_report_replslot_drop(const char *slotname);
+  * Functions in pgstat_slru.c
+  */
+ 
+-extern void pgstat_reset_slru_counter(const char *);
++extern void pgstat_reset_slru(const char *);
+ extern void pgstat_count_slru_page_zeroed(int slru_idx);
+ extern void pgstat_count_slru_page_hit(int slru_idx);
+ extern void pgstat_count_slru_page_read(int slru_idx);
+@@ -1172,7 +1157,6 @@ extern int	pgstat_slru_index(const char *name);
+  * Functions in pgstat_subscription.c
+  */
+ 
+-extern void pgstat_reset_subscription_counter(Oid subid);
+ extern void pgstat_report_subscription_error(Oid subid, bool is_apply_error);
+ extern void pgstat_report_subscription_drop(Oid subid);
+ 
+diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list
+index e1684d4caec5..639880895050 100644
+--- a/src/tools/pgindent/typedefs.list
++++ b/src/tools/pgindent/typedefs.list
+@@ -1977,8 +1977,6 @@ PgStat_MsgTempFile
+ PgStat_MsgVacuum
+ PgStat_MsgWal
+ PgStat_SLRUStats
+-PgStat_Shared_Reset_Target
+-PgStat_Single_Reset_Type
+ PgStat_StatDBEntry
+ PgStat_StatFuncEntry
+ PgStat_StatReplSlotEntry

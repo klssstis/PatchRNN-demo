@@ -1,0 +1,297 @@
+From 8a54e12a38d1545d249f1402f66c8cde2837d97c Mon Sep 17 00:00:00 2001
+From: Noah Misch <noah@leadboat.com>
+Date: Sat, 30 Jan 2021 00:00:27 -0800
+Subject: [PATCH] Fix CREATE INDEX CONCURRENTLY for simultaneous prepared
+ transactions.
+
+In a cluster having used CREATE INDEX CONCURRENTLY while having enabled
+prepared transactions, queries that use the resulting index can silently
+fail to find rows.  Fix this for future CREATE INDEX CONCURRENTLY by
+making it wait for prepared transactions like it waits for ordinary
+transactions.  This expands the VirtualTransactionId structure domain to
+admit prepared transactions.  It may be necessary to reindex to recover
+from past occurrences.  Back-patch to 9.5 (all supported versions).
+
+Andrey Borodin, reviewed (in earlier versions) by Tom Lane and Michael
+Paquier.
+
+Discussion: https://postgr.es/m/2E712143-97F7-4890-B470-4A35142ABC82@yandex-team.ru
+---
+ src/backend/storage/lmgr/lmgr.c               |  3 +-
+ src/backend/storage/lmgr/lock.c               | 43 +++++++++++--------
+ src/include/storage/lock.h                    | 17 ++++----
+ src/test/isolation/Makefile                   | 11 +++--
+ src/test/isolation/README                     |  6 +--
+ .../expected/prepared-transactions-cic.out    | 18 ++++++++
+ .../specs/prepared-transactions-cic.spec      | 37 ++++++++++++++++
+ 7 files changed, 98 insertions(+), 37 deletions(-)
+ create mode 100644 src/test/isolation/expected/prepared-transactions-cic.out
+ create mode 100644 src/test/isolation/specs/prepared-transactions-cic.spec
+
+diff --git a/src/backend/storage/lmgr/lmgr.c b/src/backend/storage/lmgr/lmgr.c
+index 7407672c9d31..5736d03083f1 100644
+--- a/src/backend/storage/lmgr/lmgr.c
++++ b/src/backend/storage/lmgr/lmgr.c
+@@ -904,8 +904,7 @@ WaitForLockersMultiple(List *locktags, LOCKMODE lockmode, bool progress)
+ 
+ 	/*
+ 	 * Note: GetLockConflicts() never reports our own xid, hence we need not
+-	 * check for that.  Also, prepared xacts are not reported, which is fine
+-	 * since they certainly aren't going to do anything anymore.
++	 * check for that.  Also, prepared xacts are reported and awaited.
+ 	 */
+ 
+ 	/* Finally wait for each such transaction to complete */
+diff --git a/src/backend/storage/lmgr/lock.c b/src/backend/storage/lmgr/lock.c
+index 20e50247ea49..79c1cf9b8b4e 100644
+--- a/src/backend/storage/lmgr/lock.c
++++ b/src/backend/storage/lmgr/lock.c
+@@ -2903,9 +2903,7 @@ FastPathGetRelationLockEntry(LOCALLOCK *locallock)
+  * so use of this function has to be thought about carefully.
+  *
+  * Note we never include the current xact's vxid in the result array,
+- * since an xact never blocks itself.  Also, prepared transactions are
+- * ignored, which is a bit more debatable but is appropriate for current
+- * uses of the result.
++ * since an xact never blocks itself.
+  */
+ VirtualTransactionId *
+ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
+@@ -2930,19 +2928,21 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
+ 
+ 	/*
+ 	 * Allocate memory to store results, and fill with InvalidVXID.  We only
+-	 * need enough space for MaxBackends + a terminator, since prepared xacts
+-	 * don't count. InHotStandby allocate once in TopMemoryContext.
++	 * need enough space for MaxBackends + max_prepared_xacts + a terminator.
++	 * InHotStandby allocate once in TopMemoryContext.
+ 	 */
+ 	if (InHotStandby)
+ 	{
+ 		if (vxids == NULL)
+ 			vxids = (VirtualTransactionId *)
+ 				MemoryContextAlloc(TopMemoryContext,
+-								   sizeof(VirtualTransactionId) * (MaxBackends + 1));
++								   sizeof(VirtualTransactionId) *
++								   (MaxBackends + max_prepared_xacts + 1));
+ 	}
+ 	else
+ 		vxids = (VirtualTransactionId *)
+-			palloc0(sizeof(VirtualTransactionId) * (MaxBackends + 1));
++			palloc0(sizeof(VirtualTransactionId) *
++					(MaxBackends + max_prepared_xacts + 1));
+ 
+ 	/* Compute hash code and partition lock, and look up conflicting modes. */
+ 	hashcode = LockTagHashCode(locktag);
+@@ -3017,13 +3017,9 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
+ 				/* Conflict! */
+ 				GET_VXID_FROM_PGPROC(vxid, *proc);
+ 
+-				/*
+-				 * If we see an invalid VXID, then either the xact has already
+-				 * committed (or aborted), or it's a prepared xact.  In either
+-				 * case we may ignore it.
+-				 */
+ 				if (VirtualTransactionIdIsValid(vxid))
+ 					vxids[count++] = vxid;
++				/* else, xact already committed or aborted */
+ 
+ 				/* No need to examine remaining slots. */
+ 				break;
+@@ -3082,11 +3078,6 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
+ 
+ 				GET_VXID_FROM_PGPROC(vxid, *proc);
+ 
+-				/*
+-				 * If we see an invalid VXID, then either the xact has already
+-				 * committed (or aborted), or it's a prepared xact.  In either
+-				 * case we may ignore it.
+-				 */
+ 				if (VirtualTransactionIdIsValid(vxid))
+ 				{
+ 					int			i;
+@@ -3098,6 +3089,7 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
+ 					if (i >= fast_count)
+ 						vxids[count++] = vxid;
+ 				}
++				/* else, xact already committed or aborted */
+ 			}
+ 		}
+ 
+@@ -3107,7 +3099,7 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
+ 
+ 	LWLockRelease(partitionLock);
+ 
+-	if (count > MaxBackends)	/* should never happen */
++	if (count > MaxBackends + max_prepared_xacts)	/* should never happen */
+ 		elog(PANIC, "too many conflicting locks found");
+ 
+ 	vxids[count].backendId = InvalidBackendId;
+@@ -4464,6 +4456,21 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
+ 
+ 	Assert(VirtualTransactionIdIsValid(vxid));
+ 
++	if (VirtualTransactionIdIsPreparedXact(vxid))
++	{
++		LockAcquireResult lar;
++
++		/*
++		 * Prepared transactions don't hold vxid locks.  The
++		 * LocalTransactionId is always a normal, locked XID.
++		 */
++		SET_LOCKTAG_TRANSACTION(tag, vxid.localTransactionId);
++		lar = LockAcquire(&tag, ShareLock, false, !wait);
++		if (lar != LOCKACQUIRE_NOT_AVAIL)
++			LockRelease(&tag, ShareLock, false);
++		return lar != LOCKACQUIRE_NOT_AVAIL;
++	}
++
+ 	SET_LOCKTAG_VIRTUALTRANSACTION(tag, vxid);
+ 
+ 	/*
+diff --git a/src/include/storage/lock.h b/src/include/storage/lock.h
+index 2e6ef174e9a7..68a3487d49f3 100644
+--- a/src/include/storage/lock.h
++++ b/src/include/storage/lock.h
+@@ -46,10 +46,10 @@ extern bool Debug_deadlocks;
+ 
+ /*
+  * Top-level transactions are identified by VirtualTransactionIDs comprising
+- * the BackendId of the backend running the xact, plus a locally-assigned
+- * LocalTransactionId.  These are guaranteed unique over the short term,
+- * but will be reused after a database restart; hence they should never
+- * be stored on disk.
++ * PGPROC fields backendId and lxid.  For prepared transactions, the
++ * LocalTransactionId is an ordinary XID.  These are guaranteed unique over
++ * the short term, but will be reused after a database restart or XID
++ * wraparound; hence they should never be stored on disk.
+  *
+  * Note that struct VirtualTransactionId can not be assumed to be atomically
+  * assignable as a whole.  However, type LocalTransactionId is assumed to
+@@ -61,15 +61,16 @@ extern bool Debug_deadlocks;
+  */
+ typedef struct
+ {
+-	BackendId	backendId;		/* determined at backend startup */
+-	LocalTransactionId localTransactionId;	/* backend-local transaction id */
++	BackendId	backendId;		/* backendId from PGPROC */
++	LocalTransactionId localTransactionId;	/* lxid from PGPROC */
+ } VirtualTransactionId;
+ 
+ #define InvalidLocalTransactionId		0
+ #define LocalTransactionIdIsValid(lxid) ((lxid) != InvalidLocalTransactionId)
+ #define VirtualTransactionIdIsValid(vxid) \
+-	(((vxid).backendId != InvalidBackendId) && \
+-	 LocalTransactionIdIsValid((vxid).localTransactionId))
++	(LocalTransactionIdIsValid((vxid).localTransactionId))
++#define VirtualTransactionIdIsPreparedXact(vxid) \
++	((vxid).backendId == InvalidBackendId)
+ #define VirtualTransactionIdEquals(vxid1, vxid2) \
+ 	((vxid1).backendId == (vxid2).backendId && \
+ 	 (vxid1).localTransactionId == (vxid2).localTransactionId)
+diff --git a/src/test/isolation/Makefile b/src/test/isolation/Makefile
+index d23e2cec6400..edff04f041cd 100644
+--- a/src/test/isolation/Makefile
++++ b/src/test/isolation/Makefile
+@@ -62,12 +62,11 @@ installcheck: all
+ check: all
+ 	$(pg_isolation_regress_check) --schedule=$(srcdir)/isolation_schedule
+ 
+-# Versions of the check tests that include the prepared-transactions test
+-# It only makes sense to run these if set up to use prepared transactions,
+-# via TEMP_CONFIG for the check case, or via the postgresql.conf for the
+-# installcheck case.
++# Non-default tests.  It only makes sense to run these if set up to use
++# prepared transactions, via TEMP_CONFIG for the check case, or via the
++# postgresql.conf for the installcheck case.
+ installcheck-prepared-txns: all temp-install
+-	$(pg_isolation_regress_installcheck) --schedule=$(srcdir)/isolation_schedule prepared-transactions
++	$(pg_isolation_regress_installcheck) --schedule=$(srcdir)/isolation_schedule prepared-transactions prepared-transactions-cic
+ 
+ check-prepared-txns: all temp-install
+-	$(pg_isolation_regress_check) --schedule=$(srcdir)/isolation_schedule prepared-transactions
++	$(pg_isolation_regress_check) --schedule=$(srcdir)/isolation_schedule prepared-transactions prepared-transactions-cic
+diff --git a/src/test/isolation/README b/src/test/isolation/README
+index 217953d1834a..6ae71523258a 100644
+--- a/src/test/isolation/README
++++ b/src/test/isolation/README
+@@ -23,9 +23,9 @@ you can do something like
+     ./pg_isolation_regress fk-contention fk-deadlock
+ (look into the specs/ subdirectory to see the available tests).
+ 
+-The prepared-transactions test requires the server's
+-max_prepared_transactions parameter to be set to at least 3; therefore it
+-is not run by default.  To include it in the test run, use
++Certain tests require the server's max_prepared_transactions parameter to be
++set to at least 3; therefore they are not run by default.  To include them in
++the test run, use
+     make check-prepared-txns
+ or
+     make installcheck-prepared-txns
+diff --git a/src/test/isolation/expected/prepared-transactions-cic.out b/src/test/isolation/expected/prepared-transactions-cic.out
+new file mode 100644
+index 000000000000..043ec3c36362
+--- /dev/null
++++ b/src/test/isolation/expected/prepared-transactions-cic.out
+@@ -0,0 +1,18 @@
++Parsed test spec with 2 sessions
++
++starting permutation: w1 p1 cic2 c1 r2
++step w1: BEGIN; INSERT INTO cic_test VALUES (1);
++step p1: PREPARE TRANSACTION 's1';
++step cic2: 
++    CREATE INDEX CONCURRENTLY on cic_test(a);
++
++ERROR:  canceling statement due to lock timeout
++step c1: COMMIT PREPARED 's1';
++step r2: 
++    SET enable_seqscan to off;
++    SET enable_bitmapscan to off;
++    SELECT * FROM cic_test WHERE a = 1;
++
++a              
++
++1              
+diff --git a/src/test/isolation/specs/prepared-transactions-cic.spec b/src/test/isolation/specs/prepared-transactions-cic.spec
+new file mode 100644
+index 000000000000..c39eaf5ad0c5
+--- /dev/null
++++ b/src/test/isolation/specs/prepared-transactions-cic.spec
+@@ -0,0 +1,37 @@
++# This test verifies that CREATE INDEX CONCURRENTLY interacts with prepared
++# transactions correctly.
++setup
++{
++    CREATE TABLE cic_test (a int);
++}
++
++teardown
++{
++    DROP TABLE cic_test;
++}
++
++
++# Sessions for CREATE INDEX CONCURRENTLY test
++session "s1"
++step "w1" { BEGIN; INSERT INTO cic_test VALUES (1); }
++step "p1" { PREPARE TRANSACTION 's1'; }
++step "c1" { COMMIT PREPARED 's1'; }
++
++session "s2"
++# The isolation tester never recognizes that a lock of s1 blocks s2, because a
++# prepared transaction's locks have no pid associated.  While there's a slight
++# chance of timeout while waiting for an autovacuum-held lock, that wouldn't
++# change the output.  Hence, no timeout is too short.
++setup { SET lock_timeout = 10; }
++step "cic2"
++{
++    CREATE INDEX CONCURRENTLY on cic_test(a);
++}
++step "r2"
++{
++    SET enable_seqscan to off;
++    SET enable_bitmapscan to off;
++    SELECT * FROM cic_test WHERE a = 1;
++}
++
++permutation  "w1" "p1" "cic2" "c1" "r2"

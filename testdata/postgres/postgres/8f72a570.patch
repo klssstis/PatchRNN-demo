@@ -1,0 +1,141 @@
+From 8f72a5704854d292065886eb47ba18fbd504113e Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 1 Mar 2018 11:37:46 -0500
+Subject: [PATCH] Fix format_type() to restore its old behavior.
+
+Commit a26116c6c accidentally changed the behavior of the SQL format_type()
+function while refactoring.  For the reasons explained in that function's
+comment, a NULL typemod argument should behave differently from a -1
+argument.  Since we've managed to break this, add a regression test
+memorializing the intended behavior.
+
+In passing, be consistent about the type of the "flags" parameter.
+
+Noted by Rushabh Lathia, though I revised the patch some more.
+
+Discussion: https://postgr.es/m/CAGPqQf3RB2q-d2Awp_-x-Ur6aOxTUwnApt-vm-iTtceZxYnePg@mail.gmail.com
+---
+ contrib/postgres_fdw/deparse.c            |  2 +-
+ src/backend/utils/adt/format_type.c       | 30 ++++++++++++++---------
+ src/test/regress/expected/create_type.out | 20 +++++++++++++++
+ src/test/regress/sql/create_type.sql      |  6 +++++
+ 4 files changed, 46 insertions(+), 12 deletions(-)
+
+diff --git a/contrib/postgres_fdw/deparse.c b/contrib/postgres_fdw/deparse.c
+index 8cd5843885e4..6e2fa1420c47 100644
+--- a/contrib/postgres_fdw/deparse.c
++++ b/contrib/postgres_fdw/deparse.c
+@@ -854,7 +854,7 @@ foreign_expr_walker(Node *node,
+ static char *
+ deparse_type_name(Oid type_oid, int32 typemod)
+ {
+-	uint8 flags = FORMAT_TYPE_TYPEMOD_GIVEN;
++	bits16		flags = FORMAT_TYPE_TYPEMOD_GIVEN;
+ 
+ 	if (!is_builtin(type_oid))
+ 		flags |= FORMAT_TYPE_FORCE_QUALIFY;
+diff --git a/src/backend/utils/adt/format_type.c b/src/backend/utils/adt/format_type.c
+index 872574fdd543..f1f0ba3e0b3f 100644
+--- a/src/backend/utils/adt/format_type.c
++++ b/src/backend/utils/adt/format_type.c
+@@ -63,17 +63,23 @@ format_type(PG_FUNCTION_ARGS)
+ 	Oid			type_oid;
+ 	int32		typemod;
+ 	char	   *result;
++	bits16		flags = FORMAT_TYPE_ALLOW_INVALID;
+ 
+ 	/* Since this function is not strict, we must test for null args */
+ 	if (PG_ARGISNULL(0))
+ 		PG_RETURN_NULL();
+ 
+ 	type_oid = PG_GETARG_OID(0);
+-	typemod = PG_ARGISNULL(1) ? -1 : PG_GETARG_INT32(1);
+ 
+-	result = format_type_extended(type_oid, typemod,
+-								  FORMAT_TYPE_TYPEMOD_GIVEN |
+-								  FORMAT_TYPE_ALLOW_INVALID);
++	if (PG_ARGISNULL(1))
++		typemod = -1;
++	else
++	{
++		typemod = PG_GETARG_INT32(1);
++		flags |= FORMAT_TYPE_TYPEMOD_GIVEN;
++	}
++
++	result = format_type_extended(type_oid, typemod, flags);
+ 
+ 	PG_RETURN_TEXT_P(cstring_to_text(result));
+ }
+@@ -82,21 +88,23 @@ format_type(PG_FUNCTION_ARGS)
+  * format_type_extended
+  *		Generate a possibly-qualified type name.
+  *
+- * The default is to only qualify if the type is not in the search path, to
+- * ignore the given typmod, and to raise an error if a non-existent type_oid is
+- * given.
++ * The default behavior is to only qualify if the type is not in the search
++ * path, to ignore the given typmod, and to raise an error if a non-existent
++ * type_oid is given.
+  *
+  * The following bits in 'flags' modify the behavior:
+  * - FORMAT_TYPE_TYPEMOD_GIVEN
+- *			consider the given typmod in the output (may be -1 to request
+- *			the default behavior)
+- *
++ *			include the typmod in the output (typmod could still be -1 though)
+  * - FORMAT_TYPE_ALLOW_INVALID
+  *			if the type OID is invalid or unknown, return ??? or such instead
+  *			of failing
+- *
+  * - FORMAT_TYPE_FORCE_QUALIFY
+  *			always schema-qualify type names, regardless of search_path
++ *
++ * Note that TYPEMOD_GIVEN is not interchangeable with "typemod == -1";
++ * see the comments above for format_type().
++ *
++ * Returns a palloc'd string.
+  */
+ char *
+ format_type_extended(Oid type_oid, int32 typemod, bits16 flags)
+diff --git a/src/test/regress/expected/create_type.out b/src/test/regress/expected/create_type.out
+index 0ab85a883c05..2f7d5f94d7b8 100644
+--- a/src/test/regress/expected/create_type.out
++++ b/src/test/regress/expected/create_type.out
+@@ -191,3 +191,23 @@ TABLE mytab;
+  (-44,5.5,12)
+ (2 rows)
+ 
++-- and test format_type() a bit more, too
++select format_type('varchar'::regtype, 42);
++      format_type      
++-----------------------
++ character varying(38)
++(1 row)
++
++select format_type('bpchar'::regtype, null);
++ format_type 
++-------------
++ character
++(1 row)
++
++-- this behavior difference is intentional
++select format_type('bpchar'::regtype, -1);
++ format_type 
++-------------
++ bpchar
++(1 row)
++
+diff --git a/src/test/regress/sql/create_type.sql b/src/test/regress/sql/create_type.sql
+index 07061bc02a62..3d1deba97cfc 100644
+--- a/src/test/regress/sql/create_type.sql
++++ b/src/test/regress/sql/create_type.sql
+@@ -148,3 +148,9 @@ WHERE attrelid = 'mytab'::regclass AND attnum > 0;
+ -- might as well exercise the widget type while we're here
+ INSERT INTO mytab VALUES ('(1,2,3)'), ('(-44,5.5,12)');
+ TABLE mytab;
++
++-- and test format_type() a bit more, too
++select format_type('varchar'::regtype, 42);
++select format_type('bpchar'::regtype, null);
++-- this behavior difference is intentional
++select format_type('bpchar'::regtype, -1);

@@ -1,0 +1,174 @@
+From 8e12f4a250d250a89153da2eb9b91c31bb80c483 Mon Sep 17 00:00:00 2001
+From: Teodor Sigaev <teodor@sigaev.ru>
+Date: Thu, 10 May 2018 13:31:47 +0300
+Subject: [PATCH] Various improvements of skipping index scan during vacuum
+ technics
+
+- Change vacuum_cleanup_index_scale_factor GUC to PGC_USERSET.
+  vacuum_cleanup_index_scale_factor GUC was defined as PGC_SIGHUP.  But this
+  GUC affects not only autovacuum.  So it might be useful to change it from user
+  session in order to influence manually runned VACUUM.
+- Add missing tab-complete support for vacuum_cleanup_index_scale_factor
+  reloption.
+- Fix condition for B-tree index cleanup.
+  Zero value of vacuum_cleanup_index_scale_factor means that user wants B-tree
+  index cleanup to be never skipped.
+- Documentation and comment improvements
+
+Authors: Justin Pryzby, Alexander Korotkov, Liudmila Mantrova
+Reviewed by: all authors and Robert Haas
+Discussion: https://www.postgresql.org/message-id/flat/20180502023025.GD7631%40telsasoft.com
+---
+ doc/src/sgml/config.sgml            | 35 ++++++++++++++++++++++-------
+ src/backend/access/nbtree/nbtpage.c |  2 +-
+ src/backend/access/nbtree/nbtree.c  | 19 ++++++++--------
+ src/backend/utils/misc/guc.c        |  2 +-
+ src/bin/psql/tab-complete.c         |  6 +++--
+ 5 files changed, 43 insertions(+), 21 deletions(-)
+
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index ffea744cb8c5..c4afd148c5ca 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -1893,15 +1893,34 @@ include_dir 'conf.d'
+       </term>
+       <listitem>
+        <para>
+-        When no tuples were deleted from the heap, B-tree indexes might still
+-        be scanned during <command>VACUUM</command> cleanup stage by two
+-        reasons.  The first reason is that B-tree index contains deleted pages
+-        which can be recycled during cleanup.  The second reason is that B-tree
+-        index statistics is stalled.  The criterion of stalled index statistics
+-        is number of inserted tuples since previous statistics collection
+-        is greater than <varname>vacuum_cleanup_index_scale_factor</varname>
+-        fraction of total number of heap tuples.
++        Specifies the fraction of the total number of heap tuples counted in
++        the previous statistics collection that can be inserted without
++        incurring an index scan at the <command>VACUUM</command> cleanup stage.
++        This setting currently applies to B-tree indexes only.
+        </para>
++
++       <para>
++        If no tuples were deleted from the heap, B-tree indexes are still
++        scanned at the <command>VACUUM</command> cleanup stage when at least one
++        of the following conditions is met: the index statistics are stale, or
++        the index contains deleted pages that can be recycled during cleanup.
++        Index statistics are considered to be stale if the number of newly
++        inserted tuples exceeds the <varname>vacuum_cleanup_index_scale_factor</varname>
++        fraction of the total number of heap tuples detected by the previous
++        statistics collection. The total number of heap tuples is stored in
++        the index meta-page. Note that the meta-page does not include this data
++        until <command>VACUUM</command> finds no dead tuples, so B-tree index
++        scan at the cleanup stage can only be skipped if the second and
++        subsequent <command>VACUUM</command> cycles detect no dead tuples.
++       </para>
++
++       <para>
++        The value can range from <literal>0</literal> to <literal>100</literal>.
++        When <varname>vacuum_cleanup_index_scale_factor</varname> is set to
++        <literal>0</literal>, index scans are never skipped during
++        <command>VACUUM</command> cleanup. The default value is <literal>0.1</literal>.
++       </para>
++
+       </listitem>
+      </varlistentry>
+      </variablelist>
+diff --git a/src/backend/access/nbtree/nbtpage.c b/src/backend/access/nbtree/nbtpage.c
+index 3bcc56e9d272..22b4a7578f3e 100644
+--- a/src/backend/access/nbtree/nbtpage.c
++++ b/src/backend/access/nbtree/nbtpage.c
+@@ -189,7 +189,7 @@ _bt_update_meta_cleanup_info(Relation rel, TransactionId oldestBtpoXact,
+ 	if (metad->btm_version < BTREE_VERSION)
+ 		_bt_upgrademetapage(metapg);
+ 
+-	/* update cleanup-related infromation */
++	/* update cleanup-related information */
+ 	metad->btm_oldest_btpo_xact = oldestBtpoXact;
+ 	metad->btm_last_cleanup_num_heap_tuples = numHeapTuples;
+ 	MarkBufferDirty(metabuf);
+diff --git a/src/backend/access/nbtree/nbtree.c b/src/backend/access/nbtree/nbtree.c
+index e5dce00876e7..27a3032e42ab 100644
+--- a/src/backend/access/nbtree/nbtree.c
++++ b/src/backend/access/nbtree/nbtree.c
+@@ -818,10 +818,11 @@ _bt_vacuum_needs_cleanup(IndexVacuumInfo *info)
+ 		float8		cleanup_scale_factor;
+ 
+ 		/*
+-		 * If table receives large enough amount of insertions and no cleanup
+-		 * was performed, then index might appear to have stalled statistics.
+-		 * In order to evade that, we perform cleanup when table receives
+-		 * vacuum_cleanup_index_scale_factor fractions of insertions.
++		 * If table receives enough insertions and no cleanup was performed,
++		 * then index would appear have stale statistics.  If scale factor
++		 * is set, we avoid that by performing cleanup if the number of
++		 * inserted tuples exceeds vacuum_cleanup_index_scale_factor fraction
++		 * of original tuples count.
+ 		 */
+ 		relopts = (StdRdOptions *) info->index->rd_options;
+ 		cleanup_scale_factor = (relopts &&
+@@ -829,7 +830,7 @@ _bt_vacuum_needs_cleanup(IndexVacuumInfo *info)
+ 			? relopts->vacuum_cleanup_index_scale_factor
+ 			: vacuum_cleanup_index_scale_factor;
+ 
+-		if (cleanup_scale_factor < 0 ||
++		if (cleanup_scale_factor <= 0 ||
+ 			metad->btm_last_cleanup_num_heap_tuples < 0 ||
+ 			info->num_heap_tuples > (1.0 + cleanup_scale_factor) *
+ 			metad->btm_last_cleanup_num_heap_tuples)
+@@ -870,8 +871,8 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+ 					 &oldestBtpoXact);
+ 
+ 		/*
+-		 * Update cleanup-related information in metapage. These information
+-		 * is used only for cleanup but keeping up them to date can avoid
++		 * Update cleanup-related information in metapage. This information
++		 * is used only for cleanup but keeping them up to date can avoid
+ 		 * unnecessary cleanup even after bulkdelete.
+ 		 */
+ 		_bt_update_meta_cleanup_info(info->index, oldestBtpoXact,
+@@ -899,8 +900,8 @@ btvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+ 	 * If btbulkdelete was called, we need not do anything, just return the
+ 	 * stats from the latest btbulkdelete call.  If it wasn't called, we might
+ 	 * still need to do a pass over the index, to recycle any newly-recyclable
+-	 * pages and to obtain index statistics.  _bt_vacuum_needs_cleanup checks
+-	 * is there are newly-recyclable or stalled index statistics.
++	 * pages or to obtain index statistics.  _bt_vacuum_needs_cleanup
++	 * determines if either are needed.
+ 	 *
+ 	 * Since we aren't going to actually delete any leaf items, there's no
+ 	 * need to go through all the vacuum-cycle-ID pushups.
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index f496ad628152..7cd2d2d80ef6 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -3238,7 +3238,7 @@ static struct config_real ConfigureNamesReal[] =
+ 	},
+ 
+ 	{
+-		{"vacuum_cleanup_index_scale_factor", PGC_SIGHUP, AUTOVACUUM,
++		{"vacuum_cleanup_index_scale_factor", PGC_USERSET, AUTOVACUUM,
+ 			gettext_noop("Number of tuple inserts prior to index cleanup as a fraction of reltuples."),
+ 			NULL
+ 		},
+diff --git a/src/bin/psql/tab-complete.c b/src/bin/psql/tab-complete.c
+index b431efc98327..7bb47eadc6c1 100644
+--- a/src/bin/psql/tab-complete.c
++++ b/src/bin/psql/tab-complete.c
+@@ -1855,13 +1855,15 @@ psql_completion(const char *text, int start, int end)
+ 		COMPLETE_WITH_CONST("(");
+ 	/* ALTER INDEX <foo> SET|RESET ( */
+ 	else if (Matches5("ALTER", "INDEX", MatchAny, "RESET", "("))
+-		COMPLETE_WITH_LIST7("fillfactor", "recheck_on_update",
++		COMPLETE_WITH_LIST8("fillfactor", "recheck_on_update",
++							"vacuum_cleanup_index_scale_factor", /* BTREE */
+ 							"fastupdate", "gin_pending_list_limit", /* GIN */
+ 							"buffering",	/* GiST */
+ 							"pages_per_range", "autosummarize"	/* BRIN */
+ 			);
+ 	else if (Matches5("ALTER", "INDEX", MatchAny, "SET", "("))
+-		COMPLETE_WITH_LIST7("fillfactor =", "recheck_on_update =",
++		COMPLETE_WITH_LIST8("fillfactor =", "recheck_on_update =",
++							"vacuum_cleanup_index_scale_factor =", /* BTREE */
+ 							"fastupdate =", "gin_pending_list_limit =", /* GIN */
+ 							"buffering =",	/* GiST */
+ 							"pages_per_range =", "autosummarize ="	/* BRIN */

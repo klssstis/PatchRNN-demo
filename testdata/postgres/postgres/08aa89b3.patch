@@ -1,0 +1,251 @@
+From 08aa89b326261b669648df97d4f2a6edba22d26a Mon Sep 17 00:00:00 2001
+From: Fujii Masao <fujii@postgresql.org>
+Date: Mon, 12 Apr 2021 00:00:18 +0900
+Subject: [PATCH] Remove COMMIT_TS_SETTS record.
+
+Commit 438fc4a39c prevented the WAL replay from writing
+COMMIT_TS_SETTS record. By this change there is no code that
+generates COMMIT_TS_SETTS record in PostgreSQL core.
+Also we can think that there are no extensions using the record
+because we've not received so far any complaints about the issue
+that commit 438fc4a39c fixed. Therefore this commit removes
+COMMIT_TS_SETTS record and its related code. Even without
+this record, the timestamp required for commit timestamp feature
+can be acquired from the COMMIT record.
+
+Bump WAL page magic.
+
+Reported-by: lx zou <zoulx1982@163.com>
+Author: Fujii Masao
+Reviewed-by: Alvaro Herrera
+Discussion: https://postgr.es/m/16931-620d0f2fdc6108f1@postgresql.org
+---
+ src/backend/access/rmgrdesc/committsdesc.c | 27 ---------
+ src/backend/access/transam/commit_ts.c     | 64 +---------------------
+ src/backend/access/transam/twophase.c      |  2 +-
+ src/backend/access/transam/xact.c          |  4 +-
+ src/include/access/commit_ts.h             |  3 +-
+ src/include/access/xlog_internal.h         |  2 +-
+ 6 files changed, 6 insertions(+), 96 deletions(-)
+
+diff --git a/src/backend/access/rmgrdesc/committsdesc.c b/src/backend/access/rmgrdesc/committsdesc.c
+index 7ebd3d35efd0..26bad44b964a 100644
+--- a/src/backend/access/rmgrdesc/committsdesc.c
++++ b/src/backend/access/rmgrdesc/committsdesc.c
+@@ -38,31 +38,6 @@ commit_ts_desc(StringInfo buf, XLogReaderState *record)
+ 		appendStringInfo(buf, "pageno %d, oldestXid %u",
+ 						 trunc->pageno, trunc->oldestXid);
+ 	}
+-	else if (info == COMMIT_TS_SETTS)
+-	{
+-		xl_commit_ts_set *xlrec = (xl_commit_ts_set *) rec;
+-		int			nsubxids;
+-
+-		appendStringInfo(buf, "set %s/%d for: %u",
+-						 timestamptz_to_str(xlrec->timestamp),
+-						 xlrec->nodeid,
+-						 xlrec->mainxid);
+-		nsubxids = ((XLogRecGetDataLen(record) - SizeOfCommitTsSet) /
+-					sizeof(TransactionId));
+-		if (nsubxids > 0)
+-		{
+-			int			i;
+-			TransactionId *subxids;
+-
+-			subxids = palloc(sizeof(TransactionId) * nsubxids);
+-			memcpy(subxids,
+-				   XLogRecGetData(record) + SizeOfCommitTsSet,
+-				   sizeof(TransactionId) * nsubxids);
+-			for (i = 0; i < nsubxids; i++)
+-				appendStringInfo(buf, ", %u", subxids[i]);
+-			pfree(subxids);
+-		}
+-	}
+ }
+ 
+ const char *
+@@ -74,8 +49,6 @@ commit_ts_identify(uint8 info)
+ 			return "ZEROPAGE";
+ 		case COMMIT_TS_TRUNCATE:
+ 			return "TRUNCATE";
+-		case COMMIT_TS_SETTS:
+-			return "SETTS";
+ 		default:
+ 			return NULL;
+ 	}
+diff --git a/src/backend/access/transam/commit_ts.c b/src/backend/access/transam/commit_ts.c
+index 268bdba33982..0985fa155cae 100644
+--- a/src/backend/access/transam/commit_ts.c
++++ b/src/backend/access/transam/commit_ts.c
+@@ -114,9 +114,6 @@ static void ActivateCommitTs(void);
+ static void DeactivateCommitTs(void);
+ static void WriteZeroPageXlogRec(int pageno);
+ static void WriteTruncateXlogRec(int pageno, TransactionId oldestXid);
+-static void WriteSetTimestampXlogRec(TransactionId mainxid, int nsubxids,
+-									 TransactionId *subxids, TimestampTz timestamp,
+-									 RepOriginId nodeid);
+ 
+ /*
+  * TransactionTreeSetCommitTsData
+@@ -133,18 +130,11 @@ static void WriteSetTimestampXlogRec(TransactionId mainxid, int nsubxids,
+  * permanent) so we need to keep the information about them here. If the
+  * subtrans implementation changes in the future, we might want to revisit the
+  * decision of storing timestamp info for each subxid.
+- *
+- * The write_xlog parameter tells us whether to include an XLog record of this
+- * or not.  Normally, this is called from transaction commit routines (both
+- * normal and prepared) and the information will be stored in the transaction
+- * commit XLog record, and so they should pass "false" for this.  The XLog redo
+- * code should use "false" here as well.  Other callers probably want to pass
+- * true, so that the given values persist in case of crashes.
+  */
+ void
+ TransactionTreeSetCommitTsData(TransactionId xid, int nsubxids,
+ 							   TransactionId *subxids, TimestampTz timestamp,
+-							   RepOriginId nodeid, bool write_xlog)
++							   RepOriginId nodeid)
+ {
+ 	int			i;
+ 	TransactionId headxid;
+@@ -161,13 +151,6 @@ TransactionTreeSetCommitTsData(TransactionId xid, int nsubxids,
+ 	if (!commitTsShared->commitTsActive)
+ 		return;
+ 
+-	/*
+-	 * Comply with the WAL-before-data rule: if caller specified it wants this
+-	 * value to be recorded in WAL, do so before touching the data.
+-	 */
+-	if (write_xlog)
+-		WriteSetTimestampXlogRec(xid, nsubxids, subxids, timestamp, nodeid);
+-
+ 	/*
+ 	 * Figure out the latest Xid in this batch: either the last subxid if
+ 	 * there's any, otherwise the parent xid.
+@@ -993,28 +976,6 @@ WriteTruncateXlogRec(int pageno, TransactionId oldestXid)
+ 	(void) XLogInsert(RM_COMMIT_TS_ID, COMMIT_TS_TRUNCATE);
+ }
+ 
+-/*
+- * Write a SETTS xlog record
+- */
+-static void
+-WriteSetTimestampXlogRec(TransactionId mainxid, int nsubxids,
+-						 TransactionId *subxids, TimestampTz timestamp,
+-						 RepOriginId nodeid)
+-{
+-	xl_commit_ts_set record;
+-
+-	record.timestamp = timestamp;
+-	record.nodeid = nodeid;
+-	record.mainxid = mainxid;
+-
+-	XLogBeginInsert();
+-	XLogRegisterData((char *) &record,
+-					 offsetof(xl_commit_ts_set, mainxid) +
+-					 sizeof(TransactionId));
+-	XLogRegisterData((char *) subxids, nsubxids * sizeof(TransactionId));
+-	XLogInsert(RM_COMMIT_TS_ID, COMMIT_TS_SETTS);
+-}
+-
+ /*
+  * CommitTS resource manager's routines
+  */
+@@ -1055,29 +1016,6 @@ commit_ts_redo(XLogReaderState *record)
+ 
+ 		SimpleLruTruncate(CommitTsCtl, trunc->pageno);
+ 	}
+-	else if (info == COMMIT_TS_SETTS)
+-	{
+-		xl_commit_ts_set *setts = (xl_commit_ts_set *) XLogRecGetData(record);
+-		int			nsubxids;
+-		TransactionId *subxids;
+-
+-		nsubxids = ((XLogRecGetDataLen(record) - SizeOfCommitTsSet) /
+-					sizeof(TransactionId));
+-		if (nsubxids > 0)
+-		{
+-			subxids = palloc(sizeof(TransactionId) * nsubxids);
+-			memcpy(subxids,
+-				   XLogRecGetData(record) + SizeOfCommitTsSet,
+-				   sizeof(TransactionId) * nsubxids);
+-		}
+-		else
+-			subxids = NULL;
+-
+-		TransactionTreeSetCommitTsData(setts->mainxid, nsubxids, subxids,
+-									   setts->timestamp, setts->nodeid, false);
+-		if (subxids)
+-			pfree(subxids);
+-	}
+ 	else
+ 		elog(PANIC, "commit_ts_redo: unknown op code %u", info);
+ }
+diff --git a/src/backend/access/transam/twophase.c b/src/backend/access/transam/twophase.c
+index 3137cb3ecc15..b6581349a35b 100644
+--- a/src/backend/access/transam/twophase.c
++++ b/src/backend/access/transam/twophase.c
+@@ -2246,7 +2246,7 @@ RecordTransactionCommitPrepared(TransactionId xid,
+ 
+ 	TransactionTreeSetCommitTsData(xid, nchildren, children,
+ 								   replorigin_session_origin_timestamp,
+-								   replorigin_session_origin, false);
++								   replorigin_session_origin);
+ 
+ 	/*
+ 	 * We don't currently try to sleep before flush here ... nor is there any
+diff --git a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
+index c83aa16f2ce7..441445927e8d 100644
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -1366,7 +1366,7 @@ RecordTransactionCommit(void)
+ 
+ 		TransactionTreeSetCommitTsData(xid, nchildren, children,
+ 									   replorigin_session_origin_timestamp,
+-									   replorigin_session_origin, false);
++									   replorigin_session_origin);
+ 	}
+ 
+ 	/*
+@@ -5804,7 +5804,7 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
+ 
+ 	/* Set the transaction commit timestamp and metadata */
+ 	TransactionTreeSetCommitTsData(xid, parsed->nsubxacts, parsed->subxacts,
+-								   commit_time, origin_id, false);
++								   commit_time, origin_id);
+ 
+ 	if (standbyState == STANDBY_DISABLED)
+ 	{
+diff --git a/src/include/access/commit_ts.h b/src/include/access/commit_ts.h
+index 750369104ac5..608a1643cdd9 100644
+--- a/src/include/access/commit_ts.h
++++ b/src/include/access/commit_ts.h
+@@ -25,7 +25,7 @@ extern bool check_track_commit_timestamp(bool *newval, void **extra,
+ 
+ extern void TransactionTreeSetCommitTsData(TransactionId xid, int nsubxids,
+ 										   TransactionId *subxids, TimestampTz timestamp,
+-										   RepOriginId nodeid, bool write_xlog);
++										   RepOriginId nodeid);
+ extern bool TransactionIdGetCommitTsData(TransactionId xid,
+ 										 TimestampTz *ts, RepOriginId *nodeid);
+ extern TransactionId GetLatestCommitTsData(TimestampTz *ts,
+@@ -50,7 +50,6 @@ extern int	committssyncfiletag(const FileTag *ftag, char *path);
+ /* XLOG stuff */
+ #define COMMIT_TS_ZEROPAGE		0x00
+ #define COMMIT_TS_TRUNCATE		0x10
+-#define COMMIT_TS_SETTS			0x20
+ 
+ typedef struct xl_commit_ts_set
+ {
+diff --git a/src/include/access/xlog_internal.h b/src/include/access/xlog_internal.h
+index da94f2d472a6..26a743b6b6c3 100644
+--- a/src/include/access/xlog_internal.h
++++ b/src/include/access/xlog_internal.h
+@@ -31,7 +31,7 @@
+ /*
+  * Each page of XLOG file has a header like this:
+  */
+-#define XLOG_PAGE_MAGIC 0xD10C	/* can be used as WAL version indicator */
++#define XLOG_PAGE_MAGIC 0xD10D	/* can be used as WAL version indicator */
+ 
+ typedef struct XLogPageHeaderData
+ {

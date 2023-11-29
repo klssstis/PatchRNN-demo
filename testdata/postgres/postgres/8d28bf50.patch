@@ -1,0 +1,146 @@
+From 8d28bf500f6536e295e9c3d7b85cdfec1c4dc913 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Wed, 26 Sep 2018 10:25:54 +0900
+Subject: [PATCH] Rework activation of commit timestamps during recovery
+
+The activation and deactivation of commit timestamp tracking has not
+been handled consistently for a primary or standbys at recovery.  The
+facility can be activated at three different moments of recovery:
+- The beginning, where a primary would use the GUC value for the
+decision-making, and where a standby relies on the contents of the
+control file.
+- When replaying a XLOG_PARAMETER_CHANGE record at redo.
+- The end, where both primary and standby rely on the GUC value.
+
+Using the GUC value for a primary at the beginning of recovery causes
+problems with commit timestamp access when doing crash recovery.
+Particularly, when replaying transaction commits, it could be possible
+that an attempt to read commit timestamps is done for a transaction
+which committed at a moment when track_commit_timestamp was disabled.
+
+A test case is added to reproduce the failure.  The test works down to
+v11 as it takes advantage of transaction commits within procedures.
+
+Reported-by: Hailong Li
+Author: Masahiko Sawasa, Michael Paquier
+Reviewed-by: Kyotaro Horiguchi
+Discussion: https://postgr.es/m/11224478-a782-203b-1f17-e4797b39bdf0@qunar.com
+Backpatch-through: 9.5, where commit timestamps have been introduced.
+---
+ src/backend/access/transam/commit_ts.c      |  9 +++---
+ src/backend/access/transam/xlog.c           |  9 +++---
+ src/test/modules/commit_ts/t/004_restart.pl | 36 ++++++++++++++++++---
+ 3 files changed, 40 insertions(+), 14 deletions(-)
+
+diff --git a/src/backend/access/transam/commit_ts.c b/src/backend/access/transam/commit_ts.c
+index 73fac1ba81d3..599203c96ce8 100644
+--- a/src/backend/access/transam/commit_ts.c
++++ b/src/backend/access/transam/commit_ts.c
+@@ -573,10 +573,9 @@ CompleteCommitTsInitialization(void)
+ 	 * any leftover data.
+ 	 *
+ 	 * Conversely, we activate the module if the feature is enabled.  This is
+-	 * not necessary in a master system because we already did it earlier, but
+-	 * if we're in a standby server that got promoted which had the feature
+-	 * enabled and was following a master that had the feature disabled, this
+-	 * is where we turn it on locally.
++	 * necessary for primary and standby as the activation depends on the
++	 * control file contents at the beginning of recovery or when a
++	 * XLOG_PARAMETER_CHANGE is replayed.
+ 	 */
+ 	if (!track_commit_timestamp)
+ 		DeactivateCommitTs();
+@@ -586,7 +585,7 @@ CompleteCommitTsInitialization(void)
+ 
+ /*
+  * Activate or deactivate CommitTs' upon reception of a XLOG_PARAMETER_CHANGE
+- * XLog record in a standby.
++ * XLog record during recovery.
+  */
+ void
+ CommitTsParameterChange(bool newvalue, bool oldvalue)
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 4754e7543679..5abaeb005b38 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -6833,11 +6833,12 @@ StartupXLOG(void)
+ 	StartupMultiXact();
+ 
+ 	/*
+-	 * Ditto commit timestamps.  In a standby, we do it if setting is enabled
+-	 * in ControlFile; in a master we base the decision on the GUC itself.
++	 * Ditto for commit timestamps.  Activate the facility if the setting is
++	 * enabled in the control file, as there should be no tracking of commit
++	 * timestamps done when the setting was disabled.  This facility can be
++	 * started or stopped when replaying a XLOG_PARAMETER_CHANGE record.
+ 	 */
+-	if (ArchiveRecoveryRequested ?
+-		ControlFile->track_commit_timestamp : track_commit_timestamp)
++	if (ControlFile->track_commit_timestamp)
+ 		StartupCommitTs();
+ 
+ 	/*
+diff --git a/src/test/modules/commit_ts/t/004_restart.pl b/src/test/modules/commit_ts/t/004_restart.pl
+index daf42d3a029b..241b0b08dcf6 100644
+--- a/src/test/modules/commit_ts/t/004_restart.pl
++++ b/src/test/modules/commit_ts/t/004_restart.pl
+@@ -1,4 +1,4 @@
+-# Testing of commit timestamps preservation across clean restarts
++# Testing of commit timestamps preservation across restarts
+ use strict;
+ use warnings;
+ use PostgresNode;
+@@ -71,12 +71,36 @@
+ 	'timestamps before and after restart are equal');
+ 
+ # Now disable commit timestamps
+-
+ $node_master->append_conf('postgresql.conf', 'track_commit_timestamp = off');
+-
+ $node_master->stop('fast');
++
++# Start the server, which generates a XLOG_PARAMETER_CHANGE record where
++# the parameter change is registered.
+ $node_master->start;
+ 
++# Now restart again the server so as no XLOG_PARAMETER_CHANGE record are
++# replayed with the follow-up immediate shutdown.
++$node_master->restart;
++
++# Move commit timestamps across page boundaries.  Things should still
++# be able to work across restarts with those transactions committed while
++# track_commit_timestamp is disabled.
++$node_master->safe_psql('postgres',
++qq(CREATE PROCEDURE consume_xid(cnt int)
++AS \$\$
++DECLARE
++    i int;
++    BEGIN
++        FOR i in 1..cnt LOOP
++            EXECUTE 'SELECT txid_current()';
++            COMMIT;
++        END LOOP;
++    END;
++\$\$
++LANGUAGE plpgsql;
++));
++$node_master->safe_psql('postgres', 'CALL consume_xid(2000)');
++
+ ($ret, $stdout, $stderr) = $node_master->psql('postgres',
+ 	qq[SELECT pg_xact_commit_timestamp('$xid');]);
+ is($ret, 3, 'no commit timestamp from enable tx when cts disabled');
+@@ -106,10 +130,12 @@
+ # Re-enable, restart and ensure we can still get the old timestamps
+ $node_master->append_conf('postgresql.conf', 'track_commit_timestamp = on');
+ 
+-$node_master->stop('fast');
++# An immediate shutdown is used here.  At next startup recovery will
++# replay transactions which committed when track_commit_timestamp was
++# disabled, and the facility should be able to work properly.
++$node_master->stop('immediate');
+ $node_master->start;
+ 
+-
+ my $after_enable_ts = $node_master->safe_psql('postgres',
+ 	qq[SELECT pg_xact_commit_timestamp('$xid');]);
+ is($after_enable_ts, '', 'timestamp of enabled tx null after re-enable');

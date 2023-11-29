@@ -1,0 +1,182 @@
+From 8fcb32db98eda1ad2a0c0b40b1cbb5d9a7aa68f0 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Fri, 7 Apr 2023 10:10:17 +0900
+Subject: [PATCH] Add more protections in WAL record APIs against overflows
+
+This commit adds a limit to the size of an XLogRecord at 1020MB, based
+on a suggestion by Heikki Linnakangas.  This counts for the overhead
+needed by the XLogReader when allocating the memory it needs to read a
+record in DecodeXLogRecordRequiredSpace(), based on the record size.  An
+assertion based on that is added to detect that any additions in the
+XLogReader facilities would not cause any overflows.  If that's ever the
+case, the upper bound allowed would need to be adjusted.
+
+Before this, it was possible for an external module to create WAL
+records large enough to be assembled but not replayable, causing
+failures when replaying such WAL records on standbys.  One case
+mentioned where this is possible is the in-core function
+pg_logical_emit_message() (wrapper for LogLogicalMessage), that allows
+to emit WAL records with an arbitrary amount of data potentially higher
+than the replay limit of approximately 1GB (limit of a palloc, minus the
+overhead needed by a XLogReader).
+
+This commit is a follow-up of ffd1b6b that has added similar protections
+for the block-level data.  Here, the checks are extended to the whole
+record length, mainrdata_len being extended from uint32 to uint64 with
+the routines registering buffer and record data still limited to uint32
+to minimize the checks when assembling a record.  All the error messages
+related to overflow checks are improved to provide more context about
+the error happening.
+
+Author: Matthias van de Meent
+Reviewed-by: Andres Freund, Heikki Linnakangas, Michael Paquier
+Discussion: https://postgr.es/m/CAEze2WgGiw+LZt+vHf8tWqB_6VxeLsMeoAuod0N=ij1q17n5pw@mail.gmail.com
+---
+ src/backend/access/transam/xloginsert.c | 62 +++++++++++++++++++++----
+ src/include/access/xlogrecord.h         | 11 +++++
+ 2 files changed, 65 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/access/transam/xloginsert.c b/src/backend/access/transam/xloginsert.c
+index 008612e03249..e2a5a3d13ba3 100644
+--- a/src/backend/access/transam/xloginsert.c
++++ b/src/backend/access/transam/xloginsert.c
+@@ -98,7 +98,7 @@ static int	max_registered_block_id = 0;	/* highest block_id + 1 currently
+  */
+ static XLogRecData *mainrdata_head;
+ static XLogRecData *mainrdata_last = (XLogRecData *) &mainrdata_head;
+-static uint32 mainrdata_len;	/* total # of bytes in chain */
++static uint64 mainrdata_len;	/* total # of bytes in chain */
+ 
+ /* flags for the in-progress insertion */
+ static uint8 curinsert_flags = 0;
+@@ -355,7 +355,10 @@ XLogRegisterData(char *data, uint32 len)
+ 	Assert(begininsert_called);
+ 
+ 	if (num_rdatas >= max_rdatas)
+-		elog(ERROR, "too much WAL data");
++		ereport(ERROR,
++				(errmsg_internal("too much WAL data"),
++				 errdetail_internal("%u out of %u data segments are already in use.",
++									num_rdatas, max_rdatas)));
+ 	rdata = &rdatas[num_rdatas++];
+ 
+ 	rdata->data = data;
+@@ -405,9 +408,16 @@ XLogRegisterBufData(uint8 block_id, char *data, uint32 len)
+ 	 * regbuf->rdata_len does not grow beyond what
+ 	 * XLogRecordBlockHeader->data_length can hold.
+ 	 */
+-	if (num_rdatas >= max_rdatas ||
+-		regbuf->rdata_len + len > UINT16_MAX)
+-		elog(ERROR, "too much WAL data");
++	if (num_rdatas >= max_rdatas)
++		ereport(ERROR,
++				(errmsg_internal("too much WAL data"),
++				 errdetail_internal("%u out of %u data segments are already in use.",
++									num_rdatas, max_rdatas)));
++	if (regbuf->rdata_len + len > UINT16_MAX || len > UINT16_MAX)
++		ereport(ERROR,
++				(errmsg_internal("too much WAL data"),
++				 errdetail_internal("Registering more than maximum %u bytes allowed to block %u: current %u bytes, adding %u bytes.",
++									UINT16_MAX, block_id, regbuf->rdata_len, len)));
+ 
+ 	rdata = &rdatas[num_rdatas++];
+ 
+@@ -527,7 +537,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
+ 				   XLogRecPtr *fpw_lsn, int *num_fpi, bool *topxid_included)
+ {
+ 	XLogRecData *rdt;
+-	uint32		total_len = 0;
++	uint64		total_len = 0;
+ 	int			block_id;
+ 	pg_crc32c	rdata_crc;
+ 	registered_buffer *prev_regbuf = NULL;
+@@ -841,8 +851,18 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
+ 	{
+ 		if (mainrdata_len > 255)
+ 		{
++			uint32		mainrdata_len_4b;
++
++			if (mainrdata_len > PG_UINT32_MAX)
++				ereport(ERROR,
++						(errmsg_internal("too much WAL data"),
++						 errdetail_internal("Main data length is %llu bytes for a maximum of %u bytes.",
++											(unsigned long long) mainrdata_len,
++											PG_UINT32_MAX)));
++
++			mainrdata_len_4b = (uint32) mainrdata_len;
+ 			*(scratch++) = (char) XLR_BLOCK_ID_DATA_LONG;
+-			memcpy(scratch, &mainrdata_len, sizeof(uint32));
++			memcpy(scratch, &mainrdata_len_4b, sizeof(uint32));
+ 			scratch += sizeof(uint32);
+ 		}
+ 		else
+@@ -872,13 +892,27 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
+ 	for (rdt = hdr_rdt.next; rdt != NULL; rdt = rdt->next)
+ 		COMP_CRC32C(rdata_crc, rdt->data, rdt->len);
+ 
++	/*
++	 * Ensure that the XLogRecord is not too large.
++	 *
++	 * XLogReader machinery is only able to handle records up to a certain
++	 * size (ignoring machine resource limitations), so make sure that we will
++	 * not emit records larger than the sizes advertised to be supported.
++	 * This cap is based on DecodeXLogRecordRequiredSpace().
++	 */
++	if (total_len >= XLogRecordMaxSize)
++		ereport(ERROR,
++				(errmsg_internal("oversized WAL record"),
++				 errdetail_internal("WAL record would be %llu bytes (of maximum %u bytes); rmid %u flags %u.",
++									(unsigned long long) total_len, XLogRecordMaxSize, rmid, info)));
++
+ 	/*
+ 	 * Fill in the fields in the record header. Prev-link is filled in later,
+ 	 * once we know where in the WAL the record will be inserted. The CRC does
+ 	 * not include the record header yet.
+ 	 */
+ 	rechdr->xl_xid = GetCurrentTransactionIdIfAny();
+-	rechdr->xl_tot_len = total_len;
++	rechdr->xl_tot_len = (uint32) total_len;
+ 	rechdr->xl_info = info;
+ 	rechdr->xl_rmid = rmid;
+ 	rechdr->xl_prev = InvalidXLogRecPtr;
+@@ -1297,6 +1331,18 @@ log_newpage_range(Relation rel, ForkNumber forknum,
+ void
+ InitXLogInsert(void)
+ {
++#ifdef USE_ASSERT_CHECKING
++
++	/*
++	 * Check that any records assembled can be decoded.  This is capped based
++	 * on what XLogReader would require at its maximum bound.  This code path
++	 * is called once per backend, more than enough for this check.
++	 */
++	size_t		max_required = DecodeXLogRecordRequiredSpace(XLogRecordMaxSize);
++
++	Assert(AllocSizeIsValid(max_required));
++#endif
++
+ 	/* Initialize the working areas */
+ 	if (xloginsert_cxt == NULL)
+ 	{
+diff --git a/src/include/access/xlogrecord.h b/src/include/access/xlogrecord.h
+index 0d576f7883e4..f355e08e1d31 100644
+--- a/src/include/access/xlogrecord.h
++++ b/src/include/access/xlogrecord.h
+@@ -62,6 +62,17 @@ typedef struct XLogRecord
+ #define XLR_INFO_MASK			0x0F
+ #define XLR_RMGR_INFO_MASK		0xF0
+ 
++/*
++ * XLogReader needs to allocate all the data of a WAL record in a single
++ * chunk.  This means that a single XLogRecord cannot exceed MaxAllocSize
++ * in length if we ignore any allocation overhead of the XLogReader.
++ *
++ * To accommodate some overhead, this value allows for 4M of allocation
++ * overhead, that should be plenty enough for what
++ * DecodeXLogRecordRequiredSpace() expects as extra.
++ */
++#define XLogRecordMaxSize	(1020 * 1024 * 1024)
++
+ /*
+  * If a WAL record modifies any relation files, in ways not covered by the
+  * usual block references, this flag is set. This is not used for anything

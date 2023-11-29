@@ -1,0 +1,323 @@
+From 8b938d36f7446e76436ca4a8ddcebbebaeaab480 Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Mon, 18 Mar 2019 12:59:35 +0900
+Subject: [PATCH] Refactor more code logic to update the control file
+
+ce6afc6 has begun the refactoring work by plugging pg_rewind into a
+central routine to update the control file, and left around two extra
+copies, with one in xlog.c for the backend and one in pg_resetwal.c.  By
+adding an extra option to the central routine in controldata_utils.c to
+control if a flush of the control file needs to be done, it is proving
+to be straight-forward to make xlog.c and pg_resetwal.c use the central
+code path at the condition of moving the wait event tracking there.
+Hence, this allows to have only one central code path to update the
+control file, shaving the code from the duplicates.
+
+This refactoring actually fixes a problem in pg_resetwal.  Previously,
+the control file was first removed before being recreated.  So if a
+crash happened between the moment the file was removed and the moment
+the file was created, then it would have been possible to not have a
+control file anymore in the database folder.
+
+Author: Fabien Coelho
+Reviewed-by: Michael Paquier
+Discussion: https://postgr.es/m/alpine.DEB.2.21.1903170935210.2506@lancre
+---
+ src/backend/access/transam/xlog.c      | 48 +++----------------
+ src/bin/pg_resetwal/pg_resetwal.c      | 64 ++------------------------
+ src/bin/pg_rewind/pg_rewind.c          |  2 +-
+ src/common/controldata_utils.c         | 51 ++++++++++++++++----
+ src/include/common/controldata_utils.h |  6 +--
+ 5 files changed, 55 insertions(+), 116 deletions(-)
+
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 54d3c558c641..ad12ebc4269e 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -40,6 +40,7 @@
+ #include "catalog/pg_control.h"
+ #include "catalog/pg_database.h"
+ #include "commands/tablespace.h"
++#include "common/controldata_utils.h"
+ #include "miscadmin.h"
+ #include "pgstat.h"
+ #include "port/atomics.h"
+@@ -4754,51 +4755,14 @@ ReadControlFile(void)
+ 					PGC_INTERNAL, PGC_S_OVERRIDE);
+ }
+ 
++/*
++ * Utility wrapper to update the control file.  Note that the control
++ * file gets flushed.
++ */
+ void
+ UpdateControlFile(void)
+ {
+-	int			fd;
+-
+-	INIT_CRC32C(ControlFile->crc);
+-	COMP_CRC32C(ControlFile->crc,
+-				(char *) ControlFile,
+-				offsetof(ControlFileData, crc));
+-	FIN_CRC32C(ControlFile->crc);
+-
+-	fd = BasicOpenFile(XLOG_CONTROL_FILE,
+-					   O_RDWR | PG_BINARY);
+-	if (fd < 0)
+-		ereport(PANIC,
+-				(errcode_for_file_access(),
+-				 errmsg("could not open file \"%s\": %m", XLOG_CONTROL_FILE)));
+-
+-	errno = 0;
+-	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_WRITE_UPDATE);
+-	if (write(fd, ControlFile, sizeof(ControlFileData)) != sizeof(ControlFileData))
+-	{
+-		/* if write didn't set errno, assume problem is no disk space */
+-		if (errno == 0)
+-			errno = ENOSPC;
+-		ereport(PANIC,
+-				(errcode_for_file_access(),
+-				 errmsg("could not write to file \"%s\": %m",
+-						XLOG_CONTROL_FILE)));
+-	}
+-	pgstat_report_wait_end();
+-
+-	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_SYNC_UPDATE);
+-	if (pg_fsync(fd) != 0)
+-		ereport(PANIC,
+-				(errcode_for_file_access(),
+-				 errmsg("could not fsync file \"%s\": %m",
+-						XLOG_CONTROL_FILE)));
+-	pgstat_report_wait_end();
+-
+-	if (close(fd))
+-		ereport(PANIC,
+-				(errcode_for_file_access(),
+-				 errmsg("could not close file \"%s\": %m",
+-						XLOG_CONTROL_FILE)));
++	update_controlfile(DataDir, NULL, ControlFile, true);
+ }
+ 
+ /*
+diff --git a/src/bin/pg_resetwal/pg_resetwal.c b/src/bin/pg_resetwal/pg_resetwal.c
+index 2af871321666..a7b25ffe1cd8 100644
+--- a/src/bin/pg_resetwal/pg_resetwal.c
++++ b/src/bin/pg_resetwal/pg_resetwal.c
+@@ -49,8 +49,7 @@
+ #include "access/multixact.h"
+ #include "access/xlog.h"
+ #include "access/xlog_internal.h"
+-#include "catalog/catversion.h"
+-#include "catalog/pg_control.h"
++#include "common/controldata_utils.h"
+ #include "common/fe_memutils.h"
+ #include "common/file_perm.h"
+ #include "common/restricted_token.h"
+@@ -918,18 +917,6 @@ PrintNewControlValues(void)
+ static void
+ RewriteControlFile(void)
+ {
+-	int			fd;
+-	char		buffer[PG_CONTROL_FILE_SIZE];	/* need not be aligned */
+-
+-	/*
+-	 * For good luck, apply the same static assertions as in backend's
+-	 * WriteControlFile().
+-	 */
+-	StaticAssertStmt(sizeof(ControlFileData) <= PG_CONTROL_MAX_SAFE_SIZE,
+-					 "pg_control is too large for atomic disk writes");
+-	StaticAssertStmt(sizeof(ControlFileData) <= PG_CONTROL_FILE_SIZE,
+-					 "sizeof(ControlFileData) exceeds PG_CONTROL_FILE_SIZE");
+-
+ 	/*
+ 	 * Adjust fields as needed to force an empty XLOG starting at
+ 	 * newXlogSegNo.
+@@ -961,53 +948,8 @@ RewriteControlFile(void)
+ 	ControlFile.max_prepared_xacts = 0;
+ 	ControlFile.max_locks_per_xact = 64;
+ 
+-	/* Contents are protected with a CRC */
+-	INIT_CRC32C(ControlFile.crc);
+-	COMP_CRC32C(ControlFile.crc,
+-				(char *) &ControlFile,
+-				offsetof(ControlFileData, crc));
+-	FIN_CRC32C(ControlFile.crc);
+-
+-	/*
+-	 * We write out PG_CONTROL_FILE_SIZE bytes into pg_control, zero-padding
+-	 * the excess over sizeof(ControlFileData).  This reduces the odds of
+-	 * premature-EOF errors when reading pg_control.  We'll still fail when we
+-	 * check the contents of the file, but hopefully with a more specific
+-	 * error than "couldn't read pg_control".
+-	 */
+-	memset(buffer, 0, PG_CONTROL_FILE_SIZE);
+-	memcpy(buffer, &ControlFile, sizeof(ControlFileData));
+-
+-	unlink(XLOG_CONTROL_FILE);
+-
+-	fd = open(XLOG_CONTROL_FILE,
+-			  O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
+-			  pg_file_create_mode);
+-	if (fd < 0)
+-	{
+-		fprintf(stderr, _("%s: could not create pg_control file: %s\n"),
+-				progname, strerror(errno));
+-		exit(1);
+-	}
+-
+-	errno = 0;
+-	if (write(fd, buffer, PG_CONTROL_FILE_SIZE) != PG_CONTROL_FILE_SIZE)
+-	{
+-		/* if write didn't set errno, assume problem is no disk space */
+-		if (errno == 0)
+-			errno = ENOSPC;
+-		fprintf(stderr, _("%s: could not write pg_control file: %s\n"),
+-				progname, strerror(errno));
+-		exit(1);
+-	}
+-
+-	if (fsync(fd) != 0)
+-	{
+-		fprintf(stderr, _("%s: fsync error: %s\n"), progname, strerror(errno));
+-		exit(1);
+-	}
+-
+-	close(fd);
++	/* The control file gets flushed here. */
++	update_controlfile(".", progname, &ControlFile, true);
+ }
+ 
+ 
+diff --git a/src/bin/pg_rewind/pg_rewind.c b/src/bin/pg_rewind/pg_rewind.c
+index 7f1d6bf48af2..3dcadb9b40af 100644
+--- a/src/bin/pg_rewind/pg_rewind.c
++++ b/src/bin/pg_rewind/pg_rewind.c
+@@ -377,7 +377,7 @@ main(int argc, char **argv)
+ 	ControlFile_new.minRecoveryPoint = endrec;
+ 	ControlFile_new.minRecoveryPointTLI = endtli;
+ 	ControlFile_new.state = DB_IN_ARCHIVE_RECOVERY;
+-	update_controlfile(datadir_target, progname, &ControlFile_new);
++	update_controlfile(datadir_target, progname, &ControlFile_new, do_sync);
+ 
+ 	pg_log(PG_PROGRESS, "syncing target data directory\n");
+ 	syncTargetDirectory();
+diff --git a/src/common/controldata_utils.c b/src/common/controldata_utils.c
+index 71e67a2edaa8..567281349e07 100644
+--- a/src/common/controldata_utils.c
++++ b/src/common/controldata_utils.c
+@@ -29,7 +29,9 @@
+ #include "common/controldata_utils.h"
+ #include "common/file_perm.h"
+ #include "port/pg_crc32c.h"
++
+ #ifndef FRONTEND
++#include "pgstat.h"
+ #include "storage/fd.h"
+ #endif
+ 
+@@ -144,13 +146,14 @@ get_controlfile(const char *DataDir, const char *progname, bool *crc_ok_p)
+  * update_controlfile()
+  *
+  * Update controlfile values with the contents given by caller.  The
+- * contents to write are included in "ControlFile".  Note that it is up
+- * to the caller to fsync the updated file, and to properly lock
+- * ControlFileLock when calling this routine in the backend.
++ * contents to write are included in "ControlFile". "do_sync" can be
++ * optionally used to flush the updated control file.  Note that it is up
++ * to the caller to properly lock ControlFileLock when calling this
++ * routine in the backend.
+  */
+ void
+ update_controlfile(const char *DataDir, const char *progname,
+-				   ControlFileData *ControlFile)
++				   ControlFileData *ControlFile, bool do_sync)
+ {
+ 	int			fd;
+ 	char		buffer[PG_CONTROL_FILE_SIZE];
+@@ -182,7 +185,12 @@ update_controlfile(const char *DataDir, const char *progname,
+ 	snprintf(ControlFilePath, sizeof(ControlFilePath), "%s/%s", DataDir, XLOG_CONTROL_FILE);
+ 
+ #ifndef FRONTEND
+-	if ((fd = OpenTransientFile(ControlFilePath, O_WRONLY | PG_BINARY)) == -1)
++
++	/*
++	 * All errors issue a PANIC, so no need to use OpenTransientFile() and to
++	 * worry about file descriptor leaks.
++	 */
++	if ((fd = BasicOpenFile(ControlFilePath, O_RDWR | PG_BINARY)) < 0)
+ 		ereport(PANIC,
+ 				(errcode_for_file_access(),
+ 				 errmsg("could not open file \"%s\": %m",
+@@ -198,6 +206,9 @@ update_controlfile(const char *DataDir, const char *progname,
+ #endif
+ 
+ 	errno = 0;
++#ifndef FRONTEND
++	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_WRITE_UPDATE);
++#endif
+ 	if (write(fd, buffer, PG_CONTROL_FILE_SIZE) != PG_CONTROL_FILE_SIZE)
+ 	{
+ 		/* if write didn't set errno, assume problem is no disk space */
+@@ -215,19 +226,41 @@ update_controlfile(const char *DataDir, const char *progname,
+ 		exit(EXIT_FAILURE);
+ #endif
+ 	}
++#ifndef FRONTEND
++	pgstat_report_wait_end();
++#endif
+ 
++	if (do_sync)
++	{
++#ifndef FRONTEND
++		pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_SYNC_UPDATE);
++		if (pg_fsync(fd) != 0)
++			ereport(PANIC,
++					(errcode_for_file_access(),
++					 errmsg("could not fsync file \"%s\": %m",
++							ControlFilePath)));
++		pgstat_report_wait_end();
++#else
++		if (fsync(fd) != 0)
++		{
++			fprintf(stderr, _("%s: could not fsync file \"%s\": %s\n"),
++					progname, ControlFilePath, strerror(errno));
++			exit(EXIT_FAILURE);
++		}
++#endif
++	}
++
++	if (close(fd) < 0)
++	{
+ #ifndef FRONTEND
+-	if (CloseTransientFile(fd))
+ 		ereport(PANIC,
+ 				(errcode_for_file_access(),
+ 				 errmsg("could not close file \"%s\": %m",
+ 						ControlFilePath)));
+ #else
+-	if (close(fd) < 0)
+-	{
+ 		fprintf(stderr, _("%s: could not close file \"%s\": %s\n"),
+ 				progname, ControlFilePath, strerror(errno));
+ 		exit(EXIT_FAILURE);
+-	}
+ #endif
++	}
+ }
+diff --git a/src/include/common/controldata_utils.h b/src/include/common/controldata_utils.h
+index 95317ebacf29..750ba6516491 100644
+--- a/src/include/common/controldata_utils.h
++++ b/src/include/common/controldata_utils.h
+@@ -13,9 +13,9 @@
+ #include "catalog/pg_control.h"
+ 
+ extern ControlFileData *get_controlfile(const char *DataDir,
+-										const char *progname,
+-										bool *crc_ok_p);
++				const char *progname,
++				bool *crc_ok_p);
+ extern void update_controlfile(const char *DataDir, const char *progname,
+-							   ControlFileData *ControlFile);
++				   ControlFileData *ControlFile, bool do_sync);
+ 
+ #endif							/* COMMON_CONTROLDATA_UTILS_H */

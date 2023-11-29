@@ -1,0 +1,288 @@
+From 8cad5adb9c0be82e9f40d51b02a542439f47de9e Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sat, 27 Apr 2019 13:15:54 -0400
+Subject: [PATCH] Avoid postgres_fdw crash for a targetlist entry that's just a
+ Param.
+
+foreign_grouping_ok() is willing to put fairly arbitrary expressions into
+the targetlist of a remote SELECT that's doing grouping or aggregation on
+the remote side, including expressions that have no foreign component to
+them at all.  This is possibly a bit dubious from an efficiency standpoint;
+but it rises to the level of a crash-causing bug if the expression is just
+a Param or non-foreign Var.  In that case, the expression will necessarily
+also appear in the fdw_exprs list of values we need to send to the remote
+server, and then setrefs.c's set_foreignscan_references will mistakenly
+replace the fdw_exprs entry with a Var referencing the targetlist result.
+
+The root cause of this problem is bad design in commit e7cb7ee14: it put
+logic into set_foreignscan_references that IMV is postgres_fdw-specific,
+and yet this bug shows that it isn't postgres_fdw-specific enough.  The
+transformation being done on fdw_exprs assumes that fdw_exprs is to be
+evaluated with the fdw_scan_tlist as input, which is not how postgres_fdw
+uses it; yet it could be the right thing for some other FDW.  (In the
+bigger picture, setrefs.c has no business assuming this for the other
+expression fields of a ForeignScan either.)
+
+The right fix therefore would be to expand the FDW API so that the
+FDW could inform setrefs.c how it intends to evaluate these various
+expressions.  We can't change that in the back branches though, and we
+also can't just summarily change setrefs.c's behavior there, or we're
+likely to break external FDWs.
+
+As a stopgap, therefore, hack up postgres_fdw so that it won't attempt
+to send targetlist entries that look exactly like the fdw_exprs entries
+they'd produce.  In most cases this actually produces a superior plan,
+IMO, with less data needing to be transmitted and returned; so we probably
+ought to think harder about whether we should ship tlist expressions at
+all when they don't contain any foreign Vars or Aggs.  But that's an
+optimization not a bug fix so I left it for later.  One case where this
+produces an inferior plan is where the expression in question is actually
+a GROUP BY expression: then the restriction prevents us from using remote
+grouping.  It might be possible to work around that (since that would
+reduce to group-by-a-constant on the remote side); but it seems like a
+pretty unlikely corner case, so I'm not sure it's worth expending effort
+solely to improve that.  In any case the right long-term answer is to fix
+the API as sketched above, and then revert this hack.
+
+Per bug #15781 from Sean Johnston.  Back-patch to v10 where the problem
+was introduced.
+
+Discussion: https://postgr.es/m/15781-2601b1002bad087c@postgresql.org
+---
+ contrib/postgres_fdw/deparse.c                | 49 +++++++++++++++++++
+ .../postgres_fdw/expected/postgres_fdw.out    | 40 +++++++++++++++
+ contrib/postgres_fdw/postgres_fdw.c           | 32 ++++++++++--
+ contrib/postgres_fdw/postgres_fdw.h           |  3 ++
+ contrib/postgres_fdw/sql/postgres_fdw.sql     | 10 ++++
+ 5 files changed, 129 insertions(+), 5 deletions(-)
+
+diff --git a/contrib/postgres_fdw/deparse.c b/contrib/postgres_fdw/deparse.c
+index 079406f4f330..c4e331166f9b 100644
+--- a/contrib/postgres_fdw/deparse.c
++++ b/contrib/postgres_fdw/deparse.c
+@@ -841,6 +841,55 @@ foreign_expr_walker(Node *node,
+ 	return true;
+ }
+ 
++/*
++ * Returns true if given expr is something we'd have to send the value of
++ * to the foreign server.
++ *
++ * This should return true when the expression is a shippable node that
++ * deparseExpr would add to context->params_list.  Note that we don't care
++ * if the expression *contains* such a node, only whether one appears at top
++ * level.  We need this to detect cases where setrefs.c would recognize a
++ * false match between an fdw_exprs item (which came from the params_list)
++ * and an entry in fdw_scan_tlist (which we're considering putting the given
++ * expression into).
++ */
++bool
++is_foreign_param(PlannerInfo *root,
++				 RelOptInfo *baserel,
++				 Expr *expr)
++{
++	if (expr == NULL)
++		return false;
++
++	switch (nodeTag(expr))
++	{
++		case T_Var:
++			{
++				/* It would have to be sent unless it's a foreign Var */
++				Var		   *var = (Var *) expr;
++				PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) (baserel->fdw_private);
++				Relids		relids;
++
++				if (IS_UPPER_REL(baserel))
++					relids = fpinfo->outerrel->relids;
++				else
++					relids = baserel->relids;
++
++				if (bms_is_member(var->varno, relids) && var->varlevelsup == 0)
++					return false;	/* foreign Var, so not a param */
++				else
++					return true;	/* it'd have to be a param */
++				break;
++			}
++		case T_Param:
++			/* Params always have to be sent to the foreign server */
++			return true;
++		default:
++			break;
++	}
++	return false;
++}
++
+ /*
+  * Convert type OID + typmod info into a type name we can ship to the remote
+  * server.  Someplace else had better have verified that this type name is
+diff --git a/contrib/postgres_fdw/expected/postgres_fdw.out b/contrib/postgres_fdw/expected/postgres_fdw.out
+index 48ea67aaeca5..e034b030f152 100644
+--- a/contrib/postgres_fdw/expected/postgres_fdw.out
++++ b/contrib/postgres_fdw/expected/postgres_fdw.out
+@@ -2707,6 +2707,46 @@ select sum(c1) from ft1 group by c2 having avg(c1 * (random() <= 1)::int) > 100
+                Remote SQL: SELECT "C 1", c2 FROM "S 1"."T 1"
+ (10 rows)
+ 
++-- Remote aggregate in combination with a local Param (for the output
++-- of an initplan) can be trouble, per bug #15781
++explain (verbose, costs off)
++select exists(select 1 from pg_enum), sum(c1) from ft1;
++                    QUERY PLAN                    
++--------------------------------------------------
++ Foreign Scan
++   Output: $0, (sum(ft1.c1))
++   Relations: Aggregate on (public.ft1)
++   Remote SQL: SELECT sum("C 1") FROM "S 1"."T 1"
++   InitPlan 1 (returns $0)
++     ->  Seq Scan on pg_catalog.pg_enum
++(6 rows)
++
++select exists(select 1 from pg_enum), sum(c1) from ft1;
++ exists |  sum   
++--------+--------
++ t      | 500500
++(1 row)
++
++explain (verbose, costs off)
++select exists(select 1 from pg_enum), sum(c1) from ft1 group by 1;
++                    QUERY PLAN                     
++---------------------------------------------------
++ GroupAggregate
++   Output: ($0), sum(ft1.c1)
++   Group Key: $0
++   InitPlan 1 (returns $0)
++     ->  Seq Scan on pg_catalog.pg_enum
++   ->  Foreign Scan on public.ft1
++         Output: $0, ft1.c1
++         Remote SQL: SELECT "C 1" FROM "S 1"."T 1"
++(8 rows)
++
++select exists(select 1 from pg_enum), sum(c1) from ft1 group by 1;
++ exists |  sum   
++--------+--------
++ t      | 500500
++(1 row)
++
+ -- Testing ORDER BY, DISTINCT, FILTER, Ordered-sets and VARIADIC within aggregates
+ -- ORDER BY within aggregate, same column used to order
+ explain (verbose, costs off)
+diff --git a/contrib/postgres_fdw/postgres_fdw.c b/contrib/postgres_fdw/postgres_fdw.c
+index 794363c184c1..6c9e320af990 100644
+--- a/contrib/postgres_fdw/postgres_fdw.c
++++ b/contrib/postgres_fdw/postgres_fdw.c
+@@ -5486,7 +5486,6 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
+ 	PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) grouped_rel->fdw_private;
+ 	PathTarget *grouping_target = grouped_rel->reltarget;
+ 	PgFdwRelationInfo *ofpinfo;
+-	List	   *aggvars;
+ 	ListCell   *lc;
+ 	int			i;
+ 	List	   *tlist = NIL;
+@@ -5512,6 +5511,15 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
+ 	 * server.  All GROUP BY expressions will be part of the grouping target
+ 	 * and thus there is no need to search for them separately.  Add grouping
+ 	 * expressions into target list which will be passed to foreign server.
++	 *
++	 * A tricky fine point is that we must not put any expression into the
++	 * target list that is just a foreign param (that is, something that
++	 * deparse.c would conclude has to be sent to the foreign server).  If we
++	 * do, the expression will also appear in the fdw_exprs list of the plan
++	 * node, and setrefs.c will get confused and decide that the fdw_exprs
++	 * entry is actually a reference to the fdw_scan_tlist entry, resulting in
++	 * a broken plan.  Somewhat oddly, it's OK if the expression contains such
++	 * a node, as long as it's not at top level; then no match is possible.
+ 	 */
+ 	i = 0;
+ 	foreach(lc, grouping_target->exprs)
+@@ -5532,6 +5540,13 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
+ 			if (!is_foreign_expr(root, grouped_rel, expr))
+ 				return false;
+ 
++			/*
++			 * If it would be a foreign param, we can't put it into the tlist,
++			 * so we have to fail.
++			 */
++			if (is_foreign_param(root, grouped_rel, expr))
++				return false;
++
+ 			/*
+ 			 * Pushable, so add to tlist.  We need to create a TLE for this
+ 			 * expression and apply the sortgroupref to it.  We cannot use
+@@ -5547,9 +5562,11 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
+ 		else
+ 		{
+ 			/*
+-			 * Non-grouping expression we need to compute.  Is it shippable?
++			 * Non-grouping expression we need to compute.  Can we ship it
++			 * as-is to the foreign server?
+ 			 */
+-			if (is_foreign_expr(root, grouped_rel, expr))
++			if (is_foreign_expr(root, grouped_rel, expr) &&
++				!is_foreign_param(root, grouped_rel, expr))
+ 			{
+ 				/* Yes, so add to tlist as-is; OK to suppress duplicates */
+ 				tlist = add_to_flat_tlist(tlist, list_make1(expr));
+@@ -5557,12 +5574,16 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
+ 			else
+ 			{
+ 				/* Not pushable as a whole; extract its Vars and aggregates */
++				List	   *aggvars;
++
+ 				aggvars = pull_var_clause((Node *) expr,
+ 										  PVC_INCLUDE_AGGREGATES);
+ 
+ 				/*
+ 				 * If any aggregate expression is not shippable, then we
+-				 * cannot push down aggregation to the foreign server.
++				 * cannot push down aggregation to the foreign server.  (We
++				 * don't have to check is_foreign_param, since that certainly
++				 * won't return true for any such expression.)
+ 				 */
+ 				if (!is_foreign_expr(root, grouped_rel, (Expr *) aggvars))
+ 					return false;
+@@ -5649,7 +5670,8 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
+ 			 * If aggregates within local conditions are not safe to push
+ 			 * down, then we cannot push down the query.  Vars are already
+ 			 * part of GROUP BY clause which are checked above, so no need to
+-			 * access them again here.
++			 * access them again here.  Again, we need not check
++			 * is_foreign_param for a foreign aggregate.
+ 			 */
+ 			if (IsA(expr, Aggref))
+ 			{
+diff --git a/contrib/postgres_fdw/postgres_fdw.h b/contrib/postgres_fdw/postgres_fdw.h
+index b3829450675e..3e4603d718e7 100644
+--- a/contrib/postgres_fdw/postgres_fdw.h
++++ b/contrib/postgres_fdw/postgres_fdw.h
+@@ -146,6 +146,9 @@ extern void classifyConditions(PlannerInfo *root,
+ extern bool is_foreign_expr(PlannerInfo *root,
+ 				RelOptInfo *baserel,
+ 				Expr *expr);
++extern bool is_foreign_param(PlannerInfo *root,
++				 RelOptInfo *baserel,
++				 Expr *expr);
+ extern void deparseInsertSql(StringInfo buf, RangeTblEntry *rte,
+ 				 Index rtindex, Relation rel,
+ 				 List *targetAttrs, bool doNothing,
+diff --git a/contrib/postgres_fdw/sql/postgres_fdw.sql b/contrib/postgres_fdw/sql/postgres_fdw.sql
+index 127cd30a9229..73852f1ae699 100644
+--- a/contrib/postgres_fdw/sql/postgres_fdw.sql
++++ b/contrib/postgres_fdw/sql/postgres_fdw.sql
+@@ -685,6 +685,16 @@ select count(*) from (select c5, count(c1) from ft1 group by c5, sqrt(c2) having
+ explain (verbose, costs off)
+ select sum(c1) from ft1 group by c2 having avg(c1 * (random() <= 1)::int) > 100 order by 1;
+ 
++-- Remote aggregate in combination with a local Param (for the output
++-- of an initplan) can be trouble, per bug #15781
++explain (verbose, costs off)
++select exists(select 1 from pg_enum), sum(c1) from ft1;
++select exists(select 1 from pg_enum), sum(c1) from ft1;
++
++explain (verbose, costs off)
++select exists(select 1 from pg_enum), sum(c1) from ft1 group by 1;
++select exists(select 1 from pg_enum), sum(c1) from ft1 group by 1;
++
+ 
+ -- Testing ORDER BY, DISTINCT, FILTER, Ordered-sets and VARIADIC within aggregates
+ 

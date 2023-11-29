@@ -1,0 +1,66 @@
+From 8f6ce7fb090a674f18b72e89a2b868fe1343fe8f Mon Sep 17 00:00:00 2001
+From: Dean Rasheed <dean.a.rasheed@gmail.com>
+Date: Fri, 20 Jul 2018 08:55:44 +0100
+Subject: [PATCH] Guard against rare RAND_bytes() failures in
+ pg_strong_random().
+
+When built using OpenSSL, pg_strong_random() uses RAND_bytes() to
+generate the random number. On very rare occasions that can fail, if
+its PRNG has not been seeded with enough data. Additionally, once it
+does fail, all subsequent calls will also fail until more seed data is
+added. Since this is required during backend startup, this can result
+in all new backends failing to start until a postmaster restart.
+
+Guard against that by checking the state of OpenSSL's PRNG using
+RAND_status(), and if necessary (very rarely), seeding it using
+RAND_poll().
+
+Back-patch to v10, where pg_strong_random() was introduced.
+
+Dean Rasheed and Michael Paquier.
+
+Discussion: https://postgr.es/m/CAEZATCXMtxbzSAvyKKk5uCRf9pNt4UV%2BF_5v%3DgLfJUuPxU4Ytg%40mail.gmail.com
+---
+ src/port/pg_strong_random.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/src/port/pg_strong_random.c b/src/port/pg_strong_random.c
+index bc7a8aacb937..f9a06d66061b 100644
+--- a/src/port/pg_strong_random.c
++++ b/src/port/pg_strong_random.c
+@@ -103,6 +103,35 @@ pg_strong_random(void *buf, size_t len)
+ 	 * When built with OpenSSL, use OpenSSL's RAND_bytes function.
+ 	 */
+ #if defined(USE_OPENSSL_RANDOM)
++	int			i;
++
++	/*
++	 * Check that OpenSSL's CSPRNG has been sufficiently seeded, and if not
++	 * add more seed data using RAND_poll().  With some older versions of
++	 * OpenSSL, it may be necessary to call RAND_poll() a number of times.
++	 */
++#define NUM_RAND_POLL_RETRIES 8
++
++	for (i = 0; i < NUM_RAND_POLL_RETRIES; i++)
++	{
++		if (RAND_status() == 1)
++		{
++			/* The CSPRNG is sufficiently seeded */
++			break;
++		}
++
++		if (RAND_poll() == 0)
++		{
++			/*
++			 * RAND_poll() failed to generate any seed data, which means that
++			 * RAND_bytes() will probably fail.  For now, just fall through
++			 * and let that happen.  XXX: maybe we could seed it some other
++			 * way.
++			 */
++			break;
++		}
++	}
++
+ 	if (RAND_bytes(buf, len) == 1)
+ 		return true;
+ 	return false;

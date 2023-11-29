@@ -1,0 +1,105 @@
+From 8c67d29fd51c0381d8bce41d35d7726725924616 Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Tue, 12 Feb 2019 18:42:37 -0300
+Subject: [PATCH] Relax overly strict assertion
+
+Ever since its birth, ReorderBufferBuildTupleCidHash() has contained an
+assertion that a catalog tuple cannot change Cmax after acquiring one.  But
+that's wrong: if a subtransaction executes DDL that affects that catalog
+tuple, and later aborts and another DDL affects the same tuple, it will
+change Cmax.  Relax the assertion to merely verify that the Cmax remains
+valid and monotonically increasing, instead.
+
+Add a test that tickles the relevant code.
+
+Diagnosed by, and initial patch submitted by: Arseny Sher
+Co-authored-by: Arseny Sher
+Discussion: https://postgr.es/m/874l9p8hyw.fsf@ars-thinkpad
+---
+ contrib/test_decoding/expected/ddl.out         | 18 ++++++++++++++++++
+ contrib/test_decoding/sql/ddl.sql              | 13 +++++++++++++
+ .../replication/logical/reorderbuffer.c        | 14 +++++++++-----
+ 3 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/contrib/test_decoding/expected/ddl.out b/contrib/test_decoding/expected/ddl.out
+index b7c76469fc37..2bd28e6d15e2 100644
+--- a/contrib/test_decoding/expected/ddl.out
++++ b/contrib/test_decoding/expected/ddl.out
+@@ -409,6 +409,24 @@ SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'inc
+  COMMIT
+ (6 rows)
+ 
++-- check that DDL in aborted subtransactions handled correctly
++CREATE TABLE tr_sub_ddl(data int);
++BEGIN;
++SAVEPOINT a;
++ALTER TABLE tr_sub_ddl ALTER COLUMN data TYPE text;
++INSERT INTO tr_sub_ddl VALUES ('blah-blah');
++ROLLBACK TO SAVEPOINT a;
++ALTER TABLE tr_sub_ddl ALTER COLUMN data TYPE bigint;
++INSERT INTO tr_sub_ddl VALUES(43);
++COMMIT;
++SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
++                       data                       
++--------------------------------------------------
++ BEGIN
++ table public.tr_sub_ddl: INSERT: data[bigint]:43
++ COMMIT
++(3 rows)
++
+ /*
+  * Check whether treating a table as a catalog table works somewhat
+  */
+diff --git a/contrib/test_decoding/sql/ddl.sql b/contrib/test_decoding/sql/ddl.sql
+index c4b10a4cf9e5..a55086443ca2 100644
+--- a/contrib/test_decoding/sql/ddl.sql
++++ b/contrib/test_decoding/sql/ddl.sql
+@@ -234,6 +234,19 @@ INSERT INTO tr_sub(path) VALUES ('5-top-1-#1');
+ COMMIT;
+ 
+ 
++SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
++
++-- check that DDL in aborted subtransactions handled correctly
++CREATE TABLE tr_sub_ddl(data int);
++BEGIN;
++SAVEPOINT a;
++ALTER TABLE tr_sub_ddl ALTER COLUMN data TYPE text;
++INSERT INTO tr_sub_ddl VALUES ('blah-blah');
++ROLLBACK TO SAVEPOINT a;
++ALTER TABLE tr_sub_ddl ALTER COLUMN data TYPE bigint;
++INSERT INTO tr_sub_ddl VALUES(43);
++COMMIT;
++
+ SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
+ 
+ 
+diff --git a/src/backend/replication/logical/reorderbuffer.c b/src/backend/replication/logical/reorderbuffer.c
+index a49e226967c8..2b486b5e9f3a 100644
+--- a/src/backend/replication/logical/reorderbuffer.c
++++ b/src/backend/replication/logical/reorderbuffer.c
+@@ -1326,15 +1326,19 @@ ReorderBufferBuildTupleCidHash(ReorderBuffer *rb, ReorderBufferTXN *txn)
+ 		}
+ 		else
+ 		{
++			/*
++			 * Maybe we already saw this tuple before in this transaction,
++			 * but if so it must have the same cmin.
++			 */
+ 			Assert(ent->cmin == change->data.tuplecid.cmin);
+-			Assert(ent->cmax == InvalidCommandId ||
+-				   ent->cmax == change->data.tuplecid.cmax);
+ 
+ 			/*
+-			 * if the tuple got valid in this transaction and now got deleted
+-			 * we already have a valid cmin stored. The cmax will be
+-			 * InvalidCommandId though.
++			 * cmax may be initially invalid, but once set it can only grow,
++			 * and never become invalid again.
+ 			 */
++			Assert((ent->cmax == InvalidCommandId) ||
++				   ((change->data.tuplecid.cmax != InvalidCommandId) &&
++					(change->data.tuplecid.cmax > ent->cmax)));
+ 			ent->cmax = change->data.tuplecid.cmax;
+ 		}
+ 	}

@@ -1,0 +1,663 @@
+From 8fba928fd78856712f69d96852f8061e77390fda Mon Sep 17 00:00:00 2001
+From: Thomas Munro <tmunro@postgresql.org>
+Date: Thu, 23 Mar 2023 12:39:43 +1300
+Subject: [PATCH] Improve the naming of Parallel Hash Join phases.
+
+* Commit 3048898e dropped -ING from PHJ wait event names.  Update the
+  corresponding barrier phases names to match.
+
+* Rename the "DONE" phases to "FREE".  That's symmetrical with
+  "ALLOCATE", and names the activity that actually happens in that phase
+  (as we do for the other phases) rather than a state.  The bug fixed by
+  commit 8d578b9b might have been more obvious with this name.
+
+* Rename the batch/bucket growth barriers' "ALLOCATE" phases to
+  "REALLOCATE", a better description of what they do.
+
+* Update the high level comments about phases to highlight phases
+  are executed by a single process with an asterisk (mostly memory
+  management phases).
+
+No behavior change, as this is just improving internal identifiers.  The
+only user-visible sign of this is that a couple of wait events' display
+names change from "...Allocate" to "...Reallocate" in pg_stat_activity,
+to stay in sync with the internal names.
+
+Reviewed-by: Melanie Plageman <melanieplageman@gmail.com>
+Discussion: https://postgr.es/m/CA%2BhUKG%2BMDpwF2Eo2LAvzd%3DpOh81wUTsrwU1uAwR-v6OGBB6%2B7g%40mail.gmail.com
+---
+ doc/src/sgml/monitoring.sgml            | 20 +++---
+ src/backend/executor/nodeHash.c         | 73 ++++++++++----------
+ src/backend/executor/nodeHashjoin.c     | 90 +++++++++++++------------
+ src/backend/utils/activity/wait_event.c | 12 ++--
+ src/include/executor/hashjoin.h         | 38 +++++------
+ src/include/utils/wait_event.h          |  4 +-
+ 6 files changed, 119 insertions(+), 118 deletions(-)
+
+diff --git a/doc/src/sgml/monitoring.sgml b/doc/src/sgml/monitoring.sgml
+index 2ae24127a834..7ab4424bf13d 100644
+--- a/doc/src/sgml/monitoring.sgml
++++ b/doc/src/sgml/monitoring.sgml
+@@ -1700,11 +1700,6 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
+       <entry>Waiting for other Parallel Hash participants to finish partitioning
+        the outer relation.</entry>
+      </row>
+-     <row>
+-      <entry><literal>HashGrowBatchesAllocate</literal></entry>
+-      <entry>Waiting for an elected Parallel Hash participant to allocate more
+-       batches.</entry>
+-     </row>
+      <row>
+       <entry><literal>HashGrowBatchesDecide</literal></entry>
+       <entry>Waiting to elect a Parallel Hash participant to decide on future
+@@ -1720,21 +1715,26 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
+       <entry>Waiting for an elected Parallel Hash participant to decide on
+        future batch growth.</entry>
+      </row>
++     <row>
++      <entry><literal>HashGrowBatchesReallocate</literal></entry>
++      <entry>Waiting for an elected Parallel Hash participant to allocate more
++       batches.</entry>
++     </row>
+      <row>
+       <entry><literal>HashGrowBatchesRepartition</literal></entry>
+       <entry>Waiting for other Parallel Hash participants to finish
+        repartitioning.</entry>
+      </row>
+-     <row>
+-      <entry><literal>HashGrowBucketsAllocate</literal></entry>
+-      <entry>Waiting for an elected Parallel Hash participant to finish
+-       allocating more buckets.</entry>
+-     </row>
+      <row>
+       <entry><literal>HashGrowBucketsElect</literal></entry>
+       <entry>Waiting to elect a Parallel Hash participant to allocate more
+        buckets.</entry>
+      </row>
++     <row>
++      <entry><literal>HashGrowBucketsReallocate</literal></entry>
++      <entry>Waiting for an elected Parallel Hash participant to finish
++       allocating more buckets.</entry>
++     </row>
+      <row>
+       <entry><literal>HashGrowBucketsReinsert</literal></entry>
+       <entry>Waiting for other Parallel Hash participants to finish inserting
+diff --git a/src/backend/executor/nodeHash.c b/src/backend/executor/nodeHash.c
+index 1e624fed7aef..748c9b002432 100644
+--- a/src/backend/executor/nodeHash.c
++++ b/src/backend/executor/nodeHash.c
+@@ -246,10 +246,10 @@ MultiExecParallelHash(HashState *node)
+ 	 */
+ 	pstate = hashtable->parallel_state;
+ 	build_barrier = &pstate->build_barrier;
+-	Assert(BarrierPhase(build_barrier) >= PHJ_BUILD_ALLOCATING);
++	Assert(BarrierPhase(build_barrier) >= PHJ_BUILD_ALLOCATE);
+ 	switch (BarrierPhase(build_barrier))
+ 	{
+-		case PHJ_BUILD_ALLOCATING:
++		case PHJ_BUILD_ALLOCATE:
+ 
+ 			/*
+ 			 * Either I just allocated the initial hash table in
+@@ -259,7 +259,7 @@ MultiExecParallelHash(HashState *node)
+ 			BarrierArriveAndWait(build_barrier, WAIT_EVENT_HASH_BUILD_ALLOCATE);
+ 			/* Fall through. */
+ 
+-		case PHJ_BUILD_HASHING_INNER:
++		case PHJ_BUILD_HASH_INNER:
+ 
+ 			/*
+ 			 * It's time to begin hashing, or if we just arrived here then
+@@ -271,10 +271,10 @@ MultiExecParallelHash(HashState *node)
+ 			 * below.
+ 			 */
+ 			if (PHJ_GROW_BATCHES_PHASE(BarrierAttach(&pstate->grow_batches_barrier)) !=
+-				PHJ_GROW_BATCHES_ELECTING)
++				PHJ_GROW_BATCHES_ELECT)
+ 				ExecParallelHashIncreaseNumBatches(hashtable);
+ 			if (PHJ_GROW_BUCKETS_PHASE(BarrierAttach(&pstate->grow_buckets_barrier)) !=
+-				PHJ_GROW_BUCKETS_ELECTING)
++				PHJ_GROW_BUCKETS_ELECT)
+ 				ExecParallelHashIncreaseNumBuckets(hashtable);
+ 			ExecParallelHashEnsureBatchAccessors(hashtable);
+ 			ExecParallelHashTableSetCurrentBatch(hashtable, 0);
+@@ -338,17 +338,17 @@ MultiExecParallelHash(HashState *node)
+ 	 * Unless we're completely done and the batch state has been freed, make
+ 	 * sure we have accessors.
+ 	 */
+-	if (BarrierPhase(build_barrier) < PHJ_BUILD_DONE)
++	if (BarrierPhase(build_barrier) < PHJ_BUILD_FREE)
+ 		ExecParallelHashEnsureBatchAccessors(hashtable);
+ 
+ 	/*
+ 	 * The next synchronization point is in ExecHashJoin's HJ_BUILD_HASHTABLE
+-	 * case, which will bring the build phase to PHJ_BUILD_RUNNING (if it
+-	 * isn't there already).
++	 * case, which will bring the build phase to PHJ_BUILD_RUN (if it isn't
++	 * there already).
+ 	 */
+-	Assert(BarrierPhase(build_barrier) == PHJ_BUILD_HASHING_OUTER ||
+-		   BarrierPhase(build_barrier) == PHJ_BUILD_RUNNING ||
+-		   BarrierPhase(build_barrier) == PHJ_BUILD_DONE);
++	Assert(BarrierPhase(build_barrier) == PHJ_BUILD_HASH_OUTER ||
++		   BarrierPhase(build_barrier) == PHJ_BUILD_RUN ||
++		   BarrierPhase(build_barrier) == PHJ_BUILD_FREE);
+ }
+ 
+ /* ----------------------------------------------------------------
+@@ -592,8 +592,8 @@ ExecHashTableCreate(HashState *state, List *hashOperators, List *hashCollations,
+ 		 * Attach to the build barrier.  The corresponding detach operation is
+ 		 * in ExecHashTableDetach.  Note that we won't attach to the
+ 		 * batch_barrier for batch 0 yet.  We'll attach later and start it out
+-		 * in PHJ_BATCH_PROBING phase, because batch 0 is allocated up front
+-		 * and then loaded while hashing (the standard hybrid hash join
++		 * in PHJ_BATCH_PROBE phase, because batch 0 is allocated up front and
++		 * then loaded while hashing (the standard hybrid hash join
+ 		 * algorithm), and we'll coordinate that using build_barrier.
+ 		 */
+ 		build_barrier = &pstate->build_barrier;
+@@ -606,7 +606,7 @@ ExecHashTableCreate(HashState *state, List *hashOperators, List *hashCollations,
+ 		 * SharedHashJoinBatch objects and the hash table for batch 0.  One
+ 		 * backend will be elected to do that now if necessary.
+ 		 */
+-		if (BarrierPhase(build_barrier) == PHJ_BUILD_ELECTING &&
++		if (BarrierPhase(build_barrier) == PHJ_BUILD_ELECT &&
+ 			BarrierArriveAndWait(build_barrier, WAIT_EVENT_HASH_BUILD_ELECT))
+ 		{
+ 			pstate->nbatch = nbatch;
+@@ -627,7 +627,7 @@ ExecHashTableCreate(HashState *state, List *hashOperators, List *hashCollations,
+ 		/*
+ 		 * The next Parallel Hash synchronization point is in
+ 		 * MultiExecParallelHash(), which will progress it all the way to
+-		 * PHJ_BUILD_RUNNING.  The caller must not return control from this
++		 * PHJ_BUILD_RUN.  The caller must not return control from this
+ 		 * executor node between now and then.
+ 		 */
+ 	}
+@@ -1075,7 +1075,7 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
+ {
+ 	ParallelHashJoinState *pstate = hashtable->parallel_state;
+ 
+-	Assert(BarrierPhase(&pstate->build_barrier) == PHJ_BUILD_HASHING_INNER);
++	Assert(BarrierPhase(&pstate->build_barrier) == PHJ_BUILD_HASH_INNER);
+ 
+ 	/*
+ 	 * It's unlikely, but we need to be prepared for new participants to show
+@@ -1084,7 +1084,7 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
+ 	 */
+ 	switch (PHJ_GROW_BATCHES_PHASE(BarrierPhase(&pstate->grow_batches_barrier)))
+ 	{
+-		case PHJ_GROW_BATCHES_ELECTING:
++		case PHJ_GROW_BATCHES_ELECT:
+ 
+ 			/*
+ 			 * Elect one participant to prepare to grow the number of batches.
+@@ -1200,13 +1200,13 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
+ 			}
+ 			/* Fall through. */
+ 
+-		case PHJ_GROW_BATCHES_ALLOCATING:
++		case PHJ_GROW_BATCHES_REALLOCATE:
+ 			/* Wait for the above to be finished. */
+ 			BarrierArriveAndWait(&pstate->grow_batches_barrier,
+-								 WAIT_EVENT_HASH_GROW_BATCHES_ALLOCATE);
++								 WAIT_EVENT_HASH_GROW_BATCHES_REALLOCATE);
+ 			/* Fall through. */
+ 
+-		case PHJ_GROW_BATCHES_REPARTITIONING:
++		case PHJ_GROW_BATCHES_REPARTITION:
+ 			/* Make sure that we have the current dimensions and buckets. */
+ 			ExecParallelHashEnsureBatchAccessors(hashtable);
+ 			ExecParallelHashTableSetCurrentBatch(hashtable, 0);
+@@ -1219,7 +1219,7 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
+ 								 WAIT_EVENT_HASH_GROW_BATCHES_REPARTITION);
+ 			/* Fall through. */
+ 
+-		case PHJ_GROW_BATCHES_DECIDING:
++		case PHJ_GROW_BATCHES_DECIDE:
+ 
+ 			/*
+ 			 * Elect one participant to clean up and decide whether further
+@@ -1274,7 +1274,7 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
+ 			}
+ 			/* Fall through. */
+ 
+-		case PHJ_GROW_BATCHES_FINISHING:
++		case PHJ_GROW_BATCHES_FINISH:
+ 			/* Wait for the above to complete. */
+ 			BarrierArriveAndWait(&pstate->grow_batches_barrier,
+ 								 WAIT_EVENT_HASH_GROW_BATCHES_FINISH);
+@@ -1514,7 +1514,7 @@ ExecParallelHashIncreaseNumBuckets(HashJoinTable hashtable)
+ 	HashMemoryChunk chunk;
+ 	dsa_pointer chunk_s;
+ 
+-	Assert(BarrierPhase(&pstate->build_barrier) == PHJ_BUILD_HASHING_INNER);
++	Assert(BarrierPhase(&pstate->build_barrier) == PHJ_BUILD_HASH_INNER);
+ 
+ 	/*
+ 	 * It's unlikely, but we need to be prepared for new participants to show
+@@ -1523,7 +1523,7 @@ ExecParallelHashIncreaseNumBuckets(HashJoinTable hashtable)
+ 	 */
+ 	switch (PHJ_GROW_BUCKETS_PHASE(BarrierPhase(&pstate->grow_buckets_barrier)))
+ 	{
+-		case PHJ_GROW_BUCKETS_ELECTING:
++		case PHJ_GROW_BUCKETS_ELECT:
+ 			/* Elect one participant to prepare to increase nbuckets. */
+ 			if (BarrierArriveAndWait(&pstate->grow_buckets_barrier,
+ 									 WAIT_EVENT_HASH_GROW_BUCKETS_ELECT))
+@@ -1552,13 +1552,13 @@ ExecParallelHashIncreaseNumBuckets(HashJoinTable hashtable)
+ 			}
+ 			/* Fall through. */
+ 
+-		case PHJ_GROW_BUCKETS_ALLOCATING:
++		case PHJ_GROW_BUCKETS_REALLOCATE:
+ 			/* Wait for the above to complete. */
+ 			BarrierArriveAndWait(&pstate->grow_buckets_barrier,
+-								 WAIT_EVENT_HASH_GROW_BUCKETS_ALLOCATE);
++								 WAIT_EVENT_HASH_GROW_BUCKETS_REALLOCATE);
+ 			/* Fall through. */
+ 
+-		case PHJ_GROW_BUCKETS_REINSERTING:
++		case PHJ_GROW_BUCKETS_REINSERT:
+ 			/* Reinsert all tuples into the hash table. */
+ 			ExecParallelHashEnsureBatchAccessors(hashtable);
+ 			ExecParallelHashTableSetCurrentBatch(hashtable, 0);
+@@ -1714,7 +1714,7 @@ ExecParallelHashTableInsert(HashJoinTable hashtable,
+ 
+ 		/* Try to load it into memory. */
+ 		Assert(BarrierPhase(&hashtable->parallel_state->build_barrier) ==
+-			   PHJ_BUILD_HASHING_INNER);
++			   PHJ_BUILD_HASH_INNER);
+ 		hashTuple = ExecParallelHashTupleAlloc(hashtable,
+ 											   HJTUPLE_OVERHEAD + tuple->t_len,
+ 											   &shared);
+@@ -2868,7 +2868,7 @@ ExecParallelHashTupleAlloc(HashJoinTable hashtable, size_t size,
+ 	if (pstate->growth != PHJ_GROWTH_DISABLED)
+ 	{
+ 		Assert(curbatch == 0);
+-		Assert(BarrierPhase(&pstate->build_barrier) == PHJ_BUILD_HASHING_INNER);
++		Assert(BarrierPhase(&pstate->build_barrier) == PHJ_BUILD_HASH_INNER);
+ 
+ 		/*
+ 		 * Check if our space limit would be exceeded.  To avoid choking on
+@@ -2988,7 +2988,7 @@ ExecParallelHashJoinSetUpBatches(HashJoinTable hashtable, int nbatch)
+ 		{
+ 			/* Batch 0 doesn't need to be loaded. */
+ 			BarrierAttach(&shared->batch_barrier);
+-			while (BarrierPhase(&shared->batch_barrier) < PHJ_BATCH_PROBING)
++			while (BarrierPhase(&shared->batch_barrier) < PHJ_BATCH_PROBE)
+ 				BarrierArriveAndWait(&shared->batch_barrier, 0);
+ 			BarrierDetach(&shared->batch_barrier);
+ 		}
+@@ -3063,7 +3063,7 @@ ExecParallelHashEnsureBatchAccessors(HashJoinTable hashtable)
+ 	/*
+ 	 * We should never see a state where the batch-tracking array is freed,
+ 	 * because we should have given up sooner if we join when the build
+-	 * barrier has reached the PHJ_BUILD_DONE phase.
++	 * barrier has reached the PHJ_BUILD_FREE phase.
+ 	 */
+ 	Assert(DsaPointerIsValid(pstate->batches));
+ 
+@@ -3146,7 +3146,7 @@ ExecHashTableDetachBatch(HashJoinTable hashtable)
+ 			 * longer attached, but since there is no way it's moving after
+ 			 * this point it seems safe to make the following assertion.
+ 			 */
+-			Assert(BarrierPhase(&batch->batch_barrier) == PHJ_BATCH_DONE);
++			Assert(BarrierPhase(&batch->batch_barrier) == PHJ_BATCH_FREE);
+ 
+ 			/* Free shared chunks and buckets. */
+ 			while (DsaPointerIsValid(batch->chunks))
+@@ -3189,13 +3189,12 @@ ExecHashTableDetach(HashJoinTable hashtable)
+ 
+ 	/*
+ 	 * If we're involved in a parallel query, we must either have gotten all
+-	 * the way to PHJ_BUILD_RUNNING, or joined too late and be in
+-	 * PHJ_BUILD_DONE.
++	 * the way to PHJ_BUILD_RUN, or joined too late and be in PHJ_BUILD_FREE.
+ 	 */
+ 	Assert(!pstate ||
+-		   BarrierPhase(&pstate->build_barrier) >= PHJ_BUILD_RUNNING);
++		   BarrierPhase(&pstate->build_barrier) >= PHJ_BUILD_RUN);
+ 
+-	if (pstate && BarrierPhase(&pstate->build_barrier) == PHJ_BUILD_RUNNING)
++	if (pstate && BarrierPhase(&pstate->build_barrier) == PHJ_BUILD_RUN)
+ 	{
+ 		int			i;
+ 
+@@ -3218,7 +3217,7 @@ ExecHashTableDetach(HashJoinTable hashtable)
+ 			 * Late joining processes will see this state and give up
+ 			 * immediately.
+ 			 */
+-			Assert(BarrierPhase(&pstate->build_barrier) == PHJ_BUILD_DONE);
++			Assert(BarrierPhase(&pstate->build_barrier) == PHJ_BUILD_FREE);
+ 
+ 			if (DsaPointerIsValid(pstate->batches))
+ 			{
+diff --git a/src/backend/executor/nodeHashjoin.c b/src/backend/executor/nodeHashjoin.c
+index 32f12fefd7cb..f189fb4d2873 100644
+--- a/src/backend/executor/nodeHashjoin.c
++++ b/src/backend/executor/nodeHashjoin.c
+@@ -39,27 +39,30 @@
+  *
+  * One barrier called build_barrier is used to coordinate the hashing phases.
+  * The phase is represented by an integer which begins at zero and increments
+- * one by one, but in the code it is referred to by symbolic names as follows:
++ * one by one, but in the code it is referred to by symbolic names as follows.
++ * An asterisk indicates a phase that is performed by a single arbitrarily
++ * chosen process.
+  *
+- *   PHJ_BUILD_ELECTING              -- initial state
+- *   PHJ_BUILD_ALLOCATING            -- one sets up the batches and table 0
+- *   PHJ_BUILD_HASHING_INNER         -- all hash the inner rel
+- *   PHJ_BUILD_HASHING_OUTER         -- (multi-batch only) all hash the outer
+- *   PHJ_BUILD_RUNNING               -- building done, probing can begin
+- *   PHJ_BUILD_DONE                  -- all work complete, one frees batches
++ *   PHJ_BUILD_ELECT                 -- initial state
++ *   PHJ_BUILD_ALLOCATE*             -- one sets up the batches and table 0
++ *   PHJ_BUILD_HASH_INNER            -- all hash the inner rel
++ *   PHJ_BUILD_HASH_OUTER            -- (multi-batch only) all hash the outer
++ *   PHJ_BUILD_RUN                   -- building done, probing can begin
++ *   PHJ_BUILD_FREE*                 -- all work complete, one frees batches
+  *
+- * While in the phase PHJ_BUILD_HASHING_INNER a separate pair of barriers may
++ * While in the phase PHJ_BUILD_HASH_INNER a separate pair of barriers may
+  * be used repeatedly as required to coordinate expansions in the number of
+  * batches or buckets.  Their phases are as follows:
+  *
+- *   PHJ_GROW_BATCHES_ELECTING       -- initial state
+- *   PHJ_GROW_BATCHES_ALLOCATING     -- one allocates new batches
+- *   PHJ_GROW_BATCHES_REPARTITIONING -- all repartition
+- *   PHJ_GROW_BATCHES_FINISHING      -- one cleans up, detects skew
++ *   PHJ_GROW_BATCHES_ELECT          -- initial state
++ *   PHJ_GROW_BATCHES_REALLOCATE*    -- one allocates new batches
++ *   PHJ_GROW_BATCHES_REPARTITION    -- all repartition
++ *   PHJ_GROW_BATCHES_DECIDE*        -- one detects skew and cleans up
++ *   PHJ_GROW_BATCHES_FINISH         -- finished one growth cycle
+  *
+- *   PHJ_GROW_BUCKETS_ELECTING       -- initial state
+- *   PHJ_GROW_BUCKETS_ALLOCATING     -- one allocates new buckets
+- *   PHJ_GROW_BUCKETS_REINSERTING    -- all insert tuples
++ *   PHJ_GROW_BUCKETS_ELECT          -- initial state
++ *   PHJ_GROW_BUCKETS_REALLOCATE*    -- one allocates new buckets
++ *   PHJ_GROW_BUCKETS_REINSERT       -- all insert tuples
+  *
+  * If the planner got the number of batches and buckets right, those won't be
+  * necessary, but on the other hand we might finish up needing to expand the
+@@ -67,27 +70,27 @@
+  * within our memory budget and load factor target.  For that reason it's a
+  * separate pair of barriers using circular phases.
+  *
+- * The PHJ_BUILD_HASHING_OUTER phase is required only for multi-batch joins,
++ * The PHJ_BUILD_HASH_OUTER phase is required only for multi-batch joins,
+  * because we need to divide the outer relation into batches up front in order
+  * to be able to process batches entirely independently.  In contrast, the
+  * parallel-oblivious algorithm simply throws tuples 'forward' to 'later'
+  * batches whenever it encounters them while scanning and probing, which it
+  * can do because it processes batches in serial order.
+  *
+- * Once PHJ_BUILD_RUNNING is reached, backends then split up and process
++ * Once PHJ_BUILD_RUN is reached, backends then split up and process
+  * different batches, or gang up and work together on probing batches if there
+  * aren't enough to go around.  For each batch there is a separate barrier
+  * with the following phases:
+  *
+- *  PHJ_BATCH_ELECTING       -- initial state
+- *  PHJ_BATCH_ALLOCATING     -- one allocates buckets
+- *  PHJ_BATCH_LOADING        -- all load the hash table from disk
+- *  PHJ_BATCH_PROBING        -- all probe
+- *  PHJ_BATCH_DONE           -- end
++ *  PHJ_BATCH_ELECT          -- initial state
++ *  PHJ_BATCH_ALLOCATE*      -- one allocates buckets
++ *  PHJ_BATCH_LOAD           -- all load the hash table from disk
++ *  PHJ_BATCH_PROBE          -- all probe
++ *  PHJ_BATCH_FREE*          -- one frees memory
+  *
+  * Batch 0 is a special case, because it starts out in phase
+- * PHJ_BATCH_PROBING; populating batch 0's hash table is done during
+- * PHJ_BUILD_HASHING_INNER so we can skip loading.
++ * PHJ_BATCH_PROBE; populating batch 0's hash table is done during
++ * PHJ_BUILD_HASH_INNER so we can skip loading.
+  *
+  * Initially we try to plan for a single-batch hash join using the combined
+  * hash_mem of all participants to create a large shared hash table.  If that
+@@ -99,8 +102,8 @@
+  * finished.  Practically, that means that we never emit a tuple while attached
+  * to a barrier, unless the barrier has reached a phase that means that no
+  * process will wait on it again.  We emit tuples while attached to the build
+- * barrier in phase PHJ_BUILD_RUNNING, and to a per-batch barrier in phase
+- * PHJ_BATCH_PROBING.  These are advanced to PHJ_BUILD_DONE and PHJ_BATCH_DONE
++ * barrier in phase PHJ_BUILD_RUN, and to a per-batch barrier in phase
++ * PHJ_BATCH_PROBE.  These are advanced to PHJ_BUILD_FREE and PHJ_BATCH_FREE
+  * respectively without waiting, using BarrierArriveAndDetach().  The last to
+  * detach receives a different return value so that it knows that it's safe to
+  * clean up.  Any straggler process that attaches after that phase is reached
+@@ -306,13 +309,12 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
+ 					if (parallel)
+ 					{
+ 						/*
+-						 * Advance the build barrier to PHJ_BUILD_RUNNING
+-						 * before proceeding so we can negotiate resource
+-						 * cleanup.
++						 * Advance the build barrier to PHJ_BUILD_RUN before
++						 * proceeding so we can negotiate resource cleanup.
+ 						 */
+ 						Barrier    *build_barrier = &parallel_state->build_barrier;
+ 
+-						while (BarrierPhase(build_barrier) < PHJ_BUILD_RUNNING)
++						while (BarrierPhase(build_barrier) < PHJ_BUILD_RUN)
+ 							BarrierArriveAndWait(build_barrier, 0);
+ 					}
+ 					return NULL;
+@@ -336,10 +338,10 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
+ 					Barrier    *build_barrier;
+ 
+ 					build_barrier = &parallel_state->build_barrier;
+-					Assert(BarrierPhase(build_barrier) == PHJ_BUILD_HASHING_OUTER ||
+-						   BarrierPhase(build_barrier) == PHJ_BUILD_RUNNING ||
+-						   BarrierPhase(build_barrier) == PHJ_BUILD_DONE);
+-					if (BarrierPhase(build_barrier) == PHJ_BUILD_HASHING_OUTER)
++					Assert(BarrierPhase(build_barrier) == PHJ_BUILD_HASH_OUTER ||
++						   BarrierPhase(build_barrier) == PHJ_BUILD_RUN ||
++						   BarrierPhase(build_barrier) == PHJ_BUILD_FREE);
++					if (BarrierPhase(build_barrier) == PHJ_BUILD_HASH_OUTER)
+ 					{
+ 						/*
+ 						 * If multi-batch, we need to hash the outer relation
+@@ -350,7 +352,7 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
+ 						BarrierArriveAndWait(build_barrier,
+ 											 WAIT_EVENT_HASH_BUILD_HASH_OUTER);
+ 					}
+-					else if (BarrierPhase(build_barrier) == PHJ_BUILD_DONE)
++					else if (BarrierPhase(build_barrier) == PHJ_BUILD_FREE)
+ 					{
+ 						/*
+ 						 * If we attached so late that the job is finished and
+@@ -361,7 +363,7 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
+ 					}
+ 
+ 					/* Each backend should now select a batch to work on. */
+-					Assert(BarrierPhase(build_barrier) == PHJ_BUILD_RUNNING);
++					Assert(BarrierPhase(build_barrier) == PHJ_BUILD_RUN);
+ 					hashtable->curbatch = -1;
+ 					node->hj_JoinState = HJ_NEED_NEW_BATCH;
+ 
+@@ -1153,7 +1155,7 @@ ExecParallelHashJoinNewBatch(HashJoinState *hjstate)
+ 
+ 			switch (BarrierAttach(batch_barrier))
+ 			{
+-				case PHJ_BATCH_ELECTING:
++				case PHJ_BATCH_ELECT:
+ 
+ 					/* One backend allocates the hash table. */
+ 					if (BarrierArriveAndWait(batch_barrier,
+@@ -1161,13 +1163,13 @@ ExecParallelHashJoinNewBatch(HashJoinState *hjstate)
+ 						ExecParallelHashTableAlloc(hashtable, batchno);
+ 					/* Fall through. */
+ 
+-				case PHJ_BATCH_ALLOCATING:
++				case PHJ_BATCH_ALLOCATE:
+ 					/* Wait for allocation to complete. */
+ 					BarrierArriveAndWait(batch_barrier,
+ 										 WAIT_EVENT_HASH_BATCH_ALLOCATE);
+ 					/* Fall through. */
+ 
+-				case PHJ_BATCH_LOADING:
++				case PHJ_BATCH_LOAD:
+ 					/* Start (or join in) loading tuples. */
+ 					ExecParallelHashTableSetCurrentBatch(hashtable, batchno);
+ 					inner_tuples = hashtable->batches[batchno].inner_tuples;
+@@ -1187,7 +1189,7 @@ ExecParallelHashJoinNewBatch(HashJoinState *hjstate)
+ 										 WAIT_EVENT_HASH_BATCH_LOAD);
+ 					/* Fall through. */
+ 
+-				case PHJ_BATCH_PROBING:
++				case PHJ_BATCH_PROBE:
+ 
+ 					/*
+ 					 * This batch is ready to probe.  Return control to
+@@ -1197,13 +1199,13 @@ ExecParallelHashJoinNewBatch(HashJoinState *hjstate)
+ 					 * this barrier again (or else a deadlock could occur).
+ 					 * All attached participants must eventually call
+ 					 * BarrierArriveAndDetach() so that the final phase
+-					 * PHJ_BATCH_DONE can be reached.
++					 * PHJ_BATCH_FREE can be reached.
+ 					 */
+ 					ExecParallelHashTableSetCurrentBatch(hashtable, batchno);
+ 					sts_begin_parallel_scan(hashtable->batches[batchno].outer_tuples);
+ 					return true;
+ 
+-				case PHJ_BATCH_DONE:
++				case PHJ_BATCH_FREE:
+ 
+ 					/*
+ 					 * Already done.  Detach and go around again (if any
+@@ -1523,7 +1525,7 @@ ExecHashJoinReInitializeDSM(HashJoinState *state, ParallelContext *pcxt)
+ 	/*
+ 	 * It would be possible to reuse the shared hash table in single-batch
+ 	 * cases by resetting and then fast-forwarding build_barrier to
+-	 * PHJ_BUILD_DONE and batch 0's batch_barrier to PHJ_BATCH_PROBING, but
++	 * PHJ_BUILD_FREE and batch 0's batch_barrier to PHJ_BATCH_PROBE, but
+ 	 * currently shared hash tables are already freed by now (by the last
+ 	 * participant to detach from the batch).  We could consider keeping it
+ 	 * around for single-batch joins.  We'd also need to adjust
+@@ -1542,7 +1544,7 @@ ExecHashJoinReInitializeDSM(HashJoinState *state, ParallelContext *pcxt)
+ 	/* Clear any shared batch files. */
+ 	SharedFileSetDeleteAll(&pstate->fileset);
+ 
+-	/* Reset build_barrier to PHJ_BUILD_ELECTING so we can go around again. */
++	/* Reset build_barrier to PHJ_BUILD_ELECT so we can go around again. */
+ 	BarrierInit(&pstate->build_barrier, 0);
+ }
+ 
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index cb99cc633912..7940d646392b 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -367,9 +367,6 @@ pgstat_get_wait_ipc(WaitEventIPC w)
+ 		case WAIT_EVENT_HASH_BUILD_HASH_OUTER:
+ 			event_name = "HashBuildHashOuter";
+ 			break;
+-		case WAIT_EVENT_HASH_GROW_BATCHES_ALLOCATE:
+-			event_name = "HashGrowBatchesAllocate";
+-			break;
+ 		case WAIT_EVENT_HASH_GROW_BATCHES_DECIDE:
+ 			event_name = "HashGrowBatchesDecide";
+ 			break;
+@@ -379,15 +376,18 @@ pgstat_get_wait_ipc(WaitEventIPC w)
+ 		case WAIT_EVENT_HASH_GROW_BATCHES_FINISH:
+ 			event_name = "HashGrowBatchesFinish";
+ 			break;
++		case WAIT_EVENT_HASH_GROW_BATCHES_REALLOCATE:
++			event_name = "HashGrowBatchesReallocate";
++			break;
+ 		case WAIT_EVENT_HASH_GROW_BATCHES_REPARTITION:
+ 			event_name = "HashGrowBatchesRepartition";
+ 			break;
+-		case WAIT_EVENT_HASH_GROW_BUCKETS_ALLOCATE:
+-			event_name = "HashGrowBucketsAllocate";
+-			break;
+ 		case WAIT_EVENT_HASH_GROW_BUCKETS_ELECT:
+ 			event_name = "HashGrowBucketsElect";
+ 			break;
++		case WAIT_EVENT_HASH_GROW_BUCKETS_REALLOCATE:
++			event_name = "HashGrowBucketsReallocate";
++			break;
+ 		case WAIT_EVENT_HASH_GROW_BUCKETS_REINSERT:
+ 			event_name = "HashGrowBucketsReinsert";
+ 			break;
+diff --git a/src/include/executor/hashjoin.h b/src/include/executor/hashjoin.h
+index 0589096473f9..acb7592ca092 100644
+--- a/src/include/executor/hashjoin.h
++++ b/src/include/executor/hashjoin.h
+@@ -254,32 +254,32 @@ typedef struct ParallelHashJoinState
+ } ParallelHashJoinState;
+ 
+ /* The phases for building batches, used by build_barrier. */
+-#define PHJ_BUILD_ELECTING				0
+-#define PHJ_BUILD_ALLOCATING			1
+-#define PHJ_BUILD_HASHING_INNER			2
+-#define PHJ_BUILD_HASHING_OUTER			3
+-#define PHJ_BUILD_RUNNING				4
+-#define PHJ_BUILD_DONE					5
++#define PHJ_BUILD_ELECT					0
++#define PHJ_BUILD_ALLOCATE				1
++#define PHJ_BUILD_HASH_INNER			2
++#define PHJ_BUILD_HASH_OUTER			3
++#define PHJ_BUILD_RUN					4
++#define PHJ_BUILD_FREE					5
+ 
+ /* The phases for probing each batch, used by for batch_barrier. */
+-#define PHJ_BATCH_ELECTING				0
+-#define PHJ_BATCH_ALLOCATING			1
+-#define PHJ_BATCH_LOADING				2
+-#define PHJ_BATCH_PROBING				3
+-#define PHJ_BATCH_DONE					4
++#define PHJ_BATCH_ELECT					0
++#define PHJ_BATCH_ALLOCATE				1
++#define PHJ_BATCH_LOAD					2
++#define PHJ_BATCH_PROBE					3
++#define PHJ_BATCH_FREE					4
+ 
+ /* The phases of batch growth while hashing, for grow_batches_barrier. */
+-#define PHJ_GROW_BATCHES_ELECTING		0
+-#define PHJ_GROW_BATCHES_ALLOCATING		1
+-#define PHJ_GROW_BATCHES_REPARTITIONING 2
+-#define PHJ_GROW_BATCHES_DECIDING		3
+-#define PHJ_GROW_BATCHES_FINISHING		4
++#define PHJ_GROW_BATCHES_ELECT			0
++#define PHJ_GROW_BATCHES_REALLOCATE		1
++#define PHJ_GROW_BATCHES_REPARTITION	2
++#define PHJ_GROW_BATCHES_DECIDE			3
++#define PHJ_GROW_BATCHES_FINISH			4
+ #define PHJ_GROW_BATCHES_PHASE(n)		((n) % 5)	/* circular phases */
+ 
+ /* The phases of bucket growth while hashing, for grow_buckets_barrier. */
+-#define PHJ_GROW_BUCKETS_ELECTING		0
+-#define PHJ_GROW_BUCKETS_ALLOCATING		1
+-#define PHJ_GROW_BUCKETS_REINSERTING	2
++#define PHJ_GROW_BUCKETS_ELECT			0
++#define PHJ_GROW_BUCKETS_REALLOCATE		1
++#define PHJ_GROW_BUCKETS_REINSERT		2
+ #define PHJ_GROW_BUCKETS_PHASE(n)		((n) % 3)	/* circular phases */
+ 
+ typedef struct HashJoinTableData
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index 9ab23e1c4ab6..518d3b0a1f76 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -98,13 +98,13 @@ typedef enum
+ 	WAIT_EVENT_HASH_BUILD_ELECT,
+ 	WAIT_EVENT_HASH_BUILD_HASH_INNER,
+ 	WAIT_EVENT_HASH_BUILD_HASH_OUTER,
+-	WAIT_EVENT_HASH_GROW_BATCHES_ALLOCATE,
+ 	WAIT_EVENT_HASH_GROW_BATCHES_DECIDE,
+ 	WAIT_EVENT_HASH_GROW_BATCHES_ELECT,
+ 	WAIT_EVENT_HASH_GROW_BATCHES_FINISH,
++	WAIT_EVENT_HASH_GROW_BATCHES_REALLOCATE,
+ 	WAIT_EVENT_HASH_GROW_BATCHES_REPARTITION,
+-	WAIT_EVENT_HASH_GROW_BUCKETS_ALLOCATE,
+ 	WAIT_EVENT_HASH_GROW_BUCKETS_ELECT,
++	WAIT_EVENT_HASH_GROW_BUCKETS_REALLOCATE,
+ 	WAIT_EVENT_HASH_GROW_BUCKETS_REINSERT,
+ 	WAIT_EVENT_LOGICAL_APPLY_SEND_DATA,
+ 	WAIT_EVENT_LOGICAL_PARALLEL_APPLY_STATE_CHANGE,

@@ -1,0 +1,228 @@
+From 8ec5429e2f422f4d570d4909507db0d4ca83bbac Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Sun, 8 Oct 2017 12:23:32 -0400
+Subject: [PATCH] Reduce "X = X" to "X IS NOT NULL", if it's easy to do so.
+
+If the operator is a strict btree equality operator, and X isn't volatile,
+then the clause must yield true for any non-null value of X, or null if X
+is null.  At top level of a WHERE clause, we can ignore the distinction
+between false and null results, so it's valid to simplify the clause to
+"X IS NOT NULL".  This is a useful improvement mainly because we'll get
+a far better selectivity estimate in most cases.
+
+Because such cases seldom arise in well-written queries, it is unappetizing
+to expend a lot of planner cycles looking for them ... but it turns out
+that there's a place we can shoehorn this in practically for free, because
+equivclass.c already has to detect and reject candidate equivalences of the
+form X = X.  That doesn't catch every place that it would be valid to
+simplify to X IS NOT NULL, but it catches the typical case.  Working harder
+doesn't seem justified.
+
+Patch by me, reviewed by Petr Jelinek
+
+Discussion: https://postgr.es/m/CAMjNa7cC4X9YR-vAJS-jSYCajhRDvJQnN7m2sLH1wLh-_Z2bsw@mail.gmail.com
+---
+ src/backend/optimizer/path/equivclass.c  | 66 +++++++++++++++++++-----
+ src/backend/optimizer/plan/initsplan.c   |  5 +-
+ src/include/optimizer/paths.h            |  3 +-
+ src/test/regress/expected/equivclass.out | 18 +++++++
+ src/test/regress/sql/equivclass.sql      |  8 +++
+ 5 files changed, 83 insertions(+), 17 deletions(-)
+
+diff --git a/src/backend/optimizer/path/equivclass.c b/src/backend/optimizer/path/equivclass.c
+index 7997f50c18d6..a225414c9701 100644
+--- a/src/backend/optimizer/path/equivclass.c
++++ b/src/backend/optimizer/path/equivclass.c
+@@ -27,6 +27,7 @@
+ #include "optimizer/paths.h"
+ #include "optimizer/planmain.h"
+ #include "optimizer/prep.h"
++#include "optimizer/restrictinfo.h"
+ #include "optimizer/var.h"
+ #include "utils/lsyscache.h"
+ 
+@@ -71,8 +72,14 @@ static bool reconsider_full_join_clause(PlannerInfo *root,
+  *	  any delay by an outer join, so its two sides can be considered equal
+  *	  anywhere they are both computable; moreover that equality can be
+  *	  extended transitively.  Record this knowledge in the EquivalenceClass
+- *	  data structure.  Returns TRUE if successful, FALSE if not (in which
+- *	  case caller should treat the clause as ordinary, not an equivalence).
++ *	  data structure, if applicable.  Returns TRUE if successful, FALSE if not
++ *	  (in which case caller should treat the clause as ordinary, not an
++ *	  equivalence).
++ *
++ * In some cases, although we cannot convert a clause into EquivalenceClass
++ * knowledge, we can still modify it to a more useful form than the original.
++ * Then, *p_restrictinfo will be replaced by a new RestrictInfo, which is what
++ * the caller should use for further processing.
+  *
+  * If below_outer_join is true, then the clause was found below the nullable
+  * side of an outer join, so its sides might validly be both NULL rather than
+@@ -104,9 +111,11 @@ static bool reconsider_full_join_clause(PlannerInfo *root,
+  * memory context.
+  */
+ bool
+-process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
++process_equivalence(PlannerInfo *root,
++					RestrictInfo **p_restrictinfo,
+ 					bool below_outer_join)
+ {
++	RestrictInfo *restrictinfo = *p_restrictinfo;
+ 	Expr	   *clause = restrictinfo->clause;
+ 	Oid			opno,
+ 				collation,
+@@ -154,16 +163,45 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
+ 									   collation);
+ 
+ 	/*
+-	 * Reject clauses of the form X=X.  These are not as redundant as they
+-	 * might seem at first glance: assuming the operator is strict, this is
+-	 * really an expensive way to write X IS NOT NULL.  So we must not risk
+-	 * just losing the clause, which would be possible if there is already a
+-	 * single-element EquivalenceClass containing X.  The case is not common
+-	 * enough to be worth contorting the EC machinery for, so just reject the
+-	 * clause and let it be processed as a normal restriction clause.
++	 * Clauses of the form X=X cannot be translated into EquivalenceClasses.
++	 * We'd either end up with a single-entry EC, losing the knowledge that
++	 * the clause was present at all, or else make an EC with duplicate
++	 * entries, causing other issues.
+ 	 */
+ 	if (equal(item1, item2))
+-		return false;			/* X=X is not a useful equivalence */
++	{
++		/*
++		 * If the operator is strict, then the clause can be treated as just
++		 * "X IS NOT NULL".  (Since we know we are considering a top-level
++		 * qual, we can ignore the difference between FALSE and NULL results.)
++		 * It's worth making the conversion because we'll typically get a much
++		 * better selectivity estimate than we would for X=X.
++		 *
++		 * If the operator is not strict, we can't be sure what it will do
++		 * with NULLs, so don't attempt to optimize it.
++		 */
++		set_opfuncid((OpExpr *) clause);
++		if (func_strict(((OpExpr *) clause)->opfuncid))
++		{
++			NullTest   *ntest = makeNode(NullTest);
++
++			ntest->arg = item1;
++			ntest->nulltesttype = IS_NOT_NULL;
++			ntest->argisrow = false;	/* correct even if composite arg */
++			ntest->location = -1;
++
++			*p_restrictinfo =
++				make_restrictinfo((Expr *) ntest,
++								  restrictinfo->is_pushed_down,
++								  restrictinfo->outerjoin_delayed,
++								  restrictinfo->pseudoconstant,
++								  restrictinfo->security_level,
++								  NULL,
++								  restrictinfo->outer_relids,
++								  restrictinfo->nullable_relids);
++		}
++		return false;
++	}
+ 
+ 	/*
+ 	 * If below outer join, check for strictness, else reject.
+@@ -1741,7 +1779,7 @@ reconsider_outer_join_clause(PlannerInfo *root, RestrictInfo *rinfo,
+ 												   bms_copy(inner_relids),
+ 												   bms_copy(inner_nullable_relids),
+ 												   cur_ec->ec_min_security);
+-			if (process_equivalence(root, newrinfo, true))
++			if (process_equivalence(root, &newrinfo, true))
+ 				match = true;
+ 		}
+ 
+@@ -1884,7 +1922,7 @@ reconsider_full_join_clause(PlannerInfo *root, RestrictInfo *rinfo)
+ 													   bms_copy(left_relids),
+ 													   bms_copy(left_nullable_relids),
+ 													   cur_ec->ec_min_security);
+-				if (process_equivalence(root, newrinfo, true))
++				if (process_equivalence(root, &newrinfo, true))
+ 					matchleft = true;
+ 			}
+ 			eq_op = select_equality_operator(cur_ec,
+@@ -1899,7 +1937,7 @@ reconsider_full_join_clause(PlannerInfo *root, RestrictInfo *rinfo)
+ 													   bms_copy(right_relids),
+ 													   bms_copy(right_nullable_relids),
+ 													   cur_ec->ec_min_security);
+-				if (process_equivalence(root, newrinfo, true))
++				if (process_equivalence(root, &newrinfo, true))
+ 					matchright = true;
+ 			}
+ 		}
+diff --git a/src/backend/optimizer/plan/initsplan.c b/src/backend/optimizer/plan/initsplan.c
+index 9931dddba43a..974eb58d8375 100644
+--- a/src/backend/optimizer/plan/initsplan.c
++++ b/src/backend/optimizer/plan/initsplan.c
+@@ -1964,10 +1964,11 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
+ 		if (maybe_equivalence)
+ 		{
+ 			if (check_equivalence_delay(root, restrictinfo) &&
+-				process_equivalence(root, restrictinfo, below_outer_join))
++				process_equivalence(root, &restrictinfo, below_outer_join))
+ 				return;
+ 			/* EC rejected it, so set left_ec/right_ec the hard way ... */
+-			initialize_mergeclause_eclasses(root, restrictinfo);
++			if (restrictinfo->mergeopfamilies)	/* EC might have changed this */
++				initialize_mergeclause_eclasses(root, restrictinfo);
+ 			/* ... and fall through to distribute_restrictinfo_to_rels */
+ 		}
+ 		else if (maybe_outer_join && restrictinfo->can_join)
+diff --git a/src/include/optimizer/paths.h b/src/include/optimizer/paths.h
+index a15eee54bb8a..ea886b6501bf 100644
+--- a/src/include/optimizer/paths.h
++++ b/src/include/optimizer/paths.h
+@@ -127,7 +127,8 @@ typedef bool (*ec_matches_callback_type) (PlannerInfo *root,
+ 										  EquivalenceMember *em,
+ 										  void *arg);
+ 
+-extern bool process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
++extern bool process_equivalence(PlannerInfo *root,
++					RestrictInfo **p_restrictinfo,
+ 					bool below_outer_join);
+ extern Expr *canonicalize_ec_expression(Expr *expr,
+ 						   Oid req_type, Oid req_collation);
+diff --git a/src/test/regress/expected/equivclass.out b/src/test/regress/expected/equivclass.out
+index a96b2a1b07c3..c448d85dec37 100644
+--- a/src/test/regress/expected/equivclass.out
++++ b/src/test/regress/expected/equivclass.out
+@@ -421,3 +421,21 @@ reset session authorization;
+ revoke select on ec0 from regress_user_ectest;
+ revoke select on ec1 from regress_user_ectest;
+ drop user regress_user_ectest;
++-- check that X=X is converted to X IS NOT NULL when appropriate
++explain (costs off)
++  select * from tenk1 where unique1 = unique1 and unique2 = unique2;
++                         QUERY PLAN                          
++-------------------------------------------------------------
++ Seq Scan on tenk1
++   Filter: ((unique1 IS NOT NULL) AND (unique2 IS NOT NULL))
++(2 rows)
++
++-- this could be converted, but isn't at present
++explain (costs off)
++  select * from tenk1 where unique1 = unique1 or unique2 = unique2;
++                       QUERY PLAN                       
++--------------------------------------------------------
++ Seq Scan on tenk1
++   Filter: ((unique1 = unique1) OR (unique2 = unique2))
++(2 rows)
++
+diff --git a/src/test/regress/sql/equivclass.sql b/src/test/regress/sql/equivclass.sql
+index 0e4aa0cd2c55..85aa65de392e 100644
+--- a/src/test/regress/sql/equivclass.sql
++++ b/src/test/regress/sql/equivclass.sql
+@@ -254,3 +254,11 @@ revoke select on ec0 from regress_user_ectest;
+ revoke select on ec1 from regress_user_ectest;
+ 
+ drop user regress_user_ectest;
++
++-- check that X=X is converted to X IS NOT NULL when appropriate
++explain (costs off)
++  select * from tenk1 where unique1 = unique1 and unique2 = unique2;
++
++-- this could be converted, but isn't at present
++explain (costs off)
++  select * from tenk1 where unique1 = unique1 or unique2 = unique2;

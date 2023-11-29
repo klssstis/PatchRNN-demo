@@ -1,0 +1,277 @@
+From 8be8510cf89d4e150816941029d7cdddfe9aa474 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Fri, 23 Jun 2017 11:03:04 -0400
+Subject: [PATCH] Add testing to detect errors of omission in "pin" dependency
+ creation.
+
+It's essential that initdb.c's setup_depend() scan each system catalog
+that could contain objects that need to have "p" (pin) entries in pg_depend
+or pg_shdepend.  Forgetting to add that, either when a catalog is first
+invented or when it first acquires DATA() entries, is an obvious bug
+hazard.  We can detect such omissions at reasonable cost by probing every
+OID-containing system catalog to see whether the lowest-numbered OID in it
+is pinned.  If so, the catalog must have been properly accounted for in
+setup_depend().  If the lowest OID is above FirstNormalObjectId then the
+catalog must have been empty at the end of initdb, so it doesn't matter.
+There are a small number of catalogs whose first entry is made later in
+initdb than setup_depend(), resulting in nonempty expected output of the
+test, but these can be manually inspected to see that they are OK.  Any
+future mistake of this ilk will manifest as a new entry in the test's
+output.
+
+Since pg_conversion is already in the test's output, add it to the set of
+catalogs scanned by setup_depend().  That has no effect today (hence, no
+catversion bump here) but it will protect us if we ever do add pin-worthy
+conversions.
+
+This test is very much like the catalog sanity checks embodied in
+opr_sanity.sql and type_sanity.sql, but testing pg_depend doesn't seem to
+fit naturally into either of those scripts' charters.  Hence, invent a new
+test script misc_sanity.sql, which can be a home for this as well as tests
+on any other catalogs we might want in future.
+
+Discussion: https://postgr.es/m/8068.1498155068@sss.pgh.pa.us
+---
+ src/bin/initdb/initdb.c                   | 20 +++++-
+ src/test/regress/expected/misc_sanity.out | 78 +++++++++++++++++++++++
+ src/test/regress/parallel_schedule        |  2 +-
+ src/test/regress/serial_schedule          |  1 +
+ src/test/regress/sql/misc_sanity.sql      | 74 +++++++++++++++++++++
+ 5 files changed, 171 insertions(+), 4 deletions(-)
+ create mode 100644 src/test/regress/expected/misc_sanity.out
+ create mode 100644 src/test/regress/sql/misc_sanity.sql
+
+diff --git a/src/bin/initdb/initdb.c b/src/bin/initdb/initdb.c
+index 0f22e6d29a4c..b76eb1eae40c 100644
+--- a/src/bin/initdb/initdb.c
++++ b/src/bin/initdb/initdb.c
+@@ -1478,9 +1478,16 @@ setup_depend(FILE *cmdfd)
+ 		 * for instance) but generating only the minimum required set of
+ 		 * dependencies seems hard.
+ 		 *
+-		 * Note that we deliberately do not pin the system views, which
+-		 * haven't been created yet.  Also, no conversions, databases, or
+-		 * tablespaces are pinned.
++		 * Catalogs that are intentionally not scanned here are:
++		 *
++		 * pg_database: it's a feature, not a bug, that template1 is not
++		 * pinned.
++		 *
++		 * pg_extension: a pinned extension isn't really an extension, hmm?
++		 *
++		 * pg_tablespace: tablespaces don't participate in the dependency
++		 * code, and DropTableSpace() explicitly protects the built-in
++		 * tablespaces.
+ 		 *
+ 		 * First delete any already-made entries; PINs override all else, and
+ 		 * must be the only entries for their objects.
+@@ -1501,6 +1508,8 @@ setup_depend(FILE *cmdfd)
+ 		"INSERT INTO pg_depend SELECT 0,0,0, tableoid,oid,0, 'p' "
+ 		" FROM pg_constraint;\n\n",
+ 		"INSERT INTO pg_depend SELECT 0,0,0, tableoid,oid,0, 'p' "
++		" FROM pg_conversion;\n\n",
++		"INSERT INTO pg_depend SELECT 0,0,0, tableoid,oid,0, 'p' "
+ 		" FROM pg_attrdef;\n\n",
+ 		"INSERT INTO pg_depend SELECT 0,0,0, tableoid,oid,0, 'p' "
+ 		" FROM pg_language;\n\n",
+@@ -2906,6 +2915,11 @@ initialize_data_directory(void)
+ 
+ 	setup_depend(cmdfd);
+ 
++	/*
++	 * Note that no objects created after setup_depend() will be "pinned".
++	 * They are all droppable at the whim of the DBA.
++	 */
++
+ 	setup_sysviews(cmdfd);
+ 
+ 	setup_description(cmdfd);
+diff --git a/src/test/regress/expected/misc_sanity.out b/src/test/regress/expected/misc_sanity.out
+new file mode 100644
+index 000000000000..f02689660bd3
+--- /dev/null
++++ b/src/test/regress/expected/misc_sanity.out
+@@ -0,0 +1,78 @@
++--
++-- MISC_SANITY
++-- Sanity checks for common errors in making system tables that don't fit
++-- comfortably into either opr_sanity or type_sanity.
++--
++-- Every test failure in this file should be closely inspected.
++-- The description of the failing test should be read carefully before
++-- adjusting the expected output.  In most cases, the queries should
++-- not find *any* matching entries.
++--
++-- NB: run this test early, because some later tests create bogus entries.
++-- **************** pg_depend ****************
++-- Look for illegal values in pg_depend fields.
++-- classid/objid can be zero, but only in 'p' entries
++SELECT *
++FROM pg_depend as d1
++WHERE refclassid = 0 OR refobjid = 0 OR
++      deptype NOT IN ('a', 'e', 'i', 'n', 'p') OR
++      (deptype != 'p' AND (classid = 0 OR objid = 0)) OR
++      (deptype = 'p' AND (classid != 0 OR objid != 0 OR objsubid != 0));
++ classid | objid | objsubid | refclassid | refobjid | refobjsubid | deptype 
++---------+-------+----------+------------+----------+-------------+---------
++(0 rows)
++
++-- **************** pg_shdepend ****************
++-- Look for illegal values in pg_shdepend fields.
++-- classid/objid can be zero, but only in 'p' entries
++SELECT *
++FROM pg_shdepend as d1
++WHERE refclassid = 0 OR refobjid = 0 OR
++      deptype NOT IN ('a', 'o', 'p', 'r') OR
++      (deptype != 'p' AND (dbid = 0 OR classid = 0 OR objid = 0)) OR
++      (deptype = 'p' AND (dbid != 0 OR classid != 0 OR objid != 0 OR objsubid != 0));
++ dbid | classid | objid | objsubid | refclassid | refobjid | deptype 
++------+---------+-------+----------+------------+----------+---------
++(0 rows)
++
++-- Check each OID-containing system catalog to see if its lowest-numbered OID
++-- is pinned.  If not, and if that OID was generated during initdb, then
++-- perhaps initdb forgot to scan that catalog for pinnable entries.
++-- Generally, it's okay for a catalog to be listed in the output of this
++-- test if that catalog is scanned by initdb.c's setup_depend() function;
++-- whatever OID the test is complaining about must have been added later
++-- in initdb, where it intentionally isn't pinned.  Legitimate exceptions
++-- to that rule are listed in the comments in setup_depend().
++do $$
++declare relnm text;
++  reloid oid;
++  shared bool;
++  lowoid oid;
++  pinned bool;
++begin
++for relnm, reloid, shared in
++  select relname, oid, relisshared from pg_class
++  where relhasoids and oid < 16384 order by 1
++loop
++  execute 'select min(oid) from ' || relnm into lowoid;
++  continue when lowoid is null or lowoid >= 16384;
++  if shared then
++    pinned := exists(select 1 from pg_shdepend
++                     where refclassid = reloid and refobjid = lowoid
++                     and deptype = 'p');
++  else
++    pinned := exists(select 1 from pg_depend
++                     where refclassid = reloid and refobjid = lowoid
++                     and deptype = 'p');
++  end if;
++  if not pinned then
++    raise notice '% contains unpinned initdb-created object(s)', relnm;
++  end if;
++end loop;
++end$$;
++NOTICE:  pg_constraint contains unpinned initdb-created object(s)
++NOTICE:  pg_conversion contains unpinned initdb-created object(s)
++NOTICE:  pg_database contains unpinned initdb-created object(s)
++NOTICE:  pg_extension contains unpinned initdb-created object(s)
++NOTICE:  pg_rewrite contains unpinned initdb-created object(s)
++NOTICE:  pg_tablespace contains unpinned initdb-created object(s)
+diff --git a/src/test/regress/parallel_schedule b/src/test/regress/parallel_schedule
+index 1f8f0987e380..23692615f9b1 100644
+--- a/src/test/regress/parallel_schedule
++++ b/src/test/regress/parallel_schedule
+@@ -30,7 +30,7 @@ test: point lseg line box path polygon circle date time timetz timestamp timesta
+ # geometry depends on point, lseg, box, path, polygon and circle
+ # horology depends on interval, timetz, timestamp, timestamptz, reltime and abstime
+ # ----------
+-test: geometry horology regex oidjoins type_sanity opr_sanity comments expressions
++test: geometry horology regex oidjoins type_sanity opr_sanity misc_sanity comments expressions
+ 
+ # ----------
+ # These four each depend on the previous one
+diff --git a/src/test/regress/serial_schedule b/src/test/regress/serial_schedule
+index 04206c31620e..5e8b7e94c494 100644
+--- a/src/test/regress/serial_schedule
++++ b/src/test/regress/serial_schedule
+@@ -49,6 +49,7 @@ test: regex
+ test: oidjoins
+ test: type_sanity
+ test: opr_sanity
++test: misc_sanity
+ test: comments
+ test: expressions
+ test: insert
+diff --git a/src/test/regress/sql/misc_sanity.sql b/src/test/regress/sql/misc_sanity.sql
+new file mode 100644
+index 000000000000..5130a4ab794a
+--- /dev/null
++++ b/src/test/regress/sql/misc_sanity.sql
+@@ -0,0 +1,74 @@
++--
++-- MISC_SANITY
++-- Sanity checks for common errors in making system tables that don't fit
++-- comfortably into either opr_sanity or type_sanity.
++--
++-- Every test failure in this file should be closely inspected.
++-- The description of the failing test should be read carefully before
++-- adjusting the expected output.  In most cases, the queries should
++-- not find *any* matching entries.
++--
++-- NB: run this test early, because some later tests create bogus entries.
++
++
++-- **************** pg_depend ****************
++
++-- Look for illegal values in pg_depend fields.
++-- classid/objid can be zero, but only in 'p' entries
++
++SELECT *
++FROM pg_depend as d1
++WHERE refclassid = 0 OR refobjid = 0 OR
++      deptype NOT IN ('a', 'e', 'i', 'n', 'p') OR
++      (deptype != 'p' AND (classid = 0 OR objid = 0)) OR
++      (deptype = 'p' AND (classid != 0 OR objid != 0 OR objsubid != 0));
++
++-- **************** pg_shdepend ****************
++
++-- Look for illegal values in pg_shdepend fields.
++-- classid/objid can be zero, but only in 'p' entries
++
++SELECT *
++FROM pg_shdepend as d1
++WHERE refclassid = 0 OR refobjid = 0 OR
++      deptype NOT IN ('a', 'o', 'p', 'r') OR
++      (deptype != 'p' AND (dbid = 0 OR classid = 0 OR objid = 0)) OR
++      (deptype = 'p' AND (dbid != 0 OR classid != 0 OR objid != 0 OR objsubid != 0));
++
++
++-- Check each OID-containing system catalog to see if its lowest-numbered OID
++-- is pinned.  If not, and if that OID was generated during initdb, then
++-- perhaps initdb forgot to scan that catalog for pinnable entries.
++-- Generally, it's okay for a catalog to be listed in the output of this
++-- test if that catalog is scanned by initdb.c's setup_depend() function;
++-- whatever OID the test is complaining about must have been added later
++-- in initdb, where it intentionally isn't pinned.  Legitimate exceptions
++-- to that rule are listed in the comments in setup_depend().
++
++do $$
++declare relnm text;
++  reloid oid;
++  shared bool;
++  lowoid oid;
++  pinned bool;
++begin
++for relnm, reloid, shared in
++  select relname, oid, relisshared from pg_class
++  where relhasoids and oid < 16384 order by 1
++loop
++  execute 'select min(oid) from ' || relnm into lowoid;
++  continue when lowoid is null or lowoid >= 16384;
++  if shared then
++    pinned := exists(select 1 from pg_shdepend
++                     where refclassid = reloid and refobjid = lowoid
++                     and deptype = 'p');
++  else
++    pinned := exists(select 1 from pg_depend
++                     where refclassid = reloid and refobjid = lowoid
++                     and deptype = 'p');
++  end if;
++  if not pinned then
++    raise notice '% contains unpinned initdb-created object(s)', relnm;
++  end if;
++end loop;
++end$$;

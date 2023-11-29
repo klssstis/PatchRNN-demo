@@ -1,0 +1,540 @@
+From 8b21b416ed621501db3be38817c298c57470524f Mon Sep 17 00:00:00 2001
+From: Alvaro Herrera <alvherre@alvh.no-ip.org>
+Date: Tue, 18 Jun 2019 18:23:16 -0400
+Subject: [PATCH] Avoid spurious deadlocks when upgrading a tuple lock
+
+This puts back reverted commit de87a084c0a5, with some bug fixes.
+
+When two (or more) transactions are waiting for transaction T1 to release a
+tuple-level lock, and transaction T1 upgrades its lock to a higher level, a
+spurious deadlock can be reported among the waiting transactions when T1
+finishes.  The simplest example case seems to be:
+
+T1: select id from job where name = 'a' for key share;
+Y: select id from job where name = 'a' for update; -- starts waiting for T1
+Z: select id from job where name = 'a' for key share;
+T1: update job set name = 'b' where id = 1;
+Z: update job set name = 'c' where id = 1; -- starts waiting for T1
+T1: rollback;
+
+At this point, transaction Y is rolled back on account of a deadlock: Y
+holds the heavyweight tuple lock and is waiting for the Xmax to be released,
+while Z holds part of the multixact and tries to acquire the heavyweight
+lock (per protocol) and goes to sleep; once T1 releases its part of the
+multixact, Z is awakened only to be put back to sleep on the heavyweight
+lock that Y is holding while sleeping.  Kaboom.
+
+This can be avoided by having Z skip the heavyweight lock acquisition.  As
+far as I can see, the biggest downside is that if there are multiple Z
+transactions, the order in which they resume after T1 finishes is not
+guaranteed.
+
+Backpatch to 9.6.  The patch applies cleanly on 9.5, but the new tests don't
+work there (because isolationtester is not smart enough), so I'm not going
+to risk it.
+
+Author: Oleksii Kliukin
+Discussion: https://postgr.es/m/B9C9D7CD-EB94-4635-91B6-E558ACEC0EC3@hintbits.com
+Discussion: https://postgr.es/m/2815.1560521451@sss.pgh.pa.us
+---
+ src/backend/access/heap/README.tuplock        |  10 +
+ src/backend/access/heap/heapam.c              |  83 ++++++--
+ .../tuplelock-upgrade-no-deadlock.out         | 195 ++++++++++++++++++
+ src/test/isolation/isolation_schedule         |   1 +
+ .../specs/tuplelock-upgrade-no-deadlock.spec  |  72 +++++++
+ 5 files changed, 340 insertions(+), 21 deletions(-)
+ create mode 100644 src/test/isolation/expected/tuplelock-upgrade-no-deadlock.out
+ create mode 100644 src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec
+
+diff --git a/src/backend/access/heap/README.tuplock b/src/backend/access/heap/README.tuplock
+index b2f3a4ce9093..d03ddf6cdcc8 100644
+--- a/src/backend/access/heap/README.tuplock
++++ b/src/backend/access/heap/README.tuplock
+@@ -36,6 +36,16 @@ do LockTuple as well, if there is any conflict, to ensure that they don't
+ starve out waiting exclusive-lockers.  However, if there is not any active
+ conflict for a tuple, we don't incur any extra overhead.
+ 
++We make an exception to the above rule for those lockers that already hold
++some lock on a tuple and attempt to acquire a stronger one on it.  In that
++case, we skip the LockTuple() call even when there are conflicts, provided
++that the target tuple is being locked, updated or deleted by multiple sessions
++concurrently.  Failing to skip the lock would risk a deadlock, e.g., between a
++session that was first to record its weaker lock in the tuple header and would
++be waiting on the LockTuple() call to upgrade to the stronger lock level, and
++another session that has already done LockTuple() and is waiting for the first
++session transaction to release its tuple header-level lock.
++
+ We provide four levels of tuple locking strength: SELECT FOR UPDATE obtains an
+ exclusive lock which prevents any kind of modification of the tuple. This is
+ the lock level that is implicitly taken by DELETE operations, and also by
+diff --git a/src/backend/access/heap/heapam.c b/src/backend/access/heap/heapam.c
+index 8ac0f8a5134b..d768b9b061cd 100644
+--- a/src/backend/access/heap/heapam.c
++++ b/src/backend/access/heap/heapam.c
+@@ -95,7 +95,7 @@ static void GetMultiXactIdHintBits(MultiXactId multi, uint16 *new_infomask,
+ static TransactionId MultiXactIdGetUpdateXid(TransactionId xmax,
+ 											 uint16 t_infomask);
+ static bool DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
+-									LockTupleMode lockmode);
++									LockTupleMode lockmode, bool *current_is_member);
+ static void MultiXactIdWait(MultiXactId multi, MultiXactStatus status, uint16 infomask,
+ 							Relation rel, ItemPointer ctid, XLTW_Oper oper,
+ 							int *remaining);
+@@ -2547,15 +2547,20 @@ heap_delete(Relation relation, ItemPointer tid,
+ 		 */
+ 		if (infomask & HEAP_XMAX_IS_MULTI)
+ 		{
+-			/* wait for multixact */
++			bool		current_is_member = false;
++
+ 			if (DoesMultiXactIdConflict((MultiXactId) xwait, infomask,
+-										LockTupleExclusive))
++										LockTupleExclusive, &current_is_member))
+ 			{
+ 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+ 
+-				/* acquire tuple lock, if necessary */
+-				heap_acquire_tuplock(relation, &(tp.t_self), LockTupleExclusive,
+-									 LockWaitBlock, &have_tuple_lock);
++				/*
++				 * Acquire the lock, if necessary (but skip it when we're
++				 * requesting a lock and already have one; avoids deadlock).
++				 */
++				if (!current_is_member)
++					heap_acquire_tuplock(relation, &(tp.t_self), LockTupleExclusive,
++										 LockWaitBlock, &have_tuple_lock);
+ 
+ 				/* wait for multixact */
+ 				MultiXactIdWait((MultiXactId) xwait, MultiXactStatusUpdate, infomask,
+@@ -3126,15 +3131,20 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
+ 		{
+ 			TransactionId update_xact;
+ 			int			remain;
++			bool		current_is_member = false;
+ 
+ 			if (DoesMultiXactIdConflict((MultiXactId) xwait, infomask,
+-										*lockmode))
++										*lockmode, &current_is_member))
+ 			{
+ 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+ 
+-				/* acquire tuple lock, if necessary */
+-				heap_acquire_tuplock(relation, &(oldtup.t_self), *lockmode,
+-									 LockWaitBlock, &have_tuple_lock);
++				/*
++				 * Acquire the lock, if necessary (but skip it when we're
++				 * requesting a lock and already have one; avoids deadlock).
++				 */
++				if (!current_is_member)
++					heap_acquire_tuplock(relation, &(oldtup.t_self), *lockmode,
++										 LockWaitBlock, &have_tuple_lock);
+ 
+ 				/* wait for multixact */
+ 				MultiXactIdWait((MultiXactId) xwait, mxact_status, infomask,
+@@ -3981,6 +3991,7 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
+ 				new_infomask,
+ 				new_infomask2;
+ 	bool		first_time = true;
++	bool		skip_tuple_lock = false;
+ 	bool		have_tuple_lock = false;
+ 	bool		cleared_all_frozen = false;
+ 
+@@ -4081,6 +4092,21 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
+ 						result = TM_Ok;
+ 						goto out_unlocked;
+ 					}
++					else
++					{
++						/*
++						 * Disable acquisition of the heavyweight tuple lock.
++						 * Otherwise, when promoting a weaker lock, we might
++						 * deadlock with another locker that has acquired the
++						 * heavyweight tuple lock and is waiting for our
++						 * transaction to finish.
++						 *
++						 * Note that in this case we still need to wait for
++						 * the multixact if required, to avoid acquiring
++						 * conflicting locks.
++						 */
++						skip_tuple_lock = true;
++					}
+ 				}
+ 
+ 				if (members)
+@@ -4235,7 +4261,7 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
+ 			if (infomask & HEAP_XMAX_IS_MULTI)
+ 			{
+ 				if (!DoesMultiXactIdConflict((MultiXactId) xwait, infomask,
+-											 mode))
++											 mode, NULL))
+ 				{
+ 					/*
+ 					 * No conflict, but if the xmax changed under us in the
+@@ -4312,13 +4338,15 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
+ 			/*
+ 			 * Acquire tuple lock to establish our priority for the tuple, or
+ 			 * die trying.  LockTuple will release us when we are next-in-line
+-			 * for the tuple.  We must do this even if we are share-locking.
++			 * for the tuple.  We must do this even if we are share-locking,
++			 * but not if we already have a weaker lock on the tuple.
+ 			 *
+ 			 * If we are forced to "start over" below, we keep the tuple lock;
+ 			 * this arranges that we stay at the head of the line while
+ 			 * rechecking tuple state.
+ 			 */
+-			if (!heap_acquire_tuplock(relation, tid, mode, wait_policy,
++			if (!skip_tuple_lock &&
++				!heap_acquire_tuplock(relation, tid, mode, wait_policy,
+ 									  &have_tuple_lock))
+ 			{
+ 				/*
+@@ -6516,10 +6544,13 @@ HeapTupleGetUpdateXid(HeapTupleHeader tuple)
+  * tuple lock of the given strength?
+  *
+  * The passed infomask pairs up with the given multixact in the tuple header.
++ *
++ * If current_is_member is not NULL, it is set to 'true' if the current
++ * transaction is a member of the given multixact.
+  */
+ static bool
+ DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
+-						LockTupleMode lockmode)
++						LockTupleMode lockmode, bool *current_is_member)
+ {
+ 	int			nmembers;
+ 	MultiXactMember *members;
+@@ -6540,15 +6571,24 @@ DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
+ 			TransactionId memxid;
+ 			LOCKMODE	memlockmode;
+ 
+-			memlockmode = LOCKMODE_from_mxstatus(members[i].status);
++			if (result && (current_is_member == NULL || *current_is_member))
++				break;
+ 
+-			/* ignore members that don't conflict with the lock we want */
+-			if (!DoLockModesConflict(memlockmode, wanted))
+-				continue;
++			memlockmode = LOCKMODE_from_mxstatus(members[i].status);
+ 
+-			/* ignore members from current xact */
++			/* ignore members from current xact (but track their presence) */
+ 			memxid = members[i].xid;
+ 			if (TransactionIdIsCurrentTransactionId(memxid))
++			{
++				if (current_is_member != NULL)
++					*current_is_member = true;
++				continue;
++			}
++			else if (result)
++				continue;
++
++			/* ignore members that don't conflict with the lock we want */
++			if (!DoLockModesConflict(memlockmode, wanted))
+ 				continue;
+ 
+ 			if (ISUPDATE_from_mxstatus(members[i].status))
+@@ -6567,10 +6607,11 @@ DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
+ 			/*
+ 			 * Whatever remains are either live lockers that conflict with our
+ 			 * wanted lock, and updaters that are not aborted.  Those conflict
+-			 * with what we want, so return true.
++			 * with what we want.  Set up to return true, but keep going to
++			 * look for the current transaction among the multixact members,
++			 * if needed.
+ 			 */
+ 			result = true;
+-			break;
+ 		}
+ 		pfree(members);
+ 	}
+diff --git a/src/test/isolation/expected/tuplelock-upgrade-no-deadlock.out b/src/test/isolation/expected/tuplelock-upgrade-no-deadlock.out
+new file mode 100644
+index 000000000000..8e04a5439489
+--- /dev/null
++++ b/src/test/isolation/expected/tuplelock-upgrade-no-deadlock.out
+@@ -0,0 +1,195 @@
++Parsed test spec with 4 sessions
++
++starting permutation: s1_share s2_for_update s3_share s3_for_update s1_rollback s3_rollback s2_rollback
++step s1_share: select id from tlu_job where id = 1 for share;
++id             
++
++1              
++step s2_for_update: select id from tlu_job where id = 1 for update; <waiting ...>
++step s3_share: select id from tlu_job where id = 1 for share;
++id             
++
++1              
++step s3_for_update: select id from tlu_job where id = 1 for update; <waiting ...>
++step s1_rollback: rollback;
++step s3_for_update: <... completed>
++id             
++
++1              
++step s3_rollback: rollback;
++step s2_for_update: <... completed>
++id             
++
++1              
++step s2_rollback: rollback;
++
++starting permutation: s1_keyshare s2_for_update s3_keyshare s1_update s3_update s1_rollback s3_rollback s2_rollback
++step s1_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s2_for_update: select id from tlu_job where id = 1 for update; <waiting ...>
++step s3_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s1_update: update tlu_job set name = 'b' where id = 1;
++step s3_update: update tlu_job set name = 'c' where id = 1; <waiting ...>
++step s1_rollback: rollback;
++step s3_update: <... completed>
++step s3_rollback: rollback;
++step s2_for_update: <... completed>
++id             
++
++1              
++step s2_rollback: rollback;
++
++starting permutation: s1_keyshare s2_for_update s3_keyshare s1_update s3_update s1_commit s3_rollback s2_rollback
++step s1_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s2_for_update: select id from tlu_job where id = 1 for update; <waiting ...>
++step s3_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s1_update: update tlu_job set name = 'b' where id = 1;
++step s3_update: update tlu_job set name = 'c' where id = 1; <waiting ...>
++step s1_commit: commit;
++step s3_update: <... completed>
++step s3_rollback: rollback;
++step s2_for_update: <... completed>
++id             
++
++1              
++step s2_rollback: rollback;
++
++starting permutation: s1_keyshare s2_for_update s3_keyshare s3_delete s1_rollback s3_rollback s2_rollback
++step s1_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s2_for_update: select id from tlu_job where id = 1 for update; <waiting ...>
++step s3_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s3_delete: delete from tlu_job where id = 1; <waiting ...>
++step s1_rollback: rollback;
++step s3_delete: <... completed>
++step s3_rollback: rollback;
++step s2_for_update: <... completed>
++id             
++
++1              
++step s2_rollback: rollback;
++
++starting permutation: s1_keyshare s2_for_update s3_keyshare s3_delete s1_rollback s3_commit s2_rollback
++step s1_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s2_for_update: select id from tlu_job where id = 1 for update; <waiting ...>
++step s3_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s3_delete: delete from tlu_job where id = 1; <waiting ...>
++step s1_rollback: rollback;
++step s3_delete: <... completed>
++step s3_commit: commit;
++step s2_for_update: <... completed>
++id             
++
++step s2_rollback: rollback;
++
++starting permutation: s1_share s2_for_update s3_for_update s1_rollback s2_rollback s3_rollback
++step s1_share: select id from tlu_job where id = 1 for share;
++id             
++
++1              
++step s2_for_update: select id from tlu_job where id = 1 for update; <waiting ...>
++step s3_for_update: select id from tlu_job where id = 1 for update; <waiting ...>
++step s1_rollback: rollback;
++step s2_for_update: <... completed>
++id             
++
++1              
++step s2_rollback: rollback;
++step s3_for_update: <... completed>
++id             
++
++1              
++step s3_rollback: rollback;
++
++starting permutation: s1_share s2_update s3_update s1_rollback s2_rollback s3_rollback
++step s1_share: select id from tlu_job where id = 1 for share;
++id             
++
++1              
++step s2_update: update tlu_job set name = 'b' where id = 1; <waiting ...>
++step s3_update: update tlu_job set name = 'c' where id = 1; <waiting ...>
++step s1_rollback: rollback;
++step s2_update: <... completed>
++step s2_rollback: rollback;
++step s3_update: <... completed>
++step s3_rollback: rollback;
++
++starting permutation: s1_share s2_delete s3_delete s1_rollback s2_rollback s3_rollback
++step s1_share: select id from tlu_job where id = 1 for share;
++id             
++
++1              
++step s2_delete: delete from tlu_job where id = 1; <waiting ...>
++step s3_delete: delete from tlu_job where id = 1; <waiting ...>
++step s1_rollback: rollback;
++step s2_delete: <... completed>
++step s2_rollback: rollback;
++step s3_delete: <... completed>
++step s3_rollback: rollback;
++
++starting permutation: s1_keyshare s3_for_update s2_for_keyshare s1_savept_e s1_share s1_savept_f s1_fornokeyupd s2_fornokeyupd s0_begin s0_keyshare s1_rollback_f s0_keyshare s1_rollback_e s1_rollback s2_rollback s0_rollback s3_rollback
++step s1_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s3_for_update: select id from tlu_job where id = 1 for update; <waiting ...>
++step s2_for_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s1_savept_e: savepoint s1_e;
++step s1_share: select id from tlu_job where id = 1 for share;
++id             
++
++1              
++step s1_savept_f: savepoint s1_f;
++step s1_fornokeyupd: select id from tlu_job where id = 1 for no key update;
++id             
++
++1              
++step s2_fornokeyupd: select id from tlu_job where id = 1 for no key update; <waiting ...>
++step s0_begin: begin;
++step s0_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s1_rollback_f: rollback to s1_f;
++step s0_keyshare: select id from tlu_job where id = 1 for key share;
++id             
++
++1              
++step s1_rollback_e: rollback to s1_e;
++step s2_fornokeyupd: <... completed>
++id             
++
++1              
++step s1_rollback: rollback;
++step s2_rollback: rollback;
++step s0_rollback: rollback;
++step s3_for_update: <... completed>
++id             
++
++1              
++step s3_rollback: rollback;
+diff --git a/src/test/isolation/isolation_schedule b/src/test/isolation/isolation_schedule
+index 889b4d827a48..74b50779e256 100644
+--- a/src/test/isolation/isolation_schedule
++++ b/src/test/isolation/isolation_schedule
+@@ -49,6 +49,7 @@ test: reindex-concurrently
+ test: propagate-lock-delete
+ test: tuplelock-conflict
+ test: tuplelock-update
++test: tuplelock-upgrade-no-deadlock
+ test: freeze-the-dead
+ test: nowait
+ test: nowait-2
+diff --git a/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec b/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec
+new file mode 100644
+index 000000000000..73f71b17a7af
+--- /dev/null
++++ b/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec
+@@ -0,0 +1,72 @@
++# This test checks that multiple sessions locking a single row in a table
++# do not deadlock each other when one of them upgrades its existing lock
++# while the others are waiting for it.
++
++setup
++{
++    drop table if exists tlu_job;
++    create table tlu_job (id integer primary key, name text);
++
++    insert into tlu_job values(1, 'a');
++}
++
++
++teardown
++{
++    drop table tlu_job;
++}
++
++session "s0"
++step "s0_begin" { begin; }
++step "s0_keyshare" { select id from tlu_job where id = 1 for key share;}
++step "s0_share" { select id from tlu_job where id = 1 for share;}
++step "s0_rollback" { rollback; }
++
++session "s1"
++setup { begin; }
++step "s1_keyshare" { select id from tlu_job where id = 1 for key share;}
++step "s1_share" { select id from tlu_job where id = 1 for share; }
++step "s1_fornokeyupd" { select id from tlu_job where id = 1 for no key update; }
++step "s1_update" { update tlu_job set name = 'b' where id = 1;  }
++step "s1_delete" { delete from tlu_job where id = 1; }
++step "s1_savept_e" { savepoint s1_e; }
++step "s1_savept_f" { savepoint s1_f; }
++step "s1_rollback_e" { rollback to s1_e; }
++step "s1_rollback_f" { rollback to s1_f; }
++step "s1_rollback" { rollback; }
++step "s1_commit" { commit; }
++
++session "s2"
++setup { begin; }
++step "s2_for_keyshare" { select id from tlu_job where id = 1 for key share; }
++step "s2_fornokeyupd" { select id from tlu_job where id = 1 for no key update; }
++step "s2_for_update" { select id from tlu_job where id = 1 for update; }
++step "s2_update" { update tlu_job set name = 'b' where id = 1; }
++step "s2_delete" { delete from tlu_job where id = 1; }
++step "s2_rollback" { rollback; }
++step "s2_commit" { commit; }
++
++session "s3"
++setup { begin; }
++step "s3_keyshare" { select id from tlu_job where id = 1 for key share; }
++step "s3_share" { select id from tlu_job where id = 1 for share; }
++step "s3_for_update" { select id from tlu_job where id = 1 for update; }
++step "s3_update" { update tlu_job set name = 'c' where id = 1; }
++step "s3_delete" { delete from tlu_job where id = 1; }
++step "s3_rollback" { rollback; }
++step "s3_commit" { commit; }
++
++# test that s2 will not deadlock with s3 when s1 is rolled back
++permutation "s1_share" "s2_for_update" "s3_share" "s3_for_update" "s1_rollback" "s3_rollback" "s2_rollback"
++# test that update does not cause deadlocks if it can proceed
++permutation "s1_keyshare" "s2_for_update" "s3_keyshare" "s1_update" "s3_update" "s1_rollback" "s3_rollback" "s2_rollback"
++permutation "s1_keyshare" "s2_for_update" "s3_keyshare" "s1_update" "s3_update" "s1_commit"   "s3_rollback" "s2_rollback"
++# test that delete does not cause deadlocks if it can proceed
++permutation "s1_keyshare" "s2_for_update" "s3_keyshare"  "s3_delete" "s1_rollback" "s3_rollback" "s2_rollback"
++permutation "s1_keyshare" "s2_for_update" "s3_keyshare"  "s3_delete" "s1_rollback" "s3_commit"   "s2_rollback"
++# test that sessions that don't upgrade locks acquire them in order
++permutation "s1_share" "s2_for_update" "s3_for_update" "s1_rollback" "s2_rollback" "s3_rollback"
++permutation "s1_share" "s2_update" "s3_update" "s1_rollback" "s2_rollback" "s3_rollback"
++permutation "s1_share" "s2_delete" "s3_delete" "s1_rollback" "s2_rollback" "s3_rollback"
++# test s2 retrying the overall tuple lock algorithm after initially avoiding deadlock
++permutation "s1_keyshare" "s3_for_update" "s2_for_keyshare" "s1_savept_e" "s1_share" "s1_savept_f" "s1_fornokeyupd" "s2_fornokeyupd" "s0_begin" "s0_keyshare" "s1_rollback_f" "s0_keyshare" "s1_rollback_e" "s1_rollback" "s2_rollback" "s0_rollback" "s3_rollback"

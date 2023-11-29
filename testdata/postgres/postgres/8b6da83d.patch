@@ -1,0 +1,142 @@
+From 8b6da83d162cb0ac9f6d21082727bbd45c972c53 Mon Sep 17 00:00:00 2001
+From: Etsuro Fujita <efujita@postgresql.org>
+Date: Thu, 13 Jun 2019 17:59:09 +0900
+Subject: [PATCH] postgres_fdw: Account for triggers in non-direct remote
+ UPDATE planning.
+
+Previously, in postgresPlanForeignModify, we planned an UPDATE operation
+on a foreign table so that we transmit only columns that were explicitly
+targets of the UPDATE, so as to avoid unnecessary data transmission, but
+if there were BEFORE ROW UPDATE triggers on the foreign table, those
+triggers might change values for non-target columns, in which case we
+would miss sending changed values for those columns.  Prevent optimizing
+away transmitting all columns if there are BEFORE ROW UPDATE triggers on
+the foreign table.
+
+This is an oversight in commit 7cbe57c34 which added triggers on foreign
+tables, so apply the patch all the way back to 9.4 where that came in.
+
+Author: Shohei Mochizuki
+Reviewed-by: Amit Langote
+Discussion: https://postgr.es/m/201905270152.x4R1q3qi014550@toshiba.co.jp
+---
+ .../postgres_fdw/expected/postgres_fdw.out    | 33 +++++++++++++++----
+ contrib/postgres_fdw/postgres_fdw.c           | 19 +++++++----
+ contrib/postgres_fdw/sql/postgres_fdw.sql     |  5 +++
+ 3 files changed, 44 insertions(+), 13 deletions(-)
+
+diff --git a/contrib/postgres_fdw/expected/postgres_fdw.out b/contrib/postgres_fdw/expected/postgres_fdw.out
+index e034b030f152..b2050d1b6fc3 100644
+--- a/contrib/postgres_fdw/expected/postgres_fdw.out
++++ b/contrib/postgres_fdw/expected/postgres_fdw.out
+@@ -6558,6 +6558,25 @@ SELECT * from loc1;
+   2 | skidoo triggered !
+ (2 rows)
+ 
++EXPLAIN (verbose, costs off)
++UPDATE rem1 set f1 = 10;          -- all columns should be transmitted
++                              QUERY PLAN                               
++-----------------------------------------------------------------------
++ Update on public.rem1
++   Remote SQL: UPDATE public.loc1 SET f1 = $2, f2 = $3 WHERE ctid = $1
++   ->  Foreign Scan on public.rem1
++         Output: 10, f2, ctid, rem1.*
++         Remote SQL: SELECT f1, f2, ctid FROM public.loc1 FOR UPDATE
++(5 rows)
++
++UPDATE rem1 set f1 = 10;
++SELECT * from loc1;
++ f1 |               f2               
++----+--------------------------------
++ 10 | skidoo triggered ! triggered !
++ 10 | skidoo triggered ! triggered !
++(2 rows)
++
+ DELETE FROM rem1;
+ -- Add a second trigger, to check that the changes are propagated correctly
+ -- from trigger to trigger
+@@ -6670,7 +6689,7 @@ NOTICE:  trig_row_after(23, skidoo) AFTER ROW INSERT ON rem1
+ NOTICE:  NEW: (13,"test triggered !")
+   ctid  
+ --------
+- (0,27)
++ (0,29)
+ (1 row)
+ 
+ -- cleanup
+@@ -6774,10 +6793,10 @@ BEFORE UPDATE ON rem1
+ FOR EACH ROW EXECUTE PROCEDURE trigger_data(23,'skidoo');
+ EXPLAIN (verbose, costs off)
+ UPDATE rem1 set f2 = '';          -- can't be pushed down
+-                             QUERY PLAN                              
+----------------------------------------------------------------------
++                              QUERY PLAN                               
++-----------------------------------------------------------------------
+  Update on public.rem1
+-   Remote SQL: UPDATE public.loc1 SET f2 = $2 WHERE ctid = $1
++   Remote SQL: UPDATE public.loc1 SET f1 = $2, f2 = $3 WHERE ctid = $1
+    ->  Foreign Scan on public.rem1
+          Output: f1, ''::text, ctid, rem1.*
+          Remote SQL: SELECT f1, f2, ctid FROM public.loc1 FOR UPDATE
+@@ -7404,12 +7423,12 @@ AFTER UPDATE OR DELETE ON bar2
+ FOR EACH ROW EXECUTE PROCEDURE trigger_data(23,'skidoo');
+ explain (verbose, costs off)
+ update bar set f2 = f2 + 100;
+-                                      QUERY PLAN                                      
+---------------------------------------------------------------------------------------
++                                               QUERY PLAN                                               
++--------------------------------------------------------------------------------------------------------
+  Update on public.bar
+    Update on public.bar
+    Foreign Update on public.bar2
+-     Remote SQL: UPDATE public.loct2 SET f2 = $2 WHERE ctid = $1 RETURNING f1, f2, f3
++     Remote SQL: UPDATE public.loct2 SET f1 = $2, f2 = $3, f3 = $4 WHERE ctid = $1 RETURNING f1, f2, f3
+    ->  Seq Scan on public.bar
+          Output: bar.f1, (bar.f2 + 100), bar.ctid
+    ->  Foreign Scan on public.bar2
+diff --git a/contrib/postgres_fdw/postgres_fdw.c b/contrib/postgres_fdw/postgres_fdw.c
+index 11451c2055d1..3b874467f0f3 100644
+--- a/contrib/postgres_fdw/postgres_fdw.c
++++ b/contrib/postgres_fdw/postgres_fdw.c
+@@ -1686,12 +1686,19 @@ postgresPlanForeignModify(PlannerInfo *root,
+ 
+ 	/*
+ 	 * In an INSERT, we transmit all columns that are defined in the foreign
+-	 * table.  In an UPDATE, we transmit only columns that were explicitly
+-	 * targets of the UPDATE, so as to avoid unnecessary data transmission.
+-	 * (We can't do that for INSERT since we would miss sending default values
+-	 * for columns not listed in the source statement.)
+-	 */
+-	if (operation == CMD_INSERT)
++	 * table.  In an UPDATE, if there are BEFORE ROW UPDATE triggers on the
++	 * foreign table, we transmit all columns like INSERT; else we transmit
++	 * only columns that were explicitly targets of the UPDATE, so as to avoid
++	 * unnecessary data transmission.  (We can't do that for INSERT since we
++	 * would miss sending default values for columns not listed in the source
++	 * statement, and for UPDATE if there are BEFORE ROW UPDATE triggers since
++	 * those triggers might change values for non-target columns, in which
++	 * case we would miss sending changed values for those columns.)
++	 */
++	if (operation == CMD_INSERT ||
++		(operation == CMD_UPDATE &&
++		 rel->trigdesc &&
++		 rel->trigdesc->trig_update_before_row))
+ 	{
+ 		TupleDesc	tupdesc = RelationGetDescr(rel);
+ 		int			attnum;
+diff --git a/contrib/postgres_fdw/sql/postgres_fdw.sql b/contrib/postgres_fdw/sql/postgres_fdw.sql
+index 73852f1ae699..2a8e6c7b282b 100644
+--- a/contrib/postgres_fdw/sql/postgres_fdw.sql
++++ b/contrib/postgres_fdw/sql/postgres_fdw.sql
+@@ -1553,6 +1553,11 @@ SELECT * from loc1;
+ UPDATE rem1 set f2 = 'skidoo' RETURNING f2;
+ SELECT * from loc1;
+ 
++EXPLAIN (verbose, costs off)
++UPDATE rem1 set f1 = 10;          -- all columns should be transmitted
++UPDATE rem1 set f1 = 10;
++SELECT * from loc1;
++
+ DELETE FROM rem1;
+ 
+ -- Add a second trigger, to check that the changes are propagated correctly
