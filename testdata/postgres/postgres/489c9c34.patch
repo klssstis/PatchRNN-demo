@@ -1,0 +1,163 @@
+From 489c9c3407cbfd473c2f8d7863ffaaf6d2e8fcf8 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Wed, 30 Sep 2020 15:40:23 -0400
+Subject: [PATCH] Fix handling of BC years in to_date/to_timestamp.
+
+Previously, a conversion such as
+	to_date('-44-02-01','YYYY-MM-DD')
+would result in '0045-02-01 BC', as the code attempted to interpret
+the negative year as BC, but failed to apply the correction needed
+for our internal handling of BC years.  Fix the off-by-one problem.
+
+Also, arrange for the combination of a negative year and an
+explicit "BC" marker to cancel out and produce AD.  This is how
+the negative-century case works, so it seems sane to do likewise.
+
+Continue to read "year 0000" as 1 BC.  Oracle would throw an error,
+but we've accepted that case for a long time so I'm hesitant to
+change it in a back-patch.
+
+Per bug #16419 from Saeed Hubaishan.  Back-patch to all supported
+branches.
+
+Dar Alathar-Yemen and Tom Lane
+
+Discussion: https://postgr.es/m/16419-d8d9db0a7553f01b@postgresql.org
+---
+ doc/src/sgml/func.sgml                 |  9 ++++++
+ src/backend/utils/adt/formatting.c     |  7 ++--
+ src/test/regress/expected/horology.out | 45 ++++++++++++++++++++++++++
+ src/test/regress/sql/horology.sql      | 12 +++++++
+ 4 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/doc/src/sgml/func.sgml b/doc/src/sgml/func.sgml
+index 62dd7382303d..ec8451d1b9b9 100644
+--- a/doc/src/sgml/func.sgml
++++ b/doc/src/sgml/func.sgml
+@@ -7678,6 +7678,15 @@ SELECT regexp_match('abc01234xyz', '(?:(.*?)(\d+)(.*)){1,1}');
+       </para>
+      </listitem>
+ 
++     <listitem>
++      <para>
++       In <function>to_timestamp</function> and <function>to_date</function>,
++       negative years are treated as signifying BC.  If you write both a
++       negative year and an explicit <literal>BC</literal> field, you get AD
++       again.  An input of year zero is treated as 1 BC.
++      </para>
++     </listitem>
++
+      <listitem>
+       <para>
+        In <function>to_timestamp</function> and <function>to_date</function>,
+diff --git a/src/backend/utils/adt/formatting.c b/src/backend/utils/adt/formatting.c
+index b91ff7bb8036..3bb01cdb65ab 100644
+--- a/src/backend/utils/adt/formatting.c
++++ b/src/backend/utils/adt/formatting.c
+@@ -4569,8 +4569,11 @@ do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
+ 		{
+ 			/* If a 4-digit year is provided, we use that and ignore CC. */
+ 			tm->tm_year = tmfc.year;
+-			if (tmfc.bc && tm->tm_year > 0)
+-				tm->tm_year = -(tm->tm_year - 1);
++			if (tmfc.bc)
++				tm->tm_year = -tm->tm_year;
++			/* correct for our representation of BC years */
++			if (tm->tm_year < 0)
++				tm->tm_year++;
+ 		}
+ 		fmask |= DTK_M(YEAR);
+ 	}
+diff --git a/src/test/regress/expected/horology.out b/src/test/regress/expected/horology.out
+index c8c33a0fc067..7f82dcfbfef3 100644
+--- a/src/test/regress/expected/horology.out
++++ b/src/test/regress/expected/horology.out
+@@ -2916,6 +2916,45 @@ SELECT to_date('2458872', 'J');
+  01-23-2020
+ (1 row)
+ 
++--
++-- Check handling of BC dates
++--
++SELECT to_date('44-02-01 BC','YYYY-MM-DD BC');
++    to_date    
++---------------
++ 02-01-0044 BC
++(1 row)
++
++SELECT to_date('-44-02-01','YYYY-MM-DD');
++    to_date    
++---------------
++ 02-01-0044 BC
++(1 row)
++
++SELECT to_date('-44-02-01 BC','YYYY-MM-DD BC');
++  to_date   
++------------
++ 02-01-0044
++(1 row)
++
++SELECT to_timestamp('44-02-01 11:12:13 BC','YYYY-MM-DD HH24:MI:SS BC');
++          to_timestamp           
++---------------------------------
++ Fri Feb 01 11:12:13 0044 PST BC
++(1 row)
++
++SELECT to_timestamp('-44-02-01 11:12:13','YYYY-MM-DD HH24:MI:SS');
++          to_timestamp           
++---------------------------------
++ Fri Feb 01 11:12:13 0044 PST BC
++(1 row)
++
++SELECT to_timestamp('-44-02-01 11:12:13 BC','YYYY-MM-DD HH24:MI:SS BC');
++         to_timestamp         
++------------------------------
++ Mon Feb 01 11:12:13 0044 PST
++(1 row)
++
+ --
+ -- Check handling of multiple spaces in format and/or input
+ --
+@@ -3183,6 +3222,12 @@ SELECT to_date('2016 366', 'YYYY DDD');  -- ok
+ 
+ SELECT to_date('2016 367', 'YYYY DDD');
+ ERROR:  date/time field value out of range: "2016 367"
++SELECT to_date('0000-02-01','YYYY-MM-DD');  -- allowed, though it shouldn't be
++    to_date    
++---------------
++ 02-01-0001 BC
++(1 row)
++
+ --
+ -- Check behavior with SQL-style fixed-GMT-offset time zone (cf bug #8572)
+ --
+diff --git a/src/test/regress/sql/horology.sql b/src/test/regress/sql/horology.sql
+index c464e6766c69..fed21a53c867 100644
+--- a/src/test/regress/sql/horology.sql
++++ b/src/test/regress/sql/horology.sql
+@@ -426,6 +426,17 @@ SELECT to_date('1 4 1902', 'Q MM YYYY');  -- Q is ignored
+ SELECT to_date('3 4 21 01', 'W MM CC YY');
+ SELECT to_date('2458872', 'J');
+ 
++--
++-- Check handling of BC dates
++--
++
++SELECT to_date('44-02-01 BC','YYYY-MM-DD BC');
++SELECT to_date('-44-02-01','YYYY-MM-DD');
++SELECT to_date('-44-02-01 BC','YYYY-MM-DD BC');
++SELECT to_timestamp('44-02-01 11:12:13 BC','YYYY-MM-DD HH24:MI:SS BC');
++SELECT to_timestamp('-44-02-01 11:12:13','YYYY-MM-DD HH24:MI:SS');
++SELECT to_timestamp('-44-02-01 11:12:13 BC','YYYY-MM-DD HH24:MI:SS BC');
++
+ --
+ -- Check handling of multiple spaces in format and/or input
+ --
+@@ -511,6 +522,7 @@ SELECT to_date('2015 366', 'YYYY DDD');
+ SELECT to_date('2016 365', 'YYYY DDD');  -- ok
+ SELECT to_date('2016 366', 'YYYY DDD');  -- ok
+ SELECT to_date('2016 367', 'YYYY DDD');
++SELECT to_date('0000-02-01','YYYY-MM-DD');  -- allowed, though it shouldn't be
+ 
+ --
+ -- Check behavior with SQL-style fixed-GMT-offset time zone (cf bug #8572)

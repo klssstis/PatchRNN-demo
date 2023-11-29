@@ -1,0 +1,272 @@
+From 392ea0c78fdb6cb92f1af0793f6c2d48526e6fed Mon Sep 17 00:00:00 2001
+From: Michael Paquier <michael@paquier.xyz>
+Date: Fri, 9 Jun 2023 11:56:27 +0900
+Subject: [PATCH] Refactor routine to find single log content pattern in TAP
+ tests
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The same routine to check if a specific pattern can be found in the
+server logs was copied over four different test scripts.  This refactors
+the whole to use a single routine located in PostgreSQL::Test::Cluster,
+named log_contains, to grab the contents of the server logs and check
+for a specific pattern.
+
+On HEAD, the code previously used assumed that slurp_file() could not
+handle an undefined offset, setting it to zero, but slurp_file() does
+do an extra fseek() before retrieving the log contents only if an offset
+is defined.  In two places, the test was retrieving the full log
+contents with slurp_file() after calling substr() to apply an offset,
+ignoring that slurp_file() would be able to handle that.
+
+Backpatch all the way down to ease the introduction of new tests that
+could rely on the new routine.
+
+Author: Vignesh C
+Reviewed-by: Andrew Dunstan, Dagfinn Ilmari Mannsåker, Michael Paquier
+Discussion: https://postgr.es/m/CALDaNm0YSiLpjCmajwLfidQrFOrLNKPQir7s__PeVvh9U3uoTQ@mail.gmail.com
+Backpatch-through: 11
+---
+ src/test/authentication/t/003_peer.pl         | 17 ++-------
+ src/test/perl/PostgreSQL/Test/Cluster.pm      | 16 +++++++++
+ src/test/recovery/t/019_replslot_limit.pl     | 35 +++++--------------
+ src/test/recovery/t/033_replay_tsp_drops.pl   | 13 +------
+ .../t/035_standby_logical_decoding.pl         | 26 +++-----------
+ 5 files changed, 32 insertions(+), 75 deletions(-)
+
+diff --git a/src/test/authentication/t/003_peer.pl b/src/test/authentication/t/003_peer.pl
+index 3272e52cae88..d8e49760726a 100644
+--- a/src/test/authentication/t/003_peer.pl
++++ b/src/test/authentication/t/003_peer.pl
+@@ -69,17 +69,6 @@ sub test_role
+ 	}
+ }
+ 
+-# Find $pattern in log file of $node.
+-sub find_in_log
+-{
+-	my ($node, $offset, $pattern) = @_;
+-
+-	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $offset);
+-	return 0 if (length($log) <= 0);
+-
+-	return $log =~ m/$pattern/;
+-}
+-
+ my $node = PostgreSQL::Test::Cluster->new('node');
+ $node->init;
+ $node->append_conf('postgresql.conf', "log_connections = on\n");
+@@ -91,9 +80,9 @@ sub find_in_log
+ # Check if peer authentication is supported on this platform.
+ my $log_offset = -s $node->logfile;
+ $node->psql('postgres');
+-if (find_in_log(
+-		$node, $log_offset,
+-		qr/peer authentication is not supported on this platform/))
++if ($node->log_contains(
++		qr/peer authentication is not supported on this platform/,
++		$log_offset))
+ {
+ 	plan skip_all => 'peer authentication is not supported on this platform';
+ }
+diff --git a/src/test/perl/PostgreSQL/Test/Cluster.pm b/src/test/perl/PostgreSQL/Test/Cluster.pm
+index 2c2cd14a7fe2..5e161dbee607 100644
+--- a/src/test/perl/PostgreSQL/Test/Cluster.pm
++++ b/src/test/perl/PostgreSQL/Test/Cluster.pm
+@@ -2547,6 +2547,22 @@ sub log_check
+ 
+ =pod
+ 
++=item log_contains(pattern, offset)
++
++Find pattern in logfile of node after offset byte.
++
++=cut
++
++sub log_contains
++{
++	my ($self, $pattern, $offset) = @_;
++
++	return PostgreSQL::Test::Utils::slurp_file($self->logfile, $offset) =~
++	  m/$pattern/;
++}
++
++=pod
++
+ =item $node->run_log(...)
+ 
+ Runs a shell command like PostgreSQL::Test::Utils::run_log, but with connection parameters set
+diff --git a/src/test/recovery/t/019_replslot_limit.pl b/src/test/recovery/t/019_replslot_limit.pl
+index a1aba16e145f..33e50ad933be 100644
+--- a/src/test/recovery/t/019_replslot_limit.pl
++++ b/src/test/recovery/t/019_replslot_limit.pl
+@@ -161,8 +161,7 @@
+ 
+ $node_standby->stop;
+ 
+-ok( !find_in_log(
+-		$node_standby,
++ok( !$node_standby->log_contains(
+ 		"requested WAL segment [0-9A-F]+ has already been removed"),
+ 	'check that required WAL segments are still available');
+ 
+@@ -184,9 +183,8 @@
+ my $invalidated = 0;
+ for (my $i = 0; $i < 10 * $PostgreSQL::Test::Utils::timeout_default; $i++)
+ {
+-	if (find_in_log(
+-			$node_primary, 'invalidating obsolete replication slot "rep1"',
+-			$logstart))
++	if ($node_primary->log_contains(
++			'invalidating obsolete replication slot "rep1"', $logstart))
+ 	{
+ 		$invalidated = 1;
+ 		last;
+@@ -207,7 +205,7 @@
+ my $checkpoint_ended = 0;
+ for (my $i = 0; $i < 10 * $PostgreSQL::Test::Utils::timeout_default; $i++)
+ {
+-	if (find_in_log($node_primary, "checkpoint complete: ", $logstart))
++	if ($node_primary->log_contains("checkpoint complete: ", $logstart))
+ 	{
+ 		$checkpoint_ended = 1;
+ 		last;
+@@ -237,8 +235,7 @@
+ my $failed = 0;
+ for (my $i = 0; $i < 10 * $PostgreSQL::Test::Utils::timeout_default; $i++)
+ {
+-	if (find_in_log(
+-			$node_standby,
++	if ($node_standby->log_contains(
+ 			"requested WAL segment [0-9A-F]+ has already been removed",
+ 			$logstart))
+ 	{
+@@ -381,8 +378,7 @@
+ my $max_attempts = $PostgreSQL::Test::Utils::timeout_default;
+ while ($max_attempts-- >= 0)
+ {
+-	if (find_in_log(
+-			$node_primary3,
++	if ($node_primary3->log_contains(
+ 			"terminating process $senderpid to release replication slot \"rep3\"",
+ 			$logstart))
+ 	{
+@@ -406,9 +402,8 @@
+ $max_attempts = $PostgreSQL::Test::Utils::timeout_default;
+ while ($max_attempts-- >= 0)
+ {
+-	if (find_in_log(
+-			$node_primary3, 'invalidating obsolete replication slot "rep3"',
+-			$logstart))
++	if ($node_primary3->log_contains(
++			'invalidating obsolete replication slot "rep3"', $logstart))
+ 	{
+ 		$msg_logged = 1;
+ 		last;
+@@ -446,18 +441,4 @@ sub get_log_size
+ 	return (stat $node->logfile)[7];
+ }
+ 
+-# find $pat in logfile of $node after $off-th byte
+-sub find_in_log
+-{
+-	my ($node, $pat, $off) = @_;
+-
+-	$off = 0 unless defined $off;
+-	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+-	return 0 if (length($log) <= $off);
+-
+-	$log = substr($log, $off);
+-
+-	return $log =~ m/$pat/;
+-}
+-
+ done_testing();
+diff --git a/src/test/recovery/t/033_replay_tsp_drops.pl b/src/test/recovery/t/033_replay_tsp_drops.pl
+index 0a35a7bda696..af97ed9f70ad 100644
+--- a/src/test/recovery/t/033_replay_tsp_drops.pl
++++ b/src/test/recovery/t/033_replay_tsp_drops.pl
+@@ -135,8 +135,7 @@ sub test_tablespace
+ {
+ 	last
+ 	  if (
+-		find_in_log(
+-			$node_standby,
++		$node_standby->log_contains(
+ 			qr!WARNING: ( [A-Z0-9]+:)? creating missing directory: pg_tblspc/!,
+ 			$logstart));
+ 	usleep(100_000);
+@@ -144,13 +143,3 @@ sub test_tablespace
+ ok($max_attempts > 0, "invalid directory creation is detected");
+ 
+ done_testing();
+-
+-# find $pat in logfile of $node after $off-th byte
+-sub find_in_log
+-{
+-	my ($node, $pat, $off) = @_;
+-
+-	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $off);
+-
+-	return $log =~ m/$pat/;
+-}
+diff --git a/src/test/recovery/t/035_standby_logical_decoding.pl b/src/test/recovery/t/035_standby_logical_decoding.pl
+index 64beec4bd343..480e6d6caa5e 100644
+--- a/src/test/recovery/t/035_standby_logical_decoding.pl
++++ b/src/test/recovery/t/035_standby_logical_decoding.pl
+@@ -28,20 +28,6 @@
+ my $primary_slotname = 'primary_physical';
+ my $standby_physical_slotname = 'standby_physical';
+ 
+-# find $pat in logfile of $node after $off-th byte
+-sub find_in_log
+-{
+-	my ($node, $pat, $off) = @_;
+-
+-	$off = 0 unless defined $off;
+-	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+-	return 0 if (length($log) <= $off);
+-
+-	$log = substr($log, $off);
+-
+-	return $log =~ m/$pat/;
+-}
+-
+ # Fetch xmin columns from slot's pg_replication_slots row, after waiting for
+ # given boolean condition to be true to ensure we've reached a quiescent state.
+ sub wait_for_xmins
+@@ -235,14 +221,12 @@ sub check_for_invalidation
+ 	my $inactive_slot = $slot_prefix . 'inactiveslot';
+ 
+ 	# message should be issued
+-	ok( find_in_log(
+-			$node_standby,
++	ok( $node_standby->log_contains(
+ 			"invalidating obsolete replication slot \"$inactive_slot\"",
+ 			$log_start),
+ 		"inactiveslot slot invalidation is logged $test_name");
+ 
+-	ok( find_in_log(
+-			$node_standby,
++	ok( $node_standby->log_contains(
+ 			"invalidating obsolete replication slot \"$active_slot\"",
+ 			$log_start),
+ 		"activeslot slot invalidation is logged $test_name");
+@@ -657,14 +641,12 @@ sub check_for_invalidation
+ $node_primary->wait_for_replay_catchup($node_standby);
+ 
+ # message should not be issued
+-ok( !find_in_log(
+-		$node_standby,
++ok( !$node_standby->log_contains(
+ 		"invalidating obsolete slot \"no_conflict_inactiveslot\"", $logstart),
+ 	'inactiveslot slot invalidation is not logged with vacuum on conflict_test'
+ );
+ 
+-ok( !find_in_log(
+-		$node_standby,
++ok( !$node_standby->log_contains(
+ 		"invalidating obsolete slot \"no_conflict_activeslot\"", $logstart),
+ 	'activeslot slot invalidation is not logged with vacuum on conflict_test'
+ );

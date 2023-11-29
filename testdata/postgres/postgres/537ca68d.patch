@@ -1,0 +1,122 @@
+From 537ca68dbb2463f7b1c44e9466b8fbdd7505b2e1 Mon Sep 17 00:00:00 2001
+From: Tomas Vondra <tomas.vondra@postgresql.org>
+Date: Wed, 1 Sep 2021 17:41:54 +0200
+Subject: [PATCH] Identify simple column references in extended statistics
+
+Until now, when defining extended statistics, everything except a plain
+column reference was treated as complex expression. So for example "a"
+was a column reference, but "(a)" would be an expression. In most cases
+this does not matter much, but there were a couple strange consequences.
+For example
+
+    CREATE STATISTICS s ON a FROM t;
+
+would fail, because extended stats require at least two columns. But
+
+    CREATE STATISTICS s ON (a) FROM t;
+
+would succeed, because that requirement does not apply to expressions.
+Moreover, that statistics object is useless - the optimizer will always
+use the regular statistics collected for attribute "a".
+
+So do a bit more work to identify those expressions referencing a single
+column, and translate them to a simple column reference. Backpatch to
+14, where support for extended statistics on expressions was introduced.
+
+Reported-by: Justin Pryzby
+Backpatch-through: 14
+Discussion: https://postgr.es/m/20210816013255.GS10479%40telsasoft.com
+---
+ src/backend/commands/statscmds.c        | 37 +++++++++++++++++++++----
+ src/test/regress/expected/stats_ext.out |  2 ++
+ src/test/regress/sql/stats_ext.sql      |  1 +
+ 3 files changed, 34 insertions(+), 6 deletions(-)
+
+diff --git a/src/backend/commands/statscmds.c b/src/backend/commands/statscmds.c
+index 4856f4b41d69..59369f87362d 100644
+--- a/src/backend/commands/statscmds.c
++++ b/src/backend/commands/statscmds.c
+@@ -33,6 +33,7 @@
+ #include "optimizer/optimizer.h"
+ #include "statistics/statistics.h"
+ #include "utils/builtins.h"
++#include "utils/lsyscache.h"
+ #include "utils/fmgroids.h"
+ #include "utils/inval.h"
+ #include "utils/memutils.h"
+@@ -211,13 +212,15 @@ CreateStatistics(CreateStatsStmt *stmt)
+ 	/*
+ 	 * Convert the expression list to a simple array of attnums, but also keep
+ 	 * a list of more complex expressions.  While at it, enforce some
+-	 * constraints.
++	 * constraints - we don't allow extended statistics on system attributes,
++	 * and we require the data type to have less-than operator.
+ 	 *
+-	 * XXX We do only the bare minimum to separate simple attribute and
+-	 * complex expressions - for example "(a)" will be treated as a complex
+-	 * expression. No matter how elaborate the check is, there'll always be a
+-	 * way around it, if the user is determined (consider e.g. "(a+0)"), so
+-	 * it's not worth protecting against it.
++	 * There are many ways how to "mask" a simple attribute refenrece as an
++	 * expression, for example "(a+0)" etc. We can't possibly detect all of
++	 * them, but we handle at least the simple case with attribute in parens.
++	 * There'll always be a way around this, if the user is determined (like
++	 * the "(a+0)" example), but this makes it somewhat consistent with how
++	 * indexes treat attributes/expressions.
+ 	 */
+ 	foreach(cell, stmt->exprs)
+ 	{
+@@ -258,6 +261,28 @@ CreateStatistics(CreateStatsStmt *stmt)
+ 			nattnums++;
+ 			ReleaseSysCache(atttuple);
+ 		}
++		else if (IsA(selem->expr, Var))	/* column reference in parens */
++		{
++			Var *var = (Var *) selem->expr;
++			TypeCacheEntry *type;
++
++			/* Disallow use of system attributes in extended stats */
++			if (var->varattno <= 0)
++				ereport(ERROR,
++						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++						 errmsg("statistics creation on system columns is not supported")));
++
++			/* Disallow data types without a less-than operator */
++			type = lookup_type_cache(var->vartype, TYPECACHE_LT_OPR);
++			if (type->lt_opr == InvalidOid)
++				ereport(ERROR,
++						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++						 errmsg("column \"%s\" cannot be used in statistics because its type %s has no default btree operator class",
++								get_attname(relid, var->varattno, false), format_type_be(var->vartype))));
++
++			attnums[nattnums] = var->varattno;
++			nattnums++;
++		}
+ 		else					/* expression */
+ 		{
+ 			Node	   *expr = selem->expr;
+diff --git a/src/test/regress/expected/stats_ext.out b/src/test/regress/expected/stats_ext.out
+index a7f12e989dd7..c60ba45aba82 100644
+--- a/src/test/regress/expected/stats_ext.out
++++ b/src/test/regress/expected/stats_ext.out
+@@ -55,6 +55,8 @@ ERROR:  duplicate expression in statistics definition
+ CREATE STATISTICS tst (unrecognized) ON x, y FROM ext_stats_test;
+ ERROR:  unrecognized statistics kind "unrecognized"
+ -- incorrect expressions
++CREATE STATISTICS tst ON (y) FROM ext_stats_test; -- single column reference
++ERROR:  extended statistics require at least 2 columns
+ CREATE STATISTICS tst ON y + z FROM ext_stats_test; -- missing parentheses
+ ERROR:  syntax error at or near "+"
+ LINE 1: CREATE STATISTICS tst ON y + z FROM ext_stats_test;
+diff --git a/src/test/regress/sql/stats_ext.sql b/src/test/regress/sql/stats_ext.sql
+index 555b9473bbe2..6fb37962a720 100644
+--- a/src/test/regress/sql/stats_ext.sql
++++ b/src/test/regress/sql/stats_ext.sql
+@@ -41,6 +41,7 @@ CREATE STATISTICS tst ON (x || 'x'), (x || 'x'), (y + 1), (x || 'x'), (x || 'x')
+ CREATE STATISTICS tst ON (x || 'x'), (x || 'x'), y FROM ext_stats_test;
+ CREATE STATISTICS tst (unrecognized) ON x, y FROM ext_stats_test;
+ -- incorrect expressions
++CREATE STATISTICS tst ON (y) FROM ext_stats_test; -- single column reference
+ CREATE STATISTICS tst ON y + z FROM ext_stats_test; -- missing parentheses
+ CREATE STATISTICS tst ON (x, y) FROM ext_stats_test; -- tuple expression
+ DROP TABLE ext_stats_test;

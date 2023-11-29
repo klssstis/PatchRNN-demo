@@ -1,0 +1,115 @@
+From 309b2cf2433d1b1454636595600f160b41871ff5 Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Fri, 14 Oct 2022 11:11:33 -0700
+Subject: [PATCH] Have GetCurrentTransactionStopTimestamp() set
+ xactStopTimestamp if unset
+
+Previously GetCurrentTransactionStopTimestamp() computed a new timestamp
+whenever xactStopTimestamp was unset and xactStopTimestamp was only set when a
+commit or abort record was written.
+
+An upcoming patch will add additional calls to
+GetCurrentTransactionStopTimestamp() from pgstats. To avoid computing
+timestamps multiple times, set xactStopTimestamp in
+GetCurrentTransactionStopTimestamp() if not already set.
+
+Author: Dave Page <dpage@pgadmin.org>
+Reviewed-by: Andres Freund <andres@anarazel.de>
+Reviewed-by: Vik Fearing <vik@postgresfriends.org>
+Discussion: https://postgr.es/m/20220906155325.an3xesq5o3fq36gt%40awork3.anarazel.de
+---
+ src/backend/access/transam/xact.c | 42 +++++++++++++++----------------
+ 1 file changed, 21 insertions(+), 21 deletions(-)
+
+diff --git a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
+index c1ffbd89b883..fd5103a78e24 100644
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -263,7 +263,10 @@ static bool currentCommandIdUsed;
+ /*
+  * xactStartTimestamp is the value of transaction_timestamp().
+  * stmtStartTimestamp is the value of statement_timestamp().
+- * xactStopTimestamp is the time at which we log a commit or abort WAL record.
++ * xactStopTimestamp is the time at which we log a commit / abort WAL record,
++ * or if that was skipped, the time of the first subsequent
++ * GetCurrentTransactionStopTimestamp() call.
++ *
+  * These do not change as we enter and exit subtransactions, so we don't
+  * keep them inside the TransactionState stack.
+  */
+@@ -865,15 +868,24 @@ GetCurrentStatementStartTimestamp(void)
+ /*
+  *	GetCurrentTransactionStopTimestamp
+  *
+- * We return current time if the transaction stop time hasn't been set
+- * (which can happen if we decide we don't need to log an XLOG record).
++ * If the transaction stop time hasn't already been set, which can happen if
++ * we decided we don't need to log an XLOG record, set xactStopTimestamp.
+  */
+ TimestampTz
+ GetCurrentTransactionStopTimestamp(void)
+ {
+-	if (xactStopTimestamp != 0)
+-		return xactStopTimestamp;
+-	return GetCurrentTimestamp();
++	TransactionState s PG_USED_FOR_ASSERTS_ONLY = CurrentTransactionState;
++
++	/* should only be called after commit / abort processing */
++	Assert(s->state == TRANS_DEFAULT ||
++		   s->state == TRANS_COMMIT ||
++		   s->state == TRANS_ABORT ||
++		   s->state == TRANS_PREPARE);
++
++	if (xactStopTimestamp == 0)
++		xactStopTimestamp = GetCurrentTimestamp();
++
++	return xactStopTimestamp;
+ }
+ 
+ /*
+@@ -891,15 +903,6 @@ SetCurrentStatementStartTimestamp(void)
+ 		Assert(stmtStartTimestamp != 0);
+ }
+ 
+-/*
+- *	SetCurrentTransactionStopTimestamp
+- */
+-static inline void
+-SetCurrentTransactionStopTimestamp(void)
+-{
+-	xactStopTimestamp = GetCurrentTimestamp();
+-}
+-
+ /*
+  *	GetCurrentTransactionNestLevel
+  *
+@@ -1396,9 +1399,7 @@ RecordTransactionCommit(void)
+ 		START_CRIT_SECTION();
+ 		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+ 
+-		SetCurrentTransactionStopTimestamp();
+-
+-		XactLogCommitRecord(xactStopTimestamp,
++		XactLogCommitRecord(GetCurrentTransactionStopTimestamp(),
+ 							nchildren, children, nrels, rels,
+ 							ndroppedstats, droppedstats,
+ 							nmsgs, invalMessages,
+@@ -1422,7 +1423,7 @@ RecordTransactionCommit(void)
+ 		 */
+ 
+ 		if (!replorigin || replorigin_session_origin_timestamp == 0)
+-			replorigin_session_origin_timestamp = xactStopTimestamp;
++			replorigin_session_origin_timestamp = GetCurrentTransactionStopTimestamp();
+ 
+ 		TransactionTreeSetCommitTsData(xid, nchildren, children,
+ 									   replorigin_session_origin_timestamp,
+@@ -1754,8 +1755,7 @@ RecordTransactionAbort(bool isSubXact)
+ 		xact_time = GetCurrentTimestamp();
+ 	else
+ 	{
+-		SetCurrentTransactionStopTimestamp();
+-		xact_time = xactStopTimestamp;
++		xact_time = GetCurrentTransactionStopTimestamp();
+ 	}
+ 
+ 	XactLogAbortRecord(xact_time,

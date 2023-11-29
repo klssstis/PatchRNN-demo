@@ -1,0 +1,113 @@
+From 500d49794f1f61cb20f485bd5c5052c122e58cf9 Mon Sep 17 00:00:00 2001
+From: Andrew Gierth <rhodiumtoad@postgresql.org>
+Date: Tue, 11 Sep 2018 18:14:19 +0100
+Subject: [PATCH] Repair double-free in SP-GIST rescan (bug #15378)
+
+spgrescan would first reset traversalCxt, and then traverse a
+potentially non-empty stack containing pointers to traversalValues
+which had been allocated in those contexts, freeing them a second
+time. This bug originates in commit ccd6eb49a where traversalValue was
+introduced.
+
+Repair by traversing the stack before the context reset; this isn't
+ideal, since it means doing retail pfree in a context that's about to
+be reset, but the freeing of a stack entry is also done in other
+places in the code during the scan so it's not worth trying to
+refactor it further. Regression test added.
+
+Backpatch to 9.6 where the problem was introduced.
+
+Per bug #15378; analysis and patch by me, originally from a report on
+IRC by user velix; see also PostGIS ticket #4174; review by Alexander
+Korotkov.
+
+Discussion: https://postgr.es/m/153663176628.23136.11901365223750051490@wrigleys.postgresql.org
+---
+ src/backend/access/spgist/spgscan.c  | 10 +++++++---
+ src/test/regress/expected/spgist.out | 18 ++++++++++++++++++
+ src/test/regress/sql/spgist.sql      | 15 +++++++++++++++
+ 3 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/access/spgist/spgscan.c b/src/backend/access/spgist/spgscan.c
+index c72808081220..5260d5017d19 100644
+--- a/src/backend/access/spgist/spgscan.c
++++ b/src/backend/access/spgist/spgscan.c
+@@ -74,6 +74,13 @@ resetSpGistScanOpaque(SpGistScanOpaque so)
+ 
+ 	freeScanStack(so);
+ 
++	/*
++	 * clear traversal context before proceeding to the next scan; this must
++	 * not happen before the freeScanStack above, else we get double-free
++	 * crashes.
++	 */
++	MemoryContextReset(so->traversalCxt);
++
+ 	if (so->searchNulls)
+ 	{
+ 		/* Stack a work item to scan the null index entries */
+@@ -212,9 +219,6 @@ spgrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+ {
+ 	SpGistScanOpaque so = (SpGistScanOpaque) scan->opaque;
+ 
+-	/* clear traversal context before proceeding to the next scan */
+-	MemoryContextReset(so->traversalCxt);
+-
+ 	/* copy scankeys into local storage */
+ 	if (scankey && scan->numberOfKeys > 0)
+ 	{
+diff --git a/src/test/regress/expected/spgist.out b/src/test/regress/expected/spgist.out
+index 2d75bbf8dcba..9364b88bc226 100644
+--- a/src/test/regress/expected/spgist.out
++++ b/src/test/regress/expected/spgist.out
+@@ -23,6 +23,24 @@ delete from spgist_point_tbl where id % 2 = 1;
+ -- would exercise it)
+ delete from spgist_point_tbl where id < 10000;
+ vacuum spgist_point_tbl;
++-- Test rescan paths (cf. bug #15378)
++-- use box and && rather than point, so that rescan happens when the
++-- traverse stack is non-empty
++create table spgist_box_tbl(id serial, b box);
++insert into spgist_box_tbl(b)
++select box(point(i,j),point(i+s,j+s))
++  from generate_series(1,100,5) i,
++       generate_series(1,100,5) j,
++       generate_series(1,10) s;
++create index spgist_box_idx on spgist_box_tbl using spgist (b);
++select count(*)
++  from (values (point(5,5)),(point(8,8)),(point(12,12))) v(p)
++ where exists(select * from spgist_box_tbl b where b.b && box(v.p,v.p));
++ count 
++-------
++     3
++(1 row)
++
+ -- The point opclass's choose method only uses the spgMatchNode action,
+ -- so the other actions are not tested by the above. Create an index using
+ -- text opclass, which uses the others actions.
+diff --git a/src/test/regress/sql/spgist.sql b/src/test/regress/sql/spgist.sql
+index 77b43a2d3e90..c72cf42a33cd 100644
+--- a/src/test/regress/sql/spgist.sql
++++ b/src/test/regress/sql/spgist.sql
+@@ -30,6 +30,21 @@ delete from spgist_point_tbl where id < 10000;
+ 
+ vacuum spgist_point_tbl;
+ 
++-- Test rescan paths (cf. bug #15378)
++-- use box and && rather than point, so that rescan happens when the
++-- traverse stack is non-empty
++
++create table spgist_box_tbl(id serial, b box);
++insert into spgist_box_tbl(b)
++select box(point(i,j),point(i+s,j+s))
++  from generate_series(1,100,5) i,
++       generate_series(1,100,5) j,
++       generate_series(1,10) s;
++create index spgist_box_idx on spgist_box_tbl using spgist (b);
++
++select count(*)
++  from (values (point(5,5)),(point(8,8)),(point(12,12))) v(p)
++ where exists(select * from spgist_box_tbl b where b.b && box(v.p,v.p));
+ 
+ -- The point opclass's choose method only uses the spgMatchNode action,
+ -- so the other actions are not tested by the above. Create an index using

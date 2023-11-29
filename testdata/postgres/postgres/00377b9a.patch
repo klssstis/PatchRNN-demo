@@ -1,0 +1,422 @@
+From 00377b9a02b89a831ae50e1c718d34565356698f Mon Sep 17 00:00:00 2001
+From: Noah Misch <noah@leadboat.com>
+Date: Sat, 25 Jun 2022 09:07:41 -0700
+Subject: [PATCH] CREATE INDEX: use the original userid for more ACL checks.
+
+Commit a117cebd638dd02e5c2e791c25e43745f233111b used the original userid
+for ACL checks located directly in DefineIndex(), but it still adopted
+the table owner userid for more ACL checks than intended.  That broke
+dump/reload of indexes that refer to an operator class, collation, or
+exclusion operator in a schema other than "public" or "pg_catalog".
+Back-patch to v10 (all supported versions), like the earlier commit.
+
+Nathan Bossart and Noah Misch
+
+Discussion: https://postgr.es/m/f8a4105f076544c180a87ef0c4822352@stmuk.bayern.de
+---
+ contrib/citext/Makefile                      |  2 +-
+ contrib/citext/expected/create_index_acl.out | 86 ++++++++++++++++++
+ contrib/citext/sql/create_index_acl.sql      | 88 ++++++++++++++++++
+ src/backend/commands/indexcmds.c             | 96 +++++++++++++++++---
+ 4 files changed, 256 insertions(+), 16 deletions(-)
+ create mode 100644 contrib/citext/expected/create_index_acl.out
+ create mode 100644 contrib/citext/sql/create_index_acl.sql
+
+diff --git a/contrib/citext/Makefile b/contrib/citext/Makefile
+index 789932fe3669..35db6eac8c44 100644
+--- a/contrib/citext/Makefile
++++ b/contrib/citext/Makefile
+@@ -11,7 +11,7 @@ DATA = citext--1.4.sql \
+ 	citext--1.0--1.1.sql
+ PGFILEDESC = "citext - case-insensitive character string data type"
+ 
+-REGRESS = citext citext_utf8
++REGRESS = create_index_acl citext citext_utf8
+ 
+ ifdef USE_PGXS
+ PG_CONFIG = pg_config
+diff --git a/contrib/citext/expected/create_index_acl.out b/contrib/citext/expected/create_index_acl.out
+new file mode 100644
+index 000000000000..33be13a92df2
+--- /dev/null
++++ b/contrib/citext/expected/create_index_acl.out
+@@ -0,0 +1,86 @@
++-- Each DefineIndex() ACL check uses either the original userid or the table
++-- owner userid; see its header comment.  Here, confirm that DefineIndex()
++-- uses its original userid where necessary.  The test works by creating
++-- indexes that refer to as many sorts of objects as possible, with the table
++-- owner having as few applicable privileges as possible.  (The privileges.sql
++-- regress_sro_user tests look for the opposite defect; they confirm that
++-- DefineIndex() uses the table owner userid where necessary.)
++SET allow_in_place_tablespaces = true;
++CREATE TABLESPACE regress_create_idx_tblspace LOCATION '';
++RESET allow_in_place_tablespaces;
++BEGIN;
++CREATE ROLE regress_minimal;
++CREATE SCHEMA s;
++CREATE EXTENSION citext SCHEMA s;
++-- Revoke all conceivably-relevant ACLs within the extension.  The system
++-- doesn't check all these ACLs, but this will provide some coverage if that
++-- ever changes.
++REVOKE ALL ON TYPE s.citext FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_pattern_lt FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_pattern_le FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_eq FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_pattern_ge FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_pattern_gt FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_pattern_cmp FROM PUBLIC;
++-- Functions sufficient for making an index column that has the side effect of
++-- changing search_path at expression planning time.
++CREATE FUNCTION public.setter() RETURNS bool VOLATILE
++  LANGUAGE SQL AS $$SET search_path = s; SELECT true$$;
++CREATE FUNCTION s.const() RETURNS bool IMMUTABLE
++  LANGUAGE SQL AS $$SELECT public.setter()$$;
++CREATE FUNCTION s.index_this_expr(s.citext, bool) RETURNS s.citext IMMUTABLE
++  LANGUAGE SQL AS $$SELECT $1$$;
++REVOKE ALL ON FUNCTION public.setter FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.const FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.index_this_expr FROM PUBLIC;
++-- Even for an empty table, expression planning calls s.const & public.setter.
++GRANT EXECUTE ON FUNCTION public.setter TO regress_minimal;
++GRANT EXECUTE ON FUNCTION s.const TO regress_minimal;
++-- Function for index predicate.
++CREATE FUNCTION s.index_row_if(s.citext) RETURNS bool IMMUTABLE
++  LANGUAGE SQL AS $$SELECT $1 IS NOT NULL$$;
++REVOKE ALL ON FUNCTION s.index_row_if FROM PUBLIC;
++-- Even for an empty table, CREATE INDEX checks ii_Predicate permissions.
++GRANT EXECUTE ON FUNCTION s.index_row_if TO regress_minimal;
++-- Non-extension, non-function objects.
++CREATE COLLATION s.coll (LOCALE="C");
++CREATE TABLE s.x (y s.citext);
++ALTER TABLE s.x OWNER TO regress_minimal;
++-- Empty-table DefineIndex()
++CREATE UNIQUE INDEX u0rows ON s.x USING btree
++  ((s.index_this_expr(y, s.const())) COLLATE s.coll s.citext_pattern_ops)
++  TABLESPACE regress_create_idx_tblspace
++  WHERE s.index_row_if(y);
++ALTER TABLE s.x ADD CONSTRAINT e0rows EXCLUDE USING btree
++  ((s.index_this_expr(y, s.const())) COLLATE s.coll WITH s.=)
++  USING INDEX TABLESPACE regress_create_idx_tblspace
++  WHERE (s.index_row_if(y));
++-- Make the table nonempty.
++INSERT INTO s.x VALUES ('foo'), ('bar');
++-- If the INSERT runs the planner on index expressions, a search_path change
++-- survives.  As of 2022-06, the INSERT reuses a cached plan.  It does so even
++-- under debug_discard_caches, since each index is new-in-transaction.  If
++-- future work changes a cache lifecycle, this RESET may become necessary.
++RESET search_path;
++-- For a nonempty table, owner needs permissions throughout ii_Expressions.
++GRANT EXECUTE ON FUNCTION s.index_this_expr TO regress_minimal;
++CREATE UNIQUE INDEX u2rows ON s.x USING btree
++  ((s.index_this_expr(y, s.const())) COLLATE s.coll s.citext_pattern_ops)
++  TABLESPACE regress_create_idx_tblspace
++  WHERE s.index_row_if(y);
++ALTER TABLE s.x ADD CONSTRAINT e2rows EXCLUDE USING btree
++  ((s.index_this_expr(y, s.const())) COLLATE s.coll WITH s.=)
++  USING INDEX TABLESPACE regress_create_idx_tblspace
++  WHERE (s.index_row_if(y));
++-- Shall not find s.coll via search_path, despite the s.const->public.setter
++-- call having set search_path=s during expression planning.  Suppress the
++-- message itself, which depends on the database encoding.
++\set VERBOSITY sqlstate
++ALTER TABLE s.x ADD CONSTRAINT underqualified EXCLUDE USING btree
++  ((s.index_this_expr(y, s.const())) COLLATE coll WITH s.=)
++  USING INDEX TABLESPACE regress_create_idx_tblspace
++  WHERE (s.index_row_if(y));
++ERROR:  42704
++\set VERBOSITY default
++ROLLBACK;
++DROP TABLESPACE regress_create_idx_tblspace;
+diff --git a/contrib/citext/sql/create_index_acl.sql b/contrib/citext/sql/create_index_acl.sql
+new file mode 100644
+index 000000000000..10b52255693d
+--- /dev/null
++++ b/contrib/citext/sql/create_index_acl.sql
+@@ -0,0 +1,88 @@
++-- Each DefineIndex() ACL check uses either the original userid or the table
++-- owner userid; see its header comment.  Here, confirm that DefineIndex()
++-- uses its original userid where necessary.  The test works by creating
++-- indexes that refer to as many sorts of objects as possible, with the table
++-- owner having as few applicable privileges as possible.  (The privileges.sql
++-- regress_sro_user tests look for the opposite defect; they confirm that
++-- DefineIndex() uses the table owner userid where necessary.)
++
++SET allow_in_place_tablespaces = true;
++CREATE TABLESPACE regress_create_idx_tblspace LOCATION '';
++RESET allow_in_place_tablespaces;
++
++BEGIN;
++CREATE ROLE regress_minimal;
++CREATE SCHEMA s;
++CREATE EXTENSION citext SCHEMA s;
++-- Revoke all conceivably-relevant ACLs within the extension.  The system
++-- doesn't check all these ACLs, but this will provide some coverage if that
++-- ever changes.
++REVOKE ALL ON TYPE s.citext FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_pattern_lt FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_pattern_le FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_eq FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_pattern_ge FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_pattern_gt FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.citext_pattern_cmp FROM PUBLIC;
++-- Functions sufficient for making an index column that has the side effect of
++-- changing search_path at expression planning time.
++CREATE FUNCTION public.setter() RETURNS bool VOLATILE
++  LANGUAGE SQL AS $$SET search_path = s; SELECT true$$;
++CREATE FUNCTION s.const() RETURNS bool IMMUTABLE
++  LANGUAGE SQL AS $$SELECT public.setter()$$;
++CREATE FUNCTION s.index_this_expr(s.citext, bool) RETURNS s.citext IMMUTABLE
++  LANGUAGE SQL AS $$SELECT $1$$;
++REVOKE ALL ON FUNCTION public.setter FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.const FROM PUBLIC;
++REVOKE ALL ON FUNCTION s.index_this_expr FROM PUBLIC;
++-- Even for an empty table, expression planning calls s.const & public.setter.
++GRANT EXECUTE ON FUNCTION public.setter TO regress_minimal;
++GRANT EXECUTE ON FUNCTION s.const TO regress_minimal;
++-- Function for index predicate.
++CREATE FUNCTION s.index_row_if(s.citext) RETURNS bool IMMUTABLE
++  LANGUAGE SQL AS $$SELECT $1 IS NOT NULL$$;
++REVOKE ALL ON FUNCTION s.index_row_if FROM PUBLIC;
++-- Even for an empty table, CREATE INDEX checks ii_Predicate permissions.
++GRANT EXECUTE ON FUNCTION s.index_row_if TO regress_minimal;
++-- Non-extension, non-function objects.
++CREATE COLLATION s.coll (LOCALE="C");
++CREATE TABLE s.x (y s.citext);
++ALTER TABLE s.x OWNER TO regress_minimal;
++-- Empty-table DefineIndex()
++CREATE UNIQUE INDEX u0rows ON s.x USING btree
++  ((s.index_this_expr(y, s.const())) COLLATE s.coll s.citext_pattern_ops)
++  TABLESPACE regress_create_idx_tblspace
++  WHERE s.index_row_if(y);
++ALTER TABLE s.x ADD CONSTRAINT e0rows EXCLUDE USING btree
++  ((s.index_this_expr(y, s.const())) COLLATE s.coll WITH s.=)
++  USING INDEX TABLESPACE regress_create_idx_tblspace
++  WHERE (s.index_row_if(y));
++-- Make the table nonempty.
++INSERT INTO s.x VALUES ('foo'), ('bar');
++-- If the INSERT runs the planner on index expressions, a search_path change
++-- survives.  As of 2022-06, the INSERT reuses a cached plan.  It does so even
++-- under debug_discard_caches, since each index is new-in-transaction.  If
++-- future work changes a cache lifecycle, this RESET may become necessary.
++RESET search_path;
++-- For a nonempty table, owner needs permissions throughout ii_Expressions.
++GRANT EXECUTE ON FUNCTION s.index_this_expr TO regress_minimal;
++CREATE UNIQUE INDEX u2rows ON s.x USING btree
++  ((s.index_this_expr(y, s.const())) COLLATE s.coll s.citext_pattern_ops)
++  TABLESPACE regress_create_idx_tblspace
++  WHERE s.index_row_if(y);
++ALTER TABLE s.x ADD CONSTRAINT e2rows EXCLUDE USING btree
++  ((s.index_this_expr(y, s.const())) COLLATE s.coll WITH s.=)
++  USING INDEX TABLESPACE regress_create_idx_tblspace
++  WHERE (s.index_row_if(y));
++-- Shall not find s.coll via search_path, despite the s.const->public.setter
++-- call having set search_path=s during expression planning.  Suppress the
++-- message itself, which depends on the database encoding.
++\set VERBOSITY sqlstate
++ALTER TABLE s.x ADD CONSTRAINT underqualified EXCLUDE USING btree
++  ((s.index_this_expr(y, s.const())) COLLATE coll WITH s.=)
++  USING INDEX TABLESPACE regress_create_idx_tblspace
++  WHERE (s.index_row_if(y));
++\set VERBOSITY default
++ROLLBACK;
++
++DROP TABLESPACE regress_create_idx_tblspace;
+diff --git a/src/backend/commands/indexcmds.c b/src/backend/commands/indexcmds.c
+index eac13ac0b738..99f5ab83c327 100644
+--- a/src/backend/commands/indexcmds.c
++++ b/src/backend/commands/indexcmds.c
+@@ -80,7 +80,10 @@ static void ComputeIndexAttrs(IndexInfo *indexInfo,
+ 							  Oid relId,
+ 							  const char *accessMethodName, Oid accessMethodId,
+ 							  bool amcanorder,
+-							  bool isconstraint);
++							  bool isconstraint,
++							  Oid ddl_userid,
++							  int ddl_sec_context,
++							  int *ddl_save_nestlevel);
+ static char *ChooseIndexName(const char *tabname, Oid namespaceId,
+ 							 List *colnames, List *exclusionOpNames,
+ 							 bool primary, bool isconstraint);
+@@ -220,9 +223,8 @@ CheckIndexCompatible(Oid oldId,
+ 	 * Compute the operator classes, collations, and exclusion operators for
+ 	 * the new index, so we can test whether it's compatible with the existing
+ 	 * one.  Note that ComputeIndexAttrs might fail here, but that's OK:
+-	 * DefineIndex would have called this function with the same arguments
+-	 * later on, and it would have failed then anyway.  Our attributeList
+-	 * contains only key attributes, thus we're filling ii_NumIndexAttrs and
++	 * DefineIndex would have failed later.  Our attributeList contains only
++	 * key attributes, thus we're filling ii_NumIndexAttrs and
+ 	 * ii_NumIndexKeyAttrs with same value.
+ 	 */
+ 	indexInfo = makeIndexInfo(numberOfAttributes, numberOfAttributes,
+@@ -236,7 +238,7 @@ CheckIndexCompatible(Oid oldId,
+ 					  coloptions, attributeList,
+ 					  exclusionOpNames, relationId,
+ 					  accessMethodName, accessMethodId,
+-					  amcanorder, isconstraint);
++					  amcanorder, isconstraint, InvalidOid, 0, NULL);
+ 
+ 
+ 	/* Get the soon-obsolete pg_index tuple. */
+@@ -482,6 +484,19 @@ WaitForOlderSnapshots(TransactionId limitXmin, bool progress)
+  * DefineIndex
+  *		Creates a new index.
+  *
++ * This function manages the current userid according to the needs of pg_dump.
++ * Recreating old-database catalog entries in new-database is fine, regardless
++ * of which users would have permission to recreate those entries now.  That's
++ * just preservation of state.  Running opaque expressions, like calling a
++ * function named in a catalog entry or evaluating a pg_node_tree in a catalog
++ * entry, as anyone other than the object owner, is not fine.  To adhere to
++ * those principles and to remain fail-safe, use the table owner userid for
++ * most ACL checks.  Use the original userid for ACL checks reached without
++ * traversing opaque expressions.  (pg_dump can predict such ACL checks from
++ * catalogs.)  Overall, this is a mess.  Future DDL development should
++ * consider offering one DDL command for catalog setup and a separate DDL
++ * command for steps that run opaque expressions.
++ *
+  * 'relationId': the OID of the heap relation on which the index is to be
+  *		created
+  * 'stmt': IndexStmt describing the properties of the new index.
+@@ -890,7 +905,8 @@ DefineIndex(Oid relationId,
+ 					  coloptions, allIndexParams,
+ 					  stmt->excludeOpNames, relationId,
+ 					  accessMethodName, accessMethodId,
+-					  amcanorder, stmt->isconstraint);
++					  amcanorder, stmt->isconstraint, root_save_userid,
++					  root_save_sec_context, &root_save_nestlevel);
+ 
+ 	/*
+ 	 * Extra checks when creating a PRIMARY KEY index.
+@@ -1170,11 +1186,8 @@ DefineIndex(Oid relationId,
+ 
+ 	/*
+ 	 * Roll back any GUC changes executed by index functions, and keep
+-	 * subsequent changes local to this command.  It's barely possible that
+-	 * some index function changed a behavior-affecting GUC, e.g. xmloption,
+-	 * that affects subsequent steps.  This improves bug-compatibility with
+-	 * older PostgreSQL versions.  They did the AtEOXact_GUC() here for the
+-	 * purpose of clearing the above default_tablespace change.
++	 * subsequent changes local to this command.  This is essential if some
++	 * index function changed a behavior-affecting GUC, e.g. search_path.
+ 	 */
+ 	AtEOXact_GUC(false, root_save_nestlevel);
+ 	root_save_nestlevel = NewGUCNestLevel();
+@@ -1730,6 +1743,10 @@ CheckPredicate(Expr *predicate)
+  * Compute per-index-column information, including indexed column numbers
+  * or index expressions, opclasses and their options. Note, all output vectors
+  * should be allocated for all columns, including "including" ones.
++ *
++ * If the caller switched to the table owner, ddl_userid is the role for ACL
++ * checks reached without traversing opaque expressions.  Otherwise, it's
++ * InvalidOid, and other ddl_* arguments are undefined.
+  */
+ static void
+ ComputeIndexAttrs(IndexInfo *indexInfo,
+@@ -1743,12 +1760,17 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
+ 				  const char *accessMethodName,
+ 				  Oid accessMethodId,
+ 				  bool amcanorder,
+-				  bool isconstraint)
++				  bool isconstraint,
++				  Oid ddl_userid,
++				  int ddl_sec_context,
++				  int *ddl_save_nestlevel)
+ {
+ 	ListCell   *nextExclOp;
+ 	ListCell   *lc;
+ 	int			attn;
+ 	int			nkeycols = indexInfo->ii_NumIndexKeyAttrs;
++	Oid			save_userid;
++	int			save_sec_context;
+ 
+ 	/* Allocate space for exclusion operator info, if needed */
+ 	if (exclusionOpNames)
+@@ -1762,6 +1784,9 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
+ 	else
+ 		nextExclOp = NULL;
+ 
++	if (OidIsValid(ddl_userid))
++		GetUserIdAndSecContext(&save_userid, &save_sec_context);
++
+ 	/*
+ 	 * process attributeList
+ 	 */
+@@ -1892,10 +1917,24 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
+ 		}
+ 
+ 		/*
+-		 * Apply collation override if any
++		 * Apply collation override if any.  Use of ddl_userid is necessary
++		 * due to ACL checks therein, and it's safe because collations don't
++		 * contain opaque expressions (or non-opaque expressions).
+ 		 */
+ 		if (attribute->collation)
++		{
++			if (OidIsValid(ddl_userid))
++			{
++				AtEOXact_GUC(false, *ddl_save_nestlevel);
++				SetUserIdAndSecContext(ddl_userid, ddl_sec_context);
++			}
+ 			attcollation = get_collation_oid(attribute->collation, false);
++			if (OidIsValid(ddl_userid))
++			{
++				SetUserIdAndSecContext(save_userid, save_sec_context);
++				*ddl_save_nestlevel = NewGUCNestLevel();
++			}
++		}
+ 
+ 		/*
+ 		 * Check we have a collation iff it's a collatable type.  The only
+@@ -1923,12 +1962,25 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
+ 		collationOidP[attn] = attcollation;
+ 
+ 		/*
+-		 * Identify the opclass to use.
++		 * Identify the opclass to use.  Use of ddl_userid is necessary due to
++		 * ACL checks therein.  This is safe despite opclasses containing
++		 * opaque expressions (specifically, functions), because only
++		 * superusers can define opclasses.
+ 		 */
++		if (OidIsValid(ddl_userid))
++		{
++			AtEOXact_GUC(false, *ddl_save_nestlevel);
++			SetUserIdAndSecContext(ddl_userid, ddl_sec_context);
++		}
+ 		classOidP[attn] = ResolveOpClass(attribute->opclass,
+ 										 atttype,
+ 										 accessMethodName,
+ 										 accessMethodId);
++		if (OidIsValid(ddl_userid))
++		{
++			SetUserIdAndSecContext(save_userid, save_sec_context);
++			*ddl_save_nestlevel = NewGUCNestLevel();
++		}
+ 
+ 		/*
+ 		 * Identify the exclusion operator, if any.
+@@ -1942,9 +1994,23 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
+ 
+ 			/*
+ 			 * Find the operator --- it must accept the column datatype
+-			 * without runtime coercion (but binary compatibility is OK)
++			 * without runtime coercion (but binary compatibility is OK).
++			 * Operators contain opaque expressions (specifically, functions).
++			 * compatible_oper_opid() boils down to oper() and
++			 * IsBinaryCoercible().  PostgreSQL would have security problems
++			 * elsewhere if oper() started calling opaque expressions.
+ 			 */
++			if (OidIsValid(ddl_userid))
++			{
++				AtEOXact_GUC(false, *ddl_save_nestlevel);
++				SetUserIdAndSecContext(ddl_userid, ddl_sec_context);
++			}
+ 			opid = compatible_oper_opid(opname, atttype, atttype, false);
++			if (OidIsValid(ddl_userid))
++			{
++				SetUserIdAndSecContext(save_userid, save_sec_context);
++				*ddl_save_nestlevel = NewGUCNestLevel();
++			}
+ 
+ 			/*
+ 			 * Only allow commutative operators to be used in exclusion

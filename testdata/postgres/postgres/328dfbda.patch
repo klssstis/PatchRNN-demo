@@ -1,0 +1,435 @@
+From 328dfbdabd22e321bfe1f0547be71faca99a11e9 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 6 Jan 2022 13:09:05 -0500
+Subject: [PATCH] Extend psql's \lo_list/\dl to be able to print large objects'
+ ACLs.
+
+The ACL is printed when you add + to the command, similarly to
+various other psql backslash commands.
+
+Along the way, move the code for this into describe.c,
+where it is a better fit (and can share some code).
+
+Pavel Luzanov, reviewed by Georgios Kokolatos
+
+Discussion: https://postgr.es/m/6d722115-6297-bc53-bb7f-5f150e765299@postgrespro.ru
+---
+ doc/src/sgml/ddl.sgml                       |  2 +-
+ doc/src/sgml/ref/psql-ref.sgml              | 10 +++-
+ src/bin/psql/command.c                      |  6 ++-
+ src/bin/psql/describe.c                     | 46 ++++++++++++++++++
+ src/bin/psql/describe.h                     |  2 +
+ src/bin/psql/help.c                         |  4 +-
+ src/bin/psql/large_obj.c                    | 39 ---------------
+ src/bin/psql/large_obj.h                    |  1 -
+ src/test/regress/expected/largeobject.out   | 53 +++++++++++++--------
+ src/test/regress/expected/largeobject_1.out | 53 +++++++++++++--------
+ src/test/regress/sql/largeobject.sql        | 28 +++++------
+ 11 files changed, 144 insertions(+), 100 deletions(-)
+
+diff --git a/doc/src/sgml/ddl.sgml b/doc/src/sgml/ddl.sgml
+index 64d903065228..22f6c5c7abc0 100644
+--- a/doc/src/sgml/ddl.sgml
++++ b/doc/src/sgml/ddl.sgml
+@@ -2146,7 +2146,7 @@ REVOKE ALL ON accounts FROM PUBLIC;
+       <entry><literal>LARGE OBJECT</literal></entry>
+       <entry><literal>rw</literal></entry>
+       <entry>none</entry>
+-      <entry></entry>
++      <entry><literal>\dl+</literal></entry>
+      </row>
+      <row>
+       <entry><literal>SCHEMA</literal></entry>
+diff --git a/doc/src/sgml/ref/psql-ref.sgml b/doc/src/sgml/ref/psql-ref.sgml
+index ae38d3dcc3ee..1ab200a4adc2 100644
+--- a/doc/src/sgml/ref/psql-ref.sgml
++++ b/doc/src/sgml/ref/psql-ref.sgml
+@@ -1681,11 +1681,14 @@ testdb=&gt;
+ 
+ 
+       <varlistentry>
+-        <term><literal>\dl</literal></term>
++        <term><literal>\dl[+]</literal></term>
+         <listitem>
+         <para>
+         This is an alias for <command>\lo_list</command>, which shows a
+         list of large objects.
++        If <literal>+</literal> is appended to the command name,
++        each large object is listed with its associated permissions,
++        if any.
+         </para>
+         </listitem>
+       </varlistentry>
+@@ -2610,12 +2613,15 @@ lo_import 152801
+       </varlistentry>
+ 
+       <varlistentry>
+-        <term><literal>\lo_list</literal></term>
++        <term><literal>\lo_list[+]</literal></term>
+         <listitem>
+         <para>
+         Shows a list of all <productname>PostgreSQL</productname>
+         large objects currently stored in the database,
+         along with any comments provided for them.
++        If <literal>+</literal> is appended to the command name,
++        each large object is listed with its associated permissions,
++        if any.
+         </para>
+         </listitem>
+       </varlistentry>
+diff --git a/src/bin/psql/command.c b/src/bin/psql/command.c
+index fb3bab949487..414fc32152ab 100644
+--- a/src/bin/psql/command.c
++++ b/src/bin/psql/command.c
+@@ -811,7 +811,7 @@ exec_command_d(PsqlScanState scan_state, bool active_branch, const char *cmd)
+ 				success = describeRoles(pattern, show_verbose, show_system);
+ 				break;
+ 			case 'l':
+-				success = do_lo_list();
++				success = listLargeObjects(show_verbose);
+ 				break;
+ 			case 'L':
+ 				success = listLanguages(pattern, show_verbose, show_system);
+@@ -1963,7 +1963,9 @@ exec_command_lo(PsqlScanState scan_state, bool active_branch, const char *cmd)
+ 		}
+ 
+ 		else if (strcmp(cmd + 3, "list") == 0)
+-			success = do_lo_list();
++			success = listLargeObjects(false);
++		else if (strcmp(cmd + 3, "list+") == 0)
++			success = listLargeObjects(true);
+ 
+ 		else if (strcmp(cmd + 3, "unlink") == 0)
+ 		{
+diff --git a/src/bin/psql/describe.c b/src/bin/psql/describe.c
+index 0615de53255f..cdb33719ffa5 100644
+--- a/src/bin/psql/describe.c
++++ b/src/bin/psql/describe.c
+@@ -6463,3 +6463,49 @@ listOpFamilyFunctions(const char *access_method_pattern,
+ 	PQclear(res);
+ 	return true;
+ }
++
++/*
++ * \dl or \lo_list
++ * Lists large objects
++ */
++bool
++listLargeObjects(bool verbose)
++{
++	PQExpBufferData buf;
++	PGresult   *res;
++	printQueryOpt myopt = pset.popt;
++
++	initPQExpBuffer(&buf);
++
++	printfPQExpBuffer(&buf,
++					  "SELECT oid as \"%s\",\n"
++					  "  pg_catalog.pg_get_userbyid(lomowner) as \"%s\",\n  ",
++					  gettext_noop("ID"),
++					  gettext_noop("Owner"));
++
++	if (verbose)
++	{
++		printACLColumn(&buf, "lomacl");
++		appendPQExpBufferStr(&buf, ",\n  ");
++	}
++
++	appendPQExpBuffer(&buf,
++					  "pg_catalog.obj_description(oid, 'pg_largeobject') as \"%s\"\n"
++					  "FROM pg_catalog.pg_largeobject_metadata\n"
++					  "ORDER BY oid",
++					  gettext_noop("Description"));
++
++	res = PSQLexec(buf.data);
++	termPQExpBuffer(&buf);
++	if (!res)
++		return false;
++
++	myopt.nullPrint = NULL;
++	myopt.title = _("Large objects");
++	myopt.translate_header = true;
++
++	printQuery(res, &myopt, pset.queryFout, false, pset.logfile);
++
++	PQclear(res);
++	return true;
++}
+diff --git a/src/bin/psql/describe.h b/src/bin/psql/describe.h
+index 71b320f1fc69..b57ba67bba22 100644
+--- a/src/bin/psql/describe.h
++++ b/src/bin/psql/describe.h
+@@ -139,5 +139,7 @@ extern bool listOpFamilyOperators(const char *accessMethod_pattern,
+ extern bool listOpFamilyFunctions(const char *access_method_pattern,
+ 								  const char *family_pattern, bool verbose);
+ 
++/* \dl or \lo_list */
++extern bool listLargeObjects(bool verbose);
+ 
+ #endif							/* DESCRIBE_H */
+diff --git a/src/bin/psql/help.c b/src/bin/psql/help.c
+index 8cadfbb1032a..5752a36ac82d 100644
+--- a/src/bin/psql/help.c
++++ b/src/bin/psql/help.c
+@@ -248,7 +248,7 @@ slashUsage(unsigned short int pager)
+ 	fprintf(output, _("  \\dFt[+] [PATTERN]      list text search templates\n"));
+ 	fprintf(output, _("  \\dg[S+] [PATTERN]      list roles\n"));
+ 	fprintf(output, _("  \\di[S+] [PATTERN]      list indexes\n"));
+-	fprintf(output, _("  \\dl                    list large objects, same as \\lo_list\n"));
++	fprintf(output, _("  \\dl[+]                 list large objects, same as \\lo_list\n"));
+ 	fprintf(output, _("  \\dL[S+] [PATTERN]      list procedural languages\n"));
+ 	fprintf(output, _("  \\dm[S+] [PATTERN]      list materialized views\n"));
+ 	fprintf(output, _("  \\dn[S+] [PATTERN]      list schemas\n"));
+@@ -325,7 +325,7 @@ slashUsage(unsigned short int pager)
+ 	fprintf(output, _("Large Objects\n"));
+ 	fprintf(output, _("  \\lo_export LOBOID FILE\n"
+ 					  "  \\lo_import FILE [COMMENT]\n"
+-					  "  \\lo_list\n"
++					  "  \\lo_list[+]\n"
+ 					  "  \\lo_unlink LOBOID      large object operations\n"));
+ 
+ 	ClosePager(output);
+diff --git a/src/bin/psql/large_obj.c b/src/bin/psql/large_obj.c
+index 10e47c87ac9f..243875be83de 100644
+--- a/src/bin/psql/large_obj.c
++++ b/src/bin/psql/large_obj.c
+@@ -262,42 +262,3 @@ do_lo_unlink(const char *loid_arg)
+ 
+ 	return true;
+ }
+-
+-
+-
+-/*
+- * do_lo_list()
+- *
+- * Show all large objects in database with comments
+- */
+-bool
+-do_lo_list(void)
+-{
+-	PGresult   *res;
+-	char		buf[1024];
+-	printQueryOpt myopt = pset.popt;
+-
+-	snprintf(buf, sizeof(buf),
+-			 "SELECT oid as \"%s\",\n"
+-			 "  pg_catalog.pg_get_userbyid(lomowner) as \"%s\",\n"
+-			 "  pg_catalog.obj_description(oid, 'pg_largeobject') as \"%s\"\n"
+-			 "  FROM pg_catalog.pg_largeobject_metadata "
+-			 "  ORDER BY oid",
+-			 gettext_noop("ID"),
+-			 gettext_noop("Owner"),
+-			 gettext_noop("Description"));
+-
+-	res = PSQLexec(buf);
+-	if (!res)
+-		return false;
+-
+-	myopt.topt.tuples_only = false;
+-	myopt.nullPrint = NULL;
+-	myopt.title = _("Large objects");
+-	myopt.translate_header = true;
+-
+-	printQuery(res, &myopt, pset.queryFout, false, pset.logfile);
+-
+-	PQclear(res);
+-	return true;
+-}
+diff --git a/src/bin/psql/large_obj.h b/src/bin/psql/large_obj.h
+index 003acbf52c9d..3172a7704d06 100644
+--- a/src/bin/psql/large_obj.h
++++ b/src/bin/psql/large_obj.h
+@@ -11,6 +11,5 @@
+ bool		do_lo_export(const char *loid_arg, const char *filename_arg);
+ bool		do_lo_import(const char *filename_arg, const char *comment_arg);
+ bool		do_lo_unlink(const char *loid_arg);
+-bool		do_lo_list(void);
+ 
+ #endif							/* LARGE_OBJ_H */
+diff --git a/src/test/regress/expected/largeobject.out b/src/test/regress/expected/largeobject.out
+index f461ca3b9f49..8e32de04e640 100644
+--- a/src/test/regress/expected/largeobject.out
++++ b/src/test/regress/expected/largeobject.out
+@@ -6,31 +6,46 @@
+ \getenv abs_builddir PG_ABS_BUILDDIR
+ -- ensure consistent test output regardless of the default bytea format
+ SET bytea_output TO escape;
++-- Test ALTER LARGE OBJECT OWNER, GRANT, COMMENT
++CREATE ROLE regress_lo_user;
++SELECT lo_create(42);
++ lo_create 
++-----------
++        42
++(1 row)
++
++ALTER LARGE OBJECT 42 OWNER TO regress_lo_user;
++GRANT SELECT ON LARGE OBJECT 42 TO public;
++COMMENT ON LARGE OBJECT 42 IS 'the ultimate answer';
++-- Test psql's \lo_list et al (we assume no other LOs exist yet)
++\lo_list
++               Large objects
++ ID |      Owner      |     Description     
++----+-----------------+---------------------
++ 42 | regress_lo_user | the ultimate answer
++(1 row)
++
++\lo_list+
++                                  Large objects
++ ID |      Owner      |         Access privileges          |     Description     
++----+-----------------+------------------------------------+---------------------
++ 42 | regress_lo_user | regress_lo_user=rw/regress_lo_user+| the ultimate answer
++    |                 | =r/regress_lo_user                 | 
++(1 row)
++
++\lo_unlink 42
++\dl
++      Large objects
++ ID | Owner | Description 
++----+-------+-------------
++(0 rows)
++
+ -- Load a file
+ CREATE TABLE lotest_stash_values (loid oid, fd integer);
+ -- lo_creat(mode integer) returns oid
+ -- The mode arg to lo_creat is unused, some vestigal holdover from ancient times
+ -- returns the large object id
+ INSERT INTO lotest_stash_values (loid) SELECT lo_creat(42);
+--- Test ALTER LARGE OBJECT
+-CREATE ROLE regress_lo_user;
+-DO $$
+-  BEGIN
+-    EXECUTE 'ALTER LARGE OBJECT ' || (select loid from lotest_stash_values)
+-		|| ' OWNER TO regress_lo_user';
+-  END
+-$$;
+-SELECT
+-	rol.rolname
+-FROM
+-	lotest_stash_values s
+-	JOIN pg_largeobject_metadata lo ON s.loid = lo.oid
+-	JOIN pg_authid rol ON lo.lomowner = rol.oid;
+-     rolname     
+------------------
+- regress_lo_user
+-(1 row)
+-
+ -- NOTE: large objects require transactions
+ BEGIN;
+ -- lo_open(lobjId oid, mode integer) returns integer
+diff --git a/src/test/regress/expected/largeobject_1.out b/src/test/regress/expected/largeobject_1.out
+index a9725c375d59..561065da5861 100644
+--- a/src/test/regress/expected/largeobject_1.out
++++ b/src/test/regress/expected/largeobject_1.out
+@@ -6,31 +6,46 @@
+ \getenv abs_builddir PG_ABS_BUILDDIR
+ -- ensure consistent test output regardless of the default bytea format
+ SET bytea_output TO escape;
++-- Test ALTER LARGE OBJECT OWNER, GRANT, COMMENT
++CREATE ROLE regress_lo_user;
++SELECT lo_create(42);
++ lo_create 
++-----------
++        42
++(1 row)
++
++ALTER LARGE OBJECT 42 OWNER TO regress_lo_user;
++GRANT SELECT ON LARGE OBJECT 42 TO public;
++COMMENT ON LARGE OBJECT 42 IS 'the ultimate answer';
++-- Test psql's \lo_list et al (we assume no other LOs exist yet)
++\lo_list
++               Large objects
++ ID |      Owner      |     Description     
++----+-----------------+---------------------
++ 42 | regress_lo_user | the ultimate answer
++(1 row)
++
++\lo_list+
++                                  Large objects
++ ID |      Owner      |         Access privileges          |     Description     
++----+-----------------+------------------------------------+---------------------
++ 42 | regress_lo_user | regress_lo_user=rw/regress_lo_user+| the ultimate answer
++    |                 | =r/regress_lo_user                 | 
++(1 row)
++
++\lo_unlink 42
++\dl
++      Large objects
++ ID | Owner | Description 
++----+-------+-------------
++(0 rows)
++
+ -- Load a file
+ CREATE TABLE lotest_stash_values (loid oid, fd integer);
+ -- lo_creat(mode integer) returns oid
+ -- The mode arg to lo_creat is unused, some vestigal holdover from ancient times
+ -- returns the large object id
+ INSERT INTO lotest_stash_values (loid) SELECT lo_creat(42);
+--- Test ALTER LARGE OBJECT
+-CREATE ROLE regress_lo_user;
+-DO $$
+-  BEGIN
+-    EXECUTE 'ALTER LARGE OBJECT ' || (select loid from lotest_stash_values)
+-		|| ' OWNER TO regress_lo_user';
+-  END
+-$$;
+-SELECT
+-	rol.rolname
+-FROM
+-	lotest_stash_values s
+-	JOIN pg_largeobject_metadata lo ON s.loid = lo.oid
+-	JOIN pg_authid rol ON lo.lomowner = rol.oid;
+-     rolname     
+------------------
+- regress_lo_user
+-(1 row)
+-
+ -- NOTE: large objects require transactions
+ BEGIN;
+ -- lo_open(lobjId oid, mode integer) returns integer
+diff --git a/src/test/regress/sql/largeobject.sql b/src/test/regress/sql/largeobject.sql
+index 16da077f3a2d..fd3518889ebe 100644
+--- a/src/test/regress/sql/largeobject.sql
++++ b/src/test/regress/sql/largeobject.sql
+@@ -9,6 +9,19 @@
+ -- ensure consistent test output regardless of the default bytea format
+ SET bytea_output TO escape;
+ 
++-- Test ALTER LARGE OBJECT OWNER, GRANT, COMMENT
++CREATE ROLE regress_lo_user;
++SELECT lo_create(42);
++ALTER LARGE OBJECT 42 OWNER TO regress_lo_user;
++GRANT SELECT ON LARGE OBJECT 42 TO public;
++COMMENT ON LARGE OBJECT 42 IS 'the ultimate answer';
++
++-- Test psql's \lo_list et al (we assume no other LOs exist yet)
++\lo_list
++\lo_list+
++\lo_unlink 42
++\dl
++
+ -- Load a file
+ CREATE TABLE lotest_stash_values (loid oid, fd integer);
+ -- lo_creat(mode integer) returns oid
+@@ -16,21 +29,6 @@ CREATE TABLE lotest_stash_values (loid oid, fd integer);
+ -- returns the large object id
+ INSERT INTO lotest_stash_values (loid) SELECT lo_creat(42);
+ 
+--- Test ALTER LARGE OBJECT
+-CREATE ROLE regress_lo_user;
+-DO $$
+-  BEGIN
+-    EXECUTE 'ALTER LARGE OBJECT ' || (select loid from lotest_stash_values)
+-		|| ' OWNER TO regress_lo_user';
+-  END
+-$$;
+-SELECT
+-	rol.rolname
+-FROM
+-	lotest_stash_values s
+-	JOIN pg_largeobject_metadata lo ON s.loid = lo.oid
+-	JOIN pg_authid rol ON lo.lomowner = rol.oid;
+-
+ -- NOTE: large objects require transactions
+ BEGIN;
+ 

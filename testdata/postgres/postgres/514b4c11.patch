@@ -1,0 +1,187 @@
+From 514b4c11d24701d2cc90ad75ed787bf1380af673 Mon Sep 17 00:00:00 2001
+From: Tom Lane <tgl@sss.pgh.pa.us>
+Date: Thu, 29 Jul 2021 13:33:31 -0400
+Subject: [PATCH] Improve libpq's handling of OOM during error message
+ construction.
+
+Commit ffa2e4670 changed libpq so that multiple error reports
+occurring during one operation (a connection attempt or query)
+are accumulated in conn->errorMessage, where before new ones
+usually replaced any prior error.  At least in theory, that makes
+us more vulnerable to running out of memory for the errorMessage
+buffer.  If it did happen, the user would be left with just an
+empty-string error report, which is pretty unhelpful.
+
+We can improve this by relying on pqexpbuffer.c's existing "broken
+buffer" convention to track whether we've hit OOM for the current
+operation's error string, and then substituting a constant "out of
+memory" string in the small number of places where the errorMessage
+is read out.
+
+While at it, apply the same method to similar OOM cases in
+pqInternalNotice and pqGetErrorNotice3.
+
+Back-patch to v14 where ffa2e4670 came in.  In principle this could
+go back further; but in view of the lack of field reports, the
+hazard seems negligible in older branches.
+
+Discussion: https://postgr.es/m/530153.1627425648@sss.pgh.pa.us
+---
+ src/interfaces/libpq/fe-connect.c   |  8 ++++++
+ src/interfaces/libpq/fe-exec.c      | 42 +++++++++++++++++++----------
+ src/interfaces/libpq/fe-protocol3.c | 15 ++++++++---
+ src/interfaces/libpq/libpq-int.h    |  2 +-
+ 4 files changed, 48 insertions(+), 19 deletions(-)
+
+diff --git a/src/interfaces/libpq/fe-connect.c b/src/interfaces/libpq/fe-connect.c
+index e950b41374ba..49eec3e83564 100644
+--- a/src/interfaces/libpq/fe-connect.c
++++ b/src/interfaces/libpq/fe-connect.c
+@@ -6739,6 +6739,14 @@ PQerrorMessage(const PGconn *conn)
+ 	if (!conn)
+ 		return libpq_gettext("connection pointer is NULL\n");
+ 
++	/*
++	 * The errorMessage buffer might be marked "broken" due to having
++	 * previously failed to allocate enough memory for the message.  In that
++	 * case, tell the application we ran out of memory.
++	 */
++	if (PQExpBufferBroken(&conn->errorMessage))
++		return libpq_gettext("out of memory\n");
++
+ 	return conn->errorMessage.data;
+ }
+ 
+diff --git a/src/interfaces/libpq/fe-exec.c b/src/interfaces/libpq/fe-exec.c
+index aca81890bb16..6c7b3df0127c 100644
+--- a/src/interfaces/libpq/fe-exec.c
++++ b/src/interfaces/libpq/fe-exec.c
+@@ -191,7 +191,7 @@ PQmakeEmptyPGresult(PGconn *conn, ExecStatusType status)
+ 				/* non-error cases */
+ 				break;
+ 			default:
+-				pqSetResultError(result, conn->errorMessage.data);
++				pqSetResultError(result, &conn->errorMessage);
+ 				break;
+ 		}
+ 
+@@ -662,14 +662,28 @@ pqResultStrdup(PGresult *res, const char *str)
+  *		assign a new error message to a PGresult
+  */
+ void
+-pqSetResultError(PGresult *res, const char *msg)
++pqSetResultError(PGresult *res, PQExpBuffer errorMessage)
+ {
++	char	   *msg;
++
+ 	if (!res)
+ 		return;
+-	if (msg && *msg)
+-		res->errMsg = pqResultStrdup(res, msg);
++
++	/*
++	 * We handle two OOM scenarios here.  The errorMessage buffer might be
++	 * marked "broken" due to having previously failed to allocate enough
++	 * memory for the message, or it might be fine but pqResultStrdup fails
++	 * and returns NULL.  In either case, just make res->errMsg point directly
++	 * at a constant "out of memory" string.
++	 */
++	if (!PQExpBufferBroken(errorMessage))
++		msg = pqResultStrdup(res, errorMessage->data);
++	else
++		msg = NULL;
++	if (msg)
++		res->errMsg = msg;
+ 	else
+-		res->errMsg = NULL;
++		res->errMsg = libpq_gettext("out of memory\n");
+ }
+ 
+ /*
+@@ -852,19 +866,19 @@ pqInternalNotice(const PGNoticeHooks *hooks, const char *fmt,...)
+ 	/* XXX should provide a SQLSTATE too? */
+ 
+ 	/*
+-	 * Result text is always just the primary message + newline. If we can't
+-	 * allocate it, don't bother invoking the receiver.
++	 * Result text is always just the primary message + newline.  If we can't
++	 * allocate it, substitute "out of memory", as in pqSetResultError.
+ 	 */
+ 	res->errMsg = (char *) pqResultAlloc(res, strlen(msgBuf) + 2, false);
+ 	if (res->errMsg)
+-	{
+ 		sprintf(res->errMsg, "%s\n", msgBuf);
++	else
++		res->errMsg = libpq_gettext("out of memory\n");
+ 
+-		/*
+-		 * Pass to receiver, then free it.
+-		 */
+-		res->noticeHooks.noticeRec(res->noticeHooks.noticeRecArg, res);
+-	}
++	/*
++	 * Pass to receiver, then free it.
++	 */
++	res->noticeHooks.noticeRec(res->noticeHooks.noticeRecArg, res);
+ 	PQclear(res);
+ }
+ 
+@@ -2122,7 +2136,7 @@ PQgetResult(PGconn *conn)
+ 				appendPQExpBuffer(&conn->errorMessage,
+ 								  libpq_gettext("PGEventProc \"%s\" failed during PGEVT_RESULTCREATE event\n"),
+ 								  res->events[i].name);
+-				pqSetResultError(res, conn->errorMessage.data);
++				pqSetResultError(res, &conn->errorMessage);
+ 				res->resultStatus = PGRES_FATAL_ERROR;
+ 				break;
+ 			}
+diff --git a/src/interfaces/libpq/fe-protocol3.c b/src/interfaces/libpq/fe-protocol3.c
+index 2e8330534873..9ab3bf1fcb61 100644
+--- a/src/interfaces/libpq/fe-protocol3.c
++++ b/src/interfaces/libpq/fe-protocol3.c
+@@ -967,12 +967,12 @@ pqGetErrorNotice3(PGconn *conn, bool isError)
+ 	if (isError)
+ 	{
+ 		if (res)
+-			res->errMsg = pqResultStrdup(res, workBuf.data);
++			pqSetResultError(res, &workBuf);
+ 		pqClearAsyncResult(conn);	/* redundant, but be safe */
+ 		conn->result = res;
+ 		if (PQExpBufferDataBroken(workBuf))
+ 			appendPQExpBufferStr(&conn->errorMessage,
+-								 libpq_gettext("out of memory"));
++								 libpq_gettext("out of memory\n"));
+ 		else
+ 			appendPQExpBufferStr(&conn->errorMessage, workBuf.data);
+ 	}
+@@ -981,8 +981,15 @@ pqGetErrorNotice3(PGconn *conn, bool isError)
+ 		/* if we couldn't allocate the result set, just discard the NOTICE */
+ 		if (res)
+ 		{
+-			/* We can cheat a little here and not copy the message. */
+-			res->errMsg = workBuf.data;
++			/*
++			 * We can cheat a little here and not copy the message.  But if we
++			 * were unlucky enough to run out of memory while filling workBuf,
++			 * insert "out of memory", as in pqSetResultError.
++			 */
++			if (PQExpBufferDataBroken(workBuf))
++				res->errMsg = libpq_gettext("out of memory\n");
++			else
++				res->errMsg = workBuf.data;
+ 			if (res->noticeHooks.noticeRec != NULL)
+ 				res->noticeHooks.noticeRec(res->noticeHooks.noticeRecArg, res);
+ 			PQclear(res);
+diff --git a/src/interfaces/libpq/libpq-int.h b/src/interfaces/libpq/libpq-int.h
+index e9f214b61b9f..490458adef5d 100644
+--- a/src/interfaces/libpq/libpq-int.h
++++ b/src/interfaces/libpq/libpq-int.h
+@@ -637,7 +637,7 @@ extern pgthreadlock_t pg_g_threadlock;
+ 
+ /* === in fe-exec.c === */
+ 
+-extern void pqSetResultError(PGresult *res, const char *msg);
++extern void pqSetResultError(PGresult *res, PQExpBuffer errorMessage);
+ extern void *pqResultAlloc(PGresult *res, size_t nBytes, bool isBinary);
+ extern char *pqResultStrdup(PGresult *res, const char *str);
+ extern void pqClearAsyncResult(PGconn *conn);
